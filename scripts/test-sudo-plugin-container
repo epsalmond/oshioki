@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# test-sudo-plugin-container: end-to-end container test for the sudo
+# approval-plugin payload-binding contract.
+#
+# Local mode creates a private Docker network containing NATS, the subscriber,
+# and the sudo test container. Woodpecker sets SUDO_APPROVE_E2E_IN_CONTAINER=1;
+# its step is already the test container and reaches the pipeline NATS service
+# by DNS name.
+#
+# Usage: test-sudo-plugin-container
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+WORKSPACE="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+
+IMAGE="${IMAGE:-ubuntu:24.04}"
+PY_IMAGE="${PY_IMAGE:-python:3.12-slim}"
+NATS_IMAGE="${NATS_IMAGE:-nats:2.10}"
+IN_CONTAINER="${SUDO_APPROVE_E2E_IN_CONTAINER:-0}"
+SKIP_BUILD="${SUDO_APPROVE_E2E_SKIP_BUILD:-0}"
+KEEP_ARTIFACTS="${SUDO_APPROVE_E2E_KEEP_ARTIFACTS:-0}"
+
+SHARE="$(mktemp -d -t sudo-approve-test.XXXXXX)"
+SHARE="$(cd "$SHARE" && pwd -P)"
+RUN_ID="${SHARE##*.}"
+NETWORK_NAME="sudo-approve-test-${RUN_ID}"
+NATS_NAME="sudo-approve-test-nats-${RUN_ID}"
+SUB_NAME="sudo-approve-test-sub-${RUN_ID}"
+SUDO_NAME="sudo-approve-test-sudo-${RUN_ID}"
+
+TEST_SUCCEEDED=0
+NETWORK_CREATED=0
+SUBSCRIBER_PID=""
+
+run_docker() {
+  if [ "${SUDO_APPROVE_E2E_DOCKER_SUDO:-0}" = "1" ]; then
+    sudo -n docker "$@"
+  else
+    docker "$@"
+  fi
+}
+
+capture_container_logs() {
+  run_docker logs "$NATS_NAME" >"$SHARE/nats-container.log" 2>&1 || true
+  run_docker logs "$SUB_NAME" >"$SHARE/subscriber-container.log" 2>&1 || true
+  if [ ! -s "$SHARE/sudo-run.log" ]; then
+    run_docker logs "$SUDO_NAME" >"$SHARE/sudo-run.log" 2>&1 || true
+  fi
+}
+
+cleanup() {
+  set +e
+  if [ "$IN_CONTAINER" = "1" ]; then
+    if [ -n "$SUBSCRIBER_PID" ]; then
+      kill "$SUBSCRIBER_PID" >/dev/null 2>&1 || true
+      wait "$SUBSCRIBER_PID" >/dev/null 2>&1 || true
+    fi
+  else
+    if [ "$TEST_SUCCEEDED" -ne 1 ]; then
+      capture_container_logs
+    fi
+    run_docker rm -f "$NATS_NAME" "$SUB_NAME" "$SUDO_NAME" >/dev/null 2>&1 || true
+    if [ "$NETWORK_CREATED" -eq 1 ]; then
+      run_docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if [ "$TEST_SUCCEEDED" -eq 1 ] && [ "$KEEP_ARTIFACTS" != "1" ]; then
+    rm -rf "$SHARE"
+  else
+    echo "* retained test artifacts: $SHARE" >&2
+  fi
+}
+trap cleanup EXIT
+
+echo "* workspace: $WORKSPACE"
+echo "* share:     $SHARE"
+
+# A normal local run rebuilds immediately before exercising sudo. Woodpecker
+# may skip this duplicate build only with the commit receipt written by its
+# prerequisite build step and a clean service checkout.
+BUILD_RECEIPT="$WORKSPACE/target/release/.sudo-approve-e2e-commit"
+if [ "$SKIP_BUILD" = "1" ]; then
+  EXPECTED_COMMIT="$(git -C "$WORKSPACE" rev-parse HEAD)"
+  [ -f "$BUILD_RECEIPT" ] || {
+    echo "missing E2E build receipt: $BUILD_RECEIPT" >&2
+    exit 2
+  }
+  [ "$(cat "$BUILD_RECEIPT")" = "$EXPECTED_COMMIT" ] || {
+    echo "E2E build receipt does not match checkout $EXPECTED_COMMIT" >&2
+    exit 2
+  }
+  [ -z "$(git -C "$WORKSPACE" status --porcelain --untracked-files=all -- .)" ] || {
+    echo "cannot reuse CI build artifacts with a dirty sudo-approve checkout" >&2
+    exit 2
+  }
+  echo "* release:   verified CI build receipt for $EXPECTED_COMMIT"
+else
+  echo "* release:   rebuilding current sudo-approve workspace"
+  (cd "$WORKSPACE" && cargo build --workspace --release)
+  git -C "$WORKSPACE" rev-parse HEAD >"$BUILD_RECEIPT"
+fi
+
+for artifact in "$WORKSPACE/target/release/management-plane-sudo-approve" \
+                "$WORKSPACE/target/release/libplugin.so"; do
+  [ -f "$artifact" ] || {
+    echo "missing build artifact after release build: $artifact" >&2
+    exit 2
+  }
+done
+
+NATS_HOST_VALUE=""
+NATS_PORT_VALUE=""
+NATS_URL_VALUE=""
+
+if [ "$IN_CONTAINER" = "1" ]; then
+  NATS_HOST_VALUE="${NATS_HOST:-nats}"
+  NATS_PORT_VALUE="${NATS_PORT:-4222}"
+  NATS_URL_VALUE="${NATS_URL:-nats://${NATS_HOST_VALUE}:${NATS_PORT_VALUE}}"
+else
+  run_docker network create "$NETWORK_NAME" >/dev/null
+  NETWORK_CREATED=1
+  run_docker run -d --name "$NATS_NAME" --network "$NETWORK_NAME" \
+    "$NATS_IMAGE" -js \
+    --user "${NATS_USER:-sudo-approve}" \
+    --pass "${NATS_PASS:-test}" >/dev/null
+  NATS_HOST_VALUE="$NATS_NAME"
+  NATS_PORT_VALUE=4222
+  NATS_URL_VALUE="nats://${NATS_HOST_VALUE}:${NATS_PORT_VALUE}"
+fi
+
+# Assert that NATS accepts TCP connections before starting the subscriber.
+NATS_READY=0
+for _ in $(seq 1 60); do
+  if [ "$IN_CONTAINER" = "1" ]; then
+    if python3 -c 'import socket,sys; s=socket.create_connection((sys.argv[1], int(sys.argv[2])), 1); s.close()' \
+         "$NATS_HOST_VALUE" "$NATS_PORT_VALUE" >/dev/null 2>&1; then
+      NATS_READY=1
+      break
+    fi
+  elif run_docker run --rm --network "$NETWORK_NAME" "$PY_IMAGE" \
+       python3 -c 'import socket,sys; s=socket.create_connection((sys.argv[1], int(sys.argv[2])), 1); s.close()' \
+       "$NATS_HOST_VALUE" "$NATS_PORT_VALUE" >/dev/null 2>&1; then
+    NATS_READY=1
+    break
+  fi
+  sleep 1
+done
+[ "$NATS_READY" -eq 1 ] || {
+  echo "NATS never became ready at $NATS_HOST_VALUE:$NATS_PORT_VALUE" >&2
+  exit 1
+}
+echo "* NATS:      $NATS_URL_VALUE"
+
+# Copy before launch. The subscriber publishes subscriber.ready atomically
+# only after NATS has processed SUB followed by PING and returned PONG.
+cp "$SCRIPT_DIR/test-sudo-plugin-subscriber.py" "$SHARE/"
+if [ "$IN_CONTAINER" = "1" ]; then
+  python3 -c 'import cryptography' >/dev/null 2>&1 || {
+    echo "python3 cryptography module is required for in-container E2E" >&2
+    exit 2
+  }
+  SHARE_DIR="$SHARE" \
+  NATS_HOST="$NATS_HOST_VALUE" \
+  NATS_PORT="$NATS_PORT_VALUE" \
+  NATS_USER="${NATS_USER:-sudo-approve}" \
+  NATS_PASS="${NATS_PASS:-test}" \
+  TIMEOUT=180 \
+    python3 "$SHARE/test-sudo-plugin-subscriber.py" \
+      >"$SHARE/subscriber.log" 2>&1 &
+  SUBSCRIBER_PID=$!
+  echo "* subscriber:pid://${SUBSCRIBER_PID}"
+else
+  run_docker run -d --name "$SUB_NAME" --network "$NETWORK_NAME" \
+    -e SHARE_DIR=/share \
+    -e NATS_HOST="$NATS_HOST_VALUE" \
+    -e NATS_PORT="$NATS_PORT_VALUE" \
+    -e NATS_USER="${NATS_USER:-sudo-approve}" \
+    -e NATS_PASS="${NATS_PASS:-test}" \
+    -e TIMEOUT=180 \
+    -v "$SHARE":/share \
+    "$PY_IMAGE" \
+    bash -c 'pip -q install cryptography && exec python3 /share/test-sudo-plugin-subscriber.py' \
+    >/dev/null
+  echo "* subscriber:docker://${SUB_NAME}"
+fi
+
+for _ in $(seq 1 120); do
+  [ -f "$SHARE/subscriber.ready" ] && break
+  if [ "$IN_CONTAINER" = "1" ]; then
+    kill -0 "$SUBSCRIBER_PID" >/dev/null 2>&1 || break
+  elif [ "$(run_docker inspect -f '{{.State.Running}}' "$SUB_NAME" 2>/dev/null || true)" != "true" ]; then
+    break
+  fi
+  sleep 1
+done
+
+if [ ! -f "$SHARE/subscriber.ready" ] || [ ! -s "$SHARE/box_pub.hex" ]; then
+  echo "subscriber never established its NATS subscription" >&2
+  if [ "$IN_CONTAINER" = "1" ]; then
+    tail -40 "$SHARE/subscriber.log" >&2 || true
+  else
+    run_docker logs "$SUB_NAME" 2>&1 | tail -40 >&2 || true
+  fi
+  exit 1
+fi
+echo "* subscriber box: $(head -c 32 "$SHARE/box_pub.hex")..."
+
+BOX_PUB="$(cat "$SHARE/box_pub.hex")"
+EXPECTED_CMD="/usr/bin/echo"
+EXPECTED_USER="approvalcaller"
+EXPECTED_UID="12345"
+ARGS=("hello" "world with spaces" "--label=alpha=beta" "-n")
+EXPECTED_ARGV=("$EXPECTED_CMD" "${ARGS[@]}")
+
+cat >"$SHARE/devices.json" <<EOF
+[
+  {
+    "box_pub": "$BOX_PUB",
+    "credential_pub": "",
+    "credential_id": ""
+  }
+]
+EOF
+
+if [ "$IN_CONTAINER" = "1" ]; then
+  INNER_SERVICE_DIR="$WORKSPACE"
+  INNER_SHARE_DIR="$SHARE"
+else
+  INNER_SERVICE_DIR=/services/sudo-approve
+  INNER_SHARE_DIR=/share
+fi
+
+INNER_SCRIPT="$SHARE/sudo-inner.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'set -euo pipefail\n'
+  printf 'SERVICE_DIR=%q\n' "$INNER_SERVICE_DIR"
+  printf 'SHARE_DIR=%q\n' "$INNER_SHARE_DIR"
+  printf 'EXPECTED_CMD=%q\n' "$EXPECTED_CMD"
+  printf 'EXPECTED_USER=%q\n' "$EXPECTED_USER"
+  printf 'EXPECTED_UID=%q\n' "$EXPECTED_UID"
+  printf 'ARGS=('
+  printf ' %q' "${ARGS[@]}"
+  printf ' )\n'
+  cat <<'INNER'
+echo "[inner] start $(date -Is)"
+
+if ! command -v sudo >/dev/null 2>&1; then
+  apt-get update -qq >/dev/null
+  apt-get install -y -qq sudo >/dev/null
+fi
+
+"$SERVICE_DIR/scripts/install-sudo-hook" --standalone-e2e
+echo "[inner] install-sudo-hook OK"
+
+cp "$SHARE_DIR/devices.json" /etc/management-plane/sudo-approve/devices.json
+echo "[inner] devices.json planted"
+
+cleanup_e2e_sudoers() {
+  rm -f /etc/sudoers.d/sudo-approve-e2e
+}
+cleanup_e2e_sudoers
+trap cleanup_e2e_sudoers EXIT
+
+useradd --uid "$EXPECTED_UID" --create-home --shell /bin/bash "$EXPECTED_USER"
+printf '%s ALL=(root) NOPASSWD: %s\n' "$EXPECTED_USER" "$EXPECTED_CMD" \
+  > /etc/sudoers.d/sudo-approve-e2e
+chmod 0440 /etc/sudoers.d/sudo-approve-e2e
+echo "[inner] caller $EXPECTED_USER uid=$EXPECTED_UID created"
+
+sudo -k || true
+echo "[inner] running sudo as $EXPECTED_USER: $EXPECTED_CMD ${ARGS[*]}"
+if runuser -u "$EXPECTED_USER" -- sudo "$EXPECTED_CMD" "${ARGS[@]}"; then
+  sudo_status=0
+else
+  sudo_status=$?
+fi
+echo "[inner] sudo returned $sudo_status"
+printf '%s\n' "$sudo_status" >"$SHARE_DIR/sudo.status"
+
+if [ "$sudo_status" -eq 0 ]; then
+  echo "[inner] FAIL: sudo unexpectedly approved without a verdict" >&2
+  exit 1
+fi
+INNER
+} >"$INNER_SCRIPT"
+chmod +x "$INNER_SCRIPT"
+
+run_sudo() {
+  if [ "$IN_CONTAINER" = "1" ]; then
+    NATS_URL="$NATS_URL_VALUE" \
+    NATS_USER="${NATS_USER:-sudo-approve}" \
+    NATS_PASS="${NATS_PASS:-test}" \
+      bash -x "$INNER_SCRIPT" >"$SHARE/sudo-run.log" 2>&1
+  else
+    run_docker run --name "$SUDO_NAME" --network "$NETWORK_NAME" \
+      -e NATS_URL="$NATS_URL_VALUE" \
+      -e NATS_USER="${NATS_USER:-sudo-approve}" \
+      -e NATS_PASS="${NATS_PASS:-test}" \
+      -v "$SHARE":/share \
+      -v "$WORKSPACE":/services/sudo-approve \
+      -w /services/sudo-approve \
+      "$IMAGE" \
+      bash -x /share/sudo-inner.sh \
+      >"$SHARE/sudo-run.log" 2>&1
+  fi
+}
+
+echo "* sudo run:  invoking sudo $EXPECTED_CMD ${ARGS[*]}"
+if ! run_sudo; then
+  echo "FAIL: sudo test container/driver failed" >&2
+  cat "$SHARE/sudo-run.log" >&2 || true
+  exit 1
+fi
+
+for _ in $(seq 1 60); do
+  [ -f "$SHARE/approved_request.json" ] && break
+  sleep 1
+done
+
+if [ ! -f "$SHARE/approved_request.json" ]; then
+  echo "FAIL: subscriber never captured an approval payload" >&2
+  echo "--- sudo log ---" >&2
+  cat "$SHARE/sudo-run.log" >&2 || true
+  echo "--- subscriber log ---" >&2
+  if [ "$IN_CONTAINER" = "1" ]; then
+    tail -40 "$SHARE/subscriber.log" >&2 || true
+  else
+    run_docker logs "$SUB_NAME" 2>&1 | tail -40 >&2 || true
+  fi
+  exit 1
+fi
+
+echo "* payload:"
+cat "$SHARE/approved_request.json"
+echo
+
+if ! python3 - "$SHARE/approved_request.json" "$EXPECTED_USER" "$EXPECTED_UID" "$EXPECTED_CMD" "${EXPECTED_ARGV[@]}" <<'PY'
+import json
+import sys
+
+path, expected_user, expected_uid, expected_command, *expected_argv = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    request = json.load(handle)
+
+if request["command"] != expected_command:
+    raise SystemExit(
+        f"command mismatch: got {request['command']!r}, want {expected_command!r}"
+    )
+if request["argv"] != expected_argv:
+    raise SystemExit(
+        f"argv mismatch: got {request['argv']!r}, want {expected_argv!r}"
+    )
+if request["user"] != expected_user:
+    raise SystemExit(
+        f"user mismatch: got {request['user']!r}, want {expected_user!r}"
+    )
+if request["uid"] != int(expected_uid):
+    raise SystemExit(
+        f"uid mismatch: got {request['uid']!r}, want {int(expected_uid)!r}"
+    )
+PY
+then
+  echo "FAIL: approval payload does not bind the caller, command, and argv" >&2
+  exit 1
+fi
+
+TEST_SUCCEEDED=1
+echo "* PASS: approval payload binds user=$EXPECTED_USER uid=$EXPECTED_UID command=$EXPECTED_CMD argv=(${ARGS[*]})"

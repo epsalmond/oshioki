@@ -1,0 +1,31 @@
+[package]
+# `core` collides with the builtin `core` crate and breaks thiserror's derive
+# in doctests. `protocol` is unambiguous.
+name = "protocol"
+edition = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+
+# The protocol library. No binaries. Pure types + crypto so hook, server, and
+# plugin share one verified codec.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_cbor = { workspace = true }
+p256 = { workspace = true }
+sha2 = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+chacha20poly1305 = { workspace = true }
+# coset is unused — we parse x,y coordinates directly from CBOR
+# coset = { workspace = true }
+base64 = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

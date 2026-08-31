@@ -1,0 +1,11 @@
+# Build artifacts
+target/
+
+# Lockfile for binaries — commit this
+# Cargo.lock
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo

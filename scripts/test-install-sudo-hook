@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+TMPDIR="$(mktemp -d -t sudo-hook-install-test.XXXXXX)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+fail() {
+  echo "test-install-sudo-hook: $*" >&2
+  exit 1
+}
+
+# Exercise root-only installation without changing host state. These wrappers
+# only suppress ownership changes; every write remains below TMPDIR.
+mkdir -p "$TMPDIR/fake-bin" "$TMPDIR/service/scripts" "$TMPDIR/service/target/release"
+cat > "$TMPDIR/fake-bin/id" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-u" ]; then
+  printf '0\n'
+  exit 0
+fi
+exec /usr/bin/id "$@"
+EOF
+cat > "$TMPDIR/fake-bin/chown" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$TMPDIR/fake-bin/install" <<'EOF'
+#!/usr/bin/env bash
+args=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o|-g)
+      shift 2
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+exec /usr/bin/install "${args[@]}"
+EOF
+chmod 0755 "$TMPDIR/fake-bin/id" "$TMPDIR/fake-bin/chown" "$TMPDIR/fake-bin/install"
+TEST_PATH="$TMPDIR/fake-bin:/usr/bin:/bin"
+
+cp "$SCRIPT_DIR/install-sudo-hook" "$TMPDIR/service/scripts/"
+: > "$TMPDIR/service/target/release/management-plane-sudo-approve"
+: > "$TMPDIR/service/target/release/libplugin.so"
+
+run_installer() {
+  local root="$1"
+  shift
+  PATH="$TEST_PATH" \
+    SUDO_CONF="$root/sudo.conf" \
+    SUDO_PLUGIN_DIR="$root/plugin" \
+    SBIN_DIR="$root/sbin" \
+    SUDOERS_D="$root/sudoers.d" \
+    SUDO_APPROVE_STATE_DIR="$root/state" \
+    SKIP_NODEVER=1 \
+    "$TMPDIR/service/scripts/install-sudo-hook" "$@"
+}
+
+# A mode is mandatory and mutually exclusive.
+if run_installer "$TMPDIR/no-mode" >"$TMPDIR/no-mode.log" 2>&1; then
+  fail "installer accepted an omitted mode"
+fi
+grep -Fq 'choose exactly one of --prelaunch or --standalone-e2e' "$TMPDIR/no-mode.log" ||
+  fail "omitted mode did not produce a concrete error"
+if run_installer "$TMPDIR/two-modes" --prelaunch --standalone-e2e >"$TMPDIR/two-modes.log" 2>&1; then
+  fail "installer accepted both modes"
+fi
+
+# Prelaunch preserves the production-owned policy, retires only the known
+# legacy duplicate, and atomically replaces any old path-only exemptions with
+# an empty file.
+PRELAUNCH="$TMPDIR/prelaunch"
+mkdir -p "$PRELAUNCH/sudoers.d" "$PRELAUNCH/state"
+printf 'promotion-owned\n' > "$PRELAUNCH/sudoers.d/management-plane-prod"
+printf 'legacy duplicate\n' > "$PRELAUNCH/sudoers.d/management-plane-sudo-approve"
+printf 'eric /usr/local/sbin/management-plane-prod-status\n' > "$PRELAUNCH/state/exempt"
+run_installer "$PRELAUNCH" --prelaunch
+[ "$(cat "$PRELAUNCH/sudoers.d/management-plane-prod")" = "promotion-owned" ] ||
+  fail "prelaunch changed the production-owned sudoers policy"
+[ ! -e "$PRELAUNCH/sudoers.d/management-plane-sudo-approve" ] ||
+  fail "prelaunch did not retire the legacy duplicate"
+[ ! -s "$PRELAUNCH/state/exempt" ] ||
+  fail "prelaunch did not clear hook exemptions"
+[ "$(stat -c '%a' "$PRELAUNCH/state/exempt")" = "640" ] ||
+  fail "prelaunch exemption mode is not 0640"
+
+first_exempt_sha="$(sha256sum "$PRELAUNCH/state/exempt")"
+first_sudo_conf_sha="$(sha256sum "$PRELAUNCH/sudo.conf")"
+run_installer "$PRELAUNCH" --prelaunch
+[ "$(sha256sum "$PRELAUNCH/state/exempt")" = "$first_exempt_sha" ] ||
+  fail "prelaunch exemption state changed on idempotent rerun"
+[ "$(sha256sum "$PRELAUNCH/sudo.conf")" = "$first_sudo_conf_sha" ] ||
+  fail "prelaunch sudo.conf changed on idempotent rerun"
+
+# Dry-run reports retirement but changes no state.
+printf 'legacy duplicate\n' > "$PRELAUNCH/sudoers.d/management-plane-sudo-approve"
+dry_output="$(run_installer "$PRELAUNCH" --dry-run --prelaunch)"
+grep -Fq "DRY: remove stale sudoers file if present: $PRELAUNCH/sudoers.d/management-plane-sudo-approve" <<<"$dry_output" ||
+  fail "prelaunch dry-run did not report legacy retirement"
+[ -f "$PRELAUNCH/sudoers.d/management-plane-sudo-approve" ] ||
+  fail "prelaunch dry-run removed the legacy duplicate"
+rm -f "$PRELAUNCH/sudoers.d/management-plane-sudo-approve"
+
+# Refuse symlinks and non-regular objects before installing binaries or adding
+# the sudo.conf plugin block.
+for unsafe_type in symlink directory; do
+  unsafe_root="$TMPDIR/unsafe-$unsafe_type"
+  mkdir -p "$unsafe_root/sudoers.d"
+  if [ "$unsafe_type" = "symlink" ]; then
+    ln -s "$TMPDIR/elsewhere" "$unsafe_root/sudoers.d/management-plane-sudo-approve"
+  else
+    mkdir "$unsafe_root/sudoers.d/management-plane-sudo-approve"
+  fi
+  if run_installer "$unsafe_root" --prelaunch >"$unsafe_root/output.log" 2>&1; then
+    fail "prelaunch accepted stale $unsafe_type"
+  fi
+  [ ! -e "$unsafe_root/sudo.conf" ] ||
+    fail "prelaunch activated sudo.conf before rejecting stale $unsafe_type"
+  [ ! -e "$unsafe_root/sbin/management-plane-sudo-approve" ] ||
+    fail "prelaunch installed binaries before rejecting stale $unsafe_type"
+done
+
+# Standalone E2E installs no sudoers fragment, even when the destination does
+# not exist, and remains idempotent. The harness supplies its own exact fixture.
+STANDALONE="$TMPDIR/standalone"
+run_installer "$STANDALONE" --standalone-e2e
+[ ! -e "$STANDALONE/sudoers.d" ] ||
+  fail "standalone E2E created a sudoers directory"
+[ ! -s "$STANDALONE/state/exempt" ] ||
+  fail "standalone E2E installed hook exemptions"
+first_standalone_sha="$(sha256sum "$STANDALONE/sudo.conf")"
+run_installer "$STANDALONE" --standalone-e2e
+[ "$(sha256sum "$STANDALONE/sudo.conf")" = "$first_standalone_sha" ] ||
+  fail "standalone E2E sudo.conf changed on idempotent rerun"
+[ ! -e "$STANDALONE/sudoers.d" ] ||
+  fail "standalone E2E created sudoers state on rerun"
+
+echo "test-install-sudo-hook: PASS"

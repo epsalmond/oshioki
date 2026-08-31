@@ -1,0 +1,31 @@
+[package]
+name = "server"
+edition = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+
+# Binary: the approval service. NATS relay, ntfy broker, HTTP page, enrollment.
+
+[[bin]]
+name = "management-plane-sudo-approve-server"
+path = "src/main.rs"
+
+[dependencies]
+protocol = { path = "../protocol" }
+tokio = { workspace = true }
+async-nats = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+
+[lints]
+workspace = true

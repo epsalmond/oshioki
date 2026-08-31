@@ -1,0 +1,7 @@
+# Pinned toolchain used by cargo (rustup).
+# Bumped deliberately every 6-8 weeks after a workspace verification pass.
+# History: 1.97.0 initial pin, 1.98.0 first bump.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "default"
