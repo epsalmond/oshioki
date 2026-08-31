@@ -32,5 +32,4 @@ COPY scripts/ /work/scripts/
 COPY server/web/package.json server/web/package-lock.json /work/server/web/
 RUN cd /work/server/web && npm ci
 COPY server/web/ /work/server/web/
-COPY e2e/ /work/e2e/
 ENTRYPOINT ["/work/scripts/run-compose-e2e"]
