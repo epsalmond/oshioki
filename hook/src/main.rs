@@ -180,26 +180,16 @@ async fn cmd_check() -> Result<()> {
     // Seal per device and publish.
     let envelope = seal_request(&request, &devices)?;
     let payload = serde_json::to_vec(&envelope).context("serialize envelope")?;
-    let subject = format!("sudo.request.{}", request.host);
-    nats.publish(subject.clone(), payload.into())
-        .await
-        .context("publish request")?;
-    info!(subject, "published request");
-
-    // Wait for verdict.
+    let request_subject = format!("sudo.request.{}", request.host);
     let verdict_subject = format!("sudo.verdict.{}", request.id);
-    let mut sub = nats
-        .subscribe(verdict_subject)
-        .await
-        .context("subscribe verdict")?;
-
-    let timeout = tokio::time::Duration::from_secs(90);
-    let msg = tokio::time::timeout(timeout, sub.next())
-        .await
-        .context("verdict timeout")?
-        .context("verdict stream closed")?;
-
-    let verdict: Verdict = serde_json::from_slice(&msg.payload).context("deserialize verdict")?;
+    let verdict = request_verdict(
+        &nats,
+        &request_subject,
+        &verdict_subject,
+        payload,
+        tokio::time::Duration::from_secs(90),
+    )
+    .await?;
 
     // protocol::verify is implemented in parallel; if not yet present, the
     // hook fails closed. We verify against each enrolled device — the first
@@ -231,6 +221,46 @@ async fn cmd_check() -> Result<()> {
 
     info!(id = %request.id, "check approved");
     Ok(())
+}
+
+async fn request_verdict(
+    nats: &async_nats::Client,
+    request_subject: &str,
+    verdict_subject: &str,
+    payload: Vec<u8>,
+    timeout: tokio::time::Duration,
+) -> Result<Verdict> {
+    let mut deadline_stage = "subscribing to verdict";
+    let result = tokio::time::timeout(timeout, async {
+        let mut sub = nats
+            .subscribe(verdict_subject.to_string())
+            .await
+            .context("subscribe verdict")?;
+        deadline_stage = "confirming verdict subscription readiness";
+        nats.flush()
+            .await
+            .context("confirm verdict subscription readiness")?;
+
+        deadline_stage = "publishing approval request";
+        nats.publish(request_subject.to_string(), payload.into())
+            .await
+            .context("publish request")?;
+        info!(subject = request_subject, "published request");
+
+        deadline_stage = "waiting for verdict";
+        let msg = sub.next().await.context("verdict stream closed")?;
+        let verdict: Verdict =
+            serde_json::from_slice(&msg.payload).context("deserialize verdict")?;
+        Ok(verdict)
+    })
+    .await;
+
+    result.with_context(|| {
+        format!(
+            "sudo verdict deadline exceeded after {}ms while {deadline_stage}",
+            timeout.as_millis(),
+        )
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -908,4 +938,292 @@ mod hex {
     }
 
     impl std::error::Error for HexError {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    fn signed_verdict(request: &Request) -> (Verdict, Vec<u8>) {
+        let signing_key = SigningKey::from_bytes((&[1_u8; 32]).into()).unwrap();
+        let canonical_json = serde_json::to_string(request).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_json.as_bytes());
+        hasher.update(b"approve");
+        let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
+        let client_data_json = format!(
+            r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"https://sudo.internal.psalmond.com"}}"#
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"sudo.internal.psalmond.com");
+        let mut authenticator_data = hasher.finalize().to_vec();
+        authenticator_data.push(0b101);
+        authenticator_data.extend_from_slice(&[0, 0, 0, 1]);
+
+        let mut hasher = Sha256::new();
+        hasher.update(client_data_json.as_bytes());
+        let mut signed_message = authenticator_data.clone();
+        signed_message.extend_from_slice(&hasher.finalize());
+        let signature: Signature = signing_key.sign(&signed_message);
+
+        let public_key = signing_key.verifying_key().to_encoded_point(false);
+        let mut cose = BTreeMap::new();
+        cose.insert(
+            serde_cbor::Value::Integer(-2),
+            serde_cbor::Value::Bytes(public_key.x().unwrap().to_vec()),
+        );
+        cose.insert(
+            serde_cbor::Value::Integer(-3),
+            serde_cbor::Value::Bytes(public_key.y().unwrap().to_vec()),
+        );
+
+        (
+            Verdict {
+                id: request.id.clone(),
+                credential_id: vec![1, 2, 3],
+                authenticator_data,
+                client_data_json,
+                signature: signature.to_der().as_bytes().to_vec(),
+            },
+            serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap(),
+        )
+    }
+
+    async fn run_readiness_broker(
+        listener: TcpListener,
+        request_subject: &str,
+        verdict_subject: &str,
+        verdict_payload: &[u8],
+    ) -> std::io::Result<()> {
+        let (stream, _) = listener.accept().await?;
+        let (reader, mut writer) = TcpStream::into_split(stream);
+        let mut reader = BufReader::new(reader);
+        writer
+            .write_all(
+                b"INFO {\"server_id\":\"test\",\"version\":\"2.10.0\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":4222,\"max_payload\":1048576}\r\n",
+            )
+            .await?;
+
+        let mut verdict_sid = None;
+        let mut subscription_ready = false;
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Ok(());
+            }
+
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            match fields.as_slice() {
+                ["PING"] => {
+                    writer.write_all(b"PONG\r\n").await?;
+                }
+                ["SUB", subject, sid] if *subject == verdict_subject => {
+                    verdict_sid = Some((*sid).to_string());
+                    subscription_ready = true;
+                }
+                ["PUB", subject, size] => {
+                    let size = size.parse::<usize>().map_err(std::io::Error::other)?;
+                    let mut payload_and_terminator = vec![0; size + 2];
+                    reader.read_exact(&mut payload_and_terminator).await?;
+
+                    if *subject == request_subject && subscription_ready {
+                        let sid = verdict_sid
+                            .as_deref()
+                            .expect("ready subscription has a sid");
+                        writer
+                            .write_all(
+                                format!(
+                                    "MSG {verdict_subject} {sid} {}\r\n",
+                                    verdict_payload.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
+                        writer.write_all(verdict_payload).await?;
+                        writer.write_all(b"\r\n").await?;
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn run_stalled_reconnect_broker(
+        listener: TcpListener,
+        subscription_accepted: oneshot::Sender<()>,
+        reconnect_ping_stalled: oneshot::Sender<()>,
+    ) -> std::io::Result<()> {
+        let (stream, _) = listener.accept().await?;
+        let (reader, mut writer) = TcpStream::into_split(stream);
+        let mut reader = BufReader::new(reader);
+        writer
+            .write_all(
+                b"INFO {\"server_id\":\"test\",\"version\":\"2.10.0\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":4222,\"max_payload\":1048576}\r\n",
+            )
+            .await?;
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Ok(());
+            }
+            match line.split_whitespace().next() {
+                Some("PING") => writer.write_all(b"PONG\r\n").await?,
+                Some("SUB") => {
+                    let _ = subscription_accepted.send(());
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                break;
+            }
+        }
+
+        let (stream, _) = listener.accept().await?;
+        let (reader, mut writer) = TcpStream::into_split(stream);
+        let mut reader = BufReader::new(reader);
+        writer
+            .write_all(
+                b"INFO {\"server_id\":\"test-reconnect\",\"version\":\"2.10.0\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":4222,\"max_payload\":1048576}\r\n",
+            )
+            .await?;
+        let mut reconnect_ping_stalled = Some(reconnect_ping_stalled);
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Ok(());
+            }
+            if line.split_whitespace().next() == Some("PING") {
+                let _ = reconnect_ping_stalled
+                    .take()
+                    .expect("reconnect PING should arrive once")
+                    .send(());
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_verdict_waits_for_subscription_readiness() {
+        let request_subject = "sudo.request.test-host";
+        let verdict_subject = "sudo.verdict.test-id";
+        let request = Request {
+            id: "test-id".to_string(),
+            nonce: [0; 16],
+            host: "test-host".to_string(),
+            user: "eric".to_string(),
+            uid: 1000,
+            runas_uid: 0,
+            cwd: "/home/eric".to_string(),
+            tty: Some("/dev/pts/0".to_string()),
+            command: "/usr/bin/true".to_string(),
+            argv: vec!["/usr/bin/true".to_string()],
+            pid_chain: vec![],
+            ts: now_unix(),
+            expiry: now_unix() + 60,
+        };
+        let (expected, credential_pub) = signed_verdict(&request);
+        let verdict_payload = serde_json::to_vec(&expected).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let broker = tokio::spawn(async move {
+            run_readiness_broker(listener, request_subject, verdict_subject, &verdict_payload).await
+        });
+        let nats = async_nats::connect(format!("nats://{address}"))
+            .await
+            .unwrap();
+
+        let received = request_verdict(
+            &nats,
+            request_subject,
+            verdict_subject,
+            serde_json::to_vec(&request).unwrap(),
+            tokio::time::Duration::from_millis(250),
+        )
+        .await
+        .expect("an immediate verdict should arrive after subscription readiness");
+
+        assert_eq!(received, expected);
+        protocol::verify::verify(&received, &request, &credential_pub)
+            .expect("the immediate verdict should be cryptographically valid");
+        broker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_stall_respects_the_supplied_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (subscription_accepted_tx, subscription_accepted_rx) = oneshot::channel();
+        let (reconnect_ping_stalled_tx, reconnect_ping_stalled_rx) = oneshot::channel();
+        let broker = tokio::spawn(run_stalled_reconnect_broker(
+            listener,
+            subscription_accepted_tx,
+            reconnect_ping_stalled_tx,
+        ));
+        let nats = async_nats::ConnectOptions::new()
+            .reconnect_delay_callback(|_| tokio::time::Duration::ZERO)
+            .connect(format!("nats://{address}"))
+            .await
+            .unwrap();
+
+        let _priming_subscription = nats.subscribe("sudo.verdict.priming").await.unwrap();
+        nats.flush().await.unwrap();
+        subscription_accepted_rx.await.unwrap();
+        nats.force_reconnect().await.unwrap();
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            reconnect_ping_stalled_rx,
+        )
+        .await
+        .expect("broker should receive the reconnect readiness PING")
+        .unwrap();
+
+        let deadline = tokio::time::Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            request_verdict(
+                &nats,
+                "sudo.request.test-host",
+                "sudo.verdict.test-id",
+                b"request".to_vec(),
+                deadline,
+            ),
+        )
+        .await
+        .expect("request_verdict should enforce its supplied deadline")
+        .expect_err("a stalled subscription readiness check must fail closed");
+
+        assert!(
+            started.elapsed() < tokio::time::Duration::from_millis(250),
+            "request_verdict exceeded the supplied deadline by too much"
+        );
+        assert!(
+            format!("{result:#}").contains("sudo verdict deadline exceeded"),
+            "deadline failure should retain useful context: {result:#}"
+        );
+        assert!(
+            format!("{result:#}").contains("confirming verdict subscription readiness"),
+            "deadline failure should identify the stalled stage: {result:#}"
+        );
+        broker.abort();
+    }
 }

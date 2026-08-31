@@ -18,12 +18,13 @@ import sys
 import tempfile
 import time
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
 )
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-from cryptography.hazmat.primitives import serialization
 
 SHARE = os.environ["SHARE_DIR"]
 NATS_HOST = os.environ["NATS_HOST"]
@@ -67,6 +68,19 @@ atomic_write(
         serialization.NoEncryption(),
     ),
     mode=0o600,
+)
+
+credential_priv = ec.generate_private_key(ec.SECP256R1())
+credential_numbers = credential_priv.public_key().public_numbers()
+credential_cose = (
+    b"\xa2\x21\x58\x20"
+    + credential_numbers.x.to_bytes(32, "big")
+    + b"\x22\x58\x20"
+    + credential_numbers.y.to_bytes(32, "big")
+)
+atomic_write(
+    f"{SHARE}/credential_pub.b64",
+    base64.b64encode(credential_cose),
 )
 
 # --- Phase 2: subscribe over raw TCP ---
@@ -177,6 +191,44 @@ plaintext = cipher.decrypt(
     None,
 )
 request = json.loads(plaintext)
+
+canonical_request = json.dumps(request, separators=(",", ":")).encode()
+challenge_digest = hashes.Hash(hashes.SHA256())
+challenge_digest.update(canonical_request)
+challenge_digest.update(b"approve")
+challenge = base64.urlsafe_b64encode(challenge_digest.finalize()).rstrip(b"=").decode()
+client_data_json = json.dumps(
+    {
+        "type": "webauthn.get",
+        "challenge": challenge,
+        "origin": "https://sudo.internal.psalmond.com",
+    },
+    separators=(",", ":"),
+)
+
+rp_id_digest = hashes.Hash(hashes.SHA256())
+rp_id_digest.update(b"sudo.internal.psalmond.com")
+authenticator_data = rp_id_digest.finalize() + b"\x05\x00\x00\x00\x01"
+client_data_digest = hashes.Hash(hashes.SHA256())
+client_data_digest.update(client_data_json.encode())
+signed_message = authenticator_data + client_data_digest.finalize()
+signature = credential_priv.sign(signed_message, ec.ECDSA(hashes.SHA256()))
+
+verdict = json.dumps(
+    {
+        "id": request["id"],
+        "credential_id": [1, 2, 3],
+        "authenticator_data": list(authenticator_data),
+        "client_data_json": client_data_json,
+        "signature": list(signature),
+    },
+    separators=(",", ":"),
+).encode()
+verdict_subject = f"sudo.verdict.{request['id']}"
+sock.sendall(
+    f"PUB {verdict_subject} {len(verdict)}\r\n".encode() + verdict + b"\r\n"
+)
+print(f"subscriber: published immediate verdict for id={request['id']}", file=sys.stderr)
 
 approved = json.dumps(
     {

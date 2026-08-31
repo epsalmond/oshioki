@@ -195,7 +195,8 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 
-if [ ! -f "$SHARE/subscriber.ready" ] || [ ! -s "$SHARE/box_pub.hex" ]; then
+if [ ! -f "$SHARE/subscriber.ready" ] || [ ! -s "$SHARE/box_pub.hex" ] ||
+   [ ! -s "$SHARE/credential_pub.b64" ]; then
   echo "subscriber never established its NATS subscription" >&2
   if [ "$IN_CONTAINER" = "1" ]; then
     tail -40 "$SHARE/subscriber.log" >&2 || true
@@ -207,6 +208,7 @@ fi
 echo "* subscriber box: $(head -c 32 "$SHARE/box_pub.hex")..."
 
 BOX_PUB="$(cat "$SHARE/box_pub.hex")"
+CREDENTIAL_PUB="$(cat "$SHARE/credential_pub.b64")"
 EXPECTED_CMD="/usr/bin/echo"
 EXPECTED_USER="approvalcaller"
 EXPECTED_UID="12345"
@@ -217,8 +219,8 @@ cat >"$SHARE/devices.json" <<EOF
 [
   {
     "box_pub": "$BOX_PUB",
-    "credential_pub": "",
-    "credential_id": ""
+    "credential_pub": "$CREDENTIAL_PUB",
+    "credential_id": "AQID"
   }
 ]
 EOF
@@ -271,16 +273,23 @@ echo "[inner] caller $EXPECTED_USER uid=$EXPECTED_UID created"
 
 sudo -k || true
 echo "[inner] running sudo as $EXPECTED_USER: $EXPECTED_CMD ${ARGS[*]}"
+sudo_started=$SECONDS
 if runuser -u "$EXPECTED_USER" -- sudo "$EXPECTED_CMD" "${ARGS[@]}"; then
   sudo_status=0
 else
   sudo_status=$?
 fi
+sudo_elapsed=$((SECONDS - sudo_started))
 echo "[inner] sudo returned $sudo_status"
 printf '%s\n' "$sudo_status" >"$SHARE_DIR/sudo.status"
+printf '%s\n' "$sudo_elapsed" >"$SHARE_DIR/sudo.elapsed"
 
-if [ "$sudo_status" -eq 0 ]; then
-  echo "[inner] FAIL: sudo unexpectedly approved without a verdict" >&2
+if [ "$sudo_status" -ne 0 ]; then
+  echo "[inner] FAIL: sudo denied the valid immediate verdict" >&2
+  exit 1
+fi
+if [ "$sudo_elapsed" -gt 10 ]; then
+  echo "[inner] FAIL: immediate verdict took ${sudo_elapsed}s" >&2
   exit 1
 fi
 INNER
@@ -367,4 +376,4 @@ then
 fi
 
 TEST_SUCCEEDED=1
-echo "* PASS: approval payload binds user=$EXPECTED_USER uid=$EXPECTED_UID command=$EXPECTED_CMD argv=(${ARGS[*]})"
+echo "* PASS: valid immediate verdict approved in $(cat "$SHARE/sudo.elapsed")s and payload binds user=$EXPECTED_USER uid=$EXPECTED_UID command=$EXPECTED_CMD argv=(${ARGS[*]})"

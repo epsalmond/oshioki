@@ -61,6 +61,10 @@ SUDOERS_D="${SUDOERS_D:-/etc/sudoers.d}"
 NATS_URL="${NATS_URL:-nats://nats.internal.psalmond.com:4222}"
 NATS_USER="${NATS_USER:-sudo-approve}"
 NATS_PASS="${NATS_PASS:-}"
+CONFIG_NATS_PASS="$NATS_PASS"
+if [ "$DRY_RUN" -eq 1 ]; then
+  CONFIG_NATS_PASS='<redacted>'
+fi
 
 die() {
   echo "install-sudo-hook: $*" >&2
@@ -134,7 +138,7 @@ write_file 0640 "$STATE_DIR/config.env" <<EOF
 # Read by management-plane-sudo-approve at startup as root.
 NATS_URL=$NATS_URL
 NATS_USER=$NATS_USER
-NATS_PASS=$NATS_PASS
+NATS_PASS=$CONFIG_NATS_PASS
 EOF
 
 # Enrolled approval devices; empty until the enrollment flow writes entries.

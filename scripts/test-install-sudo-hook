@@ -99,9 +99,26 @@ run_installer "$PRELAUNCH" --prelaunch
 
 # Dry-run reports retirement but changes no state.
 printf 'legacy duplicate\n' > "$PRELAUNCH/sudoers.d/management-plane-sudo-approve"
-dry_output="$(run_installer "$PRELAUNCH" --dry-run --prelaunch)"
+dry_run_password='issue-889-recognizable-NATS-secret'
+dry_output="$({
+  NATS_URL='nats://dry-run.example.test:4222' \
+    NATS_USER='dry-run-user' \
+    NATS_PASS="$dry_run_password" \
+    run_installer "$PRELAUNCH" --dry-run --prelaunch
+} 2>&1)"
 grep -Fq "DRY: remove stale sudoers file if present: $PRELAUNCH/sudoers.d/management-plane-sudo-approve" <<<"$dry_output" ||
   fail "prelaunch dry-run did not report legacy retirement"
+if grep -Fq "$dry_run_password" <<<"$dry_output"; then
+  fail "prelaunch dry-run exposed NATS_PASS"
+fi
+grep -Fq "DRY: write $PRELAUNCH/state/config.env (mode 0640):" <<<"$dry_output" ||
+  fail "prelaunch dry-run omitted the config destination or mode"
+grep -Fq 'NATS_URL=nats://dry-run.example.test:4222' <<<"$dry_output" ||
+  fail "prelaunch dry-run omitted NATS_URL"
+grep -Fq 'NATS_USER=dry-run-user' <<<"$dry_output" ||
+  fail "prelaunch dry-run omitted NATS_USER"
+grep -Fq 'NATS_PASS=<redacted>' <<<"$dry_output" ||
+  fail "prelaunch dry-run omitted the redacted NATS_PASS placeholder"
 [ -f "$PRELAUNCH/sudoers.d/management-plane-sudo-approve" ] ||
   fail "prelaunch dry-run removed the legacy duplicate"
 rm -f "$PRELAUNCH/sudoers.d/management-plane-sudo-approve"
