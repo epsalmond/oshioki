@@ -56,7 +56,8 @@ case "$command_name" in
     }
     managed_state=1
     if [ "$#" -eq 0 ]; then
-      state_root="$(mktemp -d -t sudo-approve-dev.XXXXXX)"
+      temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+      state_root="$(mktemp -d "$temp_root/sudo-approve-dev.XXXXXX")"
     elif [ "$#" -eq 2 ] && [ "$1" = "--state-dir" ]; then
       state_root="$(mkdir -p "$2" && cd "$2" && pwd -P)"
       managed_state=0
@@ -64,7 +65,7 @@ case "$command_name" in
       usage
     fi
     install -d -m 0777 "$state_root/server" "$state_root/e2e"
-    project_name="sudo-approve-dev-$(basename "$state_root" | tr -cd 'a-zA-Z0-9_-')"
+    project_name="sudo-approve-dev-$(basename "$state_root" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
     session_tmp="$SESSION_FILE.$$"
     printf '%s\n%s\n%s\n' "$project_name" "$state_root" "$managed_state" >"$session_tmp"
     mv "$session_tmp" "$SESSION_FILE"
@@ -86,10 +87,11 @@ case "$command_name" in
     fi
     [ "$#" -eq 0 ] || usage
     local_checks
-    state_root="$(mktemp -d -t sudo-approve-e2e.XXXXXX)"
+    temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+    state_root="$(mktemp -d "$temp_root/sudo-approve-e2e.XXXXXX")"
     http_port=0
     install -d -m 0777 "$state_root/server" "$state_root/e2e"
-    project_name="sudo-approve-e2e-$(basename "$state_root" | tr -cd 'a-zA-Z0-9_-')"
+    project_name="sudo-approve-e2e-$(basename "$state_root" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
     test_ok=0
     cleanup_test() {
       set +e
@@ -114,8 +116,13 @@ case "$command_name" in
     compose down --volumes --remove-orphans
     rm -f "$SESSION_FILE"
     if [ "$managed_state" = 1 ]; then
-      case "$state_root" in
-        /tmp/sudo-approve-dev.*) rm -rf -- "$state_root" ;;
+      temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+      if [ "$(dirname "$state_root")" != "$temp_root" ]; then
+        echo "refusing to remove state outside the temporary directory: $state_root" >&2
+        exit 1
+      fi
+      case "$(basename "$state_root")" in
+        sudo-approve-dev.*) rm -rf -- "$state_root" ;;
         *) echo "refusing to remove unexpected managed state path: $state_root" >&2; exit 1 ;;
       esac
     fi
