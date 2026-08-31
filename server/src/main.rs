@@ -1,371 +1,601 @@
-//! `management-plane-sudo-approve-server` — the approval service.
-//!
-//! The server runs behind Traefik. It serves the HTTPS approval and
-//! enrollment pages, maintains the NATS consumer on `SUDO_APPROVE`, and
-//! publishes requests to enrolled devices as browser-page payloads.
+//! Persistent relay and browser application for sudo approval.
 
-use anyhow::Result;
+mod db;
+
+use anyhow::{Context as _, Result, bail};
+use async_nats::jetstream::{
+    self, AckKind,
+    consumer::{AckPolicy, PullConsumer, pull},
+};
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    response::Html,
+    body::Body,
+    extract::{DefaultBodyLimit, Path, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
-use futures::StreamExt;
+use db::{InsertResult, RequestLifecycle, Store};
+use futures::StreamExt as _;
+use protocol::{
+    ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
+    RequestEnvelopeV1, SealedDeviceBodyV1,
+};
+use serde::Serialize;
 use serde_json::json;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use std::{
+    path::{Path as FsPath, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
+use tracing::{error, info, warn};
 
-use protocol::Verdict;
+const REQUEST_STREAM: &str = "SUDO_APPROVE";
+const REQUEST_CONSUMER: &str = "sudo-approve-server-v1";
+const MAX_HTTP_BODY: usize = 3 * 1024 * 1024;
 
-/// Server state shared by handlers.
 #[derive(Clone)]
 struct AppState {
-    nats: Arc<async_nats::Client>,
-    pending: PendingMap,
-    /// Shared bearer token required on the approval API endpoints
-    /// (`/api/pending`, `/assertion/:id`). Loaded once from the
-    /// `SUDO_APPROVE_API_TOKEN` env var at startup; empty disables the
-    /// server with a clear error (fail closed).
-    api_token: String,
+    store: Arc<Store>,
+    nats: async_nats::Client,
+    dist_root: Arc<PathBuf>,
+    consumer_last_ok: Arc<AtomicI64>,
+    outbox_last_ok: Arc<AtomicI64>,
+    origin: Arc<String>,
+    ntfy_url: Option<Arc<String>>,
 }
 
-/// Pending requests awaiting verdicts.
-type PendingMap = Arc<Mutex<std::collections::HashMap<String, Pending>>>;
-
-/// One pending approval.
-#[derive(Debug, Clone)]
-struct Pending {
-    id: String,
-    host: String,
-    user: String,
-    command: String,
-    expiry: i64,
-    envelope_body_json: String,
+#[derive(Debug)]
+struct ApiError(StatusCode);
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(json!({"error": "request rejected"}))).into_response()
+    }
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+#[derive(Serialize)]
+struct RequestResponse {
+    sealed: SealedDeviceBodyV1,
+    expires_at: i64,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("management_plane_sudo_approve_server=info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                "management_plane_sudo_approve_server=info"
+                    .parse()
+                    .expect("valid directive"),
+            ),
         )
         .init();
-
-    let nats_url = std::env::var("NATS_URL").expect("NATS_URL not set");
-    let nats_user = std::env::var("NATS_USER").expect("NATS_USER not set");
-    let nats_pass = std::env::var("NATS_PASS").expect("NATS_PASS not set");
-    let api_token = std::env::var("SUDO_APPROVE_API_TOKEN")
-        .expect("SUDO_APPROVE_API_TOKEN not set — refusing to start unauthenticated");
-    assert!(
-        api_token.len() >= 16,
-        "SUDO_APPROVE_API_TOKEN too short (want >= 16 chars)"
-    );
-
-    info!(nats_url, "starting");
-
-    let nats = Arc::new(
-        async_nats::ConnectOptions::new()
-            .user_and_password(nats_user, nats_pass)
-            .connect(&nats_url)
-            .await
-            .expect("connect to NATS"),
-    );
-
-    let pending: PendingMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-    // Spawn NATS consumer.
-    {
-        let nats2 = nats.clone();
-        let pending2 = pending.clone();
-        tokio::spawn(async move {
-            if let Err(e) = consumer_task(nats2, pending2).await {
-                warn!(error = %e, "consumer task failed");
-            }
-        });
-    }
-
-    // Build HTTP routes.
-    let state = AppState {
-        nats,
-        pending: pending.clone(),
-        api_token,
+    let database_path = required_env("SUDO_APPROVE_STATE_PATH")?;
+    let listen = std::env::var("SUDO_APPROVE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8443".into());
+    let dist_root = std::env::var("SUDO_APPROVE_DARWIN_DIST")
+        .unwrap_or_else(|_| "/opt/sudo-approve/dist/v1/darwin-arm64".into());
+    let origin = required_env("SUDO_APPROVE_ORIGIN")?;
+    let runtime_config = protocol::HookConfigV1 {
+        version: 1,
+        origin: origin.clone(),
+        rp_id: required_env("SUDO_APPROVE_RP_ID")?,
+        server_base_url: origin,
     };
+    runtime_config
+        .validate()
+        .context("validate server origin and RP ID")?;
+    info!(origin=%runtime_config.origin, rp_id=%runtime_config.rp_id, "validated server WebAuthn configuration");
+    let store = Arc::new(Store::open(FsPath::new(&database_path))?);
+    store.ready()?;
+    let state = AppState {
+        store,
+        nats: connect_nats().await?,
+        dist_root: Arc::new(PathBuf::from(dist_root)),
+        consumer_last_ok: Arc::new(AtomicI64::new(0)),
+        outbox_last_ok: Arc::new(AtomicI64::new(now())),
+        origin: Arc::new(runtime_config.origin),
+        ntfy_url: std::env::var("SUDO_APPROVE_NTFY_URL").ok().map(Arc::new),
+    };
+    spawn_workers(&state);
     let app = Router::new()
-        .route("/", get(handle_approval_page))
-        .route("/enroll/:token", get(handle_enroll_page))
-        .route("/api/pending", get(handle_api_pending))
-        .route("/assertion/:id", post(handle_assertion))
+        .route("/r/:id", get(request_page))
+        .route("/enroll/:id", get(enrollment_page))
+        .route("/assets/app.js", get(app_js))
+        .route("/assets/app.css", get(app_css))
+        .route("/assets/libsodium.js", get(libsodium_js))
+        .route("/api/v1/requests/:id", get(get_request))
+        .route("/api/v1/requests/:id/approve", post(approve_request))
+        .route("/api/v1/requests/:id/deny", post(deny_request))
+        .route(
+            "/api/v1/enrollments/:id/submission",
+            post(submit_enrollment),
+        )
+        .route("/api/v1/enrollments/:id/status", get(enrollment_status))
+        .route("/api/v1/devices/:fingerprint", get(get_device))
+        .route("/healthz", get(health))
+        .route("/dist/v1/darwin-arm64/*path", get(dist_file))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state);
-
-    info!("listening on 8443");
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8443").await?;
+    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    info!(listen, "sudo approval server listening");
     axum::serve(listener, app).await?;
-
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// HTTP handlers
-// ---------------------------------------------------------------------------
-
-/// The approval page.
-async fn handle_approval_page() -> Html<&'static str> {
-    Html(APPROVAL_HTML)
+fn spawn_workers(state: &AppState) {
+    let request_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = request_consumer(request_state.clone()).await {
+                error!(%error, "request consumer stopped");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    });
+    let enrollment_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = enrollment_consumer(enrollment_state).await {
+            error!(%error, "enrollment consumer stopped");
+        }
+    });
+    let outbox_state = state.clone();
+    tokio::spawn(async move { outbox_worker(outbox_state).await });
+    let cleanup_store = state.store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(error) = cleanup_store.cleanup(now()) {
+                warn!(%error, "cleanup failed");
+            }
+        }
+    });
 }
 
-/// The enrollment page.
-async fn handle_enroll_page(Path(_token): Path<String>) -> Html<&'static str> {
-    Html(ENROLL_HTML)
+async fn request_consumer(state: AppState) -> Result<()> {
+    let stream = jetstream::new(state.nats.clone())
+        .get_stream(REQUEST_STREAM)
+        .await
+        .context("open request stream")?;
+    let consumer: PullConsumer = stream
+        .get_or_create_consumer(
+            REQUEST_CONSUMER,
+            pull::Config {
+                durable_name: Some(REQUEST_CONSUMER.into()),
+                filter_subject: "sudo.request.>".into(),
+                ack_policy: AckPolicy::Explicit,
+                ..Default::default()
+            },
+        )
+        .await
+        .context("open durable request consumer")?;
+    state.consumer_last_ok.store(now(), Ordering::Relaxed);
+    let mut messages = consumer.messages().await?;
+    loop {
+        let result = match tokio::time::timeout(Duration::from_secs(10), messages.next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => bail!("request consumer stream closed"),
+            Err(_) => {
+                state.consumer_last_ok.store(now(), Ordering::Relaxed);
+                continue;
+            }
+        };
+        let message = result?;
+        let raw = message.payload.as_ref();
+        if raw.len() > protocol::v1::MAX_ENVELOPE_BYTES {
+            warn!(bytes = raw.len(), "terminating oversized request envelope");
+            message
+                .ack_with(AckKind::Term)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            state.consumer_last_ok.store(now(), Ordering::Relaxed);
+            continue;
+        }
+        let envelope = match serde_json::from_slice::<RequestEnvelopeV1>(raw) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "terminating malformed request envelope");
+                message
+                    .ack_with(AckKind::Term)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                state.consumer_last_ok.store(now(), Ordering::Relaxed);
+                continue;
+            }
+        };
+        match state.store.ingest_request(raw, &envelope, now()) {
+            Ok(result @ (InsertResult::Inserted | InsertResult::Identical)) => {
+                if result == InsertResult::Inserted {
+                    queue_notification(&state, &envelope)?;
+                }
+                message
+                    .double_ack()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
+            Ok(InsertResult::Conflict) => {
+                warn!(request_id=%envelope.request_id, "terminating conflicting request id reuse");
+                message
+                    .ack_with(AckKind::Term)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
+            Err(error) => {
+                warn!(%error, "terminating invalid or expired request");
+                message
+                    .ack_with(AckKind::Term)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
+        }
+        state.consumer_last_ok.store(now(), Ordering::Relaxed);
+    }
 }
 
-/// Return pending requests as JSON.
-async fn handle_api_pending(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    check_auth(&state, &headers)?;
-    let pending = state.pending.lock().await;
-
-    let now = i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_secs(),
-    )
-    .expect("Unix timestamp fits i64");
-
-    let mut list = Vec::new();
-
-    for p in pending.values() {
-        if now < p.expiry {
-            list.push(json!({
-                "id": p.id,
-                "host": p.host,
-                "user": p.user,
-                "command": p.command,
-                "expiry": p.expiry,
-                "expiry_human": format!("{}s", p.expiry - now),
-                "body": p.envelope_body_json,
-            }));
+async fn enrollment_consumer(state: AppState) -> Result<()> {
+    let mut intents = state.nats.subscribe("sudo.enrollment.intent").await?;
+    let mut activations = state.nats.subscribe("sudo.enrollment.activation.>").await?;
+    let mut revocations = state.nats.subscribe("sudo.device.revoke.>").await?;
+    loop {
+        tokio::select! {
+            Some(message) = intents.next() => match serde_json::from_slice::<EnrollmentIntentV1>(&message.payload) {
+                Ok(intent) => { let hash = protocol::decode_base64url(&intent.secret_hash)?;
+                    if let InsertResult::Conflict = state.store.create_enrollment(&intent.enrollment_id, &hash, intent.expires_at, &intent.reply_subject)? { warn!(enrollment_id=%intent.enrollment_id, "conflicting enrollment intent"); } }
+                Err(error) => warn!(%error, "invalid enrollment intent"),
+            },
+            Some(message) = activations.next() => match serde_json::from_slice::<ActivationV1>(&message.payload) {
+                Ok(activation) => state.store.activate_enrollment(&activation.enrollment_id, &activation.device)?,
+                Err(error) => warn!(%error, "invalid enrollment activation"),
+            },
+            Some(message) = revocations.next() => {
+                if let Some(fingerprint) = message.subject.strip_prefix("sudo.device.revoke.") {
+                    if !state.store.set_device_active(fingerprint, false)? { warn!(%fingerprint, "revocation named unknown device"); }
+                    state.nats.publish(format!("sudo.device.revoked.{fingerprint}"), Vec::new().into()).await?;
+                    state.nats.flush().await?;
+                }
+            },
+            else => bail!("enrollment subscription closed"),
         }
     }
-
-    Ok(Json(json!({
-        "requests": list
-    })))
 }
 
-/// Handle a signed verdict (`WebAuthn` assertion).
-async fn handle_assertion(
+async fn outbox_worker(state: AppState) {
+    let http = reqwest::Client::new();
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        interval.tick().await;
+        match state.store.pending_outbox(32) {
+            Ok(items) => {
+                let mut healthy = true;
+                for item in items {
+                    if item.kind == "ntfy" {
+                        let result = http
+                            .post(&item.subject)
+                            .header("content-type", "application/json")
+                            .body(item.payload.clone())
+                            .send()
+                            .await;
+                        if !matches!(result, Ok(response) if response.status().is_success()) {
+                            warn!(outbox_id = item.id, "ntfy delivery failed");
+                            healthy = false;
+                            break;
+                        }
+                    } else {
+                        if let Err(error) =
+                            state.nats.publish(item.subject, item.payload.into()).await
+                        {
+                            warn!(%error, outbox_id=item.id, "outbox publish failed");
+                            healthy = false;
+                            break;
+                        }
+                        if let Err(error) = state.nats.flush().await {
+                            warn!(%error, outbox_id=item.id, "outbox flush failed");
+                            healthy = false;
+                            break;
+                        }
+                    }
+                    if let Err(error) = state.store.mark_outbox_sent(item.id) {
+                        warn!(%error, outbox_id=item.id, "outbox mark-sent failed");
+                        healthy = false;
+                        break;
+                    }
+                }
+                if healthy {
+                    state.outbox_last_ok.store(now(), Ordering::Relaxed);
+                }
+            }
+            Err(error) => warn!(%error, "outbox read failed"),
+        }
+    }
+}
+
+fn queue_notification(state: &AppState, envelope: &RequestEnvelopeV1) -> Result<()> {
+    let Some(endpoint) = &state.ntfy_url else {
+        return Ok(());
+    };
+    let payload = serde_json::to_vec(&json!({
+        "title": format!("sudo on {}", envelope.host),
+        "message": format!("{} requested sudo ({})", envelope.user, envelope.request_id),
+        "click": format!("{}/r/{}", state.origin, envelope.request_id),
+    }))?;
+    state
+        .store
+        .queue_notification(&envelope.request_id, endpoint, &payload)
+}
+
+async fn request_page(Path(_id): Path<String>) -> Response {
+    html(include_str!("../web/request.html"))
+}
+async fn enrollment_page(Path(_id): Path<String>) -> Response {
+    html(include_str!("../web/enroll.html"))
+}
+async fn app_js() -> Response {
+    asset(
+        "application/javascript",
+        include_bytes!("../web/app.js"),
+        false,
+    )
+}
+async fn app_css() -> Response {
+    asset("text/css", include_bytes!("../web/app.css"), false)
+}
+async fn libsodium_js() -> Response {
+    asset(
+        "application/javascript",
+        include_bytes!("../web/vendor/libsodium.js"),
+        false,
+    )
+}
+
+async fn get_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(verdict): Json<Verdict>,
-) -> Result<(), StatusCode> {
-    check_auth(&state, &headers)?;
-    // Hold the lock across the entire operation to avoid the double-lock pattern.
-    let pending = state.pending.lock().await;
+) -> Result<Json<RequestResponse>, ApiError> {
+    require_pending(&state, &id)?;
+    let token = bearer_token(&headers)?;
+    let request = state
+        .store
+        .sealed_request_for_token(&id, token.as_bytes(), now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let sealed = serde_json::from_str(&request.body_json)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(Json(RequestResponse {
+        sealed,
+        expires_at: request.expires_at,
+    }))
+}
 
-    if !pending.contains_key(&id) {
-        warn!(id, "assertion for unknown request");
-        return Err(StatusCode::NOT_FOUND);
+async fn approve_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(approval): Json<ApproveV1>,
+) -> Result<StatusCode, ApiError> {
+    approval
+        .validate_shape()
+        .map_err(|_| ApiError(StatusCode::CONFLICT))?;
+    authorize_request(&state, &id, &headers, &approval.device_fingerprint)?;
+    if approval.request_id != id {
+        return Err(ApiError(StatusCode::CONFLICT));
     }
+    let fingerprint = approval.device_fingerprint.clone();
+    queue_decision(&state, &id, &fingerprint, &DecisionV1::Approve(approval))
+}
+async fn deny_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(denial): Json<DenyV1>,
+) -> Result<StatusCode, ApiError> {
+    denial
+        .validate_shape()
+        .map_err(|_| ApiError(StatusCode::CONFLICT))?;
+    authorize_request(&state, &id, &headers, &denial.device_fingerprint)?;
+    if denial.request_id != id {
+        return Err(ApiError(StatusCode::CONFLICT));
+    }
+    let fingerprint = denial.device_fingerprint.clone();
+    queue_decision(&state, &id, &fingerprint, &DecisionV1::Deny(denial))
+}
+fn authorize_request(
+    state: &AppState,
+    id: &str,
+    headers: &HeaderMap,
+    fingerprint: &str,
+) -> Result<(), ApiError> {
+    require_pending(state, id)?;
+    let token = bearer_token(headers)?;
+    let request = state
+        .store
+        .sealed_request_for_token(id, token.as_bytes(), now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let sealed: SealedDeviceBodyV1 = serde_json::from_str(&request.body_json)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+    if sealed.device_fingerprint != fingerprint {
+        return Err(ApiError(StatusCode::UNAUTHORIZED));
+    }
+    Ok(())
+}
+fn require_pending(state: &AppState, id: &str) -> Result<(), ApiError> {
+    match state
+        .store
+        .request_lifecycle(id, now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+    {
+        Some(RequestLifecycle::Pending) => Ok(()),
+        Some(RequestLifecycle::Gone) => Err(ApiError(StatusCode::GONE)),
+        None => Err(ApiError(StatusCode::NOT_FOUND)),
+    }
+}
+fn queue_decision(
+    state: &AppState,
+    id: &str,
+    fingerprint: &str,
+    decision: &DecisionV1,
+) -> Result<StatusCode, ApiError> {
+    match state.store.queue_decision(id, fingerprint, decision, now()) {
+        Ok(InsertResult::Inserted | InsertResult::Identical) => Ok(StatusCode::ACCEPTED),
+        Ok(InsertResult::Conflict) => Err(ApiError(StatusCode::GONE)),
+        Err(error) if error.to_string().contains("expired") => Err(ApiError(StatusCode::GONE)),
+        Err(error) if error.to_string().contains("unknown") => Err(ApiError(StatusCode::NOT_FOUND)),
+        Err(_) => Err(ApiError(StatusCode::CONFLICT)),
+    }
+}
 
-    // Serialize the verdict before dropping the lock.
-    let payload = serde_json::to_vec(&verdict).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Drop the lock before the async NATS call.
-    drop(pending);
-
+async fn submit_enrollment(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(submission): Json<EnrollmentSubmissionV1>,
+) -> Result<StatusCode, ApiError> {
+    if submission.enrollment_id != id {
+        return Err(ApiError(StatusCode::CONFLICT));
+    }
+    match state.store.submit_enrollment(&id, &submission, now()) {
+        Ok(InsertResult::Inserted | InsertResult::Identical) => Ok(StatusCode::ACCEPTED),
+        Ok(InsertResult::Conflict) => Err(ApiError(StatusCode::CONFLICT)),
+        Err(error) if error.to_string().contains("expired") => Err(ApiError(StatusCode::GONE)),
+        Err(error) if error.to_string().contains("unknown") => Err(ApiError(StatusCode::NOT_FOUND)),
+        Err(_) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR)),
+    }
+}
+async fn enrollment_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<db::EnrollmentView>, ApiError> {
     state
-        .nats
-        .publish(format!("sudo.verdict.{id}"), payload.into())
+        .store
+        .enrollment_status(&id, now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .map(Json)
+        .ok_or(ApiError(StatusCode::NOT_FOUND))
+}
+async fn get_device(
+    State(state): State<AppState>,
+    Path(fingerprint): Path<String>,
+) -> Result<Json<protocol::DevicePublicRecordV1>, ApiError> {
+    state
+        .store
+        .active_device(&fingerprint)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .map(Json)
+        .ok_or(ApiError(StatusCode::NOT_FOUND))
+}
+async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .store
+        .ready()
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE))?;
+    let current = now();
+    let consumer_age = current - state.consumer_last_ok.load(Ordering::Relaxed);
+    let outbox_age = current - state.outbox_last_ok.load(Ordering::Relaxed);
+    if consumer_age > 30 || outbox_age > 30 {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE));
+    }
+    Ok(Json(
+        json!({"status":"ok","consumer_age_seconds":consumer_age,"outbox_age_seconds":outbox_age}),
+    ))
+}
+async fn dist_file(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+) -> Result<Response, ApiError> {
+    if path.is_empty()
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(ApiError(StatusCode::NOT_FOUND));
+    }
+    let bytes = tokio::fs::read(state.dist_root.join(&path))
         .await
-        .map_err(|e| {
-            warn!(error = %e, id, "failed to publish verdict");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    debug!(id, "published verdict to NATS");
-
-    // Remove from pending after successful publish.
-    state.pending.lock().await.remove(&id);
-
-    Ok(())
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND))?;
+    Ok(asset(
+        if FsPath::new(&path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        {
+            "application/json"
+        } else {
+            "application/octet-stream"
+        },
+        &bytes,
+        true,
+    ))
 }
 
-// ---------------------------------------------------------------------------
-// Authentication — shared bearer token on approval endpoints
-// ---------------------------------------------------------------------------
-
-/// Check the Authorization header against the shared API token.
-///
-/// This is a simple boundary to prevent unauthenticated access to
-/// `/api/pending` and `/assertion/:id`. The token is loaded from the
-/// `SUDO_APPROVE_API_TOKEN` environment variable at startup.
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let Some(header) = headers.get("Authorization") else {
-        warn!("missing Authorization header on protected endpoint");
-        return Err(StatusCode::UNAUTHORIZED);
-    };
-    let Ok(auth) = header.to_str() else {
-        warn!("invalid utf-8 in Authorization header");
-        return Err(StatusCode::UNAUTHORIZED);
-    };
-
-    let Some((scheme, token)) = auth.split_once(' ') else {
-        warn!("missing bearer token in Authorization");
-        return Err(StatusCode::UNAUTHORIZED);
-    };
-
-    if scheme != "Bearer" {
-        warn!(scheme, "unexpected auth scheme");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let token = token.trim();
-    if token.is_empty() {
-        warn!("empty bearer token");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    if token != state.api_token {
-        warn!("invalid bearer token");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    Ok(())
+fn html(body: &'static str) -> Response {
+    asset("text/html; charset=utf-8", body.as_bytes(), false)
 }
-
-// ---------------------------------------------------------------------------
-// NATS consumer — just queue requests
-// ---------------------------------------------------------------------------
-
-async fn consumer_task(nats: Arc<async_nats::Client>, pending: PendingMap) -> Result<()> {
-    let mut sub = nats.subscribe("sudo.request.>").await?;
-    info!("consuming sudo.request.>");
-
-    while let Some(msg) = sub.next().await {
-        match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-            Ok(req) => {
-                let id = req["header"]["id"].as_str().unwrap_or("").to_string();
-                let host = req["header"]["host"].as_str().unwrap_or("").to_string();
-                let user = req["header"]["user"].as_str().unwrap_or("").to_string();
-                let ts = req["header"]["ts"].as_i64().unwrap_or(0);
-                let sealed = req["sealed"][0]["ciphertext"].as_str().unwrap_or("");
-
-                if id.is_empty() {
-                    warn!("missing request id");
-                    continue;
-                }
-
-                let expiry = ts + 90;
-
-                let entry = Pending {
-                    id: id.clone(),
-                    host,
-                    user,
-                    command: format!("(exp: {}s)", ts + 90),
-                    expiry,
-                    envelope_body_json: sealed.to_string(),
-                };
-
-                debug!(id, "queued request");
-                pending.lock().await.insert(id, entry);
-            }
-            Err(e) => {
-                warn!(error = %e, "bad request payload");
-            }
-        }
-    }
-
-    Ok(())
+fn asset(content_type: &str, body: &[u8], immutable: bool) -> Response {
+    let mut response = Response::new(Body::from(body.to_vec()));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type).expect("static content type"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(if immutable {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-store"
+        }),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    response
 }
-
-// ---------------------------------------------------------------------------
-// HTML pages
-// ---------------------------------------------------------------------------
-
-const APPROVAL_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head>
-  <title>Approve sudo</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; }
-    h1 { color: #333; }
-    .request { border: 1px solid #ddd; padding: 15px; margin: 10px 0; border-radius: 4px; }
-    .command { font-family: monospace; }
-    button { background: #007bff; color: white; border: none; padding: 10px 20px; cursor: pointer; }
-    button:hover { background: #0056b3; }
-  </style>
-</head>
-<body>
-  <h1>Pending sudo requests</h1>
-  <div id="requests">Loading…</div>
-  <script>
-    async function load() {
-      const res = await fetch('/api/pending');
-      const data = await res.json();
-      document.getElementById('requests').innerHTML = data.requests.map(r => `
-        <div class="request">
-          <strong>#${r.id.slice(0,8)}</strong> on ${r.host}<br/>
-          user: ${r.user}<br/>
-          command: <span class="command">${r.command}</span><br/>
-          expires: ${r.expiry_human}<br/>
-          <button onclick="approve('${r.id}')">Approve</button>
-        </div>
-      `).join('');
+async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
-
-    async function approve(id) {
-      const credential = await navigator.credentials.create({
-        publicKey: {
-          rp: { name: "sudo" },
-          user: { id: new Uint8Array(16), name: "sudo", displayName: "sudo" },
-          challenge: new TextEncoder().encode("approve"),
-          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-          authenticatorSelection: { userVerification: "required" }
-        }
-      });
-      alert("credential ceremony not wired: see WebAuthn handler");
-    }
-
-    setInterval(load, 2000);
-    load();
-  </script>
-</body>
-</html>"#;
-
-const ENROLL_HTML: &str = r#"<!DOCTYPE html>
-<html>
-<head><title>Enroll</title></head>
-<body>
-  <h1>Enroll this device</h1>
-  <p>Enroll a Touch ID / Face ID credential for sudo approval.</p>
-  <button onclick="enroll()">Enroll</button>
-  <script>
-    async function enroll() {
-      const credential = await navigator.credentials.create({
-        publicKey: {
-          rp: { name: "sudo" },
-          user: { id: new Uint8Array(16), name: "sudo-approve", displayName: "sudo" },
-          challenge: new TextEncoder().encode("enroll"),
-          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-          authenticatorSelection: { userVerification: "required" }
-        }
-      });
-      alert("enrollment ceremony not wired");
-    }
-  </script>
-</body>
-</html>"#;
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    response
+}
+fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| value.len() >= 32)
+        .map(ToOwned::to_owned)
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))
+}
+async fn connect_nats() -> Result<async_nats::Client> {
+    async_nats::ConnectOptions::new()
+        .user_and_password(required_env("NATS_USER")?, required_env("NATS_PASS")?)
+        .connect(required_env("NATS_URL")?)
+        .await
+        .context("connect to NATS")
+}
+fn required_env(name: &str) -> Result<String> {
+    std::env::var(name).with_context(|| format!("{name} not set"))
+}
+fn now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}

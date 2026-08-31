@@ -1,118 +1,80 @@
-# sudo approve runbook
+# Sudo approval runbook
 
-## Setup
+This service is prelaunch software. Issue #867 builds and tests the protocol,
+hook, browser, server, installer, and artifacts. It does not activate a
+production service or permanent sudo plugin.
 
-**Prerequisites:**
-- Secrets seeded: NATS user/pass, NATS cert, step CA root
-- Hook binaries built: `cargo build --release --manifest-path services/sudo-approve/Cargo.toml`
-- Server image built: `cargo build --release --manifest-path services/sudo-approve/server/Cargo.toml`
-
-**Prelaunch host setup:**
-
-This installs the hook, plugin, state files, and `/etc/sudo.conf` block. It
-doesn't install sudoers policy. It also clears hook exemptions and removes the
-obsolete `/etc/sudoers.d/management-plane-sudo-approve` duplicate if present.
+## Build and test
 
 ```bash
-# 1. Install the sudo hook and plugin with no exemptions
-./services/sudo-approve/scripts/install-sudo-hook --prelaunch
-
-# 2. Configure NATS credentials
-echo "NATS_URL=nats://management-plane:4222
-NATS_USER=sudo_hook
-NATS_PASS=..." > /etc/management-plane/sudo-approve/config.env
-
-# 3. Install devices.json (empty)
-echo "[]" > /etc/management-plane/sudo-approve/devices.json
-
-# 4. Verify sudo is happy
-sudo -k
-sudo true  # should run hook instead
+cd services/sudo-approve
+cargo fmt -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --release
+./scripts/test-install-sudo-hook
+./scripts/test-sudo-plugin-container
 ```
 
-Launch promotion will own the production sudoers policy and argv-aware hook
-exemptions. Prelaunch installation doesn't derive exemptions from sudoers.
-
-### Disposable container test
-
-`--standalone-e2e` is only for the container E2E. It installs no sudoers
-policy. The harness creates and removes an exact policy for its test user and
-`/usr/bin/echo` command.
+The installer requires `target/release/SHA256SUMS`. Create it after a local
+release build:
 
 ```bash
-./services/sudo-approve/scripts/test-sudo-plugin-container
+cd services/sudo-approve/target/release
+sha256sum management-plane-sudo-approve libplugin.so > SHA256SUMS
 ```
 
-Don't use `--standalone-e2e` as a host installation path.
+## Temporary acceptance setup
 
-## Enroll a device
+Keep a second root shell open during acceptance. Snapshot Tailscale Serve
+before changing it. Use a disposable NATS JetStream stream and SQLite file.
+The hook and server must use the exact temporary HTTPS origin and RP ID.
 
-The first enrollment generates a one-time URL for an Apple/iPhone:
+Run the installer only after its dry run:
 
 ```bash
-# On nas (where requests originate):
+services/sudo-approve/scripts/install-sudo-hook --prelaunch --dry-run
+sudo services/sudo-approve/scripts/install-sudo-hook --prelaunch
+sudo services/sudo-approve/scripts/install-sudo-hook --prelaunch-status
+```
+
+`--prelaunch` installs and enables the plugin. It preserves an existing
+`devices.json`. The Linux plugin path is
+`/usr/local/libexec/sudo/approval_exec.so`. Darwin uses
+`approval_exec.dylib` in the same directory.
+
+## Enroll and manage devices
+
+Each browser profile enrolls separately. The URL fragment contains the
+five-minute enrollment secret and never reaches the server.
+
+```bash
 management-plane-sudo-approve enroll
-
-# This prints: https://sudo.internal.psalmond.com/enroll/<token>
-# Send this URL to the device owner
+management-plane-sudo-approve enroll --resume <enrollment-id>
+management-plane-sudo-approve status
+management-plane-sudo-approve revoke <fingerprint>
+management-plane-sudo-approve pin <fingerprint>
 ```
 
-On the device, open the URL. The browser will:
-1. Generate X25519 keypair for encrypted requests
-2. Generate P-256 WebAuthn credential for biometric approval
-3. POST keys to the enrollment endpoint
-4. Print fingerprint for pinning
+`pin` fetches one active public record. It recomputes the full-record
+fingerprint and requires the full fingerprint as operator confirmation.
 
-Then pin the device fingerprint:
+`test` publishes a synthetic request and waits for approve or deny. `watch`
+opens each request URL on Darwin without a shell.
+
+## Disable and restore
+
+Disable the managed block before stopping the temporary stack:
 
 ```bash
-# 4-digit code shown on nas after enrollment
-management-plane-sudo-approve pin a1b2c3d4
+sudo services/sudo-approve/scripts/install-sudo-hook --disable-prelaunch
+sudo -V
 ```
 
-## Test
+Restore the saved Tailscale Serve configuration. Stop the disposable NATS and
+server processes. Confirm ordinary sudo behavior. The installer restores the
+prior `sudo.conf` automatically if `sudo -V` fails.
 
-Test the whole flow without triggering actual sudo:
-
-```bash
-management-plane-sudo-approve test
-```
-
-## Debugging
-
-### Hook logs
-```bash
-journalctl -u management-plane-sudo-approve
-```
-
-### NATS subjects
-```bash
-# See requests being published
-nats -s nats://management-plane:4222 sub 'sudo.>' --user sudo_hook --pass ...
-```
-
-### Verify plugin is loaded
-```bash
-sudo -V | grep approval  # should show approval-plugin
-```
-
-## Rollback
-
-The approval plugin denies everything if misconfigured. To rollback:
-
-```bash
-# Remove the approval-plugin line from /etc/sudo.conf
-sudoedit /etc/sudo.conf
-# Delete lines between:
-#   # BEGIN management-plane sudo approve
-#   # END management-plane sudo approve
-```
-
-## Security decisions
-
-- All requests encrypted with requestor's box secret
-- Biometric approval required for finger/Touch ID
-- Prelaunch has no hook exemptions
-- Launch promotion will own argv-aware production exemptions
-- NATS over tailscale only (no public exposure)
-- Fail closed: any verification error denies the command
+Issue #868 owns production NATS permissions, JetStream creation, ntfy,
+Compose, DNS, TLS, promotion, exemptions, alerts, and activation on `nas`.
+Issue #869 owns the durable `mbp` installer, watcher credential, LaunchAgent,
+`pam_tid`, and laptop rollback.

@@ -1,5 +1,8 @@
 # Build artifacts
 target/
+dist/
+Dockerfile.publish
+server/web/node_modules/
 
 # Lockfile for binaries — commit this
 # Cargo.lock

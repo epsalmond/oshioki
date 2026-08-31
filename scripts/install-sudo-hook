@@ -1,204 +1,137 @@
 #!/usr/bin/env bash
-# install-sudo-hook: prelaunch root installer for the sudo-approve service.
-#
-# Installs the built hook binary and the sudo approval plugin, writes
-# /etc/management-plane/sudo-approve/ state, and appends (or replaces in
-# place) the approval-plugin block in /etc/sudo.conf between BEGIN/END
-# management-plane markers.
-#
-# Runs once as root from the service checkout. Safe to re-run: every write
-# is idempotent and the sudo.conf block is rewritten in place.
-#
-# Neither mode installs sudoers policy or hook exemptions. The standalone mode
-# exists only for a disposable E2E container whose harness owns its exact
-# sudoers fixture.
-#
-# Usage:
-#   install-sudo-hook --prelaunch [--dry-run]
-#   install-sudo-hook --standalone-e2e [--dry-run]
-#   SKIP_NODEVER=1 install-sudo-hook --standalone-e2e
+# Install, disable, or inspect the retained sudo-approve prelaunch block.
 set -euo pipefail
 
+MODE=""
 DRY_RUN=0
-INSTALL_MODE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --prelaunch|--disable-prelaunch|--prelaunch-status|--standalone-e2e)
+      [ -z "$MODE" ] || { echo "install-sudo-hook: choose exactly one mode" >&2; exit 2; }
+      MODE="${1#--}"
+      ;;
     --dry-run) DRY_RUN=1 ;;
-    --prelaunch|--standalone-e2e)
-      [ -z "$INSTALL_MODE" ] || {
-        echo "install-sudo-hook: choose exactly one of --prelaunch or --standalone-e2e" >&2
-        exit 2
-      }
-      INSTALL_MODE="${1#--}"
-      ;;
-    *)
-      echo "install-sudo-hook: unknown argument: ${1}" >&2
-      exit 2
-      ;;
+    *) echo "install-sudo-hook: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+[ -n "$MODE" ] || { echo "install-sudo-hook: choose exactly one mode" >&2; exit 2; }
 
-[ -n "$INSTALL_MODE" ] || {
-  echo "install-sudo-hook: choose exactly one of --prelaunch or --standalone-e2e" >&2
-  exit 2
-}
-
-if [ "$(id -u)" -ne 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-  echo "install-sudo-hook: must run as root" >&2
-  exit 1
-fi
-
-# Paths (overridable for tests).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SERVICE_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 SUDO_CONF="${SUDO_CONF:-/etc/sudo.conf}"
-SUDO_PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/share/sudo}"
 SBIN_DIR="${SBIN_DIR:-/usr/local/sbin}"
 STATE_DIR="${SUDO_APPROVE_STATE_DIR:-/etc/management-plane/sudo-approve}"
 SUDOERS_D="${SUDOERS_D:-/etc/sudoers.d}"
-
+ORIGIN="${SUDO_APPROVE_ORIGIN:-https://sudo.internal.psalmond.com}"
+RP_ID="${SUDO_APPROVE_RP_ID:-sudo.internal.psalmond.com}"
 NATS_URL="${NATS_URL:-nats://nats.internal.psalmond.com:4222}"
 NATS_USER="${NATS_USER:-sudo-approve}"
 NATS_PASS="${NATS_PASS:-}"
-CONFIG_NATS_PASS="$NATS_PASS"
-if [ "$DRY_RUN" -eq 1 ]; then
-  CONFIG_NATS_PASS='<redacted>'
-fi
-
-die() {
-  echo "install-sudo-hook: $*" >&2
-  exit 1
-}
-
-run() {
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRY:'
-    printf ' %q' "$@"
-    printf '\n'
-  else
-    "$@"
-  fi
-}
-
-write_file() {
-  # write_file <mode> <path> ; content on stdin
-  local mode="$1" dest="$2"
-  local tmp
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRY: write %s (mode %s):\n' "$dest" "$mode"
-    sed 's/^/  | /'
-    return 0
-  fi
-  tmp="$(mktemp "${dest}.XXXXXX")"
-  cat > "$tmp"
-  chmod "$mode" "$tmp"
-  chown root:root "$tmp"
-  mv -f "$tmp" "$dest"
-}
-
-# --- Preflight: built artifacts must exist before we touch root state ---
-HOOK_BIN="$SERVICE_DIR/target/release/management-plane-sudo-approve"
-PLUGIN_SO="$SERVICE_DIR/target/release/libplugin.so"
-for f in "$HOOK_BIN" "$PLUGIN_SO"; do
-  [ -f "$f" ] || die "missing build artifact: $f (run cargo build --release first)"
-done
-
-# Retire the superseded path-only policy copy before activating a prelaunch
-# plugin. Refuse ambiguous filesystem objects instead of following or removing
-# them. Production policy at management-plane-prod is never touched.
-if [ "$INSTALL_MODE" = "prelaunch" ]; then
-  STALE_SUDOERS="$SUDOERS_D/management-plane-sudo-approve"
-  if [ -L "$STALE_SUDOERS" ]; then
-    die "refusing to retire symlink at stale sudoers path: $STALE_SUDOERS"
-  fi
-  if [ -e "$STALE_SUDOERS" ] && [ ! -f "$STALE_SUDOERS" ]; then
-    die "refusing to retire non-regular stale sudoers path: $STALE_SUDOERS"
-  fi
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRY: remove stale sudoers file if present: %s\n' "$STALE_SUDOERS"
-  elif [ -f "$STALE_SUDOERS" ]; then
-    rm -f -- "$STALE_SUDOERS" || die "could not retire stale sudoers file: $STALE_SUDOERS"
-  fi
-fi
-
-# --- Install binaries ---
-run install -d -m 0755 "$SBIN_DIR"
-run install -m 0755 -o root -g root \
-  "$HOOK_BIN" "$SBIN_DIR/management-plane-sudo-approve"
-run install -d -m 0755 "$SUDO_PLUGIN_DIR"
-run install -m 0755 -o root -g root \
-  "$PLUGIN_SO" "$SUDO_PLUGIN_DIR/libplugin.so"
-
-# --- Root-owned state directory ---
-run install -d -m 0750 -o root -g root "$STATE_DIR"
-
-write_file 0640 "$STATE_DIR/config.env" <<EOF
-# management-plane sudo-approve service configuration.
-# Read by management-plane-sudo-approve at startup as root.
-NATS_URL=$NATS_URL
-NATS_USER=$NATS_USER
-NATS_PASS=$CONFIG_NATS_PASS
-EOF
-
-# Enrolled approval devices; empty until the enrollment flow writes entries.
-write_file 0640 "$STATE_DIR/devices.json" <<'EOF'
-[]
-EOF
-
-# Prelaunch has no safe exemption format yet. An empty file makes every sudo
-# invocation use remote approval until promotion owns argv-aware exemptions.
-write_file 0640 "$STATE_DIR/exempt" <<'EOF'
-EOF
-
-# --- sudo.conf approval-plugin block ---
 BEGIN_MARK='# BEGIN management-plane sudo approve'
 END_MARK='# END management-plane sudo approve'
-read -r -d '' BLOCK <<EOF || true
-$BEGIN_MARK
-Plugin approval_exec $SUDO_PLUGIN_DIR/libplugin.so
-$END_MARK
-EOF
+LOCK_DIR="${SUDO_APPROVE_INSTALL_LOCK:-${STATE_DIR}.install.lock}"
+
+case "$(uname -s)" in
+  Linux) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=approval_exec.so; BUILD_PLUGIN=libplugin.so ;;
+  Darwin) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=approval_exec.dylib; BUILD_PLUGIN=libplugin.dylib ;;
+  *) echo "install-sudo-hook: unsupported operating system" >&2; exit 1 ;;
+esac
+HOOK_BIN="$SERVICE_DIR/target/release/management-plane-sudo-approve"
+PLUGIN_BIN="$SERVICE_DIR/target/release/$BUILD_PLUGIN"
+PLUGIN_DEST="$PLUGIN_DIR/$PLUGIN_NAME"
+
+die() { echo "install-sudo-hook: $*" >&2; exit 1; }
+run() { if [ "$DRY_RUN" -eq 1 ]; then printf 'DRY:'; printf ' %q' "$@"; printf '\n'; else "$@"; fi; }
+regular_or_absent() { [ ! -L "$1" ] || die "refusing unsafe target: $1"; [ ! -e "$1" ] || [ -f "$1" ] || die "refusing unsafe target: $1"; }
+safe_directory() { [ ! -L "$1" ] || die "refusing symlink directory: $1"; [ ! -e "$1" ] || [ -d "$1" ] || die "refusing non-directory: $1"; }
+hash_file() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+
+if [ "$MODE" = prelaunch-status ]; then
+  [ -f "$SUDO_CONF" ] || { echo "disabled"; exit 1; }
+  begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"; ends="$(grep -cF "$END_MARK" "$SUDO_CONF" || true)"
+  if [ "$begins" -eq 1 ] && [ "$ends" -eq 1 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
+  if [ "$begins" -eq 0 ] && [ "$ends" -eq 0 ]; then echo "disabled"; exit 1; fi
+  die "malformed managed block in $SUDO_CONF"
+fi
+
+[ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || die "must run as root"
+safe_directory "$(dirname "$STATE_DIR")"; safe_directory "$STATE_DIR"; regular_or_absent "$SUDO_CONF"
+safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/management-plane-sudo-approve"; regular_or_absent "$PLUGIN_DEST"
+
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir "$LOCK_DIR" 2>/dev/null || die "another installer holds $LOCK_DIR"
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
+fi
+
+rewrite_block() {
+  local action="$1" source="$2" destination="$3" tmp begins ends
+  begins="$(grep -cF "$BEGIN_MARK" "$source" 2>/dev/null || true)"; ends="$(grep -cF "$END_MARK" "$source" 2>/dev/null || true)"
+  { [ "$begins" -eq 0 ] && [ "$ends" -eq 0 ]; } || { [ "$begins" -eq 1 ] && [ "$ends" -eq 1 ]; } || die "malformed managed block in $source"
+  tmp="$(mktemp "${destination}.XXXXXX")"
+  awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+    $0 == begin { inside=1; next } $0 == end { inside=0; next } !inside { print }
+  ' "$source" > "$tmp"
+  if [ "$action" = enable ]; then
+    [ ! -s "$tmp" ] || [ "$(tail -c 1 "$tmp" | wc -l)" -ne 0 ] || printf '\n' >> "$tmp"
+    printf '%s\nPlugin approval_exec %s\n%s\n' "$BEGIN_MARK" "$PLUGIN_DEST" "$END_MARK" >> "$tmp"
+  fi
+  chmod 0644 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$destination"
+}
+
+validate_sudo() {
+  if [ "${SKIP_NODEVER:-0}" = 1 ]; then return 0; fi
+  if [ "$DRY_RUN" -eq 1 ]; then printf 'DRY: sudo -V  # validate %s\n' "$SUDO_CONF"; return 0; fi
+  sudo -V >/dev/null 2>&1
+}
+
+if [ "$MODE" = disable-prelaunch ]; then
+  [ -f "$SUDO_CONF" ] || die "missing $SUDO_CONF"
+  if [ "$DRY_RUN" -eq 1 ]; then echo "DRY: remove exact managed block from $SUDO_CONF"; exit 0; fi
+  backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
+  rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
+  if ! validate_sudo; then cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"; die "sudo -V failed after disable; restored prior configuration"; fi
+  rm -f "$backup"; echo "install-sudo-hook: prelaunch disabled and sudo validated"; exit 0
+fi
+
+for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do [ -f "$artifact" ] && [ ! -L "$artifact" ] || die "missing or unsafe build artifact: $artifact"; done
+architecture="$(uname -m)"; file_output="$(file -b "$HOOK_BIN") $(file -b "$PLUGIN_BIN")"
+case "$architecture" in
+  x86_64|amd64) grep -Eqi 'x86[-_ ]?64|x86_64' <<<"$file_output" || die "artifact architecture does not match $architecture" ;;
+  arm64|aarch64) grep -Eqi 'arm64|aarch64' <<<"$file_output" || die "artifact architecture does not match $architecture" ;;
+  *) die "unsupported architecture: $architecture" ;;
+esac
+
+CHECKSUMS="${SUDO_APPROVE_CHECKSUMS:-$SERVICE_DIR/target/release/SHA256SUMS}"
+[ -f "$CHECKSUMS" ] && [ ! -L "$CHECKSUMS" ] || die "missing artifact checksum manifest: $CHECKSUMS"
+for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do
+  name="$(basename "$artifact")"; expected="$(awk -v name="$name" '$2 == name {print $1}' "$CHECKSUMS")"
+  [ "${#expected}" -eq 64 ] || die "checksum manifest has no exact entry for $name"
+  [ "$(hash_file "$artifact")" = "$expected" ] || die "checksum mismatch for $name"
+done
+
+run install -d -m 0755 "$SBIN_DIR" "$PLUGIN_DIR"
+run install -m 0755 -o root -g root "$HOOK_BIN" "$SBIN_DIR/management-plane-sudo-approve"
+run install -m 0755 -o root -g root "$PLUGIN_BIN" "$PLUGIN_DEST"
+run install -d -m 0750 -o root -g root "$STATE_DIR"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf 'DRY: rewrite %s approval-plugin block as:\n' "$SUDO_CONF"
-  printf '  | %s\n' "$BLOCK"
+  printf 'DRY: write %s/config.env with NATS_PASS=<redacted>\n' "$STATE_DIR"
+  printf 'DRY: write %s/hook.json for origin %s and RP ID %s\n' "$STATE_DIR" "$ORIGIN" "$RP_ID"
 else
-  [ -f "$SUDO_CONF" ] || touch "$SUDO_CONF"
-  tmp="$(mktemp "${SUDO_CONF}.XXXXXX")"
-  if grep -qF "$BEGIN_MARK" "$SUDO_CONF"; then
-    # Replace the existing marker block in place.
-    awk -v begin="$BEGIN_MARK" -v end="$END_MARK" -v block="$BLOCK" '
-      $0 == begin { print block; skip = 1; next }
-      $0 == end { skip = 0; next }
-      !skip { print }
-    ' "$SUDO_CONF" > "$tmp"
-  else
-    # First install: overwrite any trailing line and append the block at end.
-    cat "$SUDO_CONF" > "$tmp"
-    # Ensure file ends with newline before appending.
-    [ -s "$tmp" ] && [ "$(tail -c 1 "$tmp" | wc -l)" -eq 0 ] && printf '\n' >> "$tmp"
-    printf '%s\n' "$BLOCK" >> "$tmp"
-  fi
-  chmod 0644 "$tmp"
-  chown root:root "$tmp"
-  mv -f "$tmp" "$SUDO_CONF"
+  tmp="$(mktemp "$STATE_DIR/config.env.XXXXXX")"; printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\n' "$NATS_URL" "$NATS_USER" "$NATS_PASS" > "$tmp"; chmod 0600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$STATE_DIR/config.env"
+  tmp="$(mktemp "$STATE_DIR/hook.json.XXXXXX")"; printf '{"version":1,"origin":"%s","rp_id":"%s","server_base_url":"%s"}\n' "$ORIGIN" "$RP_ID" "$ORIGIN" > "$tmp"; chmod 0600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$STATE_DIR/hook.json"
+  if [ ! -e "$STATE_DIR/devices.json" ]; then printf '{"version":1,"devices":[]}\n' > "$STATE_DIR/devices.json"; chmod 0600 "$STATE_DIR/devices.json"; chown root:root "$STATE_DIR/devices.json"; fi
 fi
 
-# --- Validation: sudo must still parse its config with the plugin line ---
-if [ "${SKIP_NODEVER:-0}" = "1" ]; then
-  echo "install-sudo-hook: SKIP_NODEVER=1, skipping sudo -V validation"
-elif [ "$DRY_RUN" -eq 1 ]; then
-  printf 'DRY: sudo -V  # would validate %s\n' "$SUDO_CONF"
-else
-  if ! sudo -V >/dev/null 2>&1; then
-    die "sudo -V failed after editing $SUDO_CONF; approval-plugin line rejected"
-  fi
-  echo "install-sudo-hook: sudo -V accepted $SUDO_CONF"
+if [ "$MODE" = prelaunch ]; then
+  stale="$SUDOERS_D/management-plane-sudo-approve"; regular_or_absent "$stale"; [ ! -f "$stale" ] || run rm -f -- "$stale"
 fi
 
-if [ "$INSTALL_MODE" = "standalone-e2e" ]; then
-  echo "install-sudo-hook: installed standalone E2E hook, plugin, state, and sudo.conf block (sudoers unchanged)"
-else
-  echo "install-sudo-hook: installed prelaunch hook, plugin, state, and sudo.conf block (sudoers unchanged; legacy duplicate retired)"
-fi
+if [ "$DRY_RUN" -eq 1 ]; then echo "DRY: enable exact managed block in $SUDO_CONF"; validate_sudo; exit 0; fi
+[ -f "$SUDO_CONF" ] || install -m 0644 -o root -g root /dev/null "$SUDO_CONF"
+backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
+rewrite_block enable "$SUDO_CONF" "$SUDO_CONF"
+if ! validate_sudo; then rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"; cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"; die "sudo -V failed; restored prior configuration"; fi
+rm -f "$backup"
+echo "install-sudo-hook: $MODE installed and sudo validated"

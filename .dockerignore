@@ -1,0 +1,3 @@
+target
+server/web/node_modules
+Dockerfile.publish

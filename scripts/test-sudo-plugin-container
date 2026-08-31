@@ -108,6 +108,10 @@ for artifact in "$WORKSPACE/target/release/management-plane-sudo-approve" \
     exit 2
   }
 done
+(
+  cd "$WORKSPACE/target/release"
+  sha256sum management-plane-sudo-approve libplugin.so > SHA256SUMS
+)
 
 NATS_HOST_VALUE=""
 NATS_PORT_VALUE=""
@@ -196,7 +200,7 @@ for _ in $(seq 1 120); do
 done
 
 if [ ! -f "$SHARE/subscriber.ready" ] || [ ! -s "$SHARE/box_pub.hex" ] ||
-   [ ! -s "$SHARE/credential_pub.b64" ]; then
+   [ ! -s "$SHARE/credential_pub.b64" ] || [ ! -s "$SHARE/fingerprint" ]; then
   echo "subscriber never established its NATS subscription" >&2
   if [ "$IN_CONTAINER" = "1" ]; then
     tail -40 "$SHARE/subscriber.log" >&2 || true
@@ -215,14 +219,9 @@ EXPECTED_UID="12345"
 ARGS=("hello" "world with spaces" "--label=alpha=beta" "-n")
 EXPECTED_ARGV=("$EXPECTED_CMD" "${ARGS[@]}")
 
+FINGERPRINT="$(cat "$SHARE/fingerprint")"
 cat >"$SHARE/devices.json" <<EOF
-[
-  {
-    "box_pub": "$BOX_PUB",
-    "credential_pub": "$CREDENTIAL_PUB",
-    "credential_id": "AQID"
-  }
-]
+{"version":1,"devices":[{"version":1,"fingerprint":"$FINGERPRINT","credential_id":"AQID","credential_public_key":"$CREDENTIAL_PUB","box_public_key":"$BOX_PUB","label":"container-e2e","api_token_hash":"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM","sign_count":0,"active":true}]}
 EOF
 
 if [ "$IN_CONTAINER" = "1" ]; then
@@ -248,9 +247,9 @@ INNER_SCRIPT="$SHARE/sudo-inner.sh"
   cat <<'INNER'
 echo "[inner] start $(date -Is)"
 
-if ! command -v sudo >/dev/null 2>&1; then
+if ! command -v sudo >/dev/null 2>&1 || ! command -v file >/dev/null 2>&1; then
   apt-get update -qq >/dev/null
-  apt-get install -y -qq sudo >/dev/null
+  apt-get install -y -qq sudo file >/dev/null
 fi
 
 "$SERVICE_DIR/scripts/install-sudo-hook" --standalone-e2e

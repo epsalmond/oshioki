@@ -1,0 +1,10 @@
+:root { color-scheme: light dark; font: 17px/1.45 system-ui, sans-serif; }
+body { margin: 0; background: Canvas; color: CanvasText; }
+main { max-width: 42rem; margin: 8vh auto; padding: 1.5rem; }
+h1 { font-size: 1.7rem; }
+dl { display: grid; grid-template-columns: 9rem 1fr; gap: .65rem 1rem; }
+dt { color: GrayText; }
+dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+button { font: inherit; padding: .7rem 1.1rem; margin: 1rem .7rem 0 0; }
+#approve { background: #08783e; color: white; border: 0; border-radius: .35rem; }
+#deny { background: transparent; color: #c73535; border: 1px solid currentColor; border-radius: .35rem; }
