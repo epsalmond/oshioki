@@ -58,16 +58,26 @@ fi
 [ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || die "must run as root"
 safe_directory "$(dirname "$STATE_DIR")"; safe_directory "$STATE_DIR"; regular_or_absent "$SUDO_CONF"
 safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/management-plane-sudo-approve"; regular_or_absent "$PLUGIN_DEST"
+regular_or_absent "$STATE_DIR/config.env"; regular_or_absent "$STATE_DIR/hook.json"; regular_or_absent "$STATE_DIR/devices.json"
 
 if [ "$DRY_RUN" -eq 0 ]; then
   mkdir "$LOCK_DIR" 2>/dev/null || die "another installer holds $LOCK_DIR"
   trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
 fi
 
-rewrite_block() {
-  local action="$1" source="$2" destination="$3" tmp begins ends
+validate_block() {
+  local source="$1" begins ends begin_line end_line
   begins="$(grep -cF "$BEGIN_MARK" "$source" 2>/dev/null || true)"; ends="$(grep -cF "$END_MARK" "$source" 2>/dev/null || true)"
   { [ "$begins" -eq 0 ] && [ "$ends" -eq 0 ]; } || { [ "$begins" -eq 1 ] && [ "$ends" -eq 1 ]; } || die "malformed managed block in $source"
+  if [ "$begins" -eq 1 ]; then
+    begin_line="$(grep -nF "$BEGIN_MARK" "$source" | cut -d: -f1)"; end_line="$(grep -nF "$END_MARK" "$source" | cut -d: -f1)"
+    [ "$begin_line" -lt "$end_line" ] || die "malformed managed block in $source"
+  fi
+}
+
+rewrite_block() {
+  local action="$1" source="$2" destination="$3" tmp
+  validate_block "$source"
   tmp="$(mktemp "${destination}.XXXXXX")"
   awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
     $0 == begin { inside=1; next } $0 == end { inside=0; next } !inside { print }
@@ -78,6 +88,8 @@ rewrite_block() {
   fi
   chmod 0644 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$destination"
 }
+
+[ ! -f "$SUDO_CONF" ] || validate_block "$SUDO_CONF"
 
 validate_sudo() {
   if [ "${SKIP_NODEVER:-0}" = 1 ]; then return 0; fi

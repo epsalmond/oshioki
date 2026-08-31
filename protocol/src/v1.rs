@@ -50,6 +50,19 @@ impl RequestV1 {
         if decode_base64url(&self.nonce)?.len() != 16 || self.expires_at <= self.issued_at {
             return Err(Error::InvalidRequest("invalid nonce or expiry".into()));
         }
+        if self.host.is_empty()
+            || self.host.len() > 255
+            || self.user.is_empty()
+            || self.user.len() > 256
+            || self.cwd.len() > 64 * 1024
+            || self.command.is_empty()
+            || self.command.len() > 64 * 1024
+            || self.argv.len() > 4096
+            || self.pid_chain.len() > 5
+            || self.pid_chain.iter().any(|entry| entry.len() > 512)
+        {
+            return Err(Error::InvalidRequest("invalid request field size".into()));
+        }
         Ok(())
     }
 
@@ -130,6 +143,8 @@ impl DevicePublicRecordV1 {
             || decode_base64url(&self.credential_public_key)?.is_empty()
             || decode_exact(&self.box_public_key, 32).is_err()
             || decode_exact(&self.api_token_hash, 32).is_err()
+            || self.label.is_empty()
+            || self.label.len() > 128
         {
             return Err(Error::InvalidRequest("invalid device record".into()));
         }
@@ -186,6 +201,19 @@ pub struct EnrollmentIntentV1 {
     pub reply_subject: String,
 }
 
+impl EnrollmentIntentV1 {
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.version != VERSION_V1
+            || !valid_id(&self.enrollment_id)
+            || decode_exact(&self.secret_hash, 32).is_err()
+            || self.reply_subject != format!("sudo.enrollment.submission.{}", self.enrollment_id)
+        {
+            return Err(Error::InvalidRequest("invalid enrollment intent".into()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentSubmissionV1 {
     pub version: u8,
@@ -200,6 +228,31 @@ pub struct EnrollmentSubmissionV1 {
     pub api_token_hash: String,
     pub label: String,
     pub transcript_hmac: String,
+}
+
+impl EnrollmentSubmissionV1 {
+    pub fn validate_shape(&self) -> Result<(), Error> {
+        if self.version != VERSION_V1
+            || !valid_id(&self.enrollment_id)
+            || decode_base64url(&self.registration_client_data_json)?.len() > 16 * 1024
+            || decode_base64url(&self.attestation_object)?.len() > 128 * 1024
+            || decode_base64url(&self.proof_authenticator_data)?.len() > 1024
+            || decode_base64url(&self.proof_client_data_json)?.len() > 16 * 1024
+            || decode_base64url(&self.proof_signature)?.len() > 256
+            || decode_base64url(&self.credential_id)?.is_empty()
+            || decode_base64url(&self.credential_id)?.len() > 1024
+            || decode_exact(&self.box_public_key, 32).is_err()
+            || decode_exact(&self.api_token_hash, 32).is_err()
+            || self.label.is_empty()
+            || self.label.len() > 128
+            || decode_exact(&self.transcript_hmac, 32).is_err()
+        {
+            return Err(Error::InvalidRequest(
+                "invalid enrollment submission shape".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

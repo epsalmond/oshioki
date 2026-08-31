@@ -57,11 +57,7 @@ pub fn verify_enrollment_v1(
     config: &HookConfigV1,
 ) -> Result<DevicePublicRecordV1, Error> {
     config.validate()?;
-    if submission.version != VERSION_V1 || submission.enrollment_id.is_empty() {
-        return Err(Error::InvalidRequest(
-            "invalid enrollment submission".into(),
-        ));
-    }
+    submission.validate_shape()?;
     let registration_client_data = decode_base64url(&submission.registration_client_data_json)?;
     let attestation_object = decode_base64url(&submission.attestation_object)?;
     let proof_authenticator_data = decode_base64url(&submission.proof_authenticator_data)?;

@@ -87,6 +87,13 @@ if FAIL_SUDO=1 run_installer "$ROLLBACK" --prelaunch >"$ROLLBACK/log" 2>&1; then
 UNSAFE="$TEST_ROOT/unsafe"; mkdir -p "$UNSAFE"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE/sudo.conf"
 if run_installer "$UNSAFE" --prelaunch >"$UNSAFE/log" 2>&1; then fail "accepted symlink sudo.conf"; fi
 
+UNSAFE_STATE="$TEST_ROOT/unsafe-state"; mkdir -p "$UNSAFE_STATE/state"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE_STATE/state/devices.json"
+if run_installer "$UNSAFE_STATE" --prelaunch >"$UNSAFE_STATE/log" 2>&1; then fail "accepted symlink devices.json"; fi
+
+BAD_BLOCK="$TEST_ROOT/bad-block"; mkdir -p "$BAD_BLOCK"; printf '# END management-plane sudo approve\n# BEGIN management-plane sudo approve\n' > "$BAD_BLOCK/sudo.conf"
+if run_installer "$BAD_BLOCK" --prelaunch >"$BAD_BLOCK/log" 2>&1; then fail "accepted reversed managed block"; fi
+[ ! -e "$BAD_BLOCK/sbin/management-plane-sudo-approve" ] || fail "installed binaries before rejecting malformed block"
+
 cp "$TEST_ROOT/service/target/release/SHA256SUMS" "$TEST_ROOT/service/target/release/SHA256SUMS.good"
 printf '0%.0s' {1..64} > "$TEST_ROOT/service/target/release/SHA256SUMS"
 printf '  management-plane-sudo-approve\n' >> "$TEST_ROOT/service/target/release/SHA256SUMS"

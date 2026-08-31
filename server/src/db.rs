@@ -210,6 +210,7 @@ impl Store {
     }
 
     pub fn activate_enrollment(&self, id: &str, device: &DevicePublicRecordV1) -> Result<()> {
+        device.validate().context("validate activated device")?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let api_token_hash = protocol::decode_base64url(&device.api_token_hash)?;
@@ -270,6 +271,9 @@ impl Store {
         envelope: &RequestEnvelopeV1,
         now: i64,
     ) -> Result<InsertResult> {
+        if raw.len() > protocol::v1::MAX_ENVELOPE_BYTES {
+            bail!("oversized request envelope");
+        }
         envelope.validate().context("validate envelope")?;
         if envelope.expires_at <= now {
             bail!("expired request");
