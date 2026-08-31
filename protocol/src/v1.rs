@@ -99,6 +99,10 @@ impl RequestEnvelopeV1 {
     pub fn validate(&self) -> Result<(), Error> {
         if self.version != VERSION_V1
             || !valid_id(&self.request_id)
+            || self.host.is_empty()
+            || self.host.len() > 255
+            || self.user.is_empty()
+            || self.user.len() > 256
             || self.sealed.is_empty()
             || self.sealed.len() > MAX_DEVICES
             || self.expires_at <= self.issued_at

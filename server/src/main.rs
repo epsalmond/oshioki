@@ -250,6 +250,9 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
                 Ok(intent) => {
                     let outcome = (|| -> Result<()> {
                         intent.validate()?;
+                        if intent.expires_at <= now() || intent.expires_at > now() + 300 {
+                            bail!("invalid enrollment intent expiry");
+                        }
                         let hash = protocol::decode_base64url(&intent.secret_hash)?;
                         if let InsertResult::Conflict = state.store.create_enrollment(&intent.enrollment_id, &hash, intent.expires_at, &intent.reply_subject)? { warn!(enrollment_id=%intent.enrollment_id, "conflicting enrollment intent"); }
                         Ok(())
