@@ -18,6 +18,8 @@ NATS_IMAGE="${NATS_IMAGE:-nats:2.10}"
 IN_CONTAINER="${SUDO_APPROVE_E2E_IN_CONTAINER:-0}"
 SKIP_BUILD="${SUDO_APPROVE_E2E_SKIP_BUILD:-0}"
 KEEP_ARTIFACTS="${SUDO_APPROVE_E2E_KEEP_ARTIFACTS:-0}"
+ORIGIN_VALUE="${SUDO_APPROVE_ORIGIN:-https://sudo.test}"
+RP_ID_VALUE="${SUDO_APPROVE_RP_ID:-sudo.test}"
 
 SHARE="$(mktemp -d -t sudo-approve-test.XXXXXX)"
 SHARE="$(cd "$SHARE" && pwd -P)"
@@ -170,6 +172,8 @@ if [ "$IN_CONTAINER" = "1" ]; then
   NATS_PORT="$NATS_PORT_VALUE" \
   NATS_USER="${NATS_USER:-sudo-approve}" \
   NATS_PASS="${NATS_PASS:-test}" \
+  SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
+  SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
   TIMEOUT=180 \
     python3 "$SHARE/test-sudo-plugin-subscriber.py" \
       >"$SHARE/subscriber.log" 2>&1 &
@@ -182,6 +186,8 @@ else
     -e NATS_PORT="$NATS_PORT_VALUE" \
     -e NATS_USER="${NATS_USER:-sudo-approve}" \
     -e NATS_PASS="${NATS_PASS:-test}" \
+    -e SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
+    -e SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
     -e TIMEOUT=180 \
     -v "$SHARE":/share \
     "$PY_IMAGE" \
@@ -301,12 +307,16 @@ run_sudo() {
     NATS_URL="$NATS_URL_VALUE" \
     NATS_USER="${NATS_USER:-sudo-approve}" \
     NATS_PASS="${NATS_PASS:-test}" \
+    SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
+    SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
       bash -x "$INNER_SCRIPT" >"$SHARE/sudo-run.log" 2>&1
   else
     run_docker run --name "$SUDO_NAME" --network "$NETWORK_NAME" \
       -e NATS_URL="$NATS_URL_VALUE" \
       -e NATS_USER="${NATS_USER:-sudo-approve}" \
       -e NATS_PASS="${NATS_PASS:-test}" \
+      -e SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
+      -e SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
       -v "$SHARE":/share \
       -v "$WORKSPACE":/sudo-approve \
       -w /sudo-approve \
@@ -320,6 +330,12 @@ echo "* sudo run:  invoking sudo $EXPECTED_CMD ${ARGS[*]}"
 if ! run_sudo; then
   echo "FAIL: sudo test container/driver failed" >&2
   cat "$SHARE/sudo-run.log" >&2 || true
+  echo "--- subscriber log ---" >&2
+  if [ "$IN_CONTAINER" = "1" ]; then
+    tail -40 "$SHARE/subscriber.log" >&2 || true
+  else
+    run_docker logs "$SUB_NAME" 2>&1 | tail -40 >&2 || true
+  fi
   exit 1
 fi
 
