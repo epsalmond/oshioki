@@ -71,6 +71,16 @@ modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
 Linux uses `/usr/local/libexec/sudo/approval_exec.so`. Darwin uses
 `approval_exec.dylib` in the same directory.
 
+The first standalone install moves the legacy `devices.json` into
+`/etc/sudo-approve` and normalizes its ownership and mode. It ignores the old
+derived NATS and hook configuration. After the install, confirm
+`--prelaunch-status`, inspect the enrolled devices, and run `sudo -V`. Then
+archive the remaining legacy directory if it exists:
+
+```bash
+sudo mv /etc/management-plane/sudo-approve /etc/management-plane/sudo-approve.retired
+```
+
 Each browser profile enrolls separately:
 
 ```bash

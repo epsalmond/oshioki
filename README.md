@@ -37,6 +37,10 @@ scripts/dev down
 
 Without `--state-dir`, `up` creates disposable state and `down` removes it.
 The server listens on `http://127.0.0.1:8443` in this development mode.
+`scripts/dev` maps the server to the invoking user under rootful Docker and to
+container UID 0 under rootless Docker. Direct Compose callers must set
+`SUDO_APPROVE_UID` to the host UID for rootful Docker or `0` for rootless
+Docker.
 
 ## Repository layout
 

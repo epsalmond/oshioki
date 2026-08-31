@@ -75,6 +75,9 @@ load_config_file() {
     case "$line" in *=*) ;; *) die "invalid config line in $path" ;; esac
     key="${line%%=*}"
     value="${line#*=}"
+    case "$value" in
+      [[:space:]]*|*[[:space:]]|\"*\"|\'*\') die "config value must be unquoted and untrimmed: $key" ;;
+    esac
     case "$key" in
       SUDO_APPROVE_ORIGIN) ORIGIN="$value" ;;
       SUDO_APPROVE_RP_ID) RP_ID="$value" ;;
@@ -103,8 +106,18 @@ validate_marker_pair() {
 }
 
 validate_block() {
-  validate_marker_pair "$1" "$BEGIN_MARK" "$END_MARK"
-  validate_marker_pair "$1" "$LEGACY_BEGIN_MARK" "$LEGACY_END_MARK"
+  local source="$1" begin_line end_line legacy_begin_line legacy_end_line
+  validate_marker_pair "$source" "$BEGIN_MARK" "$END_MARK"
+  validate_marker_pair "$source" "$LEGACY_BEGIN_MARK" "$LEGACY_END_MARK"
+  if grep -Fq "$BEGIN_MARK" "$source" && grep -Fq "$LEGACY_BEGIN_MARK" "$source"; then
+    begin_line="$(grep -nF "$BEGIN_MARK" "$source" | cut -d: -f1)"
+    end_line="$(grep -nF "$END_MARK" "$source" | cut -d: -f1)"
+    legacy_begin_line="$(grep -nF "$LEGACY_BEGIN_MARK" "$source" | cut -d: -f1)"
+    legacy_end_line="$(grep -nF "$LEGACY_END_MARK" "$source" | cut -d: -f1)"
+    if [ "$end_line" -ge "$legacy_begin_line" ] && [ "$legacy_end_line" -ge "$begin_line" ]; then
+      die "overlapping managed blocks in $source"
+    fi
+  fi
 }
 
 if [ "$MODE" = prelaunch-status ]; then
@@ -137,6 +150,10 @@ rewrite_block() {
     $0 == end || $0 == legacy_end { inside=0; next }
     !inside { print }
   ' "$source" > "$tmp"
+  if grep -q '^Plugin approval_exec ' "$tmp"; then
+    rm -f "$tmp"
+    die "unmanaged approval_exec plugin line in $source"
+  fi
   if [ "$action" = enable ]; then
     [ ! -s "$tmp" ] || [ "$(tail -c 1 "$tmp" | wc -l)" -ne 0 ] || printf '\n' >> "$tmp"
     printf '%s\nPlugin approval_exec %s\n%s\n' "$BEGIN_MARK" "$PLUGIN_DEST" "$END_MARK" >> "$tmp"
@@ -148,30 +165,24 @@ validate_legacy_state() {
   [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] || return 0
   [ ! -e "$LEGACY_STATE_DIR" ] || safe_directory "$LEGACY_STATE_DIR"
   [ -d "$LEGACY_STATE_DIR" ] || return 0
-  local name legacy destination
-  for name in devices.json hook.json config.env; do
-    legacy="$LEGACY_STATE_DIR/$name"
-    destination="$STATE_DIR/$name"
-    regular_or_absent "$legacy"
-    [ -f "$legacy" ] || continue
-    if [ -f "$destination" ]; then
-      cmp -s "$legacy" "$destination" || die "conflicting legacy and current state for $name"
-    fi
-  done
+  local legacy="$LEGACY_STATE_DIR/devices.json" destination="$STATE_DIR/devices.json"
+  regular_or_absent "$legacy"
+  [ -f "$legacy" ] || return 0
+  if [ -f "$destination" ]; then
+    cmp -s "$legacy" "$destination" || die "conflicting legacy and current state for devices.json"
+  fi
 }
 
 migrate_legacy_state() {
   validate_legacy_state
   [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] || return 0
   [ -d "$LEGACY_STATE_DIR" ] || return 0
-  local name legacy destination
-  for name in devices.json hook.json config.env; do
-    legacy="$LEGACY_STATE_DIR/$name"
-    destination="$STATE_DIR/$name"
-    [ -f "$legacy" ] || continue
-    [ ! -f "$destination" ] || continue
-    run mv -- "$legacy" "$destination"
-  done
+  local legacy="$LEGACY_STATE_DIR/devices.json" destination="$STATE_DIR/devices.json"
+  [ -f "$legacy" ] || return 0
+  [ ! -f "$destination" ] || return 0
+  run mv -- "$legacy" "$destination"
+  run chmod 0600 "$destination"
+  run chown root:root "$destination"
 }
 
 [ ! -f "$SUDO_CONF" ] || validate_block "$SUDO_CONF"

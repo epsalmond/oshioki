@@ -12,8 +12,12 @@ usage() {
 }
 
 compose() {
+  compose_uid="$(id -u)"
+  if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+    compose_uid=0
+  fi
   SUDO_APPROVE_STATE_ROOT="$state_root" SUDO_APPROVE_HTTP_PORT="${http_port:-8443}" \
-    SUDO_APPROVE_UID="$(id -u)" \
+    SUDO_APPROVE_UID="$compose_uid" \
     docker compose -f "$REPO_ROOT/compose.yaml" -p "$project_name" "$@"
 }
 
