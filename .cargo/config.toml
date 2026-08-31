@@ -1,0 +1,21 @@
+# Workspace-local cargo configuration. Targets and flags that must apply to
+# every build in this tree live here, not in individual crate manifests.
+
+# Default target for `cargo build` in this directory. linux/amd64 is the
+# deploy target for nas; osx-ci builds override with --target.
+[build]
+# Nothing pinned: leave the host default so local dev builds and the darwin
+# lane stay native. Canonical release targets are set per-lane.
+
+# Faster linking on Linux. harmless on macOS (unused there).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--no-undefined"]
+
+# Cargo's git dep resolver uses these; keep the network offline-friendly.
+[net]
+retry = 3
+git-fetch-with-cli = true
+
+# Show the full command lines for the plugin cdylib so exports are auditable.
+[term]
+verbose = false
