@@ -7,12 +7,20 @@ free_port() {
   node -e 'const net=require("node:net"); const server=net.createServer(); server.listen(0,"127.0.0.1",()=>{ console.log(server.address().port); server.close(); });'
 }
 
+for tool in cargo curl nats nats-server node npm openssl; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "missing browser test prerequisite: $tool" >&2
+    exit 2
+  }
+done
+
 NATS_PORT="${SUDO_APPROVE_TEST_NATS_PORT:-$(free_port)}"
 SERVER_PORT="${SUDO_APPROVE_TEST_SERVER_PORT:-$(free_port)}"
 HTTPS_PORT="${SUDO_APPROVE_TEST_HTTPS_PORT:-$(free_port)}"
 while [ "$SERVER_PORT" = "$NATS_PORT" ]; do SERVER_PORT="$(free_port)"; done
 while [ "$HTTPS_PORT" = "$NATS_PORT" ] || [ "$HTTPS_PORT" = "$SERVER_PORT" ]; do HTTPS_PORT="$(free_port)"; done
-STATE_ROOT="$(mktemp -d -t sudo-approve-browser.XXXXXX)"
+TEMP_ROOT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+STATE_ROOT="$(mktemp -d "$TEMP_ROOT/sudo-approve-browser.XXXXXX")"
 NATS_PID=""
 SERVER_PID=""
 TEST_OK=0
@@ -30,13 +38,6 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-
-for port in "$NATS_PORT" "$SERVER_PORT" "$HTTPS_PORT"; do
-  if ss -ltn "sport = :$port" | tail -n +2 | grep -q .; then
-    echo "test port is already in use: $port" >&2
-    exit 1
-  fi
-done
 
 mkdir -p "$STATE_ROOT/nats" "$STATE_ROOT/server" "$STATE_ROOT/hook" "$STATE_ROOT/tls"
 chmod 0700 "$STATE_ROOT/hook"
@@ -89,7 +90,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "$STATE_ROOT/tls/key.pem" -out "$STATE_ROOT/tls/cert.pem" >/dev/null 2>&1
 
 SUDO_APPROVE_HOOK="$REPO_ROOT/target/debug/sudo-approve" \
-SUDO_APPROVE_CONFIG_DIR="$STATE_ROOT/hook" \
+SUDO_APPROVE_TEST_CONFIG_DIR="$STATE_ROOT/hook" \
 SUDO_APPROVE_ORIGIN="$origin" \
 SUDO_APPROVE_SERVER_HTTP="http://127.0.0.1:$SERVER_PORT" \
 SUDO_APPROVE_TLS_KEY="$STATE_ROOT/tls/key.pem" \

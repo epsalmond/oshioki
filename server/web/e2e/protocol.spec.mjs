@@ -7,6 +7,7 @@ import https from "node:https";
 import { URL } from "node:url";
 
 const hookBinary = process.env.SUDO_APPROVE_HOOK ?? "/work/target/release/sudo-approve";
+const hookConfigDir = process.env.SUDO_APPROVE_TEST_CONFIG_DIR;
 const origin = process.env.SUDO_APPROVE_ORIGIN ?? "https://sudo.test";
 const natsOptions = {
   servers: process.env.NATS_URL ?? "nats://nats:4222",
@@ -39,7 +40,7 @@ test.beforeAll(async () => {
   });
   await new Promise((resolve, reject) => {
     proxy.once("error", reject);
-    proxy.listen(Number(process.env.SUDO_APPROVE_HTTPS_PORT ?? "443"), "0.0.0.0", resolve);
+    proxy.listen(Number(process.env.SUDO_APPROVE_HTTPS_PORT ?? "443"), "127.0.0.1", resolve);
   });
 });
 
@@ -49,7 +50,9 @@ test.afterAll(async () => {
 
 function hook(args) {
   const child = spawn(hookBinary, args, {
-    env: process.env,
+    env: hookConfigDir
+      ? { ...process.env, SUDO_APPROVE_CONFIG_DIR: hookConfigDir }
+      : process.env,
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";
@@ -201,7 +204,7 @@ async function requestWith(profile, device, action) {
       routed = true;
       break;
     }
-    expect([404, 503]).toContain(status);
+    expect(status).toBe(404);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   expect(routed).toBe(true);

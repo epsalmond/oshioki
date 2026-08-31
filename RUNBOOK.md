@@ -39,18 +39,36 @@ and routing are consumer-owned settings.
 
 ## Prelaunch installer
 
-Keep a second root shell open during supervised acceptance. Run the dry run
-before installation:
+Keep a second root shell open during supervised acceptance. Create a root-owned
+installer configuration without putting the NATS password in command history:
 
 ```bash
-scripts/install-sudo-hook --prelaunch --dry-run
-sudo scripts/install-sudo-hook --prelaunch
+sudo install -d -m 0750 /etc/sudo-approve
+sudo install -m 0600 /dev/null /etc/sudo-approve/install.env
+sudoedit /etc/sudo-approve/install.env
+```
+
+The file contains only these keys:
+
+```text
+SUDO_APPROVE_ORIGIN=https://sudo.example
+SUDO_APPROVE_RP_ID=sudo.example
+NATS_URL=nats://nats.example:4222
+NATS_USER=sudo-approve
+NATS_PASS=<secret>
+```
+
+Run the dry run and install against that file:
+
+```bash
+sudo scripts/install-sudo-hook --prelaunch --dry-run --config-file /etc/sudo-approve/install.env
+sudo scripts/install-sudo-hook --prelaunch --config-file /etc/sudo-approve/install.env
 sudo scripts/install-sudo-hook --prelaunch-status
 ```
 
-The installer requires `SUDO_APPROVE_ORIGIN`, `SUDO_APPROVE_RP_ID`, `NATS_URL`,
-and `NATS_PASS`. `--prelaunch` preserves an existing `devices.json`. Linux uses
-`/usr/local/libexec/sudo/approval_exec.so`. Darwin uses
+The installer rejects unknown config keys, symlinks, non-root ownership, and
+modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
+Linux uses `/usr/local/libexec/sudo/approval_exec.so`. Darwin uses
 `approval_exec.dylib` in the same directory.
 
 Each browser profile enrolls separately:

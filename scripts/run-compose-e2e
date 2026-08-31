@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE_ROOT="${SUDO_APPROVE_CONFIG_DIR%/hook}"
+HOOK_CONFIG_DIR="${SUDO_APPROVE_TEST_CONFIG_DIR:?set SUDO_APPROVE_TEST_CONFIG_DIR}"
+STATE_ROOT="${HOOK_CONFIG_DIR%/hook}"
 TLS_ROOT=/tmp/sudo-approve-e2e-tls
-mkdir -p "$SUDO_APPROVE_CONFIG_DIR" "$TLS_ROOT"
-chmod 0700 "$SUDO_APPROVE_CONFIG_DIR"
+mkdir -p "$HOOK_CONFIG_DIR" "$TLS_ROOT"
+chmod 0700 "$HOOK_CONFIG_DIR"
 
 printf '{"version":1,"origin":"%s","rp_id":"%s","server_base_url":"%s"}\n' \
   "$SUDO_APPROVE_ORIGIN" "$SUDO_APPROVE_RP_ID" "$SUDO_APPROVE_ORIGIN" \
-  >"$SUDO_APPROVE_CONFIG_DIR/hook.json"
+  >"$HOOK_CONFIG_DIR/hook.json"
 printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\n' \
   "$NATS_URL" "$NATS_USER" "$NATS_PASS" \
-  >"$SUDO_APPROVE_CONFIG_DIR/config.env"
-printf '{"version":1,"devices":[]}\n' >"$SUDO_APPROVE_CONFIG_DIR/devices.json"
-chmod 0600 "$SUDO_APPROVE_CONFIG_DIR"/*.json "$SUDO_APPROVE_CONFIG_DIR/config.env"
+  >"$HOOK_CONFIG_DIR/config.env"
+printf '{"version":1,"devices":[]}\n' >"$HOOK_CONFIG_DIR/devices.json"
+chmod 0600 "$HOOK_CONFIG_DIR"/*.json "$HOOK_CONFIG_DIR/config.env"
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj /CN=sudo.test -addext subjectAltName=DNS:sudo.test \

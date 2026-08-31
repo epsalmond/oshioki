@@ -11,11 +11,13 @@ RUN apt-get update \
  && apt-get install --yes --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system sudo-approve \
- && useradd --system --gid sudo-approve --home-dir /var/lib/sudo-approve --create-home sudo-approve
+ && useradd --system --gid sudo-approve --home-dir /var/lib/sudo-approve --create-home sudo-approve \
+ && install -d -o sudo-approve -g sudo-approve -m 0750 /state
 COPY --from=builder /build/target/release/sudo-approve-server /usr/local/bin/
 USER sudo-approve
 ENV SUDO_APPROVE_STATE_PATH=/state/state.sqlite3 \
     SUDO_APPROVE_LISTEN=0.0.0.0:8443
+VOLUME ["/state"]
 EXPOSE 8443
 ENTRYPOINT ["/usr/local/bin/sudo-approve-server"]
 

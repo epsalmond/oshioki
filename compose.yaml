@@ -38,6 +38,7 @@ services:
     depends_on:
       nats-init:
         condition: service_completed_successfully
+    user: "${SUDO_APPROVE_UID:?set SUDO_APPROVE_UID}"
     environment:
       NATS_URL: nats://nats:4222
       NATS_USER: sudo-approve
@@ -68,7 +69,7 @@ services:
       NATS_URL: nats://nats:4222
       NATS_USER: sudo-approve
       NATS_PASS: test-only
-      SUDO_APPROVE_CONFIG_DIR: /state/hook
+      SUDO_APPROVE_TEST_CONFIG_DIR: /state/hook
       SUDO_APPROVE_ORIGIN: https://sudo.test
       SUDO_APPROVE_RP_ID: sudo.test
       SUDO_APPROVE_SERVER_HTTP: http://server:8443

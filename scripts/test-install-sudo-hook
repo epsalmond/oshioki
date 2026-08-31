@@ -35,7 +35,7 @@ cp /usr/bin/true "$TEST_ROOT/service/target/release/$BUILD_PLUGIN"
   printf '%s  %s\n' "$(sha256_file "$BUILD_PLUGIN")" "$BUILD_PLUGIN" >> SHA256SUMS
 )
 
-for wrapper in id chown install sudo file; do
+for wrapper in id chown install sudo file stat; do
   : > "$TEST_ROOT/fake-bin/$wrapper"
 done
 cat > "$TEST_ROOT/fake-bin/id" <<'SH'
@@ -68,6 +68,14 @@ cat > "$TEST_ROOT/fake-bin/file" <<'SH'
 }
 exec /usr/bin/file "$@"
 SH
+cat > "$TEST_ROOT/fake-bin/stat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  '-c %u'|'-f %u') echo 0 ;;
+  '-c %a'|'-f %Lp') echo 600 ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+SH
 chmod 0755 "$TEST_ROOT/fake-bin"/* "$TEST_ROOT/service/scripts/install-sudo-hook"
 TEST_PATH="$TEST_ROOT/fake-bin:/usr/bin:/bin"
 
@@ -76,13 +84,37 @@ run_installer() {
   mkdir -p "$root"
   PATH="$TEST_PATH" SUDO_CONF="$root/sudo.conf" SUDO_PLUGIN_DIR="$root/plugin" SBIN_DIR="$root/sbin" \
     SUDOERS_D="$root/sudoers.d" SUDO_APPROVE_STATE_DIR="$root/state" \
-    SUDO_APPROVE_ORIGIN="https://sudo.test" SUDO_APPROVE_RP_ID="sudo.test" \
-    NATS_URL="nats://nats.test:4222" NATS_PASS="${NATS_PASS:-test-only}" \
+    SUDO_APPROVE_LEGACY_STATE_DIR="$root/legacy-state" \
+    SUDO_APPROVE_ORIGIN="${INSTALL_ORIGIN-https://sudo.test}" \
+    SUDO_APPROVE_RP_ID="${INSTALL_RP_ID-sudo.test}" \
+    NATS_URL="${INSTALL_NATS_URL-nats://nats.test:4222}" \
+    NATS_PASS="${INSTALL_NATS_PASS-${NATS_PASS:-test-only}}" \
     "$TEST_ROOT/service/scripts/install-sudo-hook" "$@"
 }
 
 if run_installer "$TEST_ROOT/no-mode" >"$TEST_ROOT/no-mode.log" 2>&1; then fail "accepted omitted mode"; fi
 grep -Fq 'choose exactly one mode' "$TEST_ROOT/no-mode.log" || fail "missing mode error"
+
+if INSTALL_ORIGIN='' run_installer "$TEST_ROOT/missing-origin" --prelaunch >"$TEST_ROOT/missing-origin.log" 2>&1; then fail "accepted missing origin"; fi
+if INSTALL_RP_ID='' run_installer "$TEST_ROOT/missing-rp-id" --prelaunch >"$TEST_ROOT/missing-rp-id.log" 2>&1; then fail "accepted missing RP ID"; fi
+if INSTALL_NATS_URL='' run_installer "$TEST_ROOT/missing-nats-url" --prelaunch >"$TEST_ROOT/missing-nats-url.log" 2>&1; then fail "accepted missing NATS URL"; fi
+if INSTALL_NATS_PASS='' run_installer "$TEST_ROOT/missing-nats-pass" --prelaunch >"$TEST_ROOT/missing-nats-pass.log" 2>&1; then fail "accepted missing NATS password"; fi
+for missing in missing-origin missing-rp-id missing-nats-url missing-nats-pass; do
+  [ ! -e "$TEST_ROOT/$missing/sbin/sudo-approve" ] || fail "$missing wrote an executable"
+done
+
+CONFIG_ROOT="$TEST_ROOT/config-file"; mkdir -p "$CONFIG_ROOT"
+printf '%s\n' \
+  'SUDO_APPROVE_ORIGIN=https://config.test' \
+  'SUDO_APPROVE_RP_ID=config.test' \
+  'NATS_URL=nats://config.test:4222' \
+  'NATS_USER=config-user' \
+  'NATS_PASS=config-secret' > "$CONFIG_ROOT/install.env"
+chmod 0600 "$CONFIG_ROOT/install.env"
+INSTALL_ORIGIN='' INSTALL_RP_ID='' INSTALL_NATS_URL='' INSTALL_NATS_PASS='' \
+  run_installer "$CONFIG_ROOT" --prelaunch --config-file "$CONFIG_ROOT/install.env"
+grep -Fq 'NATS_URL=nats://config.test:4222' "$CONFIG_ROOT/state/config.env" || fail "config file NATS URL was ignored"
+grep -Fq '"origin":"https://config.test"' "$CONFIG_ROOT/state/hook.json" || fail "config file origin was ignored"
 
 PRELAUNCH="$TEST_ROOT/prelaunch"; mkdir -p "$PRELAUNCH/sudoers.d" "$PRELAUNCH/state"
 printf 'outside-before\n' > "$PRELAUNCH/sudo.conf"
@@ -96,6 +128,29 @@ run_installer "$PRELAUNCH" --prelaunch
 run_installer "$PRELAUNCH" --prelaunch
 [ "$(grep -c '^# BEGIN sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "rerun duplicated block"
 run_installer "$PRELAUNCH" --prelaunch-status | grep -Fq enabled || fail "status did not report enabled"
+
+LEGACY_BLOCK="$TEST_ROOT/legacy-block"; mkdir -p "$LEGACY_BLOCK"
+printf 'outside-before\n# BEGIN management-plane sudo approve\nPlugin approval_exec %s\n# END management-plane sudo approve\n' \
+  "$LEGACY_BLOCK/plugin/approval_exec.so" > "$LEGACY_BLOCK/sudo.conf"
+run_installer "$LEGACY_BLOCK" --prelaunch
+[ "$(grep -c '^Plugin approval_exec ' "$LEGACY_BLOCK/sudo.conf")" -eq 1 ] || fail "legacy upgrade duplicated plugin"
+[ "$(grep -c '^# BEGIN sudo approve$' "$LEGACY_BLOCK/sudo.conf")" -eq 1 ] || fail "legacy marker was not replaced"
+if grep -Fq '# BEGIN management-plane sudo approve' "$LEGACY_BLOCK/sudo.conf"; then fail "legacy marker survived upgrade"; fi
+run_installer "$LEGACY_BLOCK" --disable-prelaunch
+if grep -Fq 'Plugin approval_exec ' "$LEGACY_BLOCK/sudo.conf"; then fail "legacy plugin survived disable"; fi
+
+LEGACY_STATE="$TEST_ROOT/legacy-state-migration"; mkdir -p "$LEGACY_STATE/legacy-state"
+printf '{"version":1,"devices":[{"sentinel":true}]}\n' > "$LEGACY_STATE/legacy-state/devices.json"
+legacy_devices_hash="$(sha256_file "$LEGACY_STATE/legacy-state/devices.json")"
+run_installer "$LEGACY_STATE" --prelaunch
+[ "$(sha256_file "$LEGACY_STATE/state/devices.json")" = "$legacy_devices_hash" ] || fail "legacy device state was not preserved"
+[ ! -e "$LEGACY_STATE/legacy-state/devices.json" ] || fail "legacy device state was not moved"
+
+CONFLICT_STATE="$TEST_ROOT/conflicting-state"; mkdir -p "$CONFLICT_STATE/state" "$CONFLICT_STATE/legacy-state"
+printf 'current\n' > "$CONFLICT_STATE/state/devices.json"
+printf 'legacy\n' > "$CONFLICT_STATE/legacy-state/devices.json"
+if run_installer "$CONFLICT_STATE" --prelaunch >"$CONFLICT_STATE/log" 2>&1; then fail "accepted conflicting legacy state"; fi
+[ ! -e "$CONFLICT_STATE/sbin/sudo-approve" ] || fail "conflicting legacy state wrote an executable"
 
 dry_secret='recognizable-dry-run-secret'
 dry_output="$(NATS_PASS="$dry_secret" run_installer "$PRELAUNCH" --prelaunch --dry-run 2>&1)"

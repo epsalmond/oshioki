@@ -13,6 +13,7 @@ usage() {
 
 compose() {
   SUDO_APPROVE_STATE_ROOT="$state_root" SUDO_APPROVE_HTTP_PORT="${http_port:-8443}" \
+    SUDO_APPROVE_UID="$(id -u)" \
     docker compose -f "$REPO_ROOT/compose.yaml" -p "$project_name" "$@"
 }
 
@@ -64,7 +65,7 @@ case "$command_name" in
     else
       usage
     fi
-    install -d -m 0777 "$state_root/server" "$state_root/e2e"
+    install -d -m 0700 "$state_root/server" "$state_root/e2e"
     project_name="sudo-approve-dev-$(basename "$state_root" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
     session_tmp="$SESSION_FILE.$$"
     printf '%s\n%s\n%s\n' "$project_name" "$state_root" "$managed_state" >"$session_tmp"
@@ -90,7 +91,7 @@ case "$command_name" in
     temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
     state_root="$(mktemp -d "$temp_root/sudo-approve-e2e.XXXXXX")"
     http_port=0
-    install -d -m 0777 "$state_root/server" "$state_root/e2e"
+    install -d -m 0700 "$state_root/server" "$state_root/e2e"
     project_name="sudo-approve-e2e-$(basename "$state_root" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
     test_ok=0
     cleanup_test() {
