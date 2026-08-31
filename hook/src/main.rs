@@ -289,7 +289,11 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
 async fn cmd_revoke(fingerprint: &str) -> Result<()> {
     let mut registry = load_registry()?;
     let original = registry.devices.len();
-    if !registry.devices.iter().any(|device| device.fingerprint == fingerprint) {
+    if !registry
+        .devices
+        .iter()
+        .any(|device| device.fingerprint == fingerprint)
+    {
         bail!("unknown device fingerprint");
     }
     let nats = connect_nats().await?;
@@ -306,7 +310,9 @@ async fn cmd_revoke(fingerprint: &str) -> Result<()> {
         .await
         .context("server revocation confirmation timeout")?
         .context("server revocation confirmation stream closed")?;
-    registry.devices.retain(|device| device.fingerprint != fingerprint);
+    registry
+        .devices
+        .retain(|device| device.fingerprint != fingerprint);
     debug_assert!(registry.devices.len() < original);
     write_registry(&registry)?;
     println!("Device revoked: {fingerprint}");
@@ -778,6 +784,9 @@ mod tests {
     fn opener_keeps_the_url_in_one_argument() {
         let command = opener_command("/usr/bin/open", "https://sudo.example/r/id?value=a b;false");
         assert_eq!(command.get_program(), "/usr/bin/open");
-        assert_eq!(command.get_args().collect::<Vec<_>>(), ["https://sudo.example/r/id?value=a b;false"]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["https://sudo.example/r/id?value=a b;false"]
+        );
     }
 }
