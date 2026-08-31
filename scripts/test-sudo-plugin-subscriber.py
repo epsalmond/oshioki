@@ -32,6 +32,10 @@ NATS_PORT = int(os.environ["NATS_PORT"])
 TIMEOUT = int(os.environ.get("TIMEOUT", "120"))
 
 
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
 def atomic_write(path: str, data: bytes, mode: int = 0o644) -> None:
     """Write data beside path, then publish it with an atomic rename."""
     fd, temporary = tempfile.mkstemp(dir=SHARE, prefix=f".{os.path.basename(path)}.")
@@ -58,7 +62,7 @@ pub = priv.public_key()
 pub_raw = pub.public_bytes(
     serialization.Encoding.Raw, serialization.PublicFormat.Raw
 )
-atomic_write(f"{SHARE}/box_pub.hex", pub_raw.hex().encode())
+atomic_write(f"{SHARE}/box_pub.hex", b64url(pub_raw).encode())
 # Private key as PEM so a human could re-decrypt if debugging.
 atomic_write(
     f"{SHARE}/box_priv.pem",
@@ -73,15 +77,25 @@ atomic_write(
 credential_priv = ec.generate_private_key(ec.SECP256R1())
 credential_numbers = credential_priv.public_key().public_numbers()
 credential_cose = (
-    b"\xa2\x21\x58\x20"
+    b"\xa5\x01\x02\x03\x26\x20\x01\x21\x58\x20"
     + credential_numbers.x.to_bytes(32, "big")
     + b"\x22\x58\x20"
     + credential_numbers.y.to_bytes(32, "big")
 )
 atomic_write(
     f"{SHARE}/credential_pub.b64",
-    base64.b64encode(credential_cose),
+    b64url(credential_cose).encode(),
 )
+credential_id = b"\x01\x02\x03"
+fingerprint_hash = hashes.Hash(hashes.SHA256())
+fingerprint_hash.update(b"management-plane-sudo-approve/fingerprint/v1\x00")
+fingerprint_hash.update(len(credential_id).to_bytes(8, "big"))
+fingerprint_hash.update(credential_id)
+fingerprint_hash.update(len(credential_cose).to_bytes(8, "big"))
+fingerprint_hash.update(credential_cose)
+fingerprint_hash.update(pub_raw)
+fingerprint = b64url(fingerprint_hash.finalize()[:16])
+atomic_write(f"{SHARE}/fingerprint", fingerprint.encode())
 
 # --- Phase 2: subscribe over raw TCP ---
 # The test server requires the same disposable credentials used by the hook.
@@ -168,34 +182,31 @@ if payload is None:
 
 # --- Phase 3: unseal and emit ---
 envelope = json.loads(payload)
-print(f"subscriber: got envelope for host {envelope['header']['host']}", file=sys.stderr)
+print(f"subscriber: got envelope for host {envelope['host']}", file=sys.stderr)
 
 # Find the sealed body addressed to us.
 mine = None
 for body in envelope["sealed"]:
-    # The hook fingerprint is the first 16 hex characters of box_pub,
-    # corresponding to the first 8 raw key bytes.
-    if body["device_fingerprint"] == pub_raw[:8].hex():
+    if body["device_fingerprint"] == fingerprint:
         mine = body
         break
 if mine is None:
     print("subscriber: no sealed body matches our fingerprint", file=sys.stderr)
     sys.exit(1)
 
-ephemeral_pub = X25519PublicKey.from_public_bytes(bytes.fromhex(mine["ephemeral_pub"]))
+ephemeral_pub = X25519PublicKey.from_public_bytes(base64.urlsafe_b64decode(mine["ephemeral_pub"] + "=="))
 shared = priv.exchange(ephemeral_pub)
 cipher = ChaCha20Poly1305(shared)
 plaintext = cipher.decrypt(
-    bytes.fromhex(mine["nonce"]),
-    bytes.fromhex(mine["ciphertext"]),
+    base64.urlsafe_b64decode(mine["nonce"] + "=="),
+    base64.urlsafe_b64decode(mine["ciphertext"] + "=="),
     None,
 )
 request = json.loads(plaintext)
 
-canonical_request = json.dumps(request, separators=(",", ":")).encode()
 challenge_digest = hashes.Hash(hashes.SHA256())
-challenge_digest.update(canonical_request)
-challenge_digest.update(b"approve")
+challenge_digest.update(b"management-plane-sudo-approve/approve/v1\x00")
+challenge_digest.update(plaintext)
 challenge = base64.urlsafe_b64encode(challenge_digest.finalize()).rstrip(b"=").decode()
 client_data_json = json.dumps(
     {
@@ -216,19 +227,22 @@ signature = credential_priv.sign(signed_message, ec.ECDSA(hashes.SHA256()))
 
 verdict = json.dumps(
     {
-        "id": request["id"],
-        "credential_id": [1, 2, 3],
-        "authenticator_data": list(authenticator_data),
-        "client_data_json": client_data_json,
-        "signature": list(signature),
+        "action": "approve",
+        "version": 1,
+        "request_id": request["request_id"],
+        "device_fingerprint": fingerprint,
+        "credential_id": b64url(credential_id),
+        "authenticator_data": b64url(authenticator_data),
+        "client_data_json": b64url(client_data_json.encode()),
+        "signature": b64url(signature),
     },
     separators=(",", ":"),
 ).encode()
-verdict_subject = f"sudo.verdict.{request['id']}"
+verdict_subject = f"sudo.verdict.{request['request_id']}"
 sock.sendall(
     f"PUB {verdict_subject} {len(verdict)}\r\n".encode() + verdict + b"\r\n"
 )
-print(f"subscriber: published immediate verdict for id={request['id']}", file=sys.stderr)
+print(f"subscriber: published immediate verdict for id={request['request_id']}", file=sys.stderr)
 
 approved = json.dumps(
     {

@@ -1,0 +1,10 @@
+{
+  "name": "management-plane-sudo-approve-web",
+  "private": true,
+  "scripts": {
+    "test": "node test-vectors.cjs && node --check app.js"
+  },
+  "dependencies": {
+    "libsodium-wrappers": "0.7.15"
+  }
+}

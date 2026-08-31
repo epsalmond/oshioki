@@ -64,6 +64,7 @@ async-nats = { version = "0.38" }
 # Crypto / auth
 p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = { version = "0.10" }
+hmac = { version = "0.12" }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 rand = { version = "0.8" }
 chacha20poly1305 = { version = "0.10" }
@@ -100,6 +101,7 @@ uuid = { version = "1", features = ["v4"] }
 
 # Async utilities
 futures = { version = "0.3" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Test-only
 assert_cmd = { version = "2" }

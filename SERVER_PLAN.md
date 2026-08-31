@@ -1,160 +1,64 @@
-# Server Implementation Plan
+# Sudo approval server architecture
 
-## What the server does
+The server stores routing data and opaque ciphertext. It cannot produce an
+approval accepted by the hook.
 
-Single binary with two concurrent responsibilities:
+## Request path
 
-1. **NATS consumer** on `sudo.request.>`: buffers pending requests and decrypts
-   sealed bodies to publish verdicts to NATS.
-2. **HTTPS server** on 8443: serves approval/enrollment pages and handles
-   WebAuthn assertions.
+The hook serializes `RequestV1` once. It computes the WebAuthn challenge from
+those bytes and seals the same bytes for each active device. The server writes
+the exact envelope and one sealed body per device before acknowledging the
+JetStream message.
 
-## HTTP Routes
+Identical redelivery is idempotent. Reuse of a request ID with different bytes
+is terminated and recorded. Malformed and expired messages are terminated.
 
-### GET / (approval page)
+The browser token identifies one device. The request API returns only that
+device's sealed body. Plaintext commands never enter SQLite, logs,
+notifications, or metrics.
 
-Serves an HTML page with embedded JavaScript. The page:
-- Fetches pending requests from GET /api/pending (JSON list)
-- For each request, decrypts the body's payload using the device's box secret
-- Displays decrypted request details (user, command, host, cwd, pid chain)
-- Builds a WebAuthn assertion ceremony with the displayed request hash as challenge
-- Prompts for biometric confirmation
-- POSTs the signed assertion to POST /assertion/:id
+## Decisions
 
-### GET /api/pending
+Approve and deny are terminal decisions. SQLite commits the first accepted
+action and an outbox record in one transaction. Later actions receive `410`.
+The outbox retries after restart until NATS publication and flush succeed.
 
-Returns JSON list of pending requests with:
-- request_id
-- host
-- user
-- expires_at (unix)
-- encrypted_body (base64)
-- device_fingerprint (which device this body is sealed to)
+The hook accepts an approval only when its request ID, fingerprint, credential
+ID, origin, RP ID, challenge, flags, COSE key, P-256 point, and signature
+match. It validates the retained raw request bytes. Explicit deny ends the
+request immediately. An invalid approval fails closed.
 
-### POST /api/enroll/:token
+## Enrollment
 
-Validates the enrollment token (one-time). If valid, serves an HTML page that:
-- Generates a WebAuthn credential (P-256 with user presence + verification)
-- Generates an X25519 keypair for the device
-- Sends the keys to POST /api/enroll/:token (JSON: credential_pub, box_pub, credential_id, label)
-- Redirects to success page
+The hook owns the enrollment secret. The server stores its SHA-256 hash and
+relays the HMAC-bound browser transcript. The hook verifies registration,
+the immediate proof assertion, origin, RP ID, UP, UV, and the ES256 key before
+atomically replacing its local registry.
 
-### POST /assertion/:id
-
-Receives a signed WebAuthn assertion (JSON: request_id, credential_id,
-client_data_json, authenticator_data, signature).
-
-The server:
-- Calls protocol::verify::verify() with the verdict and request
-- If OK, publishes the verdict to NATS subject `sudo.verdict.<id>`
-- Returns OK or error
-
-## NATS Flow
-
-On receiving sudo.request.<host> message with payload:
-
-{
-  "header": {
-    "id": "...",
-    "host": "...",
-    "user": "...",
-    "ts": ...
-  },
-  "sealed": [
-    {
-      "ephemeral_pub": "...",
-      "nonce": "...",
-      "ciphertext": "...",
-      "device_fingerprint": "..."
-    }
-  ]
-}
-
-The server:
-1. Buffers the request with its ID
-2. If the user has a registered device, sends a notification to ntfy with the
-   URL https://sudo.internal.psalmond.com/?id=<id>
-3. Serves the request via GET /api/pending/:id with encrypted body
-4. On receiving a valid assertion via POST /assertion/:id, publishes verdict
-   to NATS sudo.verdict.<id> and removes from pending
-5. On expiry (timeout), removes from pending and NACKs the message
-
-## WebAuthn Page JavaScript
-
-```javascript
-async function approve() {
-  // 1. Fetch pending requests
-  const pending = await fetch('/api/pending').then(r => r.json());
-
-  // 2. For each request, decrypt and show context
-  const first = pending[0];
-  const device = await loadDevice(); // from localStorage
-  const decrypted = await decryptBody(first.encrypted_body, device.box_secret);
-
-  // 3. Show context
-  showRequest({
-    host: decrypted.host,
-    user: decrypted.user,
-    command: decrypted.command,
-    argv: decrypted.argv,
-    cwd: decrypted.cwd,
-    pidChain: decrypted.pid_chain,
-    expiresAt: first.expires_at
-  });
-
-  // 4. Build WebAuthn ceremony
-  const requestHash = await sha256(JSON.stringify(decrypted));
-  const assertion = await navigator.credentials.get({
-    publicKey: {
-      challenge: requestHash,
-      rpId: 'sudo.internal.psalmond.com',
-      allowCredentials: [{ id: device.credential_id, type: 'public-key' }],
-      userVerification: 'required'
-    }
-  });
-
-  // 5. POST the assertion
-  await fetch(`/assertion/${first.request_id}`, {
-    method: 'POST',
-    body: JSON.stringify({
-      credential_id: b64(assertion.rawId),
-      client_data_json: assertion.response.clientDataJSON,
-      authenticator_data: assertion.response.authenticatorData,
-      signature: assertion.response.signature
-    })
-  });
-}
-```
+Activation is idempotent. A resumed hook updates the reply subject and causes
+an already stored submission to be relayed again. The server exposes a device
+only after activation confirmation.
 
 ## Persistence
 
-Pending requests are in-memory only (bounded by queue timeout).
-Device enrollment is persistent (written to /var/lib/sudo-approve/devices.json
-on the server host).
-Enrollment tokens are in-memory only (expire after first use).
+SQLite uses WAL, foreign keys, a five-second busy timeout, and embedded schema
+version 1. Tables cover devices, enrollments, requests, sealed bodies,
+tombstones, and outbox work. Cleanup expires pending enrollment state and
+removes old resolved work.
 
-## NATS Subjects
+`GET /healthz` checks the schema, durable request consumer progress, and
+outbox progress. Every browser response uses `Cache-Control: no-store`,
+`Referrer-Policy: no-referrer`, MIME sniffing protection, and a CSP that allows
+only local scripts, styles, and API calls. Darwin artifacts use immutable
+cache headers.
 
-- `sudo.request.>` — requests from hooks
-- `sudo.verdict.<id>` — verdicts the hook waits on
+## Publication
 
-## Streams Config
+The Darwin workflow builds arm64 artifacts on `osx-vm`. Main publishes
+`management-plane/sudo-approve-darwin:sha-<full-commit>`. The Linux image
+fetches that exact artifact through the registry, verifies `SHA256SUMS`, and
+records its OCI digest in the final image label.
 
-SUDO_APPROVE stream holds request bodies with 10-minute expiry. Work queue
-consumer is server-hosted.
-
-## Failure Behavior
-
-- NATS unreachable: log error, keep running (HTTP still works)
-- Malformed request payload: NACK the message, log warning
-- Assertion verification fails: return 401, log error
-- Request expires: drop from pending, NACK the message
-
-## Dependencies
-
-- axum for HTTP
-- tokio for async
-- protocol crate for types and verify()
-- async-nats for NATS
-- TRACING for logging
-- base64 for credential encoding
+The browser bundle vendors libsodium.js 0.7.15. Its WebAssembly payload is
+embedded in the reviewed browser file. `server/web/vendor/SHA256SUMS` records
+the source files used by the image.

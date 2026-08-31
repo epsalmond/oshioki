@@ -16,7 +16,6 @@ crate-type = ["cdylib"]
 # leaking allocation across the FFI boundary.
 
 [dependencies]
-protocol = { path = "../protocol" }
 libc = { workspace = true }
 nix = { workspace = true }
 serde_json = { workspace = true }
