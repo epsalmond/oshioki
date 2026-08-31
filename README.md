@@ -1,0 +1,66 @@
+# Sudo approve
+
+Sudo approve asks an enrolled browser to approve one exact sudo request. The
+hook encrypts the request for each enrolled browser. The server stores routing
+data and ciphertext. A valid approval still requires the browser's WebAuthn
+credential.
+
+This repository owns the protocol, hook, sudo plugin, server, browser app, and
+local test environment. Production deployment belongs to the consuming
+infrastructure repository.
+
+## Local loop
+
+```bash
+scripts/dev build
+scripts/dev test --quick
+scripts/dev test --browser
+scripts/dev test
+```
+
+`scripts/dev test --quick` runs the Rust, browser-vector, and installer suites
+on the host. `scripts/dev test --browser` runs the browser protocol against
+local NATS and SQLite. `scripts/dev test` creates a disposable Compose project
+and also invokes the real Linux sudo plugin path.
+
+The Compose browser test uses `https://sudo.test`. Chromium's virtual CTAP2
+authenticator represents Touch ID or Face ID. It proves WebAuthn registration
+and assertions, but it does not prove Apple hardware behavior.
+
+Start a retained development server with:
+
+```bash
+scripts/dev up --state-dir ./tmp/dev-state
+scripts/dev status
+scripts/dev down
+```
+
+Without `--state-dir`, `up` creates disposable state and `down` removes it.
+The server listens on `http://127.0.0.1:8443` in this development mode.
+`scripts/dev` maps the server to the invoking user under rootful Docker and to
+container UID 0 under rootless Docker. Direct Compose callers must set
+`SUDO_APPROVE_UID` to the host UID for rootful Docker or `0` for rootless
+Docker.
+
+## Repository layout
+
+- `protocol/` defines v1 messages, validation, sealing, and WebAuthn checks.
+- `hook/` publishes requests and verifies enrollment and approval results.
+- `plugin/` connects sudo's approval plugin ABI to the hook.
+- `server/` contains the HTTP app, NATS relay, and SQLite state.
+- `server/web/` contains the locally bundled browser UI and Playwright tests.
+- `scripts/` contains the development loop, installer, and E2E runners.
+
+SQLite is the server's local source of truth. It commits request ciphertext and
+outbox work before the JetStream message is acknowledged. The expected runtime
+is one active server with one persistent database file.
+
+## Compatibility
+
+The v1 cryptographic domain strings retain their
+`management-plane-sudo-approve/...` values. Changing those values would change
+the protocol and existing test vectors. The executable is `sudo-approve`, and
+local hook state defaults to `/etc/sudo-approve`.
+
+OCI publication and CI are outside the current iteration loop. Homebrew and
+Debian packages will be designed after the protocol and local E2E stabilize.

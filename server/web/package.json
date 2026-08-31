@@ -1,10 +1,16 @@
 {
-  "name": "management-plane-sudo-approve-web",
+  "name": "sudo-approve-web",
   "private": true,
   "scripts": {
-    "test": "node test-vectors.cjs && node --check app.js"
+    "test": "npm run test:unit",
+    "test:unit": "node test-vectors.cjs && node --check app.js",
+    "test:e2e": "playwright test --config=playwright.config.mjs"
   },
   "dependencies": {
     "libsodium-wrappers": "0.7.15"
+  },
+  "devDependencies": {
+    "@nats-io/transport-node": "3.4.0",
+    "@playwright/test": "1.62.1"
   }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "management-plane-sudo-approve"
+name = "sudo-approve"
 edition = { workspace = true }
 rust-version = { workspace = true }
 version = { workspace = true }
@@ -10,7 +10,7 @@ publish = { workspace = true }
 # Binary: the hook sudo runs. Verbs: check, enroll, pin, status, test, watch.
 
 [[bin]]
-name = "management-plane-sudo-approve"
+name = "sudo-approve"
 path = "src/main.rs"
 
 [dependencies]

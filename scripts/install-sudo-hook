@@ -4,11 +4,17 @@ set -euo pipefail
 
 MODE=""
 DRY_RUN=0
+CONFIG_FILE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --prelaunch|--disable-prelaunch|--prelaunch-status|--standalone-e2e)
       [ -z "$MODE" ] || { echo "install-sudo-hook: choose exactly one mode" >&2; exit 2; }
       MODE="${1#--}"
+      ;;
+    --config-file)
+      [ "$#" -ge 2 ] || { echo "install-sudo-hook: --config-file requires a path" >&2; exit 2; }
+      CONFIG_FILE="$2"
+      shift
       ;;
     --dry-run) DRY_RUN=1 ;;
     *) echo "install-sudo-hook: unknown argument: $1" >&2; exit 2 ;;
@@ -21,15 +27,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SERVICE_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 SUDO_CONF="${SUDO_CONF:-/etc/sudo.conf}"
 SBIN_DIR="${SBIN_DIR:-/usr/local/sbin}"
-STATE_DIR="${SUDO_APPROVE_STATE_DIR:-/etc/management-plane/sudo-approve}"
+STATE_DIR="${SUDO_APPROVE_STATE_DIR:-/etc/sudo-approve}"
+LEGACY_STATE_DIR="${SUDO_APPROVE_LEGACY_STATE_DIR:-/etc/management-plane/sudo-approve}"
 SUDOERS_D="${SUDOERS_D:-/etc/sudoers.d}"
-ORIGIN="${SUDO_APPROVE_ORIGIN:-https://sudo.internal.psalmond.com}"
-RP_ID="${SUDO_APPROVE_RP_ID:-sudo.internal.psalmond.com}"
-NATS_URL="${NATS_URL:-nats://nats.internal.psalmond.com:4222}"
+ORIGIN="${SUDO_APPROVE_ORIGIN:-}"
+RP_ID="${SUDO_APPROVE_RP_ID:-}"
+NATS_URL="${NATS_URL:-}"
 NATS_USER="${NATS_USER:-sudo-approve}"
 NATS_PASS="${NATS_PASS:-}"
-BEGIN_MARK='# BEGIN management-plane sudo approve'
-END_MARK='# END management-plane sudo approve'
+BEGIN_MARK='# BEGIN sudo approve'
+END_MARK='# END sudo approve'
+LEGACY_BEGIN_MARK='# BEGIN management-plane sudo approve'
+LEGACY_END_MARK='# END management-plane sudo approve'
 LOCK_DIR="${SUDO_APPROVE_INSTALL_LOCK:-${STATE_DIR}.install.lock}"
 
 case "$(uname -s)" in
@@ -37,7 +46,7 @@ case "$(uname -s)" in
   Darwin) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=approval_exec.dylib; BUILD_PLUGIN=libplugin.dylib ;;
   *) echo "install-sudo-hook: unsupported operating system" >&2; exit 1 ;;
 esac
-HOOK_BIN="$SERVICE_DIR/target/release/management-plane-sudo-approve"
+HOOK_BIN="$SERVICE_DIR/target/release/sudo-approve"
 PLUGIN_BIN="$SERVICE_DIR/target/release/$BUILD_PLUGIN"
 PLUGIN_DEST="$PLUGIN_DIR/$PLUGIN_NAME"
 
@@ -47,17 +56,83 @@ regular_or_absent() { [ ! -L "$1" ] || die "refusing unsafe target: $1"; [ ! -e 
 safe_directory() { [ ! -L "$1" ] || die "refusing symlink directory: $1"; [ ! -e "$1" ] || [ -d "$1" ] || die "refusing non-directory: $1"; }
 hash_file() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 
+load_config_file() {
+  local path="$1" owner mode line key value
+  if [ ! -f "$path" ] || [ -L "$path" ]; then
+    die "config file must be a regular file: $path"
+  fi
+  if owner="$(stat -c '%u' "$path" 2>/dev/null)"; then
+    mode="$(stat -c '%a' "$path")"
+  else
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+  fi
+  [ "$owner" -eq 0 ] || die "config file must be owned by root: $path"
+  [ "$mode" = 600 ] || die "config file must have mode 0600: $path"
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    case "$line" in \#*) continue ;; esac
+    case "$line" in *=*) ;; *) die "invalid config line in $path" ;; esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$value" in
+      [[:space:]]*|*[[:space:]]|\"*\"|\'*\') die "config value must be unquoted and untrimmed: $key" ;;
+    esac
+    case "$key" in
+      SUDO_APPROVE_ORIGIN) ORIGIN="$value" ;;
+      SUDO_APPROVE_RP_ID) RP_ID="$value" ;;
+      NATS_URL) NATS_URL="$value" ;;
+      NATS_USER) NATS_USER="$value" ;;
+      NATS_PASS) NATS_PASS="$value" ;;
+      *) die "unknown config key in $path: $key" ;;
+    esac
+  done < "$path"
+}
+
+[ -z "$CONFIG_FILE" ] || load_config_file "$CONFIG_FILE"
+
+validate_marker_pair() {
+  local source="$1" begin="$2" end="$3" begins ends begin_line end_line
+  begins="$(grep -cF "$begin" "$source" 2>/dev/null || true)"
+  ends="$(grep -cF "$end" "$source" 2>/dev/null || true)"
+  { [ "$begins" -eq 0 ] && [ "$ends" -eq 0 ]; } ||
+    { [ "$begins" -eq 1 ] && [ "$ends" -eq 1 ]; } ||
+    die "malformed managed block in $source"
+  if [ "$begins" -eq 1 ]; then
+    begin_line="$(grep -nF "$begin" "$source" | cut -d: -f1)"
+    end_line="$(grep -nF "$end" "$source" | cut -d: -f1)"
+    [ "$begin_line" -lt "$end_line" ] || die "malformed managed block in $source"
+  fi
+}
+
+validate_block() {
+  local source="$1" begin_line end_line legacy_begin_line legacy_end_line
+  validate_marker_pair "$source" "$BEGIN_MARK" "$END_MARK"
+  validate_marker_pair "$source" "$LEGACY_BEGIN_MARK" "$LEGACY_END_MARK"
+  if grep -Fq "$BEGIN_MARK" "$source" && grep -Fq "$LEGACY_BEGIN_MARK" "$source"; then
+    begin_line="$(grep -nF "$BEGIN_MARK" "$source" | cut -d: -f1)"
+    end_line="$(grep -nF "$END_MARK" "$source" | cut -d: -f1)"
+    legacy_begin_line="$(grep -nF "$LEGACY_BEGIN_MARK" "$source" | cut -d: -f1)"
+    legacy_end_line="$(grep -nF "$LEGACY_END_MARK" "$source" | cut -d: -f1)"
+    if [ "$end_line" -ge "$legacy_begin_line" ] && [ "$legacy_end_line" -ge "$begin_line" ]; then
+      die "overlapping managed blocks in $source"
+    fi
+  fi
+}
+
 if [ "$MODE" = prelaunch-status ]; then
   [ -f "$SUDO_CONF" ] || { echo "disabled"; exit 1; }
-  begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"; ends="$(grep -cF "$END_MARK" "$SUDO_CONF" || true)"
-  if [ "$begins" -eq 1 ] && [ "$ends" -eq 1 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
-  if [ "$begins" -eq 0 ] && [ "$ends" -eq 0 ]; then echo "disabled"; exit 1; fi
+  validate_block "$SUDO_CONF"
+  begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"
+  legacy_begins="$(grep -cF "$LEGACY_BEGIN_MARK" "$SUDO_CONF" || true)"
+  if [ $((begins + legacy_begins)) -gt 0 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
+  if [ $((begins + legacy_begins)) -eq 0 ]; then echo "disabled"; exit 1; fi
   die "malformed managed block in $SUDO_CONF"
 fi
 
 [ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || die "must run as root"
 safe_directory "$(dirname "$STATE_DIR")"; safe_directory "$STATE_DIR"; regular_or_absent "$SUDO_CONF"
-safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/management-plane-sudo-approve"; regular_or_absent "$PLUGIN_DEST"
+safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/sudo-approve"; regular_or_absent "$PLUGIN_DEST"
 regular_or_absent "$STATE_DIR/config.env"; regular_or_absent "$STATE_DIR/hook.json"; regular_or_absent "$STATE_DIR/devices.json"
 
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -65,28 +140,49 @@ if [ "$DRY_RUN" -eq 0 ]; then
   trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
 fi
 
-validate_block() {
-  local source="$1" begins ends begin_line end_line
-  begins="$(grep -cF "$BEGIN_MARK" "$source" 2>/dev/null || true)"; ends="$(grep -cF "$END_MARK" "$source" 2>/dev/null || true)"
-  { [ "$begins" -eq 0 ] && [ "$ends" -eq 0 ]; } || { [ "$begins" -eq 1 ] && [ "$ends" -eq 1 ]; } || die "malformed managed block in $source"
-  if [ "$begins" -eq 1 ]; then
-    begin_line="$(grep -nF "$BEGIN_MARK" "$source" | cut -d: -f1)"; end_line="$(grep -nF "$END_MARK" "$source" | cut -d: -f1)"
-    [ "$begin_line" -lt "$end_line" ] || die "malformed managed block in $source"
-  fi
-}
-
 rewrite_block() {
   local action="$1" source="$2" destination="$3" tmp
   validate_block "$source"
   tmp="$(mktemp "${destination}.XXXXXX")"
-  awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
-    $0 == begin { inside=1; next } $0 == end { inside=0; next } !inside { print }
+  awk -v begin="$BEGIN_MARK" -v end="$END_MARK" \
+      -v legacy_begin="$LEGACY_BEGIN_MARK" -v legacy_end="$LEGACY_END_MARK" '
+    $0 == begin || $0 == legacy_begin { inside=1; next }
+    $0 == end || $0 == legacy_end { inside=0; next }
+    !inside { print }
   ' "$source" > "$tmp"
+  if grep -q '^Plugin approval_exec ' "$tmp"; then
+    rm -f "$tmp"
+    die "unmanaged approval_exec plugin line in $source"
+  fi
   if [ "$action" = enable ]; then
     [ ! -s "$tmp" ] || [ "$(tail -c 1 "$tmp" | wc -l)" -ne 0 ] || printf '\n' >> "$tmp"
     printf '%s\nPlugin approval_exec %s\n%s\n' "$BEGIN_MARK" "$PLUGIN_DEST" "$END_MARK" >> "$tmp"
   fi
   chmod 0644 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$destination"
+}
+
+validate_legacy_state() {
+  [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] || return 0
+  [ ! -e "$LEGACY_STATE_DIR" ] || safe_directory "$LEGACY_STATE_DIR"
+  [ -d "$LEGACY_STATE_DIR" ] || return 0
+  local legacy="$LEGACY_STATE_DIR/devices.json" destination="$STATE_DIR/devices.json"
+  regular_or_absent "$legacy"
+  [ -f "$legacy" ] || return 0
+  if [ -f "$destination" ]; then
+    cmp -s "$legacy" "$destination" || die "conflicting legacy and current state for devices.json"
+  fi
+}
+
+migrate_legacy_state() {
+  validate_legacy_state
+  [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] || return 0
+  [ -d "$LEGACY_STATE_DIR" ] || return 0
+  local legacy="$LEGACY_STATE_DIR/devices.json" destination="$STATE_DIR/devices.json"
+  [ -f "$legacy" ] || return 0
+  [ ! -f "$destination" ] || return 0
+  run mv -- "$legacy" "$destination"
+  run chmod 0600 "$destination"
+  run chown root:root "$destination"
 }
 
 [ ! -f "$SUDO_CONF" ] || validate_block "$SUDO_CONF"
@@ -106,7 +202,16 @@ if [ "$MODE" = disable-prelaunch ]; then
   rm -f "$backup"; echo "install-sudo-hook: prelaunch disabled and sudo validated"; exit 0
 fi
 
-for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do [ -f "$artifact" ] && [ ! -L "$artifact" ] || die "missing or unsafe build artifact: $artifact"; done
+[ -n "$ORIGIN" ] || die "SUDO_APPROVE_ORIGIN is required"
+[ -n "$RP_ID" ] || die "SUDO_APPROVE_RP_ID is required"
+[ -n "$NATS_URL" ] || die "NATS_URL is required"
+[ -n "$NATS_PASS" ] || die "NATS_PASS is required"
+
+for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do
+  if [ ! -f "$artifact" ] || [ -L "$artifact" ]; then
+    die "missing or unsafe build artifact: $artifact"
+  fi
+done
 architecture="$(uname -m)"; file_output="$(file -b "$HOOK_BIN") $(file -b "$PLUGIN_BIN")"
 case "$architecture" in
   x86_64|amd64) grep -Eqi 'x86[-_ ]?64|x86_64' <<<"$file_output" || die "artifact architecture does not match $architecture" ;;
@@ -115,17 +220,22 @@ case "$architecture" in
 esac
 
 CHECKSUMS="${SUDO_APPROVE_CHECKSUMS:-$SERVICE_DIR/target/release/SHA256SUMS}"
-[ -f "$CHECKSUMS" ] && [ ! -L "$CHECKSUMS" ] || die "missing artifact checksum manifest: $CHECKSUMS"
+if [ ! -f "$CHECKSUMS" ] || [ -L "$CHECKSUMS" ]; then
+  die "missing artifact checksum manifest: $CHECKSUMS"
+fi
 for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do
   name="$(basename "$artifact")"; expected="$(awk -v name="$name" '$2 == name {print $1}' "$CHECKSUMS")"
   [ "${#expected}" -eq 64 ] || die "checksum manifest has no exact entry for $name"
   [ "$(hash_file "$artifact")" = "$expected" ] || die "checksum mismatch for $name"
 done
 
+validate_legacy_state
+
 run install -d -m 0755 "$SBIN_DIR" "$PLUGIN_DIR"
-run install -m 0755 -o root -g root "$HOOK_BIN" "$SBIN_DIR/management-plane-sudo-approve"
+run install -m 0755 -o root -g root "$HOOK_BIN" "$SBIN_DIR/sudo-approve"
 run install -m 0755 -o root -g root "$PLUGIN_BIN" "$PLUGIN_DEST"
 run install -d -m 0750 -o root -g root "$STATE_DIR"
+migrate_legacy_state
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf 'DRY: write %s/config.env with NATS_PASS=<redacted>\n' "$STATE_DIR"

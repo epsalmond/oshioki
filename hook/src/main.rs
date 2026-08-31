@@ -25,12 +25,12 @@ use protocol::{
     verify_approval_v1, verify_enrollment_v1,
 };
 
-const DEFAULT_CONFIG_DIR: &str = "/etc/management-plane/sudo-approve";
+const DEFAULT_CONFIG_DIR: &str = "/etc/sudo-approve";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Parser)]
-#[command(name = "management-plane-sudo-approve", about = "sudo approval hook")]
+#[command(name = "sudo-approve", about = "sudo approval hook")]
 struct Cli {
     #[command(subcommand)]
     verb: Verb,
@@ -66,11 +66,8 @@ struct EnrollmentStateV1 {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive(
-                "management_plane_sudo_approve=info"
-                    .parse()
-                    .expect("valid directive"),
-            ),
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("sudo_approve=info".parse().expect("valid directive")),
         )
         .with_writer(io::stdout)
         .init();
@@ -92,12 +89,17 @@ async fn main() -> Result<()> {
 
 async fn cmd_check() -> Result<()> {
     let request = build_request(&parse_sudo_stdin()?)?;
-    execute_request(request, APPROVAL_TIMEOUT).await
+    execute_request_at(request, APPROVAL_TIMEOUT, check_config_dir()).await
 }
 
 async fn execute_request(request: RequestV1, timeout: Duration) -> Result<()> {
+    let directory = config_dir();
+    execute_request_at(request, timeout, &directory).await
+}
+
+async fn execute_request_at(request: RequestV1, timeout: Duration, directory: &Path) -> Result<()> {
     let raw_request = request.raw_json()?;
-    let mut registry = load_registry()?;
+    let mut registry = load_registry_from(directory)?;
     let active = registry
         .devices
         .iter()
@@ -112,7 +114,7 @@ async fn execute_request(request: RequestV1, timeout: Duration) -> Result<()> {
     if payload.len() > protocol::v1::MAX_ENVELOPE_BYTES {
         bail!("request envelope exceeds 3 MiB");
     }
-    let nats = connect_nats().await?;
+    let nats = connect_nats_from(directory).await?;
     let decision = request_decision(
         &nats,
         &format!("sudo.request.{}", request.host),
@@ -149,8 +151,13 @@ async fn execute_request(request: RequestV1, timeout: Duration) -> Result<()> {
                         && device.credential_id == approval.credential_id
                 })
                 .context("approval does not name one exact pinned credential")?;
-            let outcome = verify_approval_v1(&approval, &raw_request, device, &load_hook_config()?)
-                .context("approval verification failed")?;
+            let outcome = verify_approval_v1(
+                &approval,
+                &raw_request,
+                device,
+                &load_hook_config_from(directory)?,
+            )
+            .context("approval verification failed")?;
             if outcome.counter_regressed {
                 warn!(fingerprint=%device.fingerprint, stored=device.sign_count, observed=outcome.observed_sign_count, "authenticator signature counter regressed");
             }
@@ -162,7 +169,7 @@ async fn execute_request(request: RequestV1, timeout: Duration) -> Result<()> {
                 {
                     stored.sign_count = outcome.observed_sign_count;
                 }
-                write_registry(&registry)?;
+                write_registry_to(directory, &registry)?;
             }
             info!(request_id=%request.request_id, fingerprint=%device.fingerprint, "sudo request approved");
             Ok(())
@@ -519,13 +526,22 @@ fn config_dir() -> PathBuf {
     std::env::var_os("SUDO_APPROVE_CONFIG_DIR")
         .map_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR), PathBuf::from)
 }
+fn check_config_dir() -> &'static Path {
+    Path::new(DEFAULT_CONFIG_DIR)
+}
 fn load_hook_config() -> Result<HookConfigV1> {
-    let config: HookConfigV1 = read_json(&config_dir().join("hook.json"))?;
+    load_hook_config_from(&config_dir())
+}
+fn load_hook_config_from(directory: &Path) -> Result<HookConfigV1> {
+    let config: HookConfigV1 = read_json(&directory.join("hook.json"))?;
     config.validate()?;
     Ok(config)
 }
 fn load_registry() -> Result<DeviceRegistryV1> {
-    let path = config_dir().join("devices.json");
+    load_registry_from(&config_dir())
+}
+fn load_registry_from(directory: &Path) -> Result<DeviceRegistryV1> {
+    let path = directory.join("devices.json");
     if !path.exists() {
         return Ok(DeviceRegistryV1 {
             version: VERSION_V1,
@@ -537,8 +553,11 @@ fn load_registry() -> Result<DeviceRegistryV1> {
     Ok(registry)
 }
 fn write_registry(registry: &DeviceRegistryV1) -> Result<()> {
+    write_registry_to(&config_dir(), registry)
+}
+fn write_registry_to(directory: &Path, registry: &DeviceRegistryV1) -> Result<()> {
     registry.validate()?;
-    atomic_write_json(&config_dir().join("devices.json"), registry, 0o600)
+    atomic_write_json(&directory.join("devices.json"), registry, 0o600)
 }
 
 fn create_enrollment_state() -> Result<EnrollmentStateV1> {
@@ -597,7 +616,10 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<
 }
 
 async fn connect_nats() -> Result<async_nats::Client> {
-    let env = read_env_file(&config_dir().join("config.env"))?;
+    connect_nats_from(&config_dir()).await
+}
+async fn connect_nats_from(directory: &Path) -> Result<async_nats::Client> {
+    let env = read_env_file(&directory.join("config.env"))?;
     async_nats::ConnectOptions::new()
         .user_and_password(
             env.get("NATS_USER").context("NATS_USER not set")?.clone(),
@@ -778,6 +800,11 @@ mod tests {
         atomic_write_json(&path, &registry, 0o600).unwrap();
         assert_eq!(read_json::<DeviceRegistryV1>(&path).unwrap(), registry);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn check_uses_the_root_owned_config_directory() {
+        assert_eq!(check_config_dir(), Path::new("/etc/sudo-approve"));
     }
 
     #[test]

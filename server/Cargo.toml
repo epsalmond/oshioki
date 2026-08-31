@@ -10,7 +10,7 @@ publish = { workspace = true }
 # Binary: the approval service. NATS relay, ntfy broker, HTTP page, enrollment.
 
 [[bin]]
-name = "management-plane-sudo-approve-server"
+name = "sudo-approve-server"
 path = "src/main.rs"
 
 [dependencies]

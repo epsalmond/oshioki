@@ -5,17 +5,44 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TEST_ROOT="$(mktemp -d -t sudo-hook-install-test.XXXXXX)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 fail() { echo "test-install-sudo-hook: $*" >&2; exit 1; }
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+file_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    stat -c '%a' "$1"
+  else
+    stat -f '%Lp' "$1"
+  fi
+}
 
 mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/service/scripts" "$TEST_ROOT/service/target/release"
 cp "$SCRIPT_DIR/install-sudo-hook" "$TEST_ROOT/service/scripts/"
-cp /bin/true "$TEST_ROOT/service/target/release/management-plane-sudo-approve"
-cp /bin/true "$TEST_ROOT/service/target/release/libplugin.so"
+case "$(uname -s)" in
+  Darwin) BUILD_PLUGIN=libplugin.dylib ;;
+  Linux) BUILD_PLUGIN=libplugin.so ;;
+  *) fail "unsupported test operating system" ;;
+esac
+cp /usr/bin/true "$TEST_ROOT/service/target/release/sudo-approve"
+cp /usr/bin/true "$TEST_ROOT/service/target/release/$BUILD_PLUGIN"
 (
   cd "$TEST_ROOT/service/target/release"
-  sha256sum management-plane-sudo-approve libplugin.so > SHA256SUMS
+  printf '%s  sudo-approve\n' "$(sha256_file sudo-approve)" > SHA256SUMS
+  printf '%s  %s\n' "$(sha256_file "$BUILD_PLUGIN")" "$BUILD_PLUGIN" >> SHA256SUMS
 )
 
-for wrapper in id chown install sudo file; do
+for wrapper in id chown install sudo file stat; do
   : > "$TEST_ROOT/fake-bin/$wrapper"
 done
 cat > "$TEST_ROOT/fake-bin/id" <<'SH'
@@ -39,8 +66,22 @@ exit 0
 SH
 cat > "$TEST_ROOT/fake-bin/file" <<'SH'
 #!/usr/bin/env bash
-[ "${FAKE_FILE_MISMATCH:-0}" = 1 ] && { echo 'Mach-O arm64'; exit 0; }
+[ "${FAKE_FILE_MISMATCH:-0}" = 1 ] && {
+  case "$(uname -m)" in
+    arm64|aarch64) echo 'ELF 64-bit x86-64' ;;
+    *) echo 'Mach-O arm64' ;;
+  esac
+  exit 0
+}
 exec /usr/bin/file "$@"
+SH
+cat > "$TEST_ROOT/fake-bin/stat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  '-c %u'|'-f %u') echo "${FAKE_STAT_OWNER:-0}" ;;
+  '-c %a'|'-f %Lp') echo "${FAKE_STAT_MODE:-600}" ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
 SH
 chmod 0755 "$TEST_ROOT/fake-bin"/* "$TEST_ROOT/service/scripts/install-sudo-hook"
 TEST_PATH="$TEST_ROOT/fake-bin:/usr/bin:/bin"
@@ -50,39 +91,131 @@ run_installer() {
   mkdir -p "$root"
   PATH="$TEST_PATH" SUDO_CONF="$root/sudo.conf" SUDO_PLUGIN_DIR="$root/plugin" SBIN_DIR="$root/sbin" \
     SUDOERS_D="$root/sudoers.d" SUDO_APPROVE_STATE_DIR="$root/state" \
+    SUDO_APPROVE_LEGACY_STATE_DIR="$root/legacy-state" \
+    SUDO_APPROVE_ORIGIN="${INSTALL_ORIGIN-https://sudo.test}" \
+    SUDO_APPROVE_RP_ID="${INSTALL_RP_ID-sudo.test}" \
+    NATS_URL="${INSTALL_NATS_URL-nats://nats.test:4222}" \
+    NATS_PASS="${INSTALL_NATS_PASS-${NATS_PASS:-test-only}}" \
+    FAKE_STAT_OWNER="${FAKE_STAT_OWNER:-0}" FAKE_STAT_MODE="${FAKE_STAT_MODE:-600}" \
     "$TEST_ROOT/service/scripts/install-sudo-hook" "$@"
 }
 
 if run_installer "$TEST_ROOT/no-mode" >"$TEST_ROOT/no-mode.log" 2>&1; then fail "accepted omitted mode"; fi
 grep -Fq 'choose exactly one mode' "$TEST_ROOT/no-mode.log" || fail "missing mode error"
 
+if INSTALL_ORIGIN='' run_installer "$TEST_ROOT/missing-origin" --prelaunch >"$TEST_ROOT/missing-origin.log" 2>&1; then fail "accepted missing origin"; fi
+if INSTALL_RP_ID='' run_installer "$TEST_ROOT/missing-rp-id" --prelaunch >"$TEST_ROOT/missing-rp-id.log" 2>&1; then fail "accepted missing RP ID"; fi
+if INSTALL_NATS_URL='' run_installer "$TEST_ROOT/missing-nats-url" --prelaunch >"$TEST_ROOT/missing-nats-url.log" 2>&1; then fail "accepted missing NATS URL"; fi
+if INSTALL_NATS_PASS='' run_installer "$TEST_ROOT/missing-nats-pass" --prelaunch >"$TEST_ROOT/missing-nats-pass.log" 2>&1; then fail "accepted missing NATS password"; fi
+for missing in missing-origin missing-rp-id missing-nats-url missing-nats-pass; do
+  [ ! -e "$TEST_ROOT/$missing/sbin/sudo-approve" ] || fail "$missing wrote an executable"
+done
+
+CONFIG_ROOT="$TEST_ROOT/config-file"; mkdir -p "$CONFIG_ROOT"
+printf '%s\n' \
+  'SUDO_APPROVE_ORIGIN=https://config.test' \
+  'SUDO_APPROVE_RP_ID=config.test' \
+  'NATS_URL=nats://config.test:4222' \
+  'NATS_USER=config-user' \
+  'NATS_PASS=config-secret' > "$CONFIG_ROOT/install.env"
+chmod 0600 "$CONFIG_ROOT/install.env"
+INSTALL_ORIGIN='' INSTALL_RP_ID='' INSTALL_NATS_URL='' INSTALL_NATS_PASS='' \
+  run_installer "$CONFIG_ROOT" --prelaunch --config-file "$CONFIG_ROOT/install.env"
+grep -Fq 'NATS_URL=nats://config.test:4222' "$CONFIG_ROOT/state/config.env" || fail "config file NATS URL was ignored"
+grep -Fq '"origin":"https://config.test"' "$CONFIG_ROOT/state/hook.json" || fail "config file origin was ignored"
+
+NONROOT_CONFIG="$TEST_ROOT/nonroot-config"; mkdir -p "$NONROOT_CONFIG"; cp "$CONFIG_ROOT/install.env" "$NONROOT_CONFIG/install.env"
+if FAKE_STAT_OWNER=1000 run_installer "$NONROOT_CONFIG" --prelaunch --config-file "$NONROOT_CONFIG/install.env" >"$NONROOT_CONFIG/log" 2>&1; then fail "accepted non-root config owner"; fi
+grep -Fq 'config file must be owned by root' "$NONROOT_CONFIG/log" || fail "missing config owner error"
+
+LOOSE_CONFIG="$TEST_ROOT/loose-config"; mkdir -p "$LOOSE_CONFIG"; cp "$CONFIG_ROOT/install.env" "$LOOSE_CONFIG/install.env"
+if FAKE_STAT_MODE=644 run_installer "$LOOSE_CONFIG" --prelaunch --config-file "$LOOSE_CONFIG/install.env" >"$LOOSE_CONFIG/log" 2>&1; then fail "accepted loose config mode"; fi
+grep -Fq 'config file must have mode 0600' "$LOOSE_CONFIG/log" || fail "missing config mode error"
+
+SYMLINK_CONFIG="$TEST_ROOT/symlink-config"; mkdir -p "$SYMLINK_CONFIG"; ln -s "$CONFIG_ROOT/install.env" "$SYMLINK_CONFIG/install.env"
+if run_installer "$SYMLINK_CONFIG" --prelaunch --config-file "$SYMLINK_CONFIG/install.env" >"$SYMLINK_CONFIG/log" 2>&1; then fail "accepted symlink config"; fi
+grep -Fq 'config file must be a regular file' "$SYMLINK_CONFIG/log" || fail "missing symlink config error"
+
+UNKNOWN_CONFIG="$TEST_ROOT/unknown-config"; mkdir -p "$UNKNOWN_CONFIG"; cp "$CONFIG_ROOT/install.env" "$UNKNOWN_CONFIG/install.env"; printf 'UNKNOWN=value\n' >> "$UNKNOWN_CONFIG/install.env"
+if run_installer "$UNKNOWN_CONFIG" --prelaunch --config-file "$UNKNOWN_CONFIG/install.env" >"$UNKNOWN_CONFIG/log" 2>&1; then fail "accepted unknown config key"; fi
+grep -Fq 'unknown config key' "$UNKNOWN_CONFIG/log" || fail "missing unknown config key error"
+
+QUOTED_CONFIG="$TEST_ROOT/quoted-config"; mkdir -p "$QUOTED_CONFIG"; cp "$CONFIG_ROOT/install.env" "$QUOTED_CONFIG/install.env"; printf 'NATS_PASS="quoted"\n' >> "$QUOTED_CONFIG/install.env"
+if run_installer "$QUOTED_CONFIG" --prelaunch --config-file "$QUOTED_CONFIG/install.env" >"$QUOTED_CONFIG/log" 2>&1; then fail "accepted quoted config value"; fi
+grep -Fq 'config value must be unquoted and untrimmed' "$QUOTED_CONFIG/log" || fail "missing quoted config error"
+
 PRELAUNCH="$TEST_ROOT/prelaunch"; mkdir -p "$PRELAUNCH/sudoers.d" "$PRELAUNCH/state"
 printf 'outside-before\n' > "$PRELAUNCH/sudo.conf"
 printf 'legacy\n' > "$PRELAUNCH/sudoers.d/management-plane-sudo-approve"
 printf '{"version":1,"devices":[{"sentinel":true}]}\n' > "$PRELAUNCH/state/devices.json"
-devices_hash="$(sha256sum "$PRELAUNCH/state/devices.json")"
+devices_hash="$(sha256_file "$PRELAUNCH/state/devices.json")"
 run_installer "$PRELAUNCH" --prelaunch
 [ ! -e "$PRELAUNCH/sudoers.d/management-plane-sudo-approve" ] || fail "legacy policy survived"
-[ "$(sha256sum "$PRELAUNCH/state/devices.json")" = "$devices_hash" ] || fail "existing device state changed"
-[ "$(grep -c '^# BEGIN management-plane sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "managed block duplicated"
+[ "$(sha256_file "$PRELAUNCH/state/devices.json")" = "$devices_hash" ] || fail "existing device state changed"
+[ "$(grep -c '^# BEGIN sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "managed block duplicated"
 run_installer "$PRELAUNCH" --prelaunch
-[ "$(grep -c '^# BEGIN management-plane sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "rerun duplicated block"
+[ "$(grep -c '^# BEGIN sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "rerun duplicated block"
 run_installer "$PRELAUNCH" --prelaunch-status | grep -Fq enabled || fail "status did not report enabled"
+
+LEGACY_BLOCK="$TEST_ROOT/legacy-block"; mkdir -p "$LEGACY_BLOCK"
+printf 'outside-before\n# BEGIN management-plane sudo approve\nPlugin approval_exec %s\n# END management-plane sudo approve\n' \
+  "$LEGACY_BLOCK/plugin/approval_exec.so" > "$LEGACY_BLOCK/sudo.conf"
+run_installer "$LEGACY_BLOCK" --prelaunch
+[ "$(grep -c '^Plugin approval_exec ' "$LEGACY_BLOCK/sudo.conf")" -eq 1 ] || fail "legacy upgrade duplicated plugin"
+[ "$(grep -c '^# BEGIN sudo approve$' "$LEGACY_BLOCK/sudo.conf")" -eq 1 ] || fail "legacy marker was not replaced"
+if grep -Fq '# BEGIN management-plane sudo approve' "$LEGACY_BLOCK/sudo.conf"; then fail "legacy marker survived upgrade"; fi
+run_installer "$LEGACY_BLOCK" --disable-prelaunch
+if grep -Fq 'Plugin approval_exec ' "$LEGACY_BLOCK/sudo.conf"; then fail "legacy plugin survived disable"; fi
+
+OVERLAPPING_BLOCK="$TEST_ROOT/overlapping-block"; mkdir -p "$OVERLAPPING_BLOCK"
+printf '%s\n' \
+  'outside-before' \
+  '# BEGIN sudo approve' \
+  'Plugin approval_exec /old/a.so' \
+  '# BEGIN management-plane sudo approve' \
+  '# END sudo approve' \
+  'Plugin approval_exec /old/b.so' \
+  '# END management-plane sudo approve' > "$OVERLAPPING_BLOCK/sudo.conf"
+overlapping_hash="$(sha256_file "$OVERLAPPING_BLOCK/sudo.conf")"
+if run_installer "$OVERLAPPING_BLOCK" --disable-prelaunch >"$OVERLAPPING_BLOCK/log" 2>&1; then fail "accepted overlapping managed blocks"; fi
+grep -Fq 'overlapping managed blocks' "$OVERLAPPING_BLOCK/log" || fail "missing overlapping block error"
+[ "$(sha256_file "$OVERLAPPING_BLOCK/sudo.conf")" = "$overlapping_hash" ] || fail "overlapping block failure changed sudo.conf"
+
+LEGACY_STATE="$TEST_ROOT/legacy-state-migration"; mkdir -p "$LEGACY_STATE/legacy-state"
+printf '{"version":1,"devices":[{"sentinel":true}]}\n' > "$LEGACY_STATE/legacy-state/devices.json"
+legacy_devices_hash="$(sha256_file "$LEGACY_STATE/legacy-state/devices.json")"
+run_installer "$LEGACY_STATE" --prelaunch
+[ "$(sha256_file "$LEGACY_STATE/state/devices.json")" = "$legacy_devices_hash" ] || fail "legacy device state was not preserved"
+[ ! -e "$LEGACY_STATE/legacy-state/devices.json" ] || fail "legacy device state was not moved"
+[ "$(file_mode "$LEGACY_STATE/state/devices.json")" = 600 ] || fail "migrated device state mode was not normalized"
+
+DERIVED_STATE="$TEST_ROOT/derived-state"; mkdir -p "$DERIVED_STATE/state" "$DERIVED_STATE/legacy-state"
+printf 'old config\n' > "$DERIVED_STATE/legacy-state/config.env"
+printf 'old hook\n' > "$DERIVED_STATE/legacy-state/hook.json"
+printf 'current config\n' > "$DERIVED_STATE/state/config.env"
+printf 'current hook\n' > "$DERIVED_STATE/state/hook.json"
+run_installer "$DERIVED_STATE" --prelaunch
+
+CONFLICT_STATE="$TEST_ROOT/conflicting-state"; mkdir -p "$CONFLICT_STATE/state" "$CONFLICT_STATE/legacy-state"
+printf 'current\n' > "$CONFLICT_STATE/state/devices.json"
+printf 'legacy\n' > "$CONFLICT_STATE/legacy-state/devices.json"
+if run_installer "$CONFLICT_STATE" --prelaunch >"$CONFLICT_STATE/log" 2>&1; then fail "accepted conflicting legacy state"; fi
+[ ! -e "$CONFLICT_STATE/sbin/sudo-approve" ] || fail "conflicting legacy state wrote an executable"
 
 dry_secret='recognizable-dry-run-secret'
 dry_output="$(NATS_PASS="$dry_secret" run_installer "$PRELAUNCH" --prelaunch --dry-run 2>&1)"
 grep -Fq '<redacted>' <<<"$dry_output" || fail "dry run omitted redaction"
 if grep -Fq "$dry_secret" <<<"$dry_output"; then fail "dry run disclosed NATS password"; fi
 
-outside_hash="$(printf 'outside-before\n' | sha256sum | awk '{print $1}')"
+outside_hash="$(printf 'outside-before\n' | sha256_stream)"
 run_installer "$PRELAUNCH" --disable-prelaunch
-if grep -Fq '# BEGIN management-plane sudo approve' "$PRELAUNCH/sudo.conf"; then fail "disable left managed block"; fi
-[ "$(sha256sum "$PRELAUNCH/sudo.conf" | awk '{print $1}')" = "$outside_hash" ] || fail "disable changed bytes outside block"
+if grep -Fq '# BEGIN sudo approve' "$PRELAUNCH/sudo.conf"; then fail "disable left managed block"; fi
+[ "$(sha256_file "$PRELAUNCH/sudo.conf")" = "$outside_hash" ] || fail "disable changed bytes outside block"
 if run_installer "$PRELAUNCH" --prelaunch-status >/dev/null 2>&1; then fail "disabled status returned success"; fi
 
-ROLLBACK="$TEST_ROOT/rollback"; mkdir -p "$ROLLBACK"; printf 'original\n' > "$ROLLBACK/sudo.conf"; before="$(sha256sum "$ROLLBACK/sudo.conf")"
+ROLLBACK="$TEST_ROOT/rollback"; mkdir -p "$ROLLBACK"; printf 'original\n' > "$ROLLBACK/sudo.conf"; before="$(sha256_file "$ROLLBACK/sudo.conf")"
 if FAIL_SUDO=1 run_installer "$ROLLBACK" --prelaunch >"$ROLLBACK/log" 2>&1; then fail "accepted sudo validation failure"; fi
-[ "$(sha256sum "$ROLLBACK/sudo.conf")" = "$before" ] || fail "rollback did not restore sudo.conf"
+[ "$(sha256_file "$ROLLBACK/sudo.conf")" = "$before" ] || fail "rollback did not restore sudo.conf"
 
 UNSAFE="$TEST_ROOT/unsafe"; mkdir -p "$UNSAFE"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE/sudo.conf"
 if run_installer "$UNSAFE" --prelaunch >"$UNSAFE/log" 2>&1; then fail "accepted symlink sudo.conf"; fi
@@ -90,13 +223,13 @@ if run_installer "$UNSAFE" --prelaunch >"$UNSAFE/log" 2>&1; then fail "accepted 
 UNSAFE_STATE="$TEST_ROOT/unsafe-state"; mkdir -p "$UNSAFE_STATE/state"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE_STATE/state/devices.json"
 if run_installer "$UNSAFE_STATE" --prelaunch >"$UNSAFE_STATE/log" 2>&1; then fail "accepted symlink devices.json"; fi
 
-BAD_BLOCK="$TEST_ROOT/bad-block"; mkdir -p "$BAD_BLOCK"; printf '# END management-plane sudo approve\n# BEGIN management-plane sudo approve\n' > "$BAD_BLOCK/sudo.conf"
+BAD_BLOCK="$TEST_ROOT/bad-block"; mkdir -p "$BAD_BLOCK"; printf '# END sudo approve\n# BEGIN sudo approve\n' > "$BAD_BLOCK/sudo.conf"
 if run_installer "$BAD_BLOCK" --prelaunch >"$BAD_BLOCK/log" 2>&1; then fail "accepted reversed managed block"; fi
-[ ! -e "$BAD_BLOCK/sbin/management-plane-sudo-approve" ] || fail "installed binaries before rejecting malformed block"
+[ ! -e "$BAD_BLOCK/sbin/sudo-approve" ] || fail "installed binaries before rejecting malformed block"
 
 cp "$TEST_ROOT/service/target/release/SHA256SUMS" "$TEST_ROOT/service/target/release/SHA256SUMS.good"
 printf '0%.0s' {1..64} > "$TEST_ROOT/service/target/release/SHA256SUMS"
-printf '  management-plane-sudo-approve\n' >> "$TEST_ROOT/service/target/release/SHA256SUMS"
+printf '  sudo-approve\n' >> "$TEST_ROOT/service/target/release/SHA256SUMS"
 if run_installer "$TEST_ROOT/bad-checksum" --prelaunch >"$TEST_ROOT/bad-checksum.log" 2>&1; then fail "accepted checksum mismatch"; fi
 mv "$TEST_ROOT/service/target/release/SHA256SUMS.good" "$TEST_ROOT/service/target/release/SHA256SUMS"
 

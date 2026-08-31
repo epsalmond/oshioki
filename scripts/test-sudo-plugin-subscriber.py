@@ -30,6 +30,8 @@ SHARE = os.environ["SHARE_DIR"]
 NATS_HOST = os.environ["NATS_HOST"]
 NATS_PORT = int(os.environ["NATS_PORT"])
 TIMEOUT = int(os.environ.get("TIMEOUT", "120"))
+ORIGIN = os.environ.get("SUDO_APPROVE_ORIGIN", "https://sudo.test")
+RP_ID = os.environ.get("SUDO_APPROVE_RP_ID", "sudo.test")
 
 
 def b64url(data: bytes) -> str:
@@ -177,7 +179,7 @@ while time.time() < deadline:
     buf += chunk
 
 if payload is None:
-    print("subscriber: timeout — no sudo.request MSG arrived", file=sys.stderr)
+    print("subscriber: timeout waiting for sudo.request MSG", file=sys.stderr)
     sys.exit(1)
 
 # --- Phase 3: unseal and emit ---
@@ -212,13 +214,14 @@ client_data_json = json.dumps(
     {
         "type": "webauthn.get",
         "challenge": challenge,
-        "origin": "https://sudo.internal.psalmond.com",
+        "origin": ORIGIN,
+        "crossOrigin": False,
     },
     separators=(",", ":"),
 )
 
 rp_id_digest = hashes.Hash(hashes.SHA256())
-rp_id_digest.update(b"sudo.internal.psalmond.com")
+rp_id_digest.update(RP_ID.encode())
 authenticator_data = rp_id_digest.finalize() + b"\x05\x00\x00\x00\x01"
 client_data_digest = hashes.Hash(hashes.SHA256())
 client_data_digest.update(client_data_json.encode())
@@ -242,6 +245,11 @@ verdict_subject = f"sudo.verdict.{request['request_id']}"
 sock.sendall(
     f"PUB {verdict_subject} {len(verdict)}\r\n".encode() + verdict + b"\r\n"
 )
+sock.sendall(b"PING\r\n")
+while True:
+    line = sock.recv(65535)
+    if b"PONG\r\n" in line:
+        break
 print(f"subscriber: published immediate verdict for id={request['request_id']}", file=sys.stderr)
 
 approved = json.dumps(
@@ -254,5 +262,5 @@ approved = json.dumps(
     }
 ).encode()
 atomic_write(f"{SHARE}/approved_request.json", approved)
-print(f"subscriber: unsealed payload written for command={request['command']}", file=sys.stderr)
+print("subscriber: unsealed payload written", file=sys.stderr)
 sys.exit(0)
