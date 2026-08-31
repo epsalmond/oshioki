@@ -309,6 +309,7 @@ run_sudo() {
     NATS_PASS="${NATS_PASS:-test}" \
     SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
     SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
+    SUDO_APPROVE_CONFIG_DIR=/etc/sudo-approve \
       bash -x "$INNER_SCRIPT" >"$SHARE/sudo-run.log" 2>&1
   else
     run_docker run --name "$SUDO_NAME" --network "$NETWORK_NAME" \
@@ -317,6 +318,7 @@ run_sudo() {
       -e NATS_PASS="${NATS_PASS:-test}" \
       -e SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
       -e SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
+      -e SUDO_APPROVE_CONFIG_DIR=/etc/sudo-approve \
       -v "$SHARE":/share \
       -v "$WORKSPACE":/sudo-approve \
       -w /sudo-approve \
