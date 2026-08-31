@@ -8,11 +8,16 @@ fail() { echo "test-install-sudo-hook: $*" >&2; exit 1; }
 
 mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/service/scripts" "$TEST_ROOT/service/target/release"
 cp "$SCRIPT_DIR/install-sudo-hook" "$TEST_ROOT/service/scripts/"
-cp /bin/true "$TEST_ROOT/service/target/release/sudo-approve"
-cp /bin/true "$TEST_ROOT/service/target/release/libplugin.so"
+case "$(uname -s)" in
+  Darwin) BUILD_PLUGIN=libplugin.dylib ;;
+  Linux) BUILD_PLUGIN=libplugin.so ;;
+  *) fail "unsupported test operating system" ;;
+esac
+cp /usr/bin/true "$TEST_ROOT/service/target/release/sudo-approve"
+cp /usr/bin/true "$TEST_ROOT/service/target/release/$BUILD_PLUGIN"
 (
   cd "$TEST_ROOT/service/target/release"
-  sha256sum sudo-approve libplugin.so > SHA256SUMS
+  sha256sum sudo-approve "$BUILD_PLUGIN" > SHA256SUMS
 )
 
 for wrapper in id chown install sudo file; do
@@ -39,7 +44,13 @@ exit 0
 SH
 cat > "$TEST_ROOT/fake-bin/file" <<'SH'
 #!/usr/bin/env bash
-[ "${FAKE_FILE_MISMATCH:-0}" = 1 ] && { echo 'Mach-O arm64'; exit 0; }
+[ "${FAKE_FILE_MISMATCH:-0}" = 1 ] && {
+  case "$(uname -m)" in
+    arm64|aarch64) echo 'ELF 64-bit x86-64' ;;
+    *) echo 'Mach-O arm64' ;;
+  esac
+  exit 0
+}
 exec /usr/bin/file "$@"
 SH
 chmod 0755 "$TEST_ROOT/fake-bin"/* "$TEST_ROOT/service/scripts/install-sudo-hook"
