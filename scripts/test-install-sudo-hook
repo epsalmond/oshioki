@@ -5,6 +5,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TEST_ROOT="$(mktemp -d -t sudo-hook-install-test.XXXXXX)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 fail() { echo "test-install-sudo-hook: $*" >&2; exit 1; }
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
 
 mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/service/scripts" "$TEST_ROOT/service/target/release"
 cp "$SCRIPT_DIR/install-sudo-hook" "$TEST_ROOT/service/scripts/"
@@ -17,7 +31,8 @@ cp /usr/bin/true "$TEST_ROOT/service/target/release/sudo-approve"
 cp /usr/bin/true "$TEST_ROOT/service/target/release/$BUILD_PLUGIN"
 (
   cd "$TEST_ROOT/service/target/release"
-  sha256sum sudo-approve "$BUILD_PLUGIN" > SHA256SUMS
+  printf '%s  sudo-approve\n' "$(sha256_file sudo-approve)" > SHA256SUMS
+  printf '%s  %s\n' "$(sha256_file "$BUILD_PLUGIN")" "$BUILD_PLUGIN" >> SHA256SUMS
 )
 
 for wrapper in id chown install sudo file; do
@@ -73,10 +88,10 @@ PRELAUNCH="$TEST_ROOT/prelaunch"; mkdir -p "$PRELAUNCH/sudoers.d" "$PRELAUNCH/st
 printf 'outside-before\n' > "$PRELAUNCH/sudo.conf"
 printf 'legacy\n' > "$PRELAUNCH/sudoers.d/management-plane-sudo-approve"
 printf '{"version":1,"devices":[{"sentinel":true}]}\n' > "$PRELAUNCH/state/devices.json"
-devices_hash="$(sha256sum "$PRELAUNCH/state/devices.json")"
+devices_hash="$(sha256_file "$PRELAUNCH/state/devices.json")"
 run_installer "$PRELAUNCH" --prelaunch
 [ ! -e "$PRELAUNCH/sudoers.d/management-plane-sudo-approve" ] || fail "legacy policy survived"
-[ "$(sha256sum "$PRELAUNCH/state/devices.json")" = "$devices_hash" ] || fail "existing device state changed"
+[ "$(sha256_file "$PRELAUNCH/state/devices.json")" = "$devices_hash" ] || fail "existing device state changed"
 [ "$(grep -c '^# BEGIN sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "managed block duplicated"
 run_installer "$PRELAUNCH" --prelaunch
 [ "$(grep -c '^# BEGIN sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "rerun duplicated block"
@@ -87,15 +102,15 @@ dry_output="$(NATS_PASS="$dry_secret" run_installer "$PRELAUNCH" --prelaunch --d
 grep -Fq '<redacted>' <<<"$dry_output" || fail "dry run omitted redaction"
 if grep -Fq "$dry_secret" <<<"$dry_output"; then fail "dry run disclosed NATS password"; fi
 
-outside_hash="$(printf 'outside-before\n' | sha256sum | awk '{print $1}')"
+outside_hash="$(printf 'outside-before\n' | sha256_stream)"
 run_installer "$PRELAUNCH" --disable-prelaunch
 if grep -Fq '# BEGIN sudo approve' "$PRELAUNCH/sudo.conf"; then fail "disable left managed block"; fi
-[ "$(sha256sum "$PRELAUNCH/sudo.conf" | awk '{print $1}')" = "$outside_hash" ] || fail "disable changed bytes outside block"
+[ "$(sha256_file "$PRELAUNCH/sudo.conf")" = "$outside_hash" ] || fail "disable changed bytes outside block"
 if run_installer "$PRELAUNCH" --prelaunch-status >/dev/null 2>&1; then fail "disabled status returned success"; fi
 
-ROLLBACK="$TEST_ROOT/rollback"; mkdir -p "$ROLLBACK"; printf 'original\n' > "$ROLLBACK/sudo.conf"; before="$(sha256sum "$ROLLBACK/sudo.conf")"
+ROLLBACK="$TEST_ROOT/rollback"; mkdir -p "$ROLLBACK"; printf 'original\n' > "$ROLLBACK/sudo.conf"; before="$(sha256_file "$ROLLBACK/sudo.conf")"
 if FAIL_SUDO=1 run_installer "$ROLLBACK" --prelaunch >"$ROLLBACK/log" 2>&1; then fail "accepted sudo validation failure"; fi
-[ "$(sha256sum "$ROLLBACK/sudo.conf")" = "$before" ] || fail "rollback did not restore sudo.conf"
+[ "$(sha256_file "$ROLLBACK/sudo.conf")" = "$before" ] || fail "rollback did not restore sudo.conf"
 
 UNSAFE="$TEST_ROOT/unsafe"; mkdir -p "$UNSAFE"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE/sudo.conf"
 if run_installer "$UNSAFE" --prelaunch >"$UNSAFE/log" 2>&1; then fail "accepted symlink sudo.conf"; fi
