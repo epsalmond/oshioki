@@ -139,8 +139,11 @@ fn spawn_workers(state: &AppState) {
     });
     let enrollment_state = state.clone();
     tokio::spawn(async move {
-        if let Err(error) = enrollment_consumer(enrollment_state).await {
-            error!(%error, "enrollment consumer stopped");
+        loop {
+            if let Err(error) = enrollment_consumer(enrollment_state.clone()).await {
+                error!(%error, "enrollment consumer stopped");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
     });
     let outbox_state = state.clone();
@@ -244,17 +247,31 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
     loop {
         tokio::select! {
             Some(message) = intents.next() => match serde_json::from_slice::<EnrollmentIntentV1>(&message.payload) {
-                Ok(intent) => { let hash = protocol::decode_base64url(&intent.secret_hash)?;
-                    if let InsertResult::Conflict = state.store.create_enrollment(&intent.enrollment_id, &hash, intent.expires_at, &intent.reply_subject)? { warn!(enrollment_id=%intent.enrollment_id, "conflicting enrollment intent"); } }
+                Ok(intent) => {
+                    let outcome = (|| -> Result<()> {
+                        intent.validate()?;
+                        let hash = protocol::decode_base64url(&intent.secret_hash)?;
+                        if let InsertResult::Conflict = state.store.create_enrollment(&intent.enrollment_id, &hash, intent.expires_at, &intent.reply_subject)? { warn!(enrollment_id=%intent.enrollment_id, "conflicting enrollment intent"); }
+                        Ok(())
+                    })();
+                    if let Err(error) = outcome { warn!(%error, "invalid enrollment intent"); }
+                }
                 Err(error) => warn!(%error, "invalid enrollment intent"),
             },
             Some(message) = activations.next() => match serde_json::from_slice::<ActivationV1>(&message.payload) {
-                Ok(activation) => state.store.activate_enrollment(&activation.enrollment_id, &activation.device)?,
+                Ok(activation) if activation.version == 1 && !activation.enrollment_id.is_empty() => {
+                    if let Err(error) = state.store.activate_enrollment(&activation.enrollment_id, &activation.device) { warn!(%error, "invalid enrollment activation"); }
+                },
+                Ok(_) => warn!("invalid enrollment activation"),
                 Err(error) => warn!(%error, "invalid enrollment activation"),
             },
             Some(message) = revocations.next() => {
                 if let Some(fingerprint) = message.subject.strip_prefix("sudo.device.revoke.") {
-                    if !state.store.set_device_active(fingerprint, false)? { warn!(%fingerprint, "revocation named unknown device"); }
+                    match state.store.set_device_active(fingerprint, false) {
+                        Ok(false) => warn!(%fingerprint, "revocation named unknown device"),
+                        Err(error) => { warn!(%error, %fingerprint, "revocation persistence failed"); continue; }
+                        Ok(true) => {}
+                    }
                     state.nats.publish(format!("sudo.device.revoked.{fingerprint}"), Vec::new().into()).await?;
                     state.nats.flush().await?;
                 }
@@ -458,6 +475,9 @@ async fn submit_enrollment(
     if submission.enrollment_id != id {
         return Err(ApiError(StatusCode::CONFLICT));
     }
+    submission
+        .validate_shape()
+        .map_err(|_| ApiError(StatusCode::CONFLICT))?;
     match state.store.submit_enrollment(&id, &submission, now()) {
         Ok(InsertResult::Inserted | InsertResult::Identical) => Ok(StatusCode::ACCEPTED),
         Ok(InsertResult::Conflict) => Err(ApiError(StatusCode::CONFLICT)),
@@ -514,7 +534,16 @@ async fn dist_file(
     {
         return Err(ApiError(StatusCode::NOT_FOUND));
     }
-    let bytes = tokio::fs::read(state.dist_root.join(&path))
+    let root = tokio::fs::canonicalize(state.dist_root.as_ref())
+        .await
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND))?;
+    let file = tokio::fs::canonicalize(root.join(&path))
+        .await
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND))?;
+    if !file.starts_with(&root) {
+        return Err(ApiError(StatusCode::NOT_FOUND));
+    }
+    let bytes = tokio::fs::read(file)
         .await
         .map_err(|_| ApiError(StatusCode::NOT_FOUND))?;
     Ok(asset(
@@ -561,7 +590,12 @@ fn asset(content_type: &str, body: &[u8], immutable: bool) -> Response {
     response
 }
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
+    let is_api = request.uri().path().starts_with("/api/");
     let mut response = next.run(request).await;
+    if is_api && response.status().is_client_error() {
+        let status = response.status();
+        response = (status, Json(json!({"error": "request rejected"}))).into_response();
+    }
     let headers = response.headers_mut();
     if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

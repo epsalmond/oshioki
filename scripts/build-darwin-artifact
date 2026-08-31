@@ -3,6 +3,7 @@ set -euo pipefail
 
 OUTPUT="${1:-}"
 [ -n "$OUTPUT" ] || { echo "usage: build-darwin-artifact OUTPUT_DIR" >&2; exit 2; }
+case "$OUTPUT" in /*) ;; *) OUTPUT="$(pwd -P)/$OUTPUT" ;; esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 REVISION="$(git -C "$ROOT" rev-parse HEAD)"
 TARGET="aarch64-apple-darwin"

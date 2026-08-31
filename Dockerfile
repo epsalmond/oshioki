@@ -19,6 +19,7 @@ COPY --from=builder /build/target/release/management-plane-sudo-approve-server /
 COPY --from=builder /build/target/release/management-plane-sudo-approve /opt/sudo-approve/bin/
 COPY --from=builder /build/target/release/libplugin.so /opt/sudo-approve/libexec/sudo/approval_exec.so
 COPY --from=builder /build/target/release/SHA256SUMS /opt/sudo-approve/
+COPY --from=builder /etc/ssl/certs/ /etc/ssl/certs/
 USER sudo-approve
 ENV SUDO_APPROVE_STATE_PATH=/var/lib/sudo-approve/state.sqlite3 \
     SUDO_APPROVE_DARWIN_DIST=/opt/sudo-approve/dist/v1/darwin-arm64 \
