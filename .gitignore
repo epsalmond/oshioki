@@ -1,8 +1,10 @@
 # Build artifacts
 target/
 dist/
-Dockerfile.publish
 server/web/node_modules/
+.dev-session
+server/web/test-results/
+server/web/playwright-report/
 
 # Lockfile for binaries — commit this
 # Cargo.lock

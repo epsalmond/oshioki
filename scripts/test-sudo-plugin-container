@@ -3,9 +3,8 @@
 # approval-plugin payload-binding contract.
 #
 # Local mode creates a private Docker network containing NATS, the subscriber,
-# and the sudo test container. Woodpecker sets SUDO_APPROVE_E2E_IN_CONTAINER=1;
-# its step is already the test container and reaches the pipeline NATS service
-# by DNS name.
+# and the sudo test container. Compose sets SUDO_APPROVE_E2E_IN_CONTAINER=1;
+# its runner already reaches the project NATS service by DNS name.
 #
 # Usage: test-sudo-plugin-container
 set -euo pipefail
@@ -76,11 +75,13 @@ trap cleanup EXIT
 echo "* workspace: $WORKSPACE"
 echo "* share:     $SHARE"
 
-# A normal local run rebuilds immediately before exercising sudo. Woodpecker
-# may skip this duplicate build only with the commit receipt written by its
+# A normal local run rebuilds immediately before exercising sudo. A caller may
+# skip this duplicate build only with the commit receipt written by its
 # prerequisite build step and a clean service checkout.
 BUILD_RECEIPT="$WORKSPACE/target/release/.sudo-approve-e2e-commit"
-if [ "$SKIP_BUILD" = "1" ]; then
+if [ "$SKIP_BUILD" = "1" ] && [ "${SUDO_APPROVE_E2E_PREBUILT:-0}" = "1" ]; then
+  echo "* release:   using image-built E2E artifacts"
+elif [ "$SKIP_BUILD" = "1" ]; then
   EXPECTED_COMMIT="$(git -C "$WORKSPACE" rev-parse HEAD)"
   [ -f "$BUILD_RECEIPT" ] || {
     echo "missing E2E build receipt: $BUILD_RECEIPT" >&2
@@ -101,7 +102,7 @@ else
   git -C "$WORKSPACE" rev-parse HEAD >"$BUILD_RECEIPT"
 fi
 
-for artifact in "$WORKSPACE/target/release/management-plane-sudo-approve" \
+for artifact in "$WORKSPACE/target/release/sudo-approve" \
                 "$WORKSPACE/target/release/libplugin.so"; do
   [ -f "$artifact" ] || {
     echo "missing build artifact after release build: $artifact" >&2
@@ -110,7 +111,7 @@ for artifact in "$WORKSPACE/target/release/management-plane-sudo-approve" \
 done
 (
   cd "$WORKSPACE/target/release"
-  sha256sum management-plane-sudo-approve libplugin.so > SHA256SUMS
+  sha256sum sudo-approve libplugin.so > SHA256SUMS
 )
 
 NATS_HOST_VALUE=""
@@ -228,7 +229,7 @@ if [ "$IN_CONTAINER" = "1" ]; then
   INNER_SERVICE_DIR="$WORKSPACE"
   INNER_SHARE_DIR="$SHARE"
 else
-  INNER_SERVICE_DIR=/services/sudo-approve
+  INNER_SERVICE_DIR=/sudo-approve
   INNER_SHARE_DIR=/share
 fi
 
@@ -255,7 +256,7 @@ fi
 "$SERVICE_DIR/scripts/install-sudo-hook" --standalone-e2e
 echo "[inner] install-sudo-hook OK"
 
-cp "$SHARE_DIR/devices.json" /etc/management-plane/sudo-approve/devices.json
+cp "$SHARE_DIR/devices.json" /etc/sudo-approve/devices.json
 echo "[inner] devices.json planted"
 
 cleanup_e2e_sudoers() {
@@ -307,8 +308,8 @@ run_sudo() {
       -e NATS_USER="${NATS_USER:-sudo-approve}" \
       -e NATS_PASS="${NATS_PASS:-test}" \
       -v "$SHARE":/share \
-      -v "$WORKSPACE":/services/sudo-approve \
-      -w /services/sudo-approve \
+      -v "$WORKSPACE":/sudo-approve \
+      -w /sudo-approve \
       "$IMAGE" \
       bash -x /share/sudo-inner.sh \
       >"$SHARE/sudo-run.log" 2>&1

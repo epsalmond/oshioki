@@ -21,15 +21,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SERVICE_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 SUDO_CONF="${SUDO_CONF:-/etc/sudo.conf}"
 SBIN_DIR="${SBIN_DIR:-/usr/local/sbin}"
-STATE_DIR="${SUDO_APPROVE_STATE_DIR:-/etc/management-plane/sudo-approve}"
+STATE_DIR="${SUDO_APPROVE_STATE_DIR:-/etc/sudo-approve}"
 SUDOERS_D="${SUDOERS_D:-/etc/sudoers.d}"
-ORIGIN="${SUDO_APPROVE_ORIGIN:-https://sudo.internal.psalmond.com}"
-RP_ID="${SUDO_APPROVE_RP_ID:-sudo.internal.psalmond.com}"
-NATS_URL="${NATS_URL:-nats://nats.internal.psalmond.com:4222}"
+ORIGIN="${SUDO_APPROVE_ORIGIN:-}"
+RP_ID="${SUDO_APPROVE_RP_ID:-}"
+NATS_URL="${NATS_URL:-}"
 NATS_USER="${NATS_USER:-sudo-approve}"
 NATS_PASS="${NATS_PASS:-}"
-BEGIN_MARK='# BEGIN management-plane sudo approve'
-END_MARK='# END management-plane sudo approve'
+BEGIN_MARK='# BEGIN sudo approve'
+END_MARK='# END sudo approve'
 LOCK_DIR="${SUDO_APPROVE_INSTALL_LOCK:-${STATE_DIR}.install.lock}"
 
 case "$(uname -s)" in
@@ -37,7 +37,7 @@ case "$(uname -s)" in
   Darwin) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=approval_exec.dylib; BUILD_PLUGIN=libplugin.dylib ;;
   *) echo "install-sudo-hook: unsupported operating system" >&2; exit 1 ;;
 esac
-HOOK_BIN="$SERVICE_DIR/target/release/management-plane-sudo-approve"
+HOOK_BIN="$SERVICE_DIR/target/release/sudo-approve"
 PLUGIN_BIN="$SERVICE_DIR/target/release/$BUILD_PLUGIN"
 PLUGIN_DEST="$PLUGIN_DIR/$PLUGIN_NAME"
 
@@ -57,7 +57,7 @@ fi
 
 [ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || die "must run as root"
 safe_directory "$(dirname "$STATE_DIR")"; safe_directory "$STATE_DIR"; regular_or_absent "$SUDO_CONF"
-safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/management-plane-sudo-approve"; regular_or_absent "$PLUGIN_DEST"
+safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/sudo-approve"; regular_or_absent "$PLUGIN_DEST"
 regular_or_absent "$STATE_DIR/config.env"; regular_or_absent "$STATE_DIR/hook.json"; regular_or_absent "$STATE_DIR/devices.json"
 
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -106,7 +106,16 @@ if [ "$MODE" = disable-prelaunch ]; then
   rm -f "$backup"; echo "install-sudo-hook: prelaunch disabled and sudo validated"; exit 0
 fi
 
-for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do [ -f "$artifact" ] && [ ! -L "$artifact" ] || die "missing or unsafe build artifact: $artifact"; done
+[ -n "$ORIGIN" ] || die "SUDO_APPROVE_ORIGIN is required"
+[ -n "$RP_ID" ] || die "SUDO_APPROVE_RP_ID is required"
+[ -n "$NATS_URL" ] || die "NATS_URL is required"
+[ -n "$NATS_PASS" ] || die "NATS_PASS is required"
+
+for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do
+  if [ ! -f "$artifact" ] || [ -L "$artifact" ]; then
+    die "missing or unsafe build artifact: $artifact"
+  fi
+done
 architecture="$(uname -m)"; file_output="$(file -b "$HOOK_BIN") $(file -b "$PLUGIN_BIN")"
 case "$architecture" in
   x86_64|amd64) grep -Eqi 'x86[-_ ]?64|x86_64' <<<"$file_output" || die "artifact architecture does not match $architecture" ;;
@@ -115,7 +124,9 @@ case "$architecture" in
 esac
 
 CHECKSUMS="${SUDO_APPROVE_CHECKSUMS:-$SERVICE_DIR/target/release/SHA256SUMS}"
-[ -f "$CHECKSUMS" ] && [ ! -L "$CHECKSUMS" ] || die "missing artifact checksum manifest: $CHECKSUMS"
+if [ ! -f "$CHECKSUMS" ] || [ -L "$CHECKSUMS" ]; then
+  die "missing artifact checksum manifest: $CHECKSUMS"
+fi
 for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do
   name="$(basename "$artifact")"; expected="$(awk -v name="$name" '$2 == name {print $1}' "$CHECKSUMS")"
   [ "${#expected}" -eq 64 ] || die "checksum manifest has no exact entry for $name"
@@ -123,7 +134,7 @@ for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do
 done
 
 run install -d -m 0755 "$SBIN_DIR" "$PLUGIN_DIR"
-run install -m 0755 -o root -g root "$HOOK_BIN" "$SBIN_DIR/management-plane-sudo-approve"
+run install -m 0755 -o root -g root "$HOOK_BIN" "$SBIN_DIR/sudo-approve"
 run install -m 0755 -o root -g root "$PLUGIN_BIN" "$PLUGIN_DEST"
 run install -d -m 0750 -o root -g root "$STATE_DIR"
 

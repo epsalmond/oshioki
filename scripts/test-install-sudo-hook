@@ -8,11 +8,11 @@ fail() { echo "test-install-sudo-hook: $*" >&2; exit 1; }
 
 mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/service/scripts" "$TEST_ROOT/service/target/release"
 cp "$SCRIPT_DIR/install-sudo-hook" "$TEST_ROOT/service/scripts/"
-cp /bin/true "$TEST_ROOT/service/target/release/management-plane-sudo-approve"
+cp /bin/true "$TEST_ROOT/service/target/release/sudo-approve"
 cp /bin/true "$TEST_ROOT/service/target/release/libplugin.so"
 (
   cd "$TEST_ROOT/service/target/release"
-  sha256sum management-plane-sudo-approve libplugin.so > SHA256SUMS
+  sha256sum sudo-approve libplugin.so > SHA256SUMS
 )
 
 for wrapper in id chown install sudo file; do
@@ -50,6 +50,8 @@ run_installer() {
   mkdir -p "$root"
   PATH="$TEST_PATH" SUDO_CONF="$root/sudo.conf" SUDO_PLUGIN_DIR="$root/plugin" SBIN_DIR="$root/sbin" \
     SUDOERS_D="$root/sudoers.d" SUDO_APPROVE_STATE_DIR="$root/state" \
+    SUDO_APPROVE_ORIGIN="https://sudo.test" SUDO_APPROVE_RP_ID="sudo.test" \
+    NATS_URL="nats://nats.test:4222" NATS_PASS="${NATS_PASS:-test-only}" \
     "$TEST_ROOT/service/scripts/install-sudo-hook" "$@"
 }
 
@@ -64,9 +66,9 @@ devices_hash="$(sha256sum "$PRELAUNCH/state/devices.json")"
 run_installer "$PRELAUNCH" --prelaunch
 [ ! -e "$PRELAUNCH/sudoers.d/management-plane-sudo-approve" ] || fail "legacy policy survived"
 [ "$(sha256sum "$PRELAUNCH/state/devices.json")" = "$devices_hash" ] || fail "existing device state changed"
-[ "$(grep -c '^# BEGIN management-plane sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "managed block duplicated"
+[ "$(grep -c '^# BEGIN sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "managed block duplicated"
 run_installer "$PRELAUNCH" --prelaunch
-[ "$(grep -c '^# BEGIN management-plane sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "rerun duplicated block"
+[ "$(grep -c '^# BEGIN sudo approve$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "rerun duplicated block"
 run_installer "$PRELAUNCH" --prelaunch-status | grep -Fq enabled || fail "status did not report enabled"
 
 dry_secret='recognizable-dry-run-secret'
@@ -76,7 +78,7 @@ if grep -Fq "$dry_secret" <<<"$dry_output"; then fail "dry run disclosed NATS pa
 
 outside_hash="$(printf 'outside-before\n' | sha256sum | awk '{print $1}')"
 run_installer "$PRELAUNCH" --disable-prelaunch
-if grep -Fq '# BEGIN management-plane sudo approve' "$PRELAUNCH/sudo.conf"; then fail "disable left managed block"; fi
+if grep -Fq '# BEGIN sudo approve' "$PRELAUNCH/sudo.conf"; then fail "disable left managed block"; fi
 [ "$(sha256sum "$PRELAUNCH/sudo.conf" | awk '{print $1}')" = "$outside_hash" ] || fail "disable changed bytes outside block"
 if run_installer "$PRELAUNCH" --prelaunch-status >/dev/null 2>&1; then fail "disabled status returned success"; fi
 
@@ -90,13 +92,13 @@ if run_installer "$UNSAFE" --prelaunch >"$UNSAFE/log" 2>&1; then fail "accepted 
 UNSAFE_STATE="$TEST_ROOT/unsafe-state"; mkdir -p "$UNSAFE_STATE/state"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE_STATE/state/devices.json"
 if run_installer "$UNSAFE_STATE" --prelaunch >"$UNSAFE_STATE/log" 2>&1; then fail "accepted symlink devices.json"; fi
 
-BAD_BLOCK="$TEST_ROOT/bad-block"; mkdir -p "$BAD_BLOCK"; printf '# END management-plane sudo approve\n# BEGIN management-plane sudo approve\n' > "$BAD_BLOCK/sudo.conf"
+BAD_BLOCK="$TEST_ROOT/bad-block"; mkdir -p "$BAD_BLOCK"; printf '# END sudo approve\n# BEGIN sudo approve\n' > "$BAD_BLOCK/sudo.conf"
 if run_installer "$BAD_BLOCK" --prelaunch >"$BAD_BLOCK/log" 2>&1; then fail "accepted reversed managed block"; fi
-[ ! -e "$BAD_BLOCK/sbin/management-plane-sudo-approve" ] || fail "installed binaries before rejecting malformed block"
+[ ! -e "$BAD_BLOCK/sbin/sudo-approve" ] || fail "installed binaries before rejecting malformed block"
 
 cp "$TEST_ROOT/service/target/release/SHA256SUMS" "$TEST_ROOT/service/target/release/SHA256SUMS.good"
 printf '0%.0s' {1..64} > "$TEST_ROOT/service/target/release/SHA256SUMS"
-printf '  management-plane-sudo-approve\n' >> "$TEST_ROOT/service/target/release/SHA256SUMS"
+printf '  sudo-approve\n' >> "$TEST_ROOT/service/target/release/SHA256SUMS"
 if run_installer "$TEST_ROOT/bad-checksum" --prelaunch >"$TEST_ROOT/bad-checksum.log" 2>&1; then fail "accepted checksum mismatch"; fi
 mv "$TEST_ROOT/service/target/release/SHA256SUMS.good" "$TEST_ROOT/service/target/release/SHA256SUMS"
 

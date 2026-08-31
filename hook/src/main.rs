@@ -25,12 +25,12 @@ use protocol::{
     verify_approval_v1, verify_enrollment_v1,
 };
 
-const DEFAULT_CONFIG_DIR: &str = "/etc/management-plane/sudo-approve";
+const DEFAULT_CONFIG_DIR: &str = "/etc/sudo-approve";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Parser)]
-#[command(name = "management-plane-sudo-approve", about = "sudo approval hook")]
+#[command(name = "sudo-approve", about = "sudo approval hook")]
 struct Cli {
     #[command(subcommand)]
     verb: Verb,
@@ -66,11 +66,8 @@ struct EnrollmentStateV1 {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive(
-                "management_plane_sudo_approve=info"
-                    .parse()
-                    .expect("valid directive"),
-            ),
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("sudo_approve=info".parse().expect("valid directive")),
         )
         .with_writer(io::stdout)
         .init();

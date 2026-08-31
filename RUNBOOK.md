@@ -1,80 +1,78 @@
-# Sudo approval runbook
+# Sudo approve runbook
 
-This service is prelaunch software. Issue #867 builds and tests the protocol,
-hook, browser, server, installer, and artifacts. It does not activate a
-production service or permanent sudo plugin.
+The current workflow is local and prelaunch. It does not activate a production
+service or a permanent sudo plugin.
 
 ## Build and test
 
 ```bash
-cd services/sudo-approve
-cargo fmt -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --release
-./scripts/test-install-sudo-hook
-./scripts/test-sudo-plugin-container
+scripts/dev build
+scripts/dev test --quick
+scripts/dev test --browser
+scripts/dev test
 ```
 
-The installer requires `target/release/SHA256SUMS`. Create it after a local
-release build:
+The full test creates fresh NATS and SQLite state. It runs browser enrollment
+and approval with two isolated Chromium profiles. It then installs the hook and
+plugin inside the E2E container and invokes real sudo. Failed runs retain their
+state path and scrubbed Compose logs.
+
+The installer requires `target/release/SHA256SUMS`. Create it after a release
+build:
 
 ```bash
-cd services/sudo-approve/target/release
-sha256sum management-plane-sudo-approve libplugin.so > SHA256SUMS
+cd target/release
+sha256sum sudo-approve libplugin.so > SHA256SUMS
 ```
 
-## Temporary acceptance setup
-
-Keep a second root shell open during acceptance. Snapshot Tailscale Serve
-before changing it. Use a disposable NATS JetStream stream and SQLite file.
-The hook and server must use the exact temporary HTTPS origin and RP ID.
-
-Run the installer only after its dry run:
+## Retained development state
 
 ```bash
-services/sudo-approve/scripts/install-sudo-hook --prelaunch --dry-run
-sudo services/sudo-approve/scripts/install-sudo-hook --prelaunch
-sudo services/sudo-approve/scripts/install-sudo-hook --prelaunch-status
+scripts/dev up --state-dir ./tmp/dev-state
+scripts/dev status
+scripts/dev down
 ```
 
-`--prelaunch` installs and enables the plugin. It preserves an existing
-`devices.json`. The Linux plugin path is
+The development server uses the local test origin only when the caller supplies
+matching configuration. Production origin, RP ID, NATS credentials, storage,
+and routing are consumer-owned settings.
+
+## Prelaunch installer
+
+Keep a second root shell open during supervised acceptance. Run the dry run
+before installation:
+
+```bash
+scripts/install-sudo-hook --prelaunch --dry-run
+sudo scripts/install-sudo-hook --prelaunch
+sudo scripts/install-sudo-hook --prelaunch-status
+```
+
+The installer requires `SUDO_APPROVE_ORIGIN`, `SUDO_APPROVE_RP_ID`, `NATS_URL`,
+and `NATS_PASS`. `--prelaunch` preserves an existing `devices.json`. Linux uses
 `/usr/local/libexec/sudo/approval_exec.so`. Darwin uses
 `approval_exec.dylib` in the same directory.
 
-## Enroll and manage devices
-
-Each browser profile enrolls separately. The URL fragment contains the
-five-minute enrollment secret and never reaches the server.
+Each browser profile enrolls separately:
 
 ```bash
-management-plane-sudo-approve enroll
-management-plane-sudo-approve enroll --resume <enrollment-id>
-management-plane-sudo-approve status
-management-plane-sudo-approve revoke <fingerprint>
-management-plane-sudo-approve pin <fingerprint>
+sudo-approve enroll
+sudo-approve enroll --resume <enrollment-id>
+sudo-approve status
+sudo-approve revoke <fingerprint>
+sudo-approve pin <fingerprint>
 ```
-
-`pin` fetches one active public record. It recomputes the full-record
-fingerprint and requires the full fingerprint as operator confirmation.
 
 `test` publishes a synthetic request and waits for approve or deny. `watch`
 opens each request URL on Darwin without a shell.
 
-## Disable and restore
-
-Disable the managed block before stopping the temporary stack:
+Disable the managed block before stopping a supervised stack:
 
 ```bash
-sudo services/sudo-approve/scripts/install-sudo-hook --disable-prelaunch
+sudo scripts/install-sudo-hook --disable-prelaunch
 sudo -V
 ```
 
-Restore the saved Tailscale Serve configuration. Stop the disposable NATS and
-server processes. Confirm ordinary sudo behavior. The installer restores the
-prior `sudo.conf` automatically if `sudo -V` fails.
-
-Issue #868 owns production NATS permissions, JetStream creation, ntfy,
-Compose, DNS, TLS, promotion, exemptions, alerts, and activation on `nas`.
-Issue #869 owns the durable `mbp` installer, watcher credential, LaunchAgent,
-`pam_tid`, and laptop rollback.
+The installer restores the prior `sudo.conf` automatically if validation
+fails. Production integration must also stop its server and NATS resources,
+restore routing, and confirm ordinary sudo behavior.

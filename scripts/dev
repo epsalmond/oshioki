@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Design notes: ~/.claude/plans/sudo-approve-extraction.md
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+SESSION_FILE="$REPO_ROOT/.dev-session"
+
+usage() {
+  printf 'usage: scripts/dev build|up|test|down|status [--quick|--browser] [--state-dir PATH]\n' >&2
+  exit 2
+}
+
+compose() {
+  SUDO_APPROVE_STATE_ROOT="$state_root" SUDO_APPROVE_HTTP_PORT="${http_port:-8443}" \
+    docker compose -f "$REPO_ROOT/compose.yaml" -p "$project_name" "$@"
+}
+
+local_checks() {
+  cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --locked
+  cargo clippy --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --all-targets --locked -- -D warnings
+  npm --prefix "$REPO_ROOT/server/web" ci
+  npm --prefix "$REPO_ROOT/server/web" test
+  "$REPO_ROOT/scripts/test-install-sudo-hook"
+}
+
+read_session() {
+  [ -f "$SESSION_FILE" ] || {
+    echo "no active development session" >&2
+    exit 1
+  }
+  project_name="$(sed -n '1p' "$SESSION_FILE")"
+  state_root="$(sed -n '2p' "$SESSION_FILE")"
+  managed_state="$(sed -n '3p' "$SESSION_FILE")"
+  if [ -z "$project_name" ] || [ -z "$state_root" ]; then
+    echo "invalid development session file" >&2
+    exit 1
+  fi
+}
+
+command_name="${1:-}"
+[ -n "$command_name" ] || usage
+shift
+
+case "$command_name" in
+  build)
+    [ "$#" -eq 0 ] || usage
+    cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --locked
+    npm --prefix "$REPO_ROOT/server/web" ci
+    npm --prefix "$REPO_ROOT/server/web" test
+    ;;
+  up)
+    [ ! -e "$SESSION_FILE" ] || {
+      echo "a development session is already active; run scripts/dev down first" >&2
+      exit 1
+    }
+    managed_state=1
+    if [ "$#" -eq 0 ]; then
+      state_root="$(mktemp -d -t sudo-approve-dev.XXXXXX)"
+    elif [ "$#" -eq 2 ] && [ "$1" = "--state-dir" ]; then
+      state_root="$(mkdir -p "$2" && cd "$2" && pwd -P)"
+      managed_state=0
+    else
+      usage
+    fi
+    install -d -m 0777 "$state_root/server" "$state_root/e2e"
+    project_name="sudo-approve-dev-$(basename "$state_root" | tr -cd 'a-zA-Z0-9_-')"
+    session_tmp="$SESSION_FILE.$$"
+    printf '%s\n%s\n%s\n' "$project_name" "$state_root" "$managed_state" >"$session_tmp"
+    mv "$session_tmp" "$SESSION_FILE"
+    if ! compose up --detach server; then
+      rm -f "$SESSION_FILE"
+      [ "$managed_state" = 0 ] || rm -rf -- "$state_root"
+      exit 1
+    fi
+    printf 'development server: http://127.0.0.1:8443\nstate: %s\n' "$state_root"
+    ;;
+  test)
+    if [ "$#" -eq 1 ] && [ "$1" = "--quick" ]; then
+      local_checks
+      exit 0
+    fi
+    if [ "$#" -eq 1 ] && [ "$1" = "--browser" ]; then
+      "$REPO_ROOT/scripts/test-browser-local"
+      exit 0
+    fi
+    [ "$#" -eq 0 ] || usage
+    local_checks
+    state_root="$(mktemp -d -t sudo-approve-e2e.XXXXXX)"
+    http_port=0
+    install -d -m 0777 "$state_root/server" "$state_root/e2e"
+    project_name="sudo-approve-e2e-$(basename "$state_root" | tr -cd 'a-zA-Z0-9_-')"
+    test_ok=0
+    cleanup_test() {
+      set +e
+      if [ "$test_ok" -ne 1 ]; then
+        mkdir -p "$state_root/logs"
+        compose logs --no-color >"$state_root/logs/compose.log" 2>&1
+        printf 'retained failed test state: %s\n' "$state_root" >&2
+      fi
+      compose down --volumes --remove-orphans >/dev/null 2>&1
+      if [ "$test_ok" -eq 1 ]; then
+        rm -rf -- "$state_root"
+      fi
+    }
+    trap cleanup_test EXIT
+    compose build server e2e
+    compose run --rm e2e
+    test_ok=1
+    ;;
+  down)
+    [ "$#" -eq 0 ] || usage
+    read_session
+    compose down --volumes --remove-orphans
+    rm -f "$SESSION_FILE"
+    if [ "$managed_state" = 1 ]; then
+      case "$state_root" in
+        /tmp/sudo-approve-dev.*) rm -rf -- "$state_root" ;;
+        *) echo "refusing to remove unexpected managed state path: $state_root" >&2; exit 1 ;;
+      esac
+    fi
+    ;;
+  status)
+    [ "$#" -eq 0 ] || usage
+    read_session
+    compose ps
+    printf 'state: %s\n' "$state_root"
+    ;;
+  *) usage ;;
+esac
