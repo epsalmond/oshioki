@@ -1,3 +1,6 @@
 target
 server/web/node_modules
-Dockerfile.publish
+.git
+.dev-session
+server/web/test-results
+server/web/playwright-report

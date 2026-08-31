@@ -528,7 +528,28 @@ mod tests {
         DenyV1, SealedDeviceBodyV1,
         v1::{VERSION_V1, encode_base64url},
     };
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temporary_database() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sudo-approve-db-test-{}-{nonce}.sqlite3",
+            std::process::id()
+        ))
+    }
+
+    fn remove_database(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     fn device(token: &[u8]) -> DevicePublicRecordV1 {
         let credential_id = vec![1; 16];
@@ -613,6 +634,16 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+
+        let mut conflicting = envelope.clone();
+        conflicting.user = "somebody-else".into();
+        let conflicting_raw = serde_json::to_vec(&conflicting).unwrap();
+        assert_eq!(
+            store
+                .ingest_request(&conflicting_raw, &conflicting, 20)
+                .unwrap(),
+            InsertResult::Conflict
+        );
     }
 
     #[test]
@@ -640,5 +671,61 @@ mod tests {
                 .unwrap(),
             InsertResult::Identical
         );
+    }
+
+    #[test]
+    fn restart_replays_unsent_outbox_until_marked() {
+        let path = temporary_database();
+        let device = device(b"restart-token");
+        let decision = DecisionV1::Deny(DenyV1 {
+            version: VERSION_V1,
+            request_id: "request-1".into(),
+            device_fingerprint: device.fingerprint.clone(),
+        });
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.put_device(&device).unwrap();
+            let envelope = envelope(&device.fingerprint);
+            let raw = serde_json::to_vec(&envelope).unwrap();
+            store.ingest_request(&raw, &envelope, 20).unwrap();
+            store
+                .queue_decision("request-1", &device.fingerprint, &decision, 20)
+                .unwrap();
+            assert_eq!(store.pending_outbox(10).unwrap().len(), 1);
+        }
+
+        {
+            let store = Store::open(&path).unwrap();
+            store.ready().unwrap();
+            assert_eq!(
+                store.request_lifecycle("request-1", 20).unwrap(),
+                Some(RequestLifecycle::Gone)
+            );
+            assert!(
+                store
+                    .sealed_request_for_token("request-1", b"restart-token", 20)
+                    .unwrap()
+                    .is_none()
+            );
+            let pending = store.pending_outbox(10).unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].kind, "decision");
+            assert_eq!(pending[0].subject, "sudo.verdict.request-1");
+            store.mark_outbox_sent(pending[0].id).unwrap();
+            assert!(store.pending_outbox(10).unwrap().is_empty());
+
+            let connection = store.lock().unwrap();
+            let foreign_keys: i64 = connection
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .unwrap();
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(foreign_keys, 1);
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        }
+
+        remove_database(&path);
     }
 }

@@ -67,11 +67,8 @@ struct RequestResponse {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive(
-                "management_plane_sudo_approve_server=info"
-                    .parse()
-                    .expect("valid directive"),
-            ),
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("sudo_approve_server=info".parse().expect("valid directive")),
         )
         .init();
     let database_path = required_env("SUDO_APPROVE_STATE_PATH")?;
@@ -589,7 +586,7 @@ fn asset(content_type: &str, body: &[u8], immutable: bool) -> Response {
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
     response
 }
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
@@ -611,7 +608,7 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
     response
 }
 fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {

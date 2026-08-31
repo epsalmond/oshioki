@@ -49,16 +49,19 @@ removes old resolved work.
 `GET /healthz` checks the schema, durable request consumer progress, and
 outbox progress. Every browser response uses `Cache-Control: no-store`,
 `Referrer-Policy: no-referrer`, MIME sniffing protection, and a CSP that allows
-only local scripts, styles, and API calls. Darwin artifacts use immutable
-cache headers.
+only local scripts, styles, and API calls. Optional distribution artifacts use
+immutable cache headers.
 
-## Publication
+## Local verification
 
-The Darwin workflow builds arm64 artifacts on `osx-vm`. Main publishes
-`management-plane/sudo-approve-darwin:sha-<full-commit>`. The Linux image
-fetches that exact artifact through the registry, verifies `SHA256SUMS`, and
-records its OCI digest in the final image label.
+Compose runs NATS, the server, and an ephemeral E2E runner. Playwright uses a
+virtual internal CTAP2 authenticator for registration and assertions. The same
+runner installs the Linux plugin and invokes real sudo without touching the
+host's sudo configuration.
 
 The browser bundle vendors libsodium.js 0.7.15. Its WebAssembly payload is
 embedded in the reviewed browser file. `server/web/vendor/SHA256SUMS` records
-the source files used by the image.
+the source files included in the browser application.
+
+Package publication remains deferred. A future server container may be a
+deployment choice. It will not transport Darwin packages.

@@ -3,9 +3,8 @@
 # approval-plugin payload-binding contract.
 #
 # Local mode creates a private Docker network containing NATS, the subscriber,
-# and the sudo test container. Woodpecker sets SUDO_APPROVE_E2E_IN_CONTAINER=1;
-# its step is already the test container and reaches the pipeline NATS service
-# by DNS name.
+# and the sudo test container. Compose sets SUDO_APPROVE_E2E_IN_CONTAINER=1;
+# its runner already reaches the project NATS service by DNS name.
 #
 # Usage: test-sudo-plugin-container
 set -euo pipefail
@@ -19,6 +18,8 @@ NATS_IMAGE="${NATS_IMAGE:-nats:2.10}"
 IN_CONTAINER="${SUDO_APPROVE_E2E_IN_CONTAINER:-0}"
 SKIP_BUILD="${SUDO_APPROVE_E2E_SKIP_BUILD:-0}"
 KEEP_ARTIFACTS="${SUDO_APPROVE_E2E_KEEP_ARTIFACTS:-0}"
+ORIGIN_VALUE="${SUDO_APPROVE_ORIGIN:-https://sudo.test}"
+RP_ID_VALUE="${SUDO_APPROVE_RP_ID:-sudo.test}"
 
 SHARE="$(mktemp -d -t sudo-approve-test.XXXXXX)"
 SHARE="$(cd "$SHARE" && pwd -P)"
@@ -76,11 +77,13 @@ trap cleanup EXIT
 echo "* workspace: $WORKSPACE"
 echo "* share:     $SHARE"
 
-# A normal local run rebuilds immediately before exercising sudo. Woodpecker
-# may skip this duplicate build only with the commit receipt written by its
+# A normal local run rebuilds immediately before exercising sudo. A caller may
+# skip this duplicate build only with the commit receipt written by its
 # prerequisite build step and a clean service checkout.
 BUILD_RECEIPT="$WORKSPACE/target/release/.sudo-approve-e2e-commit"
-if [ "$SKIP_BUILD" = "1" ]; then
+if [ "$SKIP_BUILD" = "1" ] && [ "${SUDO_APPROVE_E2E_PREBUILT:-0}" = "1" ]; then
+  echo "* release:   using image-built E2E artifacts"
+elif [ "$SKIP_BUILD" = "1" ]; then
   EXPECTED_COMMIT="$(git -C "$WORKSPACE" rev-parse HEAD)"
   [ -f "$BUILD_RECEIPT" ] || {
     echo "missing E2E build receipt: $BUILD_RECEIPT" >&2
@@ -101,17 +104,19 @@ else
   git -C "$WORKSPACE" rev-parse HEAD >"$BUILD_RECEIPT"
 fi
 
-for artifact in "$WORKSPACE/target/release/management-plane-sudo-approve" \
+for artifact in "$WORKSPACE/target/release/sudo-approve" \
                 "$WORKSPACE/target/release/libplugin.so"; do
   [ -f "$artifact" ] || {
     echo "missing build artifact after release build: $artifact" >&2
     exit 2
   }
 done
-(
-  cd "$WORKSPACE/target/release"
-  sha256sum management-plane-sudo-approve libplugin.so > SHA256SUMS
-)
+if [ "${SUDO_APPROVE_E2E_PREBUILT:-0}" != "1" ]; then
+  (
+    cd "$WORKSPACE/target/release"
+    sha256sum sudo-approve libplugin.so > SHA256SUMS
+  )
+fi
 
 NATS_HOST_VALUE=""
 NATS_PORT_VALUE=""
@@ -169,6 +174,8 @@ if [ "$IN_CONTAINER" = "1" ]; then
   NATS_PORT="$NATS_PORT_VALUE" \
   NATS_USER="${NATS_USER:-sudo-approve}" \
   NATS_PASS="${NATS_PASS:-test}" \
+  SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
+  SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
   TIMEOUT=180 \
     python3 "$SHARE/test-sudo-plugin-subscriber.py" \
       >"$SHARE/subscriber.log" 2>&1 &
@@ -181,6 +188,8 @@ else
     -e NATS_PORT="$NATS_PORT_VALUE" \
     -e NATS_USER="${NATS_USER:-sudo-approve}" \
     -e NATS_PASS="${NATS_PASS:-test}" \
+    -e SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
+    -e SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
     -e TIMEOUT=180 \
     -v "$SHARE":/share \
     "$PY_IMAGE" \
@@ -228,7 +237,7 @@ if [ "$IN_CONTAINER" = "1" ]; then
   INNER_SERVICE_DIR="$WORKSPACE"
   INNER_SHARE_DIR="$SHARE"
 else
-  INNER_SERVICE_DIR=/services/sudo-approve
+  INNER_SERVICE_DIR=/sudo-approve
   INNER_SHARE_DIR=/share
 fi
 
@@ -255,7 +264,7 @@ fi
 "$SERVICE_DIR/scripts/install-sudo-hook" --standalone-e2e
 echo "[inner] install-sudo-hook OK"
 
-cp "$SHARE_DIR/devices.json" /etc/management-plane/sudo-approve/devices.json
+cp "$SHARE_DIR/devices.json" /etc/sudo-approve/devices.json
 echo "[inner] devices.json planted"
 
 cleanup_e2e_sudoers() {
@@ -300,15 +309,19 @@ run_sudo() {
     NATS_URL="$NATS_URL_VALUE" \
     NATS_USER="${NATS_USER:-sudo-approve}" \
     NATS_PASS="${NATS_PASS:-test}" \
+    SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
+    SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
       bash -x "$INNER_SCRIPT" >"$SHARE/sudo-run.log" 2>&1
   else
     run_docker run --name "$SUDO_NAME" --network "$NETWORK_NAME" \
       -e NATS_URL="$NATS_URL_VALUE" \
       -e NATS_USER="${NATS_USER:-sudo-approve}" \
       -e NATS_PASS="${NATS_PASS:-test}" \
+      -e SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
+      -e SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
       -v "$SHARE":/share \
-      -v "$WORKSPACE":/services/sudo-approve \
-      -w /services/sudo-approve \
+      -v "$WORKSPACE":/sudo-approve \
+      -w /sudo-approve \
       "$IMAGE" \
       bash -x /share/sudo-inner.sh \
       >"$SHARE/sudo-run.log" 2>&1
@@ -319,6 +332,12 @@ echo "* sudo run:  invoking sudo $EXPECTED_CMD ${ARGS[*]}"
 if ! run_sudo; then
   echo "FAIL: sudo test container/driver failed" >&2
   cat "$SHARE/sudo-run.log" >&2 || true
+  echo "--- subscriber log ---" >&2
+  if [ "$IN_CONTAINER" = "1" ]; then
+    tail -40 "$SHARE/subscriber.log" >&2 || true
+  else
+    run_docker logs "$SUB_NAME" 2>&1 | tail -40 >&2 || true
+  fi
   exit 1
 fi
 
