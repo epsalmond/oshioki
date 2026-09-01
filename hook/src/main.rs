@@ -123,7 +123,8 @@ async fn execute_request_at(
     if announce_url {
         let config = load_hook_config_from(directory)?;
         println!(
-            "Approval URL (expires in 90 seconds):\n  {}",
+            "Approval URL (expires in {} seconds):\n  {}",
+            timeout.as_secs(),
             approval_url(&config.server_base_url, &request.request_id)
         );
         io::stdout().flush()?;
@@ -411,7 +412,7 @@ async fn cmd_watch() -> Result<()> {
             }
         };
         envelope.validate()?;
-        let url = format!("{}/r/{}", config.server_base_url, envelope.request_id);
+        let url = approval_url(&config.server_base_url, &envelope.request_id);
         let opener =
             std::env::var("SUDO_APPROVE_OPENER").unwrap_or_else(|_| "/usr/bin/open".into());
         let status = opener_command(&opener, &url)

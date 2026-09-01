@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Design notes: ~/.claude/plans/sudo-approve-safari-acceptance.md
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
@@ -36,28 +37,92 @@ mutate_serve() {
   "$PRIVILEGE_BIN" "$TAILSCALE_BIN" serve "$@"
 }
 
-restore_serve() {
-  local current_config expected_config compare_status=0
-  if "$JQ_BIN" -e '[(del(.version) | .. | scalars)] | length == 0' "$serve_snapshot" >/dev/null; then
-    mutate_serve reset
-  else
-    mutate_serve set-config --all "$serve_snapshot"
-  fi
+normalize_serve_config() {
+  "$JQ_BIN" -S 'del(.version) | walk(if type == "object" then with_entries(select(.value != null and .value != {})) else . end)' "$1"
+}
 
-  current_config="$(mktemp "$state_root/.serve-current.XXXXXX")"
-  expected_config="$(mktemp "$state_root/.serve-expected.XXXXXX")"
-  if ! "$TAILSCALE_BIN" serve get-config --all >"$current_config" ||
-     ! "$JQ_BIN" -S 'del(.version)' "$serve_snapshot" >"$expected_config" ||
-     ! "$JQ_BIN" -S 'del(.version)' "$current_config" >"$current_config.normalized" ||
-     ! cmp -s "$expected_config" "$current_config.normalized"; then
+serve_configs_match() {
+  local left="$1" right="$2" left_normalized right_normalized compare_status=0
+  left_normalized="$(mktemp "$state_root/.serve-left.XXXXXX")"
+  right_normalized="$(mktemp "$state_root/.serve-right.XXXXXX")"
+  if ! normalize_serve_config "$left" >"$left_normalized" ||
+     ! normalize_serve_config "$right" >"$right_normalized" ||
+     ! cmp -s "$left_normalized" "$right_normalized"; then
     compare_status=1
   fi
-  rm -f -- "$current_config" "$current_config.normalized" "$expected_config"
+  rm -f -- "$left_normalized" "$right_normalized"
+  return "$compare_status"
+}
+
+expected_serve_config() {
+  local destination="$1" route_key="$rp_id:$https_port" proxy="http://127.0.0.1:$server_port"
+  # shellcheck disable=SC2016 # jq variables must not expand in the shell.
+  "$JQ_BIN" -n --arg port "$https_port" --arg route_key "$route_key" --arg proxy "$proxy" \
+    '{TCP:{($port):{HTTPS:true}},Web:{($route_key):{Handlers:{"/":{Proxy:$proxy}}}}}' >"$destination"
+}
+
+serve_config_is_empty() {
+  local normalized
+  normalized="$(mktemp "$state_root/.serve-empty.XXXXXX")"
+  normalize_serve_config "$1" >"$normalized"
+  if "$JQ_BIN" -e 'type == "object" and length == 0' "$normalized" >/dev/null; then
+    rm -f -- "$normalized"
+    return 0
+  fi
+  rm -f -- "$normalized"
+  return 1
+}
+
+current_serve_matches_acceptance() {
+  local current_config expected_config compare_status=0
+  current_config="$(mktemp "$state_root/.serve-current.XXXXXX")"
+  expected_config="$(mktemp "$state_root/.serve-expected.XXXXXX")"
+  if ! "$TAILSCALE_BIN" serve status --json >"$current_config" ||
+     ! expected_serve_config "$expected_config" ||
+     ! serve_configs_match "$current_config" "$expected_config"; then
+    compare_status=1
+  fi
+  rm -f -- "$current_config" "$expected_config"
+  return "$compare_status"
+}
+
+restore_serve() {
+  local current_config compare_status=0
+  current_config="$(mktemp "$state_root/.serve-current.XXXXXX")"
+  if ! "$TAILSCALE_BIN" serve status --json >"$current_config"; then
+    rm -f -- "$current_config"
+    return 1
+  fi
+  if serve_configs_match "$current_config" "$serve_snapshot"; then
+    rm -f -- "$current_config"
+    return 0
+  fi
+  rm -f -- "$current_config"
+  current_serve_matches_acceptance || return 1
+  mutate_serve reset || return 1
+
+  current_config="$(mktemp "$state_root/.serve-current.XXXXXX")"
+  if ! "$TAILSCALE_BIN" serve status --json >"$current_config" ||
+     ! serve_configs_match "$current_config" "$serve_snapshot"; then
+    compare_status=1
+  fi
+  rm -f -- "$current_config"
   return "$compare_status"
 }
 
 free_port() {
   "$NODE_BIN" -e 'const net=require("node:net"); const server=net.createServer(); server.listen(0,"127.0.0.1",()=>{ console.log(server.address().port); server.close(); });'
+}
+
+allocate_ports() {
+  local fixed_nats="${SUDO_APPROVE_ACCEPTANCE_NATS_PORT:-}" fixed_server="${SUDO_APPROVE_ACCEPTANCE_SERVER_PORT:-}"
+  for _ in $(seq 1 20); do
+    nats_port="${fixed_nats:-$(free_port)}"
+    server_port="${fixed_server:-$(free_port)}"
+    [ "$nats_port" = "$server_port" ] || return 0
+    [ -z "$fixed_nats" ] || [ -z "$fixed_server" ] || break
+  done
+  die "could not allocate distinct NATS and server ports"
 }
 
 validate_port() {
@@ -77,6 +142,32 @@ regular_or_absent() {
 process_start() {
   [ -r "/proc/$1/stat" ] || return 1
   awk '{print $22}' "/proc/$1/stat"
+}
+
+start_detached() {
+  local pid_file="$1" log_file="$2" candidate_pid candidate_start
+  shift 2
+  regular_or_absent "$pid_file"
+  rm -f -- "$pid_file"
+  # shellcheck disable=SC2016 # The detached shell expands its own PID and arguments.
+  "$SETSID_BIN" --fork sh -c 'umask 077; printf "%s\n" "$$" >"$1"; shift; exec "$@"' \
+    sh "$pid_file" "$@" </dev/null >"$log_file" 2>&1
+  for _ in $(seq 1 100); do
+    if [ -s "$pid_file" ]; then
+      candidate_pid="$(sed -n '1p' "$pid_file")"
+      case "$candidate_pid" in
+        ''|*[!0-9]*) die "detached process wrote an invalid PID" ;;
+      esac
+      candidate_start="$(process_start "$candidate_pid" || true)"
+      if [ -n "$candidate_start" ]; then
+        detached_pid="$candidate_pid"
+        detached_start="$candidate_start"
+        return 0
+      fi
+    fi
+    sleep 0.01
+  done
+  die "detached process did not publish a live PID"
 }
 
 process_is_owned() {
@@ -157,7 +248,6 @@ read_session() {
 
 write_session() {
   local temporary="$SESSION_FILE.$$"
-  umask 077
   # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
   "$JQ_BIN" -n \
     --arg state_root "$state_root" \
@@ -202,11 +292,7 @@ wait_for_server() {
 }
 
 verify_serve_route() {
-  local route_key="$rp_id:$https_port" proxy="http://127.0.0.1:$server_port"
-  # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
-  "$TAILSCALE_BIN" serve status --json |
-    "$JQ_BIN" -e --arg route_key "$route_key" --arg proxy "$proxy" \
-      '.Web[$route_key].Handlers["/"].Proxy == $proxy' >/dev/null
+  current_serve_matches_acceptance
 }
 
 wait_for_origin() {
@@ -267,19 +353,19 @@ start_session() {
   "$TAILSCALE_BIN" status --json | "$JQ_BIN" -e '.Self.Online == true' >/dev/null || die "Tailscale is not online"
   rp_id="$($TAILSCALE_BIN status --json | "$JQ_BIN" -er '.Self.DNSName | select(type == "string" and length > 1)' | sed 's/\.$//')"
   [ -n "$rp_id" ] || die "Tailscale DNS name is unavailable"
-  nats_port="${SUDO_APPROVE_ACCEPTANCE_NATS_PORT:-$(free_port)}"
-  server_port="${SUDO_APPROVE_ACCEPTANCE_SERVER_PORT:-$(free_port)}"
+  allocate_ports
   https_port="${SUDO_APPROVE_ACCEPTANCE_HTTPS_PORT:-8443}"
   validate_port "$nats_port"
   validate_port "$server_port"
   validate_port "$https_port"
-  [ "$nats_port" != "$server_port" ] || die "NATS and server ports must differ"
   origin="https://$rp_id:$https_port"
 
-  "$TAILSCALE_BIN" serve get-config --all >"$serve_snapshot"
+  "$TAILSCALE_BIN" serve status --json >"$serve_snapshot"
   if [ ! -f "$serve_snapshot" ] || [ -L "$serve_snapshot" ]; then
     die "Tailscale Serve snapshot was not created"
   fi
+  serve_config_is_empty "$serve_snapshot" ||
+    die "pre-existing Tailscale Serve configuration must be removed or handled by the operator"
 
   "$CARGO_BIN" build --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --locked
   [ -x "$SERVER_BIN" ] || die "server binary is missing after build: $SERVER_BIN"
@@ -289,11 +375,10 @@ start_session() {
   nats_config="$state_root/nats/auth.conf"
   printf 'authorization {\n  users = [{user: "sudo-approve", password: "%s"}]\n}\n' "$password" >"$nats_config"
   chmod 0600 "$nats_config"
-  "$SETSID_BIN" -- "$NATS_SERVER_BIN" -c "$nats_config" -js -sd "$state_root/nats/store" -a 127.0.0.1 -p "$nats_port" \
-    </dev/null \
-    >"$state_root/logs/nats.log" 2>&1 &
-  nats_pid=$!
-  nats_start="$(process_start "$nats_pid")"
+  start_detached "$state_root/nats.pid" "$state_root/logs/nats.log" \
+    "$NATS_SERVER_BIN" -c "$nats_config" -js -sd "$state_root/nats/store" -a 127.0.0.1 -p "$nats_port"
+  nats_pid="$detached_pid"
+  nats_start="$detached_start"
   wait_for_nats "$password"
   NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user sudo-approve \
     stream info SUDO_APPROVE >/dev/null 2>&1 || \
@@ -318,9 +403,9 @@ start_session() {
   SUDO_APPROVE_LISTEN="127.0.0.1:$server_port" \
   SUDO_APPROVE_ORIGIN="$origin" \
   SUDO_APPROVE_RP_ID="$rp_id" \
-    "$SETSID_BIN" -- "$SERVER_BIN" </dev/null >"$state_root/logs/server.log" 2>&1 &
-  server_pid=$!
-  server_start="$(process_start "$server_pid")"
+    start_detached "$state_root/server.pid" "$state_root/logs/server.log" "$SERVER_BIN"
+  server_pid="$detached_pid"
+  server_start="$detached_start"
   wait_for_server
 
   acceptance_started_serve=1

@@ -9,6 +9,8 @@ FAKE_BIN="$TEST_ROOT/bin"
 TAILSCALE_LOG="$TEST_ROOT/tailscale.log"
 PRIVILEGE_LOG="$TEST_ROOT/privilege.log"
 PROCESS_LOG="$TEST_ROOT/process.log"
+SERVE_STATE="$TEST_ROOT/serve-state.json"
+EXPECTED_SERVE_STATE="$TEST_ROOT/expected-serve-state.json"
 NATS_PID=""
 SERVER_PID=""
 
@@ -70,28 +72,29 @@ case "$1 $2" in
   "status --json")
     printf '%s\n' '{"Self":{"DNSName":"nas.example.test.","Online":true}}'
     ;;
-  "serve get-config")
-    [ "$3" = --all ]
-    if [ -n "${FAKE_SERVE_SNAPSHOT:-}" ]; then
+  "serve status")
+    [ "$3" = --json ]
+    if [ -f "$FAKE_SERVE_STATE" ]; then
+      cat "$FAKE_SERVE_STATE"
+    elif [ -n "${FAKE_SERVE_SNAPSHOT:-}" ]; then
       printf '%s\n' "$FAKE_SERVE_SNAPSHOT"
     else
-      printf '%s\n' '{"version":"alpha0","TCP":{}}'
+      printf '%s\n' '{}'
     fi
     printf 'snapshot\n' >>"$FAKE_TAILSCALE_LOG"
     ;;
-  "serve set-config")
-    [ "$3" = --all ]
-    printf 'restore %s %s\n' "$4" "$(tr -d '\n' <"$4")" >>"$FAKE_TAILSCALE_LOG"
-    ;;
   "serve reset")
     printf 'reset\n' >>"$FAKE_TAILSCALE_LOG"
-    ;;
-  "serve status")
-    printf '%s\n' '{"Web":{"nas.example.test:18444":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:18443"}}}}}'
+    printf '%s\n' '{}' >"$FAKE_SERVE_STATE"
     ;;
   "serve --bg")
     printf 'serve %s\n' "${*:3}" >>"$FAKE_TAILSCALE_LOG"
     [ "${FAKE_FAIL_SERVE:-0}" = 0 ] || exit 1
+    [ "$3" = --yes ]
+    https_port="${4#--https=}"
+    proxy="$5"
+    printf '{"TCP":{"%s":{"HTTPS":true}},"Web":{"nas.example.test:%s":{"Handlers":{"/":{"Proxy":"%s"}}}}}\n' \
+      "$https_port" "$https_port" "$proxy" >"$FAKE_SERVE_STATE"
     ;;
   *)
     printf 'unexpected tailscale call: %s\n' "$*" >&2
@@ -105,6 +108,7 @@ export PATH="$FAKE_BIN:$PATH"
 export FAKE_TAILSCALE_LOG="$TAILSCALE_LOG"
 export FAKE_PRIVILEGE_LOG="$PRIVILEGE_LOG"
 export FAKE_PROCESS_LOG="$PROCESS_LOG"
+export FAKE_SERVE_STATE="$SERVE_STATE"
 export SUDO_APPROVE_ACCEPTANCE_SESSION_FILE="$SESSION_FILE"
 export SUDO_APPROVE_ACCEPTANCE_TAILSCALE_BIN="$FAKE_BIN/tailscale"
 export SUDO_APPROVE_ACCEPTANCE_PRIVILEGE_BIN="$FAKE_BIN/sudo"
@@ -138,6 +142,18 @@ esac
 "$SCRIPT" status | grep -Fq 'https://nas.example.test:18444'
 "$SCRIPT" enroll | grep -Fq 'Enrollment URL:'
 "$SCRIPT" test | grep -Fq 'synthetic request complete'
+cp "$SERVE_STATE" "$EXPECTED_SERVE_STATE"
+jq '.TCP["9443"] = {"HTTPS":true}' "$SERVE_STATE" >"$SERVE_STATE.tmp"
+mv "$SERVE_STATE.tmp" "$SERVE_STATE"
+if "$SCRIPT" down >"$TEST_ROOT/mismatched-down.log" 2>&1; then
+  fail "down reset an unexpected Serve configuration"
+fi
+[ -e "$SESSION_FILE" ] || fail "failed restoration discarded the acceptance session"
+grep -Fq 'Serve restoration must be retried' "$TEST_ROOT/mismatched-down.log"
+if grep -Fq 'reset' "$TAILSCALE_LOG"; then
+  fail "failed restoration reset an unexpected Serve configuration"
+fi
+cp "$EXPECTED_SERVE_STATE" "$SERVE_STATE"
 "$SCRIPT" down
 [ ! -e "$SESSION_FILE" ] || fail "session file remains after down"
 [ -d "$TEST_ROOT/state" ] || fail "operator state directory was removed"
@@ -149,7 +165,7 @@ NATS_PID=""
 SERVER_PID=""
 grep -Fq 'serve --yes --https=18444 http://127.0.0.1:18443' "$TAILSCALE_LOG"
 grep -Fq 'reset' "$TAILSCALE_LOG"
-grep -Fq '"version":"alpha0"' "$TEST_ROOT/state/serve-config.json"
+grep -Fxq '{}' "$TEST_ROOT/state/serve-config.json"
 grep -Fq "$FAKE_BIN/tailscale serve --bg --yes --https=18444 http://127.0.0.1:18443" "$PRIVILEGE_LOG"
 grep -Fq "$FAKE_BIN/tailscale serve reset" "$PRIVILEGE_LOG"
 [ "$(wc -l <"$PRIVILEGE_LOG")" -eq 2 ] || fail "unexpected privileged command count"
@@ -157,25 +173,31 @@ grep -Fq "$FAKE_BIN/tailscale serve reset" "$PRIVILEGE_LOG"
 : >"$TAILSCALE_LOG"
 : >"$PRIVILEGE_LOG"
 : >"$PROCESS_LOG"
+printf '%s\n' '{"TCP":{"443":{"HTTPS":true}}}' >"$SERVE_STATE"
+if "$SCRIPT" up --state-dir "$TEST_ROOT/existing-state" >"$TEST_ROOT/existing-start.log" 2>&1; then
+  fail "pre-existing Serve configuration was accepted"
+fi
+[ ! -e "$SESSION_FILE" ] || fail "refused startup left a session file"
+[ ! -s "$PRIVILEGE_LOG" ] || fail "refused startup mutated Serve configuration"
+grep -Fq 'pre-existing Tailscale Serve configuration' "$TEST_ROOT/existing-start.log"
+
+: >"$TAILSCALE_LOG"
+: >"$PRIVILEGE_LOG"
+: >"$PROCESS_LOG"
+printf '%s\n' '{}' >"$SERVE_STATE"
 export FAKE_FAIL_SERVE=1
-export FAKE_SERVE_SNAPSHOT='{"version":"alpha0","TCP":{"443":{"HTTPS":true}}}'
 if "$SCRIPT" up --state-dir "$TEST_ROOT/failed-state" >"$TEST_ROOT/failed-start.log" 2>&1; then
   fail "failed Serve startup was accepted"
 fi
 unset FAKE_FAIL_SERVE
 [ ! -e "$SESSION_FILE" ] || fail "failed startup left a session file"
-if ! grep -Fq 'restore ' "$TAILSCALE_LOG"; then
-  cat "$TEST_ROOT/failed-start.log" >&2
-  cat "$TAILSCALE_LOG" >&2
-  fail "failed Serve startup did not restore its snapshot"
-fi
-grep -Fq "$FAKE_BIN/tailscale serve set-config --all $TEST_ROOT/failed-state/serve-config.json" "$PRIVILEGE_LOG"
+grep -Fxq '{}' "$SERVE_STATE" || fail "failed Serve startup changed node configuration"
 while read -r _ failed_pid; do
   failed_state="$(awk '{print $3}' "/proc/$failed_pid/stat" 2>/dev/null || true)"
   [ -z "$failed_state" ] || [ "$failed_state" = Z ] || fail "failed startup left process $failed_pid running"
 done <"$PROCESS_LOG"
 
-printf '%s\n' '{"version":1,"state_root":"/","managed_state":true,"nats_pid":1,"server_pid":1,"nats_port":1,"server_port":1,"origin":"https://nas.example.test","rp_id":"nas.example.test","serve_snapshot":"/serve.json"}' >"$SESSION_FILE"
+printf '%s\n' '{"version":1,"state_root":"/","managed_state":true,"nats_pid":1,"nats_start":"1","server_pid":1,"server_start":"1","nats_port":1,"server_port":1,"https_port":443,"origin":"https://nas.example.test","rp_id":"nas.example.test","serve_snapshot":"/serve.json"}' >"$SESSION_FILE"
 chmod 0600 "$SESSION_FILE"
 if "$SCRIPT" down >"$TEST_ROOT/unsafe.log" 2>&1; then
   fail "unsafe managed state path was accepted"

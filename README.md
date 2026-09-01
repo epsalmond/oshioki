@@ -21,7 +21,8 @@ scripts/dev test
 `scripts/dev test --quick` runs the Rust, browser-vector, and installer suites
 on the host. `scripts/dev test --browser` runs the browser protocol against
 local NATS and SQLite. `scripts/dev test` creates a disposable Compose project
-and also invokes the real Linux sudo plugin path.
+and also invokes the real Linux sudo plugin path. Non-Linux hosts skip the
+acceptance lifecycle test, which relies on Linux process identity.
 
 The Compose browser test uses `https://sudo.test`. Chromium's virtual CTAP2
 authenticator represents Touch ID or Face ID. It proves WebAuthn registration
@@ -55,7 +56,11 @@ scripts/dev-acceptance down
 The command derives the WebAuthn origin from the host's Tailscale DNS name. It
 runs isolated NATS and SQLite state on loopback and temporarily points
 Tailscale Serve on HTTPS port 8443 at the local server, avoiding an existing
-listener on 443. `down` restores the prior Serve configuration. The acceptance
+listener on 443. `up` requires an empty node-level Serve configuration because
+the Tailscale service config commands cannot restore node routes. `down` resets
+the acceptance route only when the live node config exactly matches what the
+helper created. Otherwise it stops the services, retains the session, and asks
+the operator to resolve the Serve state before retrying `down`. The acceptance
 command does not install or enable the sudo plugin. Use `--state-dir PATH` with
 `up` to retain browser enrollment across sessions. Serve mutations run through
 `sudo`; Tailscale discovery, the server, NATS, and the hook remain under the
