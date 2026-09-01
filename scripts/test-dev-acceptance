@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SCRIPT="$REPO_ROOT/scripts/dev-acceptance"
+TEST_ROOT="$(mktemp -d -t sudo-approve-dev-acceptance-test.XXXXXX)"
+SESSION_FILE="$TEST_ROOT/session.json"
+FAKE_BIN="$TEST_ROOT/bin"
+TAILSCALE_LOG="$TEST_ROOT/tailscale.log"
+PROCESS_LOG="$TEST_ROOT/process.log"
+NATS_PID=""
+SERVER_PID=""
+
+cleanup() {
+  set +e
+  [ -z "$SERVER_PID" ] || kill "$SERVER_PID" >/dev/null 2>&1 || true
+  [ -z "$NATS_PID" ] || kill "$NATS_PID" >/dev/null 2>&1 || true
+  rm -rf -- "$TEST_ROOT"
+}
+trap cleanup EXIT
+
+fail() {
+  echo "test-dev-acceptance: $*" >&2
+  exit 1
+}
+
+[ -x "$SCRIPT" ] || fail "missing executable scripts/dev-acceptance"
+mkdir -p "$FAKE_BIN"
+
+cat >"$FAKE_BIN/cargo" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$FAKE_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$FAKE_BIN/nats" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$FAKE_BIN/nats-server" <<'EOF'
+#!/usr/bin/env bash
+printf 'nats %s\n' "$$" >>"$FAKE_PROCESS_LOG"
+exec sleep 300
+EOF
+cat >"$FAKE_BIN/sudo-approve-server" <<'EOF'
+#!/usr/bin/env bash
+printf 'server %s\n' "$$" >>"$FAKE_PROCESS_LOG"
+exec sleep 300
+EOF
+cat >"$FAKE_BIN/sudo-approve" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  enroll) echo "Enrollment URL: https://nas.example.test/enroll/test#secret" ;;
+  test) echo "synthetic request complete" ;;
+  *) exit 2 ;;
+esac
+EOF
+cat >"$FAKE_BIN/tailscale" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1 $2" in
+  "status --json")
+    printf '%s\n' '{"Self":{"DNSName":"nas.example.test.","Online":true}}'
+    ;;
+  "serve get-config")
+    printf '%s\n' '{"version":"alpha0","TCP":{}}' >"$3"
+    printf 'snapshot %s\n' "$3" >>"$FAKE_TAILSCALE_LOG"
+    ;;
+  "serve set-config")
+    printf 'restore %s %s\n' "$3" "$(tr -d '\n' <"$3")" >>"$FAKE_TAILSCALE_LOG"
+    ;;
+  "serve status")
+    printf '%s\n' '{"Web":{"nas.example.test:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:18443"}}}}}'
+    ;;
+  "serve --bg")
+    printf 'serve %s\n' "${*:3}" >>"$FAKE_TAILSCALE_LOG"
+    [ "${FAKE_FAIL_SERVE:-0}" = 0 ] || exit 1
+    ;;
+  *)
+    printf 'unexpected tailscale call: %s\n' "$*" >&2
+    exit 2
+    ;;
+esac
+EOF
+chmod 0755 "$FAKE_BIN"/*
+
+export PATH="$FAKE_BIN:$PATH"
+export FAKE_TAILSCALE_LOG="$TAILSCALE_LOG"
+export FAKE_PROCESS_LOG="$PROCESS_LOG"
+export SUDO_APPROVE_ACCEPTANCE_SESSION_FILE="$SESSION_FILE"
+export SUDO_APPROVE_ACCEPTANCE_NATS_PORT=14222
+export SUDO_APPROVE_ACCEPTANCE_SERVER_PORT=18443
+export SUDO_APPROVE_ACCEPTANCE_SERVER_BIN="$FAKE_BIN/sudo-approve-server"
+export SUDO_APPROVE_ACCEPTANCE_HOOK_BIN="$FAKE_BIN/sudo-approve"
+
+"$SCRIPT" up --state-dir "$TEST_ROOT/state"
+[ -f "$SESSION_FILE" ] || fail "session file was not created"
+[ "$(stat -c %a "$SESSION_FILE")" = 600 ] || fail "session file mode is not 0600"
+[ -f "$TEST_ROOT/state/hook/hook.json" ] || fail "hook config was not created"
+[ -f "$TEST_ROOT/state/hook/config.env" ] || fail "hook environment was not created"
+[ -f "$TEST_ROOT/state/hook/devices.json" ] || fail "device registry was not created"
+NATS_PID="$(jq -r .nats_pid "$SESSION_FILE")"
+SERVER_PID="$(jq -r .server_pid "$SESSION_FILE")"
+kill -0 "$NATS_PID"
+kill -0 "$SERVER_PID"
+NATS_PASSWORD_VALUE="$(sed -n 's/^NATS_PASS=//p' "$TEST_ROOT/state/hook/config.env")"
+case "$(tr '\0' ' ' <"/proc/$NATS_PID/cmdline")" in
+  *"$NATS_PASSWORD_VALUE"*) fail "NATS password appears in process arguments" ;;
+esac
+"$SCRIPT" status | grep -Fq 'https://nas.example.test'
+"$SCRIPT" enroll | grep -Fq 'Enrollment URL:'
+"$SCRIPT" test | grep -Fq 'synthetic request complete'
+"$SCRIPT" down
+[ ! -e "$SESSION_FILE" ] || fail "session file remains after down"
+[ -d "$TEST_ROOT/state" ] || fail "operator state directory was removed"
+NATS_STATE="$(awk '{print $3}' "/proc/$NATS_PID/stat" 2>/dev/null || true)"
+SERVER_STATE="$(awk '{print $3}' "/proc/$SERVER_PID/stat" 2>/dev/null || true)"
+[ -z "$NATS_STATE" ] || [ "$NATS_STATE" = Z ] || fail "NATS process remains after down"
+[ -z "$SERVER_STATE" ] || [ "$SERVER_STATE" = Z ] || fail "server process remains after down"
+NATS_PID=""
+SERVER_PID=""
+grep -Fq 'serve --yes http://127.0.0.1:18443' "$TAILSCALE_LOG"
+grep -Fq 'restore ' "$TAILSCALE_LOG"
+grep -Fq '"version":"alpha0"' "$TAILSCALE_LOG"
+
+: >"$TAILSCALE_LOG"
+: >"$PROCESS_LOG"
+export FAKE_FAIL_SERVE=1
+if "$SCRIPT" up --state-dir "$TEST_ROOT/failed-state" >"$TEST_ROOT/failed-start.log" 2>&1; then
+  fail "failed Serve startup was accepted"
+fi
+unset FAKE_FAIL_SERVE
+[ ! -e "$SESSION_FILE" ] || fail "failed startup left a session file"
+if ! grep -Fq 'restore ' "$TAILSCALE_LOG"; then
+  cat "$TEST_ROOT/failed-start.log" >&2
+  cat "$TAILSCALE_LOG" >&2
+  fail "failed Serve startup did not restore its snapshot"
+fi
+while read -r _ failed_pid; do
+  failed_state="$(awk '{print $3}' "/proc/$failed_pid/stat" 2>/dev/null || true)"
+  [ -z "$failed_state" ] || [ "$failed_state" = Z ] || fail "failed startup left process $failed_pid running"
+done <"$PROCESS_LOG"
+
+printf '%s\n' '{"version":1,"state_root":"/","managed_state":true,"nats_pid":1,"server_pid":1,"nats_port":1,"server_port":1,"origin":"https://nas.example.test","rp_id":"nas.example.test","serve_snapshot":"/serve.json"}' >"$SESSION_FILE"
+chmod 0600 "$SESSION_FILE"
+if "$SCRIPT" down >"$TEST_ROOT/unsafe.log" 2>&1; then
+  fail "unsafe managed state path was accepted"
+fi
+grep -Fq 'refusing unsafe managed state path' "$TEST_ROOT/unsafe.log"
+
+echo "test-dev-acceptance: PASS"

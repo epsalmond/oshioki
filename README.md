@@ -42,6 +42,23 @@ container UID 0 under rootless Docker. Direct Compose callers must set
 `SUDO_APPROVE_UID` to the host UID for rootful Docker or `0` for rootless
 Docker.
 
+Run a supervised Safari acceptance session on a Linux Tailscale host with:
+
+```bash
+scripts/dev-acceptance up
+scripts/dev-acceptance enroll
+scripts/dev-acceptance test
+scripts/dev-acceptance status
+scripts/dev-acceptance down
+```
+
+The command derives the WebAuthn origin from the host's Tailscale DNS name. It
+runs isolated NATS and SQLite state on loopback and temporarily points
+Tailscale Serve at the local server. `down` restores the prior Serve
+configuration. The acceptance command does not install or enable the sudo
+plugin. Use `--state-dir PATH` with `up` to retain browser enrollment across
+sessions.
+
 ## Repository layout
 
 - `protocol/` defines v1 messages, validation, sealing, and WebAuthn checks.

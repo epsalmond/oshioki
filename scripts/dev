@@ -26,6 +26,7 @@ local_checks() {
   cargo clippy --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --all-targets --locked -- -D warnings
   npm --prefix "$REPO_ROOT/server/web" ci
   npm --prefix "$REPO_ROOT/server/web" test
+  "$REPO_ROOT/scripts/test-dev-acceptance"
   "$REPO_ROOT/scripts/test-install-sudo-hook"
 }
 
