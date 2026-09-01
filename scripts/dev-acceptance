@@ -207,7 +207,7 @@ start_session() {
     if [ "$acceptance_startup_complete" -ne 1 ]; then
       set +e
       if [ "$acceptance_started_serve" -eq 1 ] && [ -f "$serve_snapshot" ]; then
-        "$TAILSCALE_BIN" serve set-config "$serve_snapshot" --all >/dev/null 2>&1
+        "$TAILSCALE_BIN" serve set-config --all "$serve_snapshot" >/dev/null 2>&1
       fi
       [ -z "${server_pid:-}" ] || kill "$server_pid" >/dev/null 2>&1 || true
       [ -z "${nats_pid:-}" ] || kill "$nats_pid" >/dev/null 2>&1 || true
@@ -227,7 +227,7 @@ start_session() {
   validate_port "$server_port"
   [ "$nats_port" != "$server_port" ] || die "NATS and server ports must differ"
 
-  "$TAILSCALE_BIN" serve get-config "$serve_snapshot" --all
+  "$TAILSCALE_BIN" serve get-config --all >"$serve_snapshot"
   if [ ! -f "$serve_snapshot" ] || [ -L "$serve_snapshot" ]; then
     die "Tailscale Serve snapshot was not created"
   fi
@@ -304,7 +304,7 @@ stop_session() {
   if [ ! -f "$serve_snapshot" ] || [ -L "$serve_snapshot" ]; then
     die "Serve snapshot is missing or unsafe"
   fi
-  if ! "$TAILSCALE_BIN" serve set-config "$serve_snapshot" --all; then
+  if ! "$TAILSCALE_BIN" serve set-config --all "$serve_snapshot"; then
     restore_ok=0
     echo "dev-acceptance: failed to restore Tailscale Serve configuration" >&2
   fi

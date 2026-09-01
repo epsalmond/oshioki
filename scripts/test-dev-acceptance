@@ -65,11 +65,13 @@ case "$1 $2" in
     printf '%s\n' '{"Self":{"DNSName":"nas.example.test.","Online":true}}'
     ;;
   "serve get-config")
-    printf '%s\n' '{"version":"alpha0","TCP":{}}' >"$3"
-    printf 'snapshot %s\n' "$3" >>"$FAKE_TAILSCALE_LOG"
+    [ "$3" = --all ]
+    printf '%s\n' '{"version":"alpha0","TCP":{}}'
+    printf 'snapshot\n' >>"$FAKE_TAILSCALE_LOG"
     ;;
   "serve set-config")
-    printf 'restore %s %s\n' "$3" "$(tr -d '\n' <"$3")" >>"$FAKE_TAILSCALE_LOG"
+    [ "$3" = --all ]
+    printf 'restore %s %s\n' "$4" "$(tr -d '\n' <"$4")" >>"$FAKE_TAILSCALE_LOG"
     ;;
   "serve status")
     printf '%s\n' '{"Web":{"nas.example.test:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:18443"}}}}}'
