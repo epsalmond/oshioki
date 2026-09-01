@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 SESSION_FILE="${SUDO_APPROVE_ACCEPTANCE_SESSION_FILE:-$REPO_ROOT/.acceptance-session}"
 TAILSCALE_BIN="${SUDO_APPROVE_ACCEPTANCE_TAILSCALE_BIN:-tailscale}"
+PRIVILEGE_BIN="${SUDO_APPROVE_ACCEPTANCE_PRIVILEGE_BIN:-sudo}"
 NATS_SERVER_BIN="${SUDO_APPROVE_ACCEPTANCE_NATS_SERVER_BIN:-nats-server}"
 NATS_BIN="${SUDO_APPROVE_ACCEPTANCE_NATS_BIN:-nats}"
 CARGO_BIN="${SUDO_APPROVE_ACCEPTANCE_CARGO_BIN:-cargo}"
@@ -28,6 +29,10 @@ die() {
 
 require_tool() {
   command -v "$1" >/dev/null 2>&1 || die "missing prerequisite: $1"
+}
+
+mutate_serve() {
+  "$PRIVILEGE_BIN" "$TAILSCALE_BIN" serve "$@"
 }
 
 free_port() {
@@ -177,7 +182,7 @@ start_session() {
   acceptance_started_serve=0
   acceptance_startup_complete=0
   [ ! -e "$SESSION_FILE" ] || die "an acceptance session already exists; run scripts/dev-acceptance down first"
-  for tool in "$CARGO_BIN" "$CURL_BIN" "$JQ_BIN" "$NATS_BIN" "$NATS_SERVER_BIN" "$NODE_BIN" "$OPENSSL_BIN" "$TAILSCALE_BIN"; do
+  for tool in "$CARGO_BIN" "$CURL_BIN" "$JQ_BIN" "$NATS_BIN" "$NATS_SERVER_BIN" "$NODE_BIN" "$OPENSSL_BIN" "$PRIVILEGE_BIN" "$TAILSCALE_BIN"; do
     require_tool "$tool"
   done
   [ -d /proc/self ] || die "acceptance sessions currently require Linux process identity from /proc"
@@ -207,7 +212,7 @@ start_session() {
     if [ "$acceptance_startup_complete" -ne 1 ]; then
       set +e
       if [ "$acceptance_started_serve" -eq 1 ] && [ -f "$serve_snapshot" ]; then
-        "$TAILSCALE_BIN" serve set-config --all "$serve_snapshot" >/dev/null 2>&1
+        mutate_serve set-config --all "$serve_snapshot" >/dev/null 2>&1
       fi
       [ -z "${server_pid:-}" ] || kill "$server_pid" >/dev/null 2>&1 || true
       [ -z "${nats_pid:-}" ] || kill "$nats_pid" >/dev/null 2>&1 || true
@@ -274,7 +279,7 @@ start_session() {
   wait_for_server
 
   acceptance_started_serve=1
-  "$TAILSCALE_BIN" serve --bg --yes "http://127.0.0.1:$server_port"
+  mutate_serve --bg --yes "http://127.0.0.1:$server_port"
   write_session
   acceptance_startup_complete=1
   trap - EXIT
@@ -304,7 +309,7 @@ stop_session() {
   if [ ! -f "$serve_snapshot" ] || [ -L "$serve_snapshot" ]; then
     die "Serve snapshot is missing or unsafe"
   fi
-  if ! "$TAILSCALE_BIN" serve set-config --all "$serve_snapshot"; then
+  if ! mutate_serve set-config --all "$serve_snapshot"; then
     restore_ok=0
     echo "dev-acceptance: failed to restore Tailscale Serve configuration" >&2
   fi
