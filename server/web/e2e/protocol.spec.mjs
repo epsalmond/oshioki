@@ -58,13 +58,15 @@ test.afterEach(async () => {
   }
   await Promise.allSettled(running.map((processHandle) => processHandle.exited));
 
+  const failures = [];
   const fingerprints = [...enrolledFingerprints];
-  enrolledFingerprints.clear();
   for (const fingerprint of fingerprints) {
     const revocation = hook(["revoke", fingerprint]);
     const result = await revocation.exited;
-    expect(result.code, result.stderr).toBe(0);
+    if (result.code === 0) enrolledFingerprints.delete(fingerprint);
+    else failures.push(`${fingerprint}: ${result.stderr}`);
   }
+  expect(failures).toEqual([]);
 });
 
 function hook(args) {
@@ -156,25 +158,26 @@ async function enrollmentUrl(processHandle) {
   return match[0];
 }
 
-async function gotoEnrollment(page, url) {
+async function navigate(page, url) {
   try {
     await page.goto(url);
   } catch (error) {
     if (!error.message.includes("ERR_NETWORK_CHANGED")) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 50));
     await page.goto(url);
   }
 }
 
 async function completeEnrollment(profile, processHandle, url) {
-  await gotoEnrollment(profile.page, url);
+  await navigate(profile.page, url);
   await expect(profile.page).not.toHaveURL(/#/);
   await profile.page.getByRole("button", { name: "Continue" }).click();
   await expect(profile.page.locator("#status")).toContainText("Enrolled as");
   const result = await processHandle.exited;
-  expect(result.code, result.stderr).toBe(0);
   const device = await enrolledDevice(profile.page);
+  if (device?.fingerprint) enrolledFingerprints.add(device.fingerprint);
+  expect(result.code, result.stderr).toBe(0);
   expect(device).toBeTruthy();
-  enrolledFingerprints.add(device.fingerprint);
   return device;
 }
 
@@ -286,9 +289,9 @@ async function waitForRouted(page, requestId, token) {
 
 async function requestWith(profile, device, action) {
   const { envelope, processHandle } = await pendingRequest();
-  await profile.page.goto(`${origin}/healthz`);
+  await navigate(profile.page, `${origin}/healthz`);
   await waitForRouted(profile.page, envelope.request_id, device.apiToken);
-  await profile.page.goto(`${origin}/r/${envelope.request_id}`);
+  await navigate(profile.page, `${origin}/r/${envelope.request_id}`);
   await expect(profile.page.locator("#request")).toBeVisible();
   await expect(profile.page.locator("#actions")).toBeVisible();
   await expect(profile.page.locator("#command")).toHaveText("/usr/bin/true");
@@ -364,6 +367,7 @@ test("enrollment resumes with the same secret and rejects expired local state", 
     const expiredResult = await expired.exited;
     expect(expiredResult.code).not.toBe(0);
     expect(expiredResult.stderr).toContain("enrollment expired");
+    expect(existsSync(expiredPath)).toBe(false);
 
     const invalid = hook(["enroll", "--resume", "../../outside"]);
     const invalidResult = await invalid.exited;
@@ -382,7 +386,7 @@ test("ciphertext tampering fails before request rendering", async ({ browser }) 
   const profile = await virtualProfile(browser, consoleErrors);
   const device = await enroll(profile);
   const { envelope, processHandle } = await pendingRequest();
-  await profile.page.goto(`${origin}/healthz`);
+  await navigate(profile.page, `${origin}/healthz`);
   await waitForRouted(profile.page, envelope.request_id, device.apiToken);
   const owned = await apiRequest(envelope.request_id, device.apiToken);
   expect(owned.status).toBe(200);
@@ -393,7 +397,7 @@ test("ciphertext tampering fails before request rendering", async ({ browser }) 
   await profile.page.route(`**/api/v1/requests/${envelope.request_id}`, async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", json: tampered });
   });
-  await profile.page.goto(`${origin}/r/${envelope.request_id}`);
+  await navigate(profile.page, `${origin}/r/${envelope.request_id}`);
   await expect(profile.page.locator("#status")).toHaveText("This request could not be verified.");
   await expect(profile.page.locator("#request")).toBeHidden();
   await expect(profile.page.locator("#actions")).toBeHidden();
