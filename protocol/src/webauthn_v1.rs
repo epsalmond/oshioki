@@ -201,6 +201,7 @@ mod tests {
         device: &DevicePublicRecordV1,
         config: &HookConfigV1,
         cross_origin: bool,
+        flags: u8,
         count: u32,
     ) -> ApproveV1 {
         let client = format!(
@@ -210,7 +211,7 @@ mod tests {
             cross_origin
         );
         let mut auth = Sha256::digest(config.rp_id.as_bytes()).to_vec();
-        auth.push(0x05);
+        auth.push(flags);
         auth.extend_from_slice(&count.to_be_bytes());
         let mut message = auth.clone();
         message.extend_from_slice(&Sha256::digest(client.as_bytes()));
@@ -230,7 +231,7 @@ mod tests {
     fn validates_exact_bytes_and_reports_counter_regression() {
         let (signing, device, config) = fixture();
         let raw = br#"{"version":1,"request_id":"request-1"}"#;
-        let approval = signed(raw, &signing, &device, &config, false, 3);
+        let approval = signed(raw, &signing, &device, &config, false, 0x05, 3);
         let result = verify_approval_v1(&approval, raw, &device, &config).unwrap();
         assert!(result.counter_regressed);
         assert!(verify_approval_v1(&approval, b"different", &device, &config).is_err());
@@ -240,10 +241,48 @@ mod tests {
     fn rejects_cross_origin() {
         let (signing, device, config) = fixture();
         let raw = b"request";
-        let approval = signed(raw, &signing, &device, &config, true, 0);
+        let approval = signed(raw, &signing, &device, &config, true, 0x05, 0);
         assert!(matches!(
             verify_approval_v1(&approval, raw, &device, &config),
             Err(Error::BadOrigin)
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_origin() {
+        let (signing, device, config) = fixture();
+        let raw = b"request";
+        let approval = signed(raw, &signing, &device, &config, false, 0x05, 0);
+        let mut wrong = config.clone();
+        wrong.origin = "https://other.example".into();
+        wrong.server_base_url = wrong.origin.clone();
+        assert!(matches!(
+            verify_approval_v1(&approval, raw, &device, &wrong),
+            Err(Error::BadOrigin)
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_rp_id() {
+        let (signing, device, config) = fixture();
+        let raw = b"request";
+        let approval = signed(raw, &signing, &device, &config, false, 0x05, 0);
+        let mut wrong = config.clone();
+        wrong.rp_id = "other.example".into();
+        assert!(matches!(
+            verify_approval_v1(&approval, raw, &device, &wrong),
+            Err(Error::BadRpId)
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_user_verification() {
+        let (signing, device, config) = fixture();
+        let raw = b"request";
+        let approval = signed(raw, &signing, &device, &config, false, 0x01, 0);
+        assert!(matches!(
+            verify_approval_v1(&approval, raw, &device, &config),
+            Err(Error::MissingUserVerification)
         ));
     }
 

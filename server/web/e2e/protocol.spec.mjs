@@ -1,9 +1,10 @@
 import { expect, test } from "@playwright/test";
 import { connect } from "@nats-io/transport-node";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import { join } from "node:path";
 import { URL } from "node:url";
 
 const hookBinary = process.env.SUDO_APPROVE_HOOK ?? "/work/target/release/sudo-approve";
@@ -126,11 +127,13 @@ async function enrolledDevice(page) {
   });
 }
 
-async function enroll(profile) {
-  const processHandle = hook(["enroll"]);
+async function enrollmentUrl(processHandle) {
   const match = await waitForMatch(processHandle, /https:\/\/sudo\.test(?::[0-9]+)?\/enroll\/[0-9a-f-]+#[A-Za-z0-9_-]+/);
-  const enrollmentUrl = match[0];
-  await profile.page.goto(enrollmentUrl);
+  return match[0];
+}
+
+async function completeEnrollment(profile, processHandle, url) {
+  await profile.page.goto(url);
   await expect(profile.page).not.toHaveURL(/#/);
   await profile.page.getByRole("button", { name: "Continue" }).click();
   await expect(profile.page.locator("#status")).toContainText("Enrolled as");
@@ -139,6 +142,25 @@ async function enroll(profile) {
   const device = await enrolledDevice(profile.page);
   expect(device).toBeTruthy();
   return device;
+}
+
+async function enroll(profile) {
+  const processHandle = hook(["enroll"]);
+  return completeEnrollment(profile, processHandle, await enrollmentUrl(processHandle));
+}
+
+async function enrollAfterResume(profile) {
+  const interrupted = hook(["enroll"]);
+  const firstUrl = await enrollmentUrl(interrupted);
+  const enrollmentId = new URL(firstUrl).pathname.split("/").at(-1);
+  interrupted.child.kill("SIGTERM");
+  const interruptedResult = await interrupted.exited;
+  expect(interruptedResult.code).not.toBe(0);
+
+  const resumed = hook(["enroll", "--resume", enrollmentId]);
+  const resumedUrl = await enrollmentUrl(resumed);
+  expect(resumedUrl).toBe(firstUrl);
+  return completeEnrollment(profile, resumed, resumedUrl);
 }
 
 async function pendingRequest() {
@@ -189,25 +211,54 @@ async function requestStatus(requestId, token) {
   });
 }
 
-async function requestWith(profile, device, action) {
-  const { envelope, processHandle } = await pendingRequest();
-  await profile.page.goto(`${origin}/healthz`);
-  let routed = false;
+async function requestJson(requestId, token) {
+  return new Promise((resolve, reject) => {
+    const request = https.request({
+      hostname: "127.0.0.1",
+      port: Number(process.env.SUDO_APPROVE_HTTPS_PORT ?? "443"),
+      path: `/api/v1/requests/${requestId}`,
+      method: "GET",
+      servername: "sudo.test",
+      rejectUnauthorized: false,
+      headers: {
+        host: new URL(origin).host,
+        authorization: `Bearer ${token}`,
+      },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.once("end", () => {
+        if (response.statusCode !== 200) {
+          reject(new Error(`request failed ${response.statusCode}`));
+          return;
+        }
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      });
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+async function waitForRouted(page, requestId, token) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const status = await profile.page.evaluate(async ({ requestId, token }) => {
-      const response = await fetch(`/api/v1/requests/${requestId}`, {
-        headers: { authorization: `Bearer ${token}` },
+    const status = await page.evaluate(async ({ id, apiToken }) => {
+      const response = await fetch(`/api/v1/requests/${id}`, {
+        headers: { authorization: `Bearer ${apiToken}` },
       });
       return response.status;
-    }, { requestId: envelope.request_id, token: device.apiToken });
-    if (status === 200) {
-      routed = true;
-      break;
-    }
+    }, { id: requestId, apiToken: token });
+    if (status === 200) return;
     expect(status).toBe(404);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  expect(routed).toBe(true);
+  throw new Error(`request ${requestId} was not routed`);
+}
+
+async function requestWith(profile, device, action) {
+  const { envelope, processHandle } = await pendingRequest();
+  await profile.page.goto(`${origin}/healthz`);
+  await waitForRouted(profile.page, envelope.request_id, device.apiToken);
   await profile.page.goto(`${origin}/r/${envelope.request_id}`);
   await expect(profile.page.locator("#command")).toHaveText("/usr/bin/true");
   await expect(profile.page.locator("#argv")).toHaveText("/usr/bin/true");
@@ -257,4 +308,57 @@ test("two browser profiles enroll independently and own their approvals", async 
   await second.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: second.authenticatorId });
   await first.context.close();
   await second.context.close();
+});
+
+test("enrollment resumes with the same secret and rejects expired local state", async ({ browser }) => {
+  const consoleErrors = [];
+  const profile = await virtualProfile(browser, consoleErrors);
+  const device = await enrollAfterResume(profile);
+  expect(device).toBeTruthy();
+  expect(consoleErrors).toEqual([]);
+
+  expect(hookConfigDir).toBeTruthy();
+  const enrollmentId = "00000000-0000-4000-8000-000000000001";
+  const enrollmentDirectory = join(hookConfigDir, "enrollments");
+  mkdirSync(enrollmentDirectory, { recursive: true });
+  writeFileSync(join(enrollmentDirectory, `${enrollmentId}.json`), JSON.stringify({
+    version: 1,
+    enrollment_id: enrollmentId,
+    secret: "A".repeat(43),
+    expires_at: 1,
+  }));
+  const expired = hook(["enroll", "--resume", enrollmentId]);
+  const expiredResult = await expired.exited;
+  expect(expiredResult.code).not.toBe(0);
+  expect(expiredResult.stderr).toContain("enrollment expired");
+
+  await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
+  await profile.context.close();
+});
+
+test("ciphertext tampering fails before request rendering", async ({ browser }) => {
+  const consoleErrors = [];
+  const profile = await virtualProfile(browser, consoleErrors);
+  const device = await enroll(profile);
+  const { envelope, processHandle } = await pendingRequest();
+  await profile.page.goto(`${origin}/healthz`);
+  await waitForRouted(profile.page, envelope.request_id, device.apiToken);
+  const tampered = await requestJson(envelope.request_id, device.apiToken);
+  const ciphertext = tampered.sealed.ciphertext;
+  tampered.sealed.ciphertext = `${ciphertext[0] === "A" ? "B" : "A"}${ciphertext.slice(1)}`;
+
+  await profile.page.route(`**/api/v1/requests/${envelope.request_id}`, async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", json: tampered });
+  });
+  await profile.page.goto(`${origin}/r/${envelope.request_id}`);
+  await expect(profile.page.locator("#status")).toHaveText("This request could not be verified.");
+  await expect(profile.page.locator("#request")).toBeHidden();
+  await expect(profile.page.locator("#actions")).toBeHidden();
+  expect(consoleErrors.length).toBeGreaterThan(0);
+
+  processHandle.child.kill("SIGTERM");
+  await processHandle.exited;
+  await profile.page.unroute(`**/api/v1/requests/${envelope.request_id}`);
+  await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
+  await profile.context.close();
 });
