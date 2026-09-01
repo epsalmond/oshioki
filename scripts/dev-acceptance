@@ -38,7 +38,7 @@ mutate_serve() {
 }
 
 normalize_serve_config() {
-  "$JQ_BIN" -S 'del(.version) | walk(if type == "object" then with_entries(select(.value != null and .value != {})) else . end)' "$1"
+  "$JQ_BIN" -S '(. // {}) | del(.version) | walk(if type == "object" then with_entries(select(.value != null and .value != {})) else . end)' "$1"
 }
 
 serve_configs_match() {
@@ -190,6 +190,18 @@ stop_owned_process() {
   die "$label did not stop"
 }
 
+cleanup_owned_process() {
+  local pid="$1" expected_start="$2" label="$3"
+  process_is_owned "$pid" "$expected_start" || return 0
+  kill "$pid" || return 0
+  for _ in $(seq 1 50); do
+    process_is_owned "$pid" "$expected_start" || return 0
+    sleep 0.1
+  done
+  echo "dev-acceptance: $label did not stop during startup cleanup" >&2
+  return 1
+}
+
 session_value() {
   # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
   "$JQ_BIN" -r --arg field "$1" 'if has($field) then .[$field] else error("missing session field") end' "$SESSION_FILE"
@@ -292,7 +304,15 @@ wait_for_server() {
 }
 
 verify_serve_route() {
-  current_serve_matches_acceptance
+  local route_key="$rp_id:$https_port" proxy="http://127.0.0.1:$server_port"
+  # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
+  "$TAILSCALE_BIN" serve status --json |
+    "$JQ_BIN" -e --arg port "$https_port" --arg route_key "$route_key" --arg proxy "$proxy" \
+      '.TCP[$port].HTTPS == true and
+       .Web[$route_key].Handlers["/"].Proxy == $proxy and
+       ((.TCP // {}) | length == 1) and
+       ((.Web // {}) | length == 1) and
+       ((.AllowFunnel // {}) | length == 0)' >/dev/null
 }
 
 wait_for_origin() {
@@ -342,8 +362,11 @@ start_session() {
       if [ "$acceptance_started_serve" -eq 1 ] && [ -f "$serve_snapshot" ]; then
         restore_serve >/dev/null 2>&1 || echo "dev-acceptance: failed to restore Tailscale Serve configuration" >&2
       fi
-      [ -z "${server_pid:-}" ] || kill "$server_pid" >/dev/null 2>&1 || true
-      [ -z "${nats_pid:-}" ] || kill "$nats_pid" >/dev/null 2>&1 || true
+      [ -z "${server_pid:-}" ] || [ -z "${server_start:-}" ] ||
+        cleanup_owned_process "$server_pid" "$server_start" server || true
+      [ -z "${nats_pid:-}" ] || [ -z "${nats_start:-}" ] ||
+        cleanup_owned_process "$nats_pid" "$nats_start" NATS || true
+      rm -f -- "$state_root/server.pid" "$state_root/nats.pid"
       [ "$managed_state" = false ] || rm -rf -- "$state_root"
     fi
     return "$exit_status"
@@ -447,6 +470,7 @@ stop_session() {
   fi
   stop_owned_process "$server_pid" "$server_start" server
   stop_owned_process "$nats_pid" "$nats_start" NATS
+  rm -f -- "$state_root/server.pid" "$state_root/nats.pid"
   [ "$restore_ok" -eq 1 ] || die "acceptance services stopped but Serve restoration must be retried"
   rm -f -- "$SESSION_FILE"
   if [ "$managed_state" = true ]; then

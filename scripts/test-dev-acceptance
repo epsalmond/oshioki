@@ -79,7 +79,7 @@ case "$1 $2" in
     elif [ -n "${FAKE_SERVE_SNAPSHOT:-}" ]; then
       printf '%s\n' "$FAKE_SERVE_SNAPSHOT"
     else
-      printf '%s\n' '{}'
+      printf '%s\n' 'null'
     fi
     printf 'snapshot\n' >>"$FAKE_TAILSCALE_LOG"
     ;;
@@ -165,7 +165,7 @@ NATS_PID=""
 SERVER_PID=""
 grep -Fq 'serve --yes --https=18444 http://127.0.0.1:18443' "$TAILSCALE_LOG"
 grep -Fq 'reset' "$TAILSCALE_LOG"
-grep -Fxq '{}' "$TEST_ROOT/state/serve-config.json"
+grep -Fxq 'null' "$TEST_ROOT/state/serve-config.json"
 grep -Fq "$FAKE_BIN/tailscale serve --bg --yes --https=18444 http://127.0.0.1:18443" "$PRIVILEGE_LOG"
 grep -Fq "$FAKE_BIN/tailscale serve reset" "$PRIVILEGE_LOG"
 [ "$(wc -l <"$PRIVILEGE_LOG")" -eq 2 ] || fail "unexpected privileged command count"
