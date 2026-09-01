@@ -12,12 +12,13 @@ usage() {
 }
 
 compose() {
-  compose_uid="$(id -u)"
+  host_uid="$(id -u)"
+  compose_uid="$host_uid"
   if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
     compose_uid=0
   fi
   SUDO_APPROVE_STATE_ROOT="$state_root" SUDO_APPROVE_HTTP_PORT="${http_port:-8443}" \
-    SUDO_APPROVE_UID="$compose_uid" \
+    SUDO_APPROVE_UID="$compose_uid" SUDO_APPROVE_HOST_UID="$host_uid" \
     docker compose -f "$REPO_ROOT/compose.yaml" -p "$project_name" "$@"
 }
 
@@ -118,6 +119,16 @@ case "$command_name" in
     trap cleanup_test EXIT
     compose build server e2e
     compose run --rm e2e
+    ownership_report="$state_root/.foreign-owner"
+    if ! find "$state_root" ! -uid "$(id -u)" -print -quit >"$ownership_report"; then
+      echo "could not verify disposable state ownership" >&2
+      exit 1
+    fi
+    if [ -s "$ownership_report" ]; then
+      echo "container left disposable state owned by another user: $(cat "$ownership_report")" >&2
+      exit 1
+    fi
+    rm -f -- "$ownership_report"
     test_ok=1
     ;;
   down)
