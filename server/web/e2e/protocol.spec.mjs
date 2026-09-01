@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { connect } from "@nats-io/transport-node";
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import { join } from "node:path";
@@ -16,6 +16,8 @@ const natsOptions = {
   pass: process.env.NATS_PASS ?? "test-only",
 };
 let proxy;
+const activeHooks = new Set();
+const enrolledFingerprints = new Set();
 
 test.beforeAll(async () => {
   const target = new URL(process.env.SUDO_APPROVE_SERVER_HTTP ?? "http://server:8443");
@@ -49,6 +51,22 @@ test.afterAll(async () => {
   if (proxy) await new Promise((resolve) => proxy.close(resolve));
 });
 
+test.afterEach(async () => {
+  const running = [...activeHooks];
+  for (const processHandle of running) {
+    if (processHandle.child.exitCode === null) processHandle.child.kill("SIGTERM");
+  }
+  await Promise.allSettled(running.map((processHandle) => processHandle.exited));
+
+  const fingerprints = [...enrolledFingerprints];
+  enrolledFingerprints.clear();
+  for (const fingerprint of fingerprints) {
+    const revocation = hook(["revoke", fingerprint]);
+    const result = await revocation.exited;
+    expect(result.code, result.stderr).toBe(0);
+  }
+});
+
 function hook(args) {
   const child = spawn(hookBinary, args, {
     env: hookConfigDir
@@ -66,11 +84,17 @@ function hook(args) {
     child.once("error", reject);
     child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
-  return {
+  const processHandle = {
     child,
     exited,
     output: () => `${stdout}\n${stderr}`,
   };
+  activeHooks.add(processHandle);
+  exited.then(
+    () => activeHooks.delete(processHandle),
+    () => activeHooks.delete(processHandle),
+  );
+  return processHandle;
 }
 
 async function waitForMatch(processHandle, pattern, timeoutMs = 15_000) {
@@ -132,8 +156,17 @@ async function enrollmentUrl(processHandle) {
   return match[0];
 }
 
+async function gotoEnrollment(page, url) {
+  try {
+    await page.goto(url);
+  } catch (error) {
+    if (!error.message.includes("ERR_NETWORK_CHANGED")) throw error;
+    await page.goto(url);
+  }
+}
+
 async function completeEnrollment(profile, processHandle, url) {
-  await profile.page.goto(url);
+  await gotoEnrollment(profile.page, url);
   await expect(profile.page).not.toHaveURL(/#/);
   await profile.page.getByRole("button", { name: "Continue" }).click();
   await expect(profile.page.locator("#status")).toContainText("Enrolled as");
@@ -141,6 +174,7 @@ async function completeEnrollment(profile, processHandle, url) {
   expect(result.code, result.stderr).toBe(0);
   const device = await enrolledDevice(profile.page);
   expect(device).toBeTruthy();
+  enrolledFingerprints.add(device.fingerprint);
   return device;
 }
 
@@ -152,15 +186,24 @@ async function enroll(profile) {
 async function enrollAfterResume(profile) {
   const interrupted = hook(["enroll"]);
   const firstUrl = await enrollmentUrl(interrupted);
-  const enrollmentId = new URL(firstUrl).pathname.split("/").at(-1);
+  const parsedUrl = new URL(firstUrl);
+  const enrollmentId = parsedUrl.pathname.split("/").at(-1);
+  expect(hookConfigDir).toBeTruthy();
+  const statePath = join(hookConfigDir, "enrollments", `${enrollmentId}.json`);
   interrupted.child.kill("SIGTERM");
   const interruptedResult = await interrupted.exited;
-  expect(interruptedResult.code).not.toBe(0);
+  expect(interruptedResult.signal).toBe("SIGTERM");
+  expect(existsSync(statePath)).toBe(true);
+  const persisted = JSON.parse(readFileSync(statePath, "utf8"));
+  expect(persisted.secret).toBe(parsedUrl.hash.slice(1));
+  expect(statSync(statePath).mode & 0o777).toBe(0o600);
 
   const resumed = hook(["enroll", "--resume", enrollmentId]);
   const resumedUrl = await enrollmentUrl(resumed);
   expect(resumedUrl).toBe(firstUrl);
-  return completeEnrollment(profile, resumed, resumedUrl);
+  const device = await completeEnrollment(profile, resumed, resumedUrl);
+  expect(existsSync(statePath)).toBe(false);
+  return device;
 }
 
 async function pendingRequest() {
@@ -189,29 +232,7 @@ async function pendingRequest() {
   return { envelope, processHandle };
 }
 
-async function requestStatus(requestId, token) {
-  return new Promise((resolve, reject) => {
-    const request = https.request({
-      hostname: "127.0.0.1",
-      port: Number(process.env.SUDO_APPROVE_HTTPS_PORT ?? "443"),
-      path: `/api/v1/requests/${requestId}`,
-      method: "GET",
-      servername: "sudo.test",
-      rejectUnauthorized: false,
-      headers: {
-        host: new URL(origin).host,
-        authorization: `Bearer ${token}`,
-      },
-    }, (response) => {
-      response.resume();
-      response.once("end", () => resolve(response.statusCode));
-    });
-    request.once("error", reject);
-    request.end();
-  });
-}
-
-async function requestJson(requestId, token) {
+async function apiRequest(requestId, token) {
   return new Promise((resolve, reject) => {
     const request = https.request({
       hostname: "127.0.0.1",
@@ -228,16 +249,24 @@ async function requestJson(requestId, token) {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
       response.once("end", () => {
-        if (response.statusCode !== 200) {
-          reject(new Error(`request failed ${response.statusCode}`));
-          return;
+        const payload = Buffer.concat(chunks).toString("utf8");
+        let body = null;
+        if (payload) {
+          try { body = JSON.parse(payload); } catch { body = payload; }
         }
-        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        resolve({
+          status: response.statusCode,
+          body,
+        });
       });
     });
     request.once("error", reject);
     request.end();
   });
+}
+
+async function requestStatus(requestId, token) {
+  return (await apiRequest(requestId, token)).status;
 }
 
 async function waitForRouted(page, requestId, token) {
@@ -260,6 +289,8 @@ async function requestWith(profile, device, action) {
   await profile.page.goto(`${origin}/healthz`);
   await waitForRouted(profile.page, envelope.request_id, device.apiToken);
   await profile.page.goto(`${origin}/r/${envelope.request_id}`);
+  await expect(profile.page.locator("#request")).toBeVisible();
+  await expect(profile.page.locator("#actions")).toBeVisible();
   await expect(profile.page.locator("#command")).toHaveText("/usr/bin/true");
   await expect(profile.page.locator("#argv")).toHaveText("/usr/bin/true");
 
@@ -321,16 +352,26 @@ test("enrollment resumes with the same secret and rejects expired local state", 
   const enrollmentId = "00000000-0000-4000-8000-000000000001";
   const enrollmentDirectory = join(hookConfigDir, "enrollments");
   mkdirSync(enrollmentDirectory, { recursive: true });
-  writeFileSync(join(enrollmentDirectory, `${enrollmentId}.json`), JSON.stringify({
+  const expiredPath = join(enrollmentDirectory, `${enrollmentId}.json`);
+  writeFileSync(expiredPath, JSON.stringify({
     version: 1,
     enrollment_id: enrollmentId,
     secret: "A".repeat(43),
     expires_at: 1,
-  }));
-  const expired = hook(["enroll", "--resume", enrollmentId]);
-  const expiredResult = await expired.exited;
-  expect(expiredResult.code).not.toBe(0);
-  expect(expiredResult.stderr).toContain("enrollment expired");
+  }), { mode: 0o600 });
+  try {
+    const expired = hook(["enroll", "--resume", enrollmentId]);
+    const expiredResult = await expired.exited;
+    expect(expiredResult.code).not.toBe(0);
+    expect(expiredResult.stderr).toContain("enrollment expired");
+
+    const invalid = hook(["enroll", "--resume", "../../outside"]);
+    const invalidResult = await invalid.exited;
+    expect(invalidResult.code).not.toBe(0);
+    expect(invalidResult.stderr).toContain("invalid enrollment id");
+  } finally {
+    rmSync(expiredPath, { force: true });
+  }
 
   await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
   await profile.context.close();
@@ -343,7 +384,9 @@ test("ciphertext tampering fails before request rendering", async ({ browser }) 
   const { envelope, processHandle } = await pendingRequest();
   await profile.page.goto(`${origin}/healthz`);
   await waitForRouted(profile.page, envelope.request_id, device.apiToken);
-  const tampered = await requestJson(envelope.request_id, device.apiToken);
+  const owned = await apiRequest(envelope.request_id, device.apiToken);
+  expect(owned.status).toBe(200);
+  const tampered = owned.body;
   const ciphertext = tampered.sealed.ciphertext;
   tampered.sealed.ciphertext = `${ciphertext[0] === "A" ? "B" : "A"}${ciphertext.slice(1)}`;
 
@@ -354,10 +397,9 @@ test("ciphertext tampering fails before request rendering", async ({ browser }) 
   await expect(profile.page.locator("#status")).toHaveText("This request could not be verified.");
   await expect(profile.page.locator("#request")).toBeHidden();
   await expect(profile.page.locator("#actions")).toBeHidden();
-  expect(consoleErrors.length).toBeGreaterThan(0);
+  expect(consoleErrors).toHaveLength(1);
+  expect(consoleErrors[0]).toMatch(/ciphertext cannot be decrypted using that key/);
 
-  processHandle.child.kill("SIGTERM");
-  await processHandle.exited;
   await profile.page.unroute(`**/api/v1/requests/${envelope.request_id}`);
   await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
   await profile.context.close();
