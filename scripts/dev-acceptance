@@ -14,6 +14,7 @@ CURL_BIN="${SUDO_APPROVE_ACCEPTANCE_CURL_BIN:-curl}"
 OPENSSL_BIN="${SUDO_APPROVE_ACCEPTANCE_OPENSSL_BIN:-openssl}"
 JQ_BIN="${SUDO_APPROVE_ACCEPTANCE_JQ_BIN:-jq}"
 NODE_BIN="${SUDO_APPROVE_ACCEPTANCE_NODE_BIN:-node}"
+SETSID_BIN="${SUDO_APPROVE_ACCEPTANCE_SETSID_BIN:-setsid}"
 SERVER_BIN="${SUDO_APPROVE_ACCEPTANCE_SERVER_BIN:-$REPO_ROOT/target/debug/sudo-approve-server}"
 HOOK_BIN="${SUDO_APPROVE_ACCEPTANCE_HOOK_BIN:-$REPO_ROOT/target/debug/sudo-approve}"
 
@@ -33,6 +34,26 @@ require_tool() {
 
 mutate_serve() {
   "$PRIVILEGE_BIN" "$TAILSCALE_BIN" serve "$@"
+}
+
+restore_serve() {
+  local current_config expected_config compare_status=0
+  if "$JQ_BIN" -e '[(del(.version) | .. | scalars)] | length == 0' "$serve_snapshot" >/dev/null; then
+    mutate_serve reset
+  else
+    mutate_serve set-config --all "$serve_snapshot"
+  fi
+
+  current_config="$(mktemp "$state_root/.serve-current.XXXXXX")"
+  expected_config="$(mktemp "$state_root/.serve-expected.XXXXXX")"
+  if ! "$TAILSCALE_BIN" serve get-config --all >"$current_config" ||
+     ! "$JQ_BIN" -S 'del(.version)' "$serve_snapshot" >"$expected_config" ||
+     ! "$JQ_BIN" -S 'del(.version)' "$current_config" >"$current_config.normalized" ||
+     ! cmp -s "$expected_config" "$current_config.normalized"; then
+    compare_status=1
+  fi
+  rm -f -- "$current_config" "$current_config.normalized" "$expected_config"
+  return "$compare_status"
 }
 
 free_port() {
@@ -182,7 +203,7 @@ start_session() {
   acceptance_started_serve=0
   acceptance_startup_complete=0
   [ ! -e "$SESSION_FILE" ] || die "an acceptance session already exists; run scripts/dev-acceptance down first"
-  for tool in "$CARGO_BIN" "$CURL_BIN" "$JQ_BIN" "$NATS_BIN" "$NATS_SERVER_BIN" "$NODE_BIN" "$OPENSSL_BIN" "$PRIVILEGE_BIN" "$TAILSCALE_BIN"; do
+  for tool in "$CARGO_BIN" "$CURL_BIN" "$JQ_BIN" "$NATS_BIN" "$NATS_SERVER_BIN" "$NODE_BIN" "$OPENSSL_BIN" "$PRIVILEGE_BIN" "$SETSID_BIN" "$TAILSCALE_BIN"; do
     require_tool "$tool"
   done
   [ -d /proc/self ] || die "acceptance sessions currently require Linux process identity from /proc"
@@ -212,7 +233,7 @@ start_session() {
     if [ "$acceptance_startup_complete" -ne 1 ]; then
       set +e
       if [ "$acceptance_started_serve" -eq 1 ] && [ -f "$serve_snapshot" ]; then
-        mutate_serve set-config --all "$serve_snapshot" >/dev/null 2>&1
+        restore_serve >/dev/null 2>&1 || echo "dev-acceptance: failed to restore Tailscale Serve configuration" >&2
       fi
       [ -z "${server_pid:-}" ] || kill "$server_pid" >/dev/null 2>&1 || true
       [ -z "${nats_pid:-}" ] || kill "$nats_pid" >/dev/null 2>&1 || true
@@ -245,7 +266,8 @@ start_session() {
   nats_config="$state_root/nats/auth.conf"
   printf 'authorization {\n  users = [{user: "sudo-approve", password: "%s"}]\n}\n' "$password" >"$nats_config"
   chmod 0600 "$nats_config"
-  "$NATS_SERVER_BIN" -c "$nats_config" -js -sd "$state_root/nats/store" -a 127.0.0.1 -p "$nats_port" \
+  "$SETSID_BIN" -- "$NATS_SERVER_BIN" -c "$nats_config" -js -sd "$state_root/nats/store" -a 127.0.0.1 -p "$nats_port" \
+    </dev/null \
     >"$state_root/logs/nats.log" 2>&1 &
   nats_pid=$!
   nats_start="$(process_start "$nats_pid")"
@@ -273,7 +295,7 @@ start_session() {
   SUDO_APPROVE_LISTEN="127.0.0.1:$server_port" \
   SUDO_APPROVE_ORIGIN="$origin" \
   SUDO_APPROVE_RP_ID="$rp_id" \
-    "$SERVER_BIN" >"$state_root/logs/server.log" 2>&1 &
+    "$SETSID_BIN" -- "$SERVER_BIN" </dev/null >"$state_root/logs/server.log" 2>&1 &
   server_pid=$!
   server_start="$(process_start "$server_pid")"
   wait_for_server
@@ -309,7 +331,7 @@ stop_session() {
   if [ ! -f "$serve_snapshot" ] || [ -L "$serve_snapshot" ]; then
     die "Serve snapshot is missing or unsafe"
   fi
-  if ! mutate_serve set-config --all "$serve_snapshot"; then
+  if ! restore_serve; then
     restore_ok=0
     echo "dev-acceptance: failed to restore Tailscale Serve configuration" >&2
   fi

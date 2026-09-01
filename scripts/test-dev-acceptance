@@ -72,12 +72,19 @@ case "$1 $2" in
     ;;
   "serve get-config")
     [ "$3" = --all ]
-    printf '%s\n' '{"version":"alpha0","TCP":{}}'
+    if [ -n "${FAKE_SERVE_SNAPSHOT:-}" ]; then
+      printf '%s\n' "$FAKE_SERVE_SNAPSHOT"
+    else
+      printf '%s\n' '{"version":"alpha0","TCP":{}}'
+    fi
     printf 'snapshot\n' >>"$FAKE_TAILSCALE_LOG"
     ;;
   "serve set-config")
     [ "$3" = --all ]
     printf 'restore %s %s\n' "$4" "$(tr -d '\n' <"$4")" >>"$FAKE_TAILSCALE_LOG"
+    ;;
+  "serve reset")
+    printf 'reset\n' >>"$FAKE_TAILSCALE_LOG"
     ;;
   "serve status")
     printf '%s\n' '{"Web":{"nas.example.test:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:18443"}}}}}'
@@ -116,6 +123,11 @@ NATS_PID="$(jq -r .nats_pid "$SESSION_FILE")"
 SERVER_PID="$(jq -r .server_pid "$SESSION_FILE")"
 kill -0 "$NATS_PID"
 kill -0 "$SERVER_PID"
+PARENT_SID="$(ps -o sid= -p "$$" | tr -d ' ')"
+NATS_SID="$(ps -o sid= -p "$NATS_PID" | tr -d ' ')"
+SERVER_SID="$(ps -o sid= -p "$SERVER_PID" | tr -d ' ')"
+[ "$NATS_SID" != "$PARENT_SID" ] || fail "NATS shares the launcher session"
+[ "$SERVER_SID" != "$PARENT_SID" ] || fail "server shares the launcher session"
 NATS_PASSWORD_VALUE="$(sed -n 's/^NATS_PASS=//p' "$TEST_ROOT/state/hook/config.env")"
 case "$(tr '\0' ' ' <"/proc/$NATS_PID/cmdline")" in
   *"$NATS_PASSWORD_VALUE"*) fail "NATS password appears in process arguments" ;;
@@ -133,16 +145,17 @@ SERVER_STATE="$(awk '{print $3}' "/proc/$SERVER_PID/stat" 2>/dev/null || true)"
 NATS_PID=""
 SERVER_PID=""
 grep -Fq 'serve --yes http://127.0.0.1:18443' "$TAILSCALE_LOG"
-grep -Fq 'restore ' "$TAILSCALE_LOG"
-grep -Fq '"version":"alpha0"' "$TAILSCALE_LOG"
+grep -Fq 'reset' "$TAILSCALE_LOG"
+grep -Fq '"version":"alpha0"' "$TEST_ROOT/state/serve-config.json"
 grep -Fq "$FAKE_BIN/tailscale serve --bg --yes http://127.0.0.1:18443" "$PRIVILEGE_LOG"
-grep -Fq "$FAKE_BIN/tailscale serve set-config --all $TEST_ROOT/state/serve-config.json" "$PRIVILEGE_LOG"
+grep -Fq "$FAKE_BIN/tailscale serve reset" "$PRIVILEGE_LOG"
 [ "$(wc -l <"$PRIVILEGE_LOG")" -eq 2 ] || fail "unexpected privileged command count"
 
 : >"$TAILSCALE_LOG"
 : >"$PRIVILEGE_LOG"
 : >"$PROCESS_LOG"
 export FAKE_FAIL_SERVE=1
+export FAKE_SERVE_SNAPSHOT='{"version":"alpha0","TCP":{"443":{"HTTPS":true}}}'
 if "$SCRIPT" up --state-dir "$TEST_ROOT/failed-state" >"$TEST_ROOT/failed-start.log" 2>&1; then
   fail "failed Serve startup was accepted"
 fi
