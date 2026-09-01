@@ -219,7 +219,10 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     } else {
         create_enrollment_state()?
     };
+    let state_path = enrollment_path(&state.enrollment_id)?;
+    prune_expired_enrollment_states(&state.enrollment_id);
     if state.expires_at <= now() {
+        remove_enrollment_state(&state_path);
         bail!("enrollment expired");
     }
     let secret_bytes: [u8; 32] = protocol::decode_base64url(&state.secret)?
@@ -289,6 +292,7 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     )
     .await?;
     nats.flush().await?;
+    remove_enrollment_state(&state_path);
     println!("Device enrolled: {} ({})", device.fingerprint, device.label);
     Ok(())
 }
@@ -569,18 +573,51 @@ fn create_enrollment_state() -> Result<EnrollmentStateV1> {
         secret: URL_SAFE_NO_PAD.encode(secret),
         expires_at: now() + 300,
     };
-    atomic_write_json(&enrollment_path(&state.enrollment_id), &state, 0o600)?;
+    atomic_write_json(&enrollment_path(&state.enrollment_id)?, &state, 0o600)?;
     Ok(state)
 }
 fn load_enrollment_state(id: &str) -> Result<EnrollmentStateV1> {
-    let state: EnrollmentStateV1 = read_json(&enrollment_path(id))?;
+    let state: EnrollmentStateV1 = read_json(&enrollment_path(id)?)?;
     if state.version != VERSION_V1 || state.enrollment_id != id {
         bail!("invalid enrollment state");
     }
     Ok(state)
 }
-fn enrollment_path(id: &str) -> PathBuf {
-    config_dir().join("enrollments").join(format!("{id}.json"))
+fn enrollment_path(id: &str) -> Result<PathBuf> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        bail!("invalid enrollment id");
+    }
+    Ok(config_dir().join("enrollments").join(format!("{id}.json")))
+}
+
+fn remove_enrollment_state(path: &Path) {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            warn!(path=%path.display(), %error, "failed to remove enrollment state");
+        }
+        _ => {}
+    }
+}
+
+fn prune_expired_enrollment_states(current_id: &str) {
+    let directory = config_dir().join("enrollments");
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(state) = read_json::<EnrollmentStateV1>(&path) else {
+            continue;
+        };
+        if state.enrollment_id != current_id && state.expires_at <= now() {
+            remove_enrollment_state(&path);
+        }
+    }
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {

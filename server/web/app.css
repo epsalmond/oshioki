@@ -1,5 +1,6 @@
 :root { color-scheme: light dark; font: 17px/1.45 system-ui, sans-serif; }
 body { margin: 0; background: Canvas; color: CanvasText; }
+[hidden] { display: none !important; }
 main { max-width: 42rem; margin: 8vh auto; padding: 1.5rem; }
 h1 { font-size: 1.7rem; }
 dl { display: grid; grid-template-columns: 9rem 1fr; gap: .65rem 1rem; }
