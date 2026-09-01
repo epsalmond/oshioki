@@ -139,6 +139,7 @@ read_session() {
   server_start="$(session_value server_start)"
   nats_port="$(session_value nats_port)"
   server_port="$(session_value server_port)"
+  https_port="$(session_value https_port)"
   case "$nats_pid:$nats_start:$server_pid:$server_start" in
     *[!0-9:]*) die "invalid recorded process identity" ;;
   esac
@@ -147,6 +148,7 @@ read_session() {
   fi
   validate_port "$nats_port"
   validate_port "$server_port"
+  validate_port "$https_port"
   origin="$(session_value origin)"
   rp_id="$(session_value rp_id)"
   serve_snapshot="$(session_value serve_snapshot)"
@@ -166,10 +168,11 @@ write_session() {
     --arg server_start "$server_start" \
     --argjson nats_port "$nats_port" \
     --argjson server_port "$server_port" \
+    --argjson https_port "$https_port" \
     --arg origin "$origin" \
     --arg rp_id "$rp_id" \
     --arg serve_snapshot "$serve_snapshot" \
-    '{version:1,state_root:$state_root,managed_state:$managed_state,nats_pid:$nats_pid,nats_start:$nats_start,server_pid:$server_pid,server_start:$server_start,nats_port:$nats_port,server_port:$server_port,origin:$origin,rp_id:$rp_id,serve_snapshot:$serve_snapshot}' \
+    '{version:1,state_root:$state_root,managed_state:$managed_state,nats_pid:$nats_pid,nats_start:$nats_start,server_pid:$server_pid,server_start:$server_start,nats_port:$nats_port,server_port:$server_port,https_port:$https_port,origin:$origin,rp_id:$rp_id,serve_snapshot:$serve_snapshot}' \
     >"$temporary"
   chmod 0600 "$temporary"
   mv "$temporary" "$SESSION_FILE"
@@ -196,6 +199,24 @@ wait_for_server() {
     sleep 0.1
   done
   die "server did not become ready"
+}
+
+verify_serve_route() {
+  local route_key="$rp_id:$https_port" proxy="http://127.0.0.1:$server_port"
+  # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
+  "$TAILSCALE_BIN" serve status --json |
+    "$JQ_BIN" -e --arg route_key "$route_key" --arg proxy "$proxy" \
+      '.Web[$route_key].Handlers["/"].Proxy == $proxy' >/dev/null
+}
+
+wait_for_origin() {
+  for _ in $(seq 1 "${SUDO_APPROVE_ACCEPTANCE_HTTPS_READY_ATTEMPTS:-300}"); do
+    if verify_serve_route && "$CURL_BIN" --fail --silent "$origin/healthz" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.1
+  done
+  die "tailnet HTTPS origin did not become ready: $origin"
 }
 
 start_session() {
@@ -246,12 +267,14 @@ start_session() {
   "$TAILSCALE_BIN" status --json | "$JQ_BIN" -e '.Self.Online == true' >/dev/null || die "Tailscale is not online"
   rp_id="$($TAILSCALE_BIN status --json | "$JQ_BIN" -er '.Self.DNSName | select(type == "string" and length > 1)' | sed 's/\.$//')"
   [ -n "$rp_id" ] || die "Tailscale DNS name is unavailable"
-  origin="https://$rp_id"
   nats_port="${SUDO_APPROVE_ACCEPTANCE_NATS_PORT:-$(free_port)}"
   server_port="${SUDO_APPROVE_ACCEPTANCE_SERVER_PORT:-$(free_port)}"
+  https_port="${SUDO_APPROVE_ACCEPTANCE_HTTPS_PORT:-8443}"
   validate_port "$nats_port"
   validate_port "$server_port"
+  validate_port "$https_port"
   [ "$nats_port" != "$server_port" ] || die "NATS and server ports must differ"
+  origin="https://$rp_id:$https_port"
 
   "$TAILSCALE_BIN" serve get-config --all >"$serve_snapshot"
   if [ ! -f "$serve_snapshot" ] || [ -L "$serve_snapshot" ]; then
@@ -301,7 +324,8 @@ start_session() {
   wait_for_server
 
   acceptance_started_serve=1
-  mutate_serve --bg --yes "http://127.0.0.1:$server_port"
+  mutate_serve --bg --yes "--https=$https_port" "http://127.0.0.1:$server_port"
+  wait_for_origin
   write_session
   acceptance_startup_complete=1
   trap - EXIT
@@ -321,7 +345,8 @@ show_status() {
   process_is_owned "$nats_pid" "$nats_start" || die "acceptance NATS is not running"
   process_is_owned "$server_pid" "$server_start" || die "acceptance server is not running"
   "$CURL_BIN" --fail --silent "http://127.0.0.1:$server_port/healthz" >/dev/null || die "acceptance server is unhealthy"
-  "$TAILSCALE_BIN" serve status --json >/dev/null
+  verify_serve_route || die "acceptance Tailscale Serve route is missing"
+  "$CURL_BIN" --fail --silent "$origin/healthz" >/dev/null || die "acceptance tailnet HTTPS origin is unhealthy"
   printf 'origin: %s\nstate: %s\nNATS PID: %s\nserver PID: %s\n' "$origin" "$state_root" "$nats_pid" "$server_pid"
 }
 

@@ -54,11 +54,12 @@ scripts/dev-acceptance down
 
 The command derives the WebAuthn origin from the host's Tailscale DNS name. It
 runs isolated NATS and SQLite state on loopback and temporarily points
-Tailscale Serve at the local server. `down` restores the prior Serve
-configuration. The acceptance command does not install or enable the sudo
-plugin. Use `--state-dir PATH` with `up` to retain browser enrollment across
-sessions. Serve mutations run through `sudo`; Tailscale discovery, the server,
-NATS, and the hook remain under the invoking user.
+Tailscale Serve on HTTPS port 8443 at the local server, avoiding an existing
+listener on 443. `down` restores the prior Serve configuration. The acceptance
+command does not install or enable the sudo plugin. Use `--state-dir PATH` with
+`up` to retain browser enrollment across sessions. Serve mutations run through
+`sudo`; Tailscale discovery, the server, NATS, and the hook remain under the
+invoking user.
 
 ## Repository layout
 

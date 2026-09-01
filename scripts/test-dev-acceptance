@@ -87,7 +87,7 @@ case "$1 $2" in
     printf 'reset\n' >>"$FAKE_TAILSCALE_LOG"
     ;;
   "serve status")
-    printf '%s\n' '{"Web":{"nas.example.test:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:18443"}}}}}'
+    printf '%s\n' '{"Web":{"nas.example.test:18444":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:18443"}}}}}'
     ;;
   "serve --bg")
     printf 'serve %s\n' "${*:3}" >>"$FAKE_TAILSCALE_LOG"
@@ -110,6 +110,7 @@ export SUDO_APPROVE_ACCEPTANCE_TAILSCALE_BIN="$FAKE_BIN/tailscale"
 export SUDO_APPROVE_ACCEPTANCE_PRIVILEGE_BIN="$FAKE_BIN/sudo"
 export SUDO_APPROVE_ACCEPTANCE_NATS_PORT=14222
 export SUDO_APPROVE_ACCEPTANCE_SERVER_PORT=18443
+export SUDO_APPROVE_ACCEPTANCE_HTTPS_PORT=18444
 export SUDO_APPROVE_ACCEPTANCE_SERVER_BIN="$FAKE_BIN/sudo-approve-server"
 export SUDO_APPROVE_ACCEPTANCE_HOOK_BIN="$FAKE_BIN/sudo-approve"
 
@@ -119,6 +120,8 @@ export SUDO_APPROVE_ACCEPTANCE_HOOK_BIN="$FAKE_BIN/sudo-approve"
 [ -f "$TEST_ROOT/state/hook/hook.json" ] || fail "hook config was not created"
 [ -f "$TEST_ROOT/state/hook/config.env" ] || fail "hook environment was not created"
 [ -f "$TEST_ROOT/state/hook/devices.json" ] || fail "device registry was not created"
+jq -e '.origin == "https://nas.example.test:18444" and .rp_id == "nas.example.test"' \
+  "$TEST_ROOT/state/hook/hook.json" >/dev/null || fail "hook origin or RP ID is wrong"
 NATS_PID="$(jq -r .nats_pid "$SESSION_FILE")"
 SERVER_PID="$(jq -r .server_pid "$SESSION_FILE")"
 kill -0 "$NATS_PID"
@@ -132,7 +135,7 @@ NATS_PASSWORD_VALUE="$(sed -n 's/^NATS_PASS=//p' "$TEST_ROOT/state/hook/config.e
 case "$(tr '\0' ' ' <"/proc/$NATS_PID/cmdline")" in
   *"$NATS_PASSWORD_VALUE"*) fail "NATS password appears in process arguments" ;;
 esac
-"$SCRIPT" status | grep -Fq 'https://nas.example.test'
+"$SCRIPT" status | grep -Fq 'https://nas.example.test:18444'
 "$SCRIPT" enroll | grep -Fq 'Enrollment URL:'
 "$SCRIPT" test | grep -Fq 'synthetic request complete'
 "$SCRIPT" down
@@ -144,10 +147,10 @@ SERVER_STATE="$(awk '{print $3}' "/proc/$SERVER_PID/stat" 2>/dev/null || true)"
 [ -z "$SERVER_STATE" ] || [ "$SERVER_STATE" = Z ] || fail "server process remains after down"
 NATS_PID=""
 SERVER_PID=""
-grep -Fq 'serve --yes http://127.0.0.1:18443' "$TAILSCALE_LOG"
+grep -Fq 'serve --yes --https=18444 http://127.0.0.1:18443' "$TAILSCALE_LOG"
 grep -Fq 'reset' "$TAILSCALE_LOG"
 grep -Fq '"version":"alpha0"' "$TEST_ROOT/state/serve-config.json"
-grep -Fq "$FAKE_BIN/tailscale serve --bg --yes http://127.0.0.1:18443" "$PRIVILEGE_LOG"
+grep -Fq "$FAKE_BIN/tailscale serve --bg --yes --https=18444 http://127.0.0.1:18443" "$PRIVILEGE_LOG"
 grep -Fq "$FAKE_BIN/tailscale serve reset" "$PRIVILEGE_LOG"
 [ "$(wc -l <"$PRIVILEGE_LOG")" -eq 2 ] || fail "unexpected privileged command count"
 
