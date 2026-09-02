@@ -1,5 +1,5 @@
 [package]
-name = "server"
+name = "oshioki-server"
 edition = { workspace = true }
 rust-version = { workspace = true }
 version = { workspace = true }
@@ -10,11 +10,11 @@ publish = { workspace = true }
 # Binary: the approval service. NATS relay, ntfy broker, HTTP page, enrollment.
 
 [[bin]]
-name = "sudo-approve-server"
+name = "oshioki-server"
 path = "src/main.rs"
 
 [dependencies]
-protocol = { path = "../protocol" }
+oshioki-protocol = { path = "../protocol" }
 tokio = { workspace = true }
 async-nats = { workspace = true }
 serde = { workspace = true }

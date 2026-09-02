@@ -14,13 +14,13 @@ for tool in cargo curl nats nats-server node npm openssl; do
   }
 done
 
-NATS_PORT="${SUDO_APPROVE_TEST_NATS_PORT:-$(free_port)}"
-SERVER_PORT="${SUDO_APPROVE_TEST_SERVER_PORT:-$(free_port)}"
-HTTPS_PORT="${SUDO_APPROVE_TEST_HTTPS_PORT:-$(free_port)}"
+NATS_PORT="${OSHIOKI_TEST_NATS_PORT:-$(free_port)}"
+SERVER_PORT="${OSHIOKI_TEST_SERVER_PORT:-$(free_port)}"
+HTTPS_PORT="${OSHIOKI_TEST_HTTPS_PORT:-$(free_port)}"
 while [ "$SERVER_PORT" = "$NATS_PORT" ]; do SERVER_PORT="$(free_port)"; done
 while [ "$HTTPS_PORT" = "$NATS_PORT" ] || [ "$HTTPS_PORT" = "$SERVER_PORT" ]; do HTTPS_PORT="$(free_port)"; done
 TEMP_ROOT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
-STATE_ROOT="$(mktemp -d "$TEMP_ROOT/sudo-approve-browser.XXXXXX")"
+STATE_ROOT="$(mktemp -d "$TEMP_ROOT/oshioki-browser.XXXXXX")"
 NATS_PID=""
 SERVER_PID=""
 TEST_OK=0
@@ -46,7 +46,7 @@ npm --prefix "$REPO_ROOT/server/web" ci
 npm --prefix "$REPO_ROOT/server/web" exec playwright install chromium
 
 nats-server -js -sd "$STATE_ROOT/nats" -p "$NATS_PORT" \
-  --user sudo-approve --pass test-only >"$STATE_ROOT/nats.log" 2>&1 &
+  --user oshioki --pass test-only >"$STATE_ROOT/nats.log" 2>&1 &
 NATS_PID=$!
 for _ in $(seq 1 50); do
   if (exec 3<>"/dev/tcp/127.0.0.1/$NATS_PORT") 2>/dev/null; then
@@ -56,26 +56,26 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 kill -0 "$NATS_PID"
-nats --server "nats://127.0.0.1:$NATS_PORT" --user sudo-approve --password test-only \
-  stream add SUDO_APPROVE --subjects 'sudo.request.>' --storage memory \
+nats --server "nats://127.0.0.1:$NATS_PORT" --user oshioki --password test-only \
+  stream add OSHIOKI --subjects 'oshioki.request.>' --storage memory \
   --retention limits --discard old --max-age 10m --defaults >/dev/null
 
 origin="https://sudo.test:$HTTPS_PORT"
 printf '{"version":1,"origin":"%s","rp_id":"sudo.test","server_base_url":"%s"}\n' \
   "$origin" "$origin" >"$STATE_ROOT/hook/hook.json"
-printf 'NATS_URL=nats://127.0.0.1:%s\nNATS_USER=sudo-approve\nNATS_PASS=test-only\n' \
+printf 'NATS_URL=nats://127.0.0.1:%s\nNATS_USER=oshioki\nNATS_PASS=test-only\n' \
   "$NATS_PORT" >"$STATE_ROOT/hook/config.env"
 printf '{"version":1,"devices":[]}\n' >"$STATE_ROOT/hook/devices.json"
 chmod 0600 "$STATE_ROOT/hook"/*
 
 NATS_URL="nats://127.0.0.1:$NATS_PORT" \
-NATS_USER=sudo-approve \
+NATS_USER=oshioki \
 NATS_PASS=test-only \
-SUDO_APPROVE_STATE_PATH="$STATE_ROOT/server/state.sqlite3" \
-SUDO_APPROVE_LISTEN="127.0.0.1:$SERVER_PORT" \
-SUDO_APPROVE_ORIGIN="$origin" \
-SUDO_APPROVE_RP_ID=sudo.test \
-  "$REPO_ROOT/target/debug/sudo-approve-server" >"$STATE_ROOT/server.log" 2>&1 &
+OSHIOKI_STATE_PATH="$STATE_ROOT/server/state.sqlite3" \
+OSHIOKI_LISTEN="127.0.0.1:$SERVER_PORT" \
+OSHIOKI_ORIGIN="$origin" \
+OSHIOKI_RP_ID=sudo.test \
+  "$REPO_ROOT/target/debug/oshioki-server" >"$STATE_ROOT/server.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 100); do
   if curl --fail --silent "http://127.0.0.1:$SERVER_PORT/healthz" >/dev/null; then
@@ -89,15 +89,15 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj /CN=sudo.test -addext subjectAltName=DNS:sudo.test \
   -keyout "$STATE_ROOT/tls/key.pem" -out "$STATE_ROOT/tls/cert.pem" >/dev/null 2>&1
 
-SUDO_APPROVE_HOOK="$REPO_ROOT/target/debug/sudo-approve" \
-SUDO_APPROVE_TEST_CONFIG_DIR="$STATE_ROOT/hook" \
-SUDO_APPROVE_ORIGIN="$origin" \
-SUDO_APPROVE_SERVER_HTTP="http://127.0.0.1:$SERVER_PORT" \
-SUDO_APPROVE_TLS_KEY="$STATE_ROOT/tls/key.pem" \
-SUDO_APPROVE_TLS_CERT="$STATE_ROOT/tls/cert.pem" \
-SUDO_APPROVE_HTTPS_PORT="$HTTPS_PORT" \
+OSHIOKI_HOOK="$REPO_ROOT/target/debug/oshioki" \
+OSHIOKI_TEST_CONFIG_DIR="$STATE_ROOT/hook" \
+OSHIOKI_ORIGIN="$origin" \
+OSHIOKI_SERVER_HTTP="http://127.0.0.1:$SERVER_PORT" \
+OSHIOKI_TLS_KEY="$STATE_ROOT/tls/key.pem" \
+OSHIOKI_TLS_CERT="$STATE_ROOT/tls/cert.pem" \
+OSHIOKI_HTTPS_PORT="$HTTPS_PORT" \
 NATS_URL="nats://127.0.0.1:$NATS_PORT" \
-NATS_USER=sudo-approve \
+NATS_USER=oshioki \
 NATS_PASS=test-only \
   npm --prefix "$REPO_ROOT/server/web" run test:e2e
 

@@ -1210,6 +1210,80 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "oshioki-hook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "base64",
+ "clap",
+ "futures",
+ "nix",
+ "oshioki-protocol",
+ "p256",
+ "rand 0.8.8",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "oshioki-plugin"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "nix",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "oshioki-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chacha20poly1305",
+ "hmac",
+ "p256",
+ "rand 0.8.8",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "oshioki-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "axum",
+ "futures",
+ "oshioki-protocol",
+ "p256",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1302,16 +1376,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
-name = "plugin"
-version = "0.1.0"
-dependencies = [
- "libc",
- "nix",
- "serde_json",
- "tracing",
-]
-
-[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1368,23 +1432,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "protocol"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chacha20poly1305",
- "hmac",
- "p256",
- "rand 0.8.8",
- "serde",
- "serde_cbor",
- "serde_json",
- "sha2",
- "thiserror 2.0.20",
- "x25519-dalek",
 ]
 
 [[package]]
@@ -1903,28 +1950,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-nats",
- "axum",
- "futures",
- "p256",
- "protocol",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_cbor",
- "serde_json",
- "sha2",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1990,9 +2015,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.15.2"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 
 [[package]]
 name = "socket2"
@@ -2031,31 +2056,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "sudo-approve"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-nats",
- "base64",
- "clap",
- "futures",
- "nix",
- "p256",
- "protocol",
- "rand 0.8.8",
- "serde",
- "serde_cbor",
- "serde_json",
- "sha2",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "x25519-dalek",
-]
 
 [[package]]
 name = "syn"

@@ -1,7 +1,7 @@
 //! `approval_exec` — the sudo approval plugin (cdylib).
 //!
 //! Exports the `SUDO_APPROVAL_PLUGIN` vtable sudo looks up when it loads this
-//! library. The plugin forks `sudo-approve check` and maps
+//! library. The plugin forks `oshioki check` and maps
 //! its exit code to the sudo approval API contract.
 //!
 //! This module is the only unsafe code in the workspace. Every unsafe block
@@ -403,10 +403,10 @@ fn push_kv(buf: &mut Vec<u8>, prefix: &str, key: &str, value: &str) {
 // ---------------------------------------------------------------------------
 
 /// Full path to the helper binary.
-const HOOK_PATH: &str = "/usr/local/sbin/sudo-approve";
+const HOOK_PATH: &str = "/usr/local/sbin/oshioki";
 
 /// Argument vector passed to the hook.
-const HOOK_ARGV: &[&str] = &["sudo-approve", "check"];
+const HOOK_ARGV: &[&str] = &["oshioki", "check"];
 
 /// Fork the hook, pipe `ctx` to its stdin, wait for it, and map the exit
 /// status to the sudo approval contract.

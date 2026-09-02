@@ -18,9 +18,9 @@ use crate::{
 };
 
 type HmacSha256 = Hmac<Sha256>;
-const REGISTRATION_DOMAIN: &[u8] = b"management-plane-sudo-approve/enroll/registration/v1\0";
-const PROOF_DOMAIN: &[u8] = b"management-plane-sudo-approve/enroll/proof/v1\0";
-const TRANSCRIPT_DOMAIN: &[u8] = b"management-plane-sudo-approve/enroll/transcript/v1\0";
+const REGISTRATION_DOMAIN: &[u8] = b"oshioki/enroll/registration/v1\0";
+const PROOF_DOMAIN: &[u8] = b"oshioki/enroll/proof/v1\0";
+const TRANSCRIPT_DOMAIN: &[u8] = b"oshioki/enroll/transcript/v1\0";
 
 #[derive(Deserialize)]
 struct ClientData {

@@ -19,8 +19,8 @@ pub const VERSION_V1: u8 = 1;
 pub const MAX_DEVICES: usize = 8;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 3 * 1024 * 1024;
-const CHALLENGE_DOMAIN: &[u8] = b"management-plane-sudo-approve/approve/v1\0";
-const FINGERPRINT_DOMAIN: &[u8] = b"management-plane-sudo-approve/fingerprint/v1\0";
+const CHALLENGE_DOMAIN: &[u8] = b"oshioki/approve/v1\0";
+const FINGERPRINT_DOMAIN: &[u8] = b"oshioki/fingerprint/v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestV1 {
@@ -210,7 +210,7 @@ impl EnrollmentIntentV1 {
         if self.version != VERSION_V1
             || !valid_id(&self.enrollment_id)
             || decode_exact(&self.secret_hash, 32).is_err()
-            || self.reply_subject != format!("sudo.enrollment.submission.{}", self.enrollment_id)
+            || self.reply_subject != format!("oshioki.enrollment.submission.{}", self.enrollment_id)
         {
             return Err(Error::InvalidRequest("invalid enrollment intent".into()));
         }
@@ -496,7 +496,7 @@ mod tests {
         );
         assert_eq!(
             encode_base64url(&approve_challenge(raw)),
-            "5VNwjeIaxy3rOFXvz7lUoZvgjLjgWdxzU3255JY4qBI"
+            "mTBOp81bPTi4PmjpqFmNPFz3vFWCzk1yBKBHmHEkWV4"
         );
     }
 }

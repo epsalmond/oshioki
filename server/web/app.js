@@ -2,10 +2,10 @@
 
 const enc = new TextEncoder();
 const dec = new TextDecoder("utf-8", { fatal: true });
-const REGISTRATION_DOMAIN = enc.encode("management-plane-sudo-approve/enroll/registration/v1\0");
-const PROOF_DOMAIN = enc.encode("management-plane-sudo-approve/enroll/proof/v1\0");
-const TRANSCRIPT_DOMAIN = enc.encode("management-plane-sudo-approve/enroll/transcript/v1\0");
-const APPROVE_DOMAIN = enc.encode("management-plane-sudo-approve/approve/v1\0");
+const REGISTRATION_DOMAIN = enc.encode("oshioki/enroll/registration/v1\0");
+const PROOF_DOMAIN = enc.encode("oshioki/enroll/proof/v1\0");
+const TRANSCRIPT_DOMAIN = enc.encode("oshioki/enroll/transcript/v1\0");
+const APPROVE_DOMAIN = enc.encode("oshioki/approve/v1\0");
 
 function b64(bytes) {
   return sodium.to_base64(new Uint8Array(bytes), sodium.base64_variants.URLSAFE_NO_PADDING);
@@ -36,7 +36,7 @@ async function sha256(...parts) { return new Uint8Array(await crypto.subtle.dige
 
 function openDb() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("management-plane-sudo-approve", 1);
+    const request = indexedDB.open("oshioki", 1);
     request.onupgradeneeded = () => request.result.createObjectStore("devices", { keyPath: "fingerprint" });
     request.onerror = () => reject(request.error); request.onsuccess = () => resolve(request.result);
   });

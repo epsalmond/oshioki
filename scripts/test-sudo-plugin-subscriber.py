@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Mock NATS subscriber for the sudo-approve container E2E test.
+"""Mock NATS subscriber for the oshioki container E2E test.
 
 Speaks just enough of the NATS text protocol to subscribe to
-`sudo.request.>`, capture the JSON envelope published by the hook, unseal
+`oshioki.request.>`, capture the JSON envelope published by the hook, unseal
 it with the device box key (generated here so the hook can enroll us),
 and write the plaintext approval request to the shared volume for the
 test harness to assert on.
@@ -30,8 +30,8 @@ SHARE = os.environ["SHARE_DIR"]
 NATS_HOST = os.environ["NATS_HOST"]
 NATS_PORT = int(os.environ["NATS_PORT"])
 TIMEOUT = int(os.environ.get("TIMEOUT", "120"))
-ORIGIN = os.environ.get("SUDO_APPROVE_ORIGIN", "https://sudo.test")
-RP_ID = os.environ.get("SUDO_APPROVE_RP_ID", "sudo.test")
+ORIGIN = os.environ.get("OSHIOKI_ORIGIN", "https://sudo.test")
+RP_ID = os.environ.get("OSHIOKI_RP_ID", "sudo.test")
 
 
 def b64url(data: bytes) -> str:
@@ -90,7 +90,7 @@ atomic_write(
 )
 credential_id = b"\x01\x02\x03"
 fingerprint_hash = hashes.Hash(hashes.SHA256())
-fingerprint_hash.update(b"management-plane-sudo-approve/fingerprint/v1\x00")
+fingerprint_hash.update(b"oshioki/fingerprint/v1\x00")
 fingerprint_hash.update(len(credential_id).to_bytes(8, "big"))
 fingerprint_hash.update(credential_id)
 fingerprint_hash.update(len(credential_cose).to_bytes(8, "big"))
@@ -113,7 +113,7 @@ conn = json.dumps(
         "pass": os.environ.get("NATS_PASS", "test"),
     }
 )
-sock.sendall(f"CONNECT {conn}\r\nSUB sudo.request.> 1\r\nPING\r\n".encode())
+sock.sendall(f"CONNECT {conn}\r\nSUB oshioki.request.> 1\r\nPING\r\n".encode())
 
 # NATS processes a connection in order. Seeing this PONG proves that the SUB
 # immediately before PING is active, so the harness may safely invoke sudo.
@@ -179,7 +179,7 @@ while time.time() < deadline:
     buf += chunk
 
 if payload is None:
-    print("subscriber: timeout waiting for sudo.request MSG", file=sys.stderr)
+    print("subscriber: timeout waiting for oshioki.request MSG", file=sys.stderr)
     sys.exit(1)
 
 # --- Phase 3: unseal and emit ---
@@ -207,7 +207,7 @@ plaintext = cipher.decrypt(
 request = json.loads(plaintext)
 
 challenge_digest = hashes.Hash(hashes.SHA256())
-challenge_digest.update(b"management-plane-sudo-approve/approve/v1\x00")
+challenge_digest.update(b"oshioki/approve/v1\x00")
 challenge_digest.update(plaintext)
 challenge = base64.urlsafe_b64encode(challenge_digest.finalize()).rstrip(b"=").decode()
 client_data_json = json.dumps(
@@ -241,7 +241,7 @@ verdict = json.dumps(
     },
     separators=(",", ":"),
 ).encode()
-verdict_subject = f"sudo.verdict.{request['request_id']}"
+verdict_subject = f"oshioki.verdict.{request['request_id']}"
 sock.sendall(
     f"PUB {verdict_subject} {len(verdict)}\r\n".encode() + verdict + b"\r\n"
 )

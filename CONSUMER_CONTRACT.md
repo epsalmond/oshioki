@@ -1,30 +1,29 @@
-# Sudo approve consumer contract
+# Oshioki consumer contract
 
-## Issue #868
+## The deploying infrastructure
 
-#868 supplies the production runtime. It must provide:
+The deploying infrastructure supplies the production runtime. It must provide:
 
-- A `SUDO_APPROVE` JetStream stream for `sudo.request.>`.
-- The durable `sudo-approve-server-v1` consumer permissions.
-- Publish and subscribe permissions for `sudo.verdict.*` and
-  `sudo.enrollment.*`.
-- Publish and subscribe permissions for `sudo.device.revoke.*`.
-- A writable SQLite path set by `SUDO_APPROVE_STATE_PATH`.
-- `SUDO_APPROVE_ORIGIN=https://sudo.internal.psalmond.com` and
-  `SUDO_APPROVE_RP_ID=sudo.internal.psalmond.com`.
+- An `OSHIOKI` JetStream stream for `oshioki.request.>`.
+- The durable `oshioki-server-v1` consumer permissions.
+- Publish and subscribe permissions for `oshioki.verdict.*` and
+  `oshioki.enrollment.*`.
+- Publish and subscribe permissions for `oshioki.device.revoke.*`.
+- A writable SQLite path set by `OSHIOKI_STATE_PATH`.
+- `OSHIOKI_ORIGIN=https://sudo.example.com` and
+  `OSHIOKI_RP_ID=sudo.example.com`.
 - A selected server package or image, plus ntfy, DNS, TLS, promotion,
   exemptions, alerts, and rollback.
 
 The runtime must not log or notify with request plaintext. An ntfy message may
 contain host, user, request ID, and `/r/<id>` URL only.
 
-## Issue #869
+## The Mac installer
 
-#869 installs the packaged Darwin client. It owns the read-only watcher
-credential, LaunchAgent, `pam_tid`, laptop activation, and rollback. `watch`
-accepts no shell command. The optional
-`SUDO_APPROVE_OPENER` test seam is one executable path followed by one URL
-argument.
+The Mac installer installs the packaged Darwin client. It owns the read-only
+watcher credential, LaunchAgent, `pam_tid`, laptop activation, and rollback.
+`watch` accepts no shell command. The optional `OSHIOKI_OPENER` test seam is
+one executable path followed by one URL argument.
 
 Neither consumer changes the v1 wire format. A protocol change requires a new
 version and a compatibility decision in this repository.

@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use protocol::{
+use oshioki_protocol::{
     DecisionV1, DevicePublicRecordV1, EnrollmentStatusV1, EnrollmentSubmissionV1, RequestEnvelopeV1,
 };
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
@@ -84,7 +84,7 @@ impl Store {
     #[cfg(test)]
     pub fn put_device(&self, device: &DevicePublicRecordV1) -> Result<()> {
         device.validate().context("validate device")?;
-        let api_token_hash = protocol::decode_base64url(&device.api_token_hash)?;
+        let api_token_hash = oshioki_protocol::decode_base64url(&device.api_token_hash)?;
         let public_json = serde_json::to_string(device)?;
         self.lock()?.execute(
             "INSERT INTO devices(fingerprint, credential_id, api_token_hash, public_record_json, active, updated_at)
@@ -213,7 +213,7 @@ impl Store {
         device.validate().context("validate activated device")?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let api_token_hash = protocol::decode_base64url(&device.api_token_hash)?;
+        let api_token_hash = oshioki_protocol::decode_base64url(&device.api_token_hash)?;
         let public_json = serde_json::to_string(device)?;
         transaction.execute(
             "INSERT INTO devices(fingerprint, credential_id, api_token_hash, public_record_json, active, updated_at)
@@ -271,7 +271,7 @@ impl Store {
         envelope: &RequestEnvelopeV1,
         now: i64,
     ) -> Result<InsertResult> {
-        if raw.len() > protocol::v1::MAX_ENVELOPE_BYTES {
+        if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
             bail!("oversized request envelope");
         }
         envelope.validate().context("validate envelope")?;
@@ -406,7 +406,7 @@ impl Store {
         transaction.execute(
             "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at)
              VALUES ('decision', ?1, ?2, ?3, unixepoch())",
-            params![request_id, format!("sudo.verdict.{request_id}"), raw],
+            params![request_id, format!("oshioki.verdict.{request_id}"), raw],
         )?;
         transaction.commit()?;
         Ok(InsertResult::Inserted)
@@ -523,11 +523,11 @@ COMMIT;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p256::ecdsa::SigningKey;
-    use protocol::{
+    use oshioki_protocol::{
         DenyV1, SealedDeviceBodyV1,
         v1::{VERSION_V1, encode_base64url},
     };
+    use p256::ecdsa::SigningKey;
     use std::{
         collections::BTreeMap,
         path::PathBuf,
@@ -540,7 +540,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "sudo-approve-db-test-{}-{nonce}.sqlite3",
+            "oshioki-db-test-{}-{nonce}.sqlite3",
             std::process::id()
         ))
     }
@@ -575,8 +575,11 @@ mod tests {
         );
         let credential_public_key = serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap();
         let box_public_key = vec![3; 32];
-        let fingerprint =
-            protocol::device_fingerprint(&credential_id, &credential_public_key, &box_public_key);
+        let fingerprint = oshioki_protocol::device_fingerprint(
+            &credential_id,
+            &credential_public_key,
+            &box_public_key,
+        );
         DevicePublicRecordV1 {
             version: 1,
             fingerprint,
@@ -711,7 +714,7 @@ mod tests {
             let pending = store.pending_outbox(10).unwrap();
             assert_eq!(pending.len(), 1);
             assert_eq!(pending[0].kind, "decision");
-            assert_eq!(pending[0].subject, "sudo.verdict.request-1");
+            assert_eq!(pending[0].subject, "oshioki.verdict.request-1");
             store.mark_outbox_sent(pending[0].id).unwrap();
             assert!(store.pending_outbox(10).unwrap().is_empty());
 
