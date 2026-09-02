@@ -15,7 +15,9 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "unattended")]
+use clap::ValueEnum;
+use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, parse_enrollment_url};
 use oshioki_protocol::{ActivationV1, DecisionV1, RequestEnvelopeV1, escape_for_terminal};
@@ -48,6 +50,7 @@ enum Verb {
     /// Watch for requests and decide them.
     Run {
         /// Decide every request without asking. For tests only.
+        #[cfg(feature = "unattended")]
         #[arg(long, value_enum)]
         auto: Option<Auto>,
     },
@@ -55,6 +58,7 @@ enum Verb {
     Show,
 }
 
+#[cfg(feature = "unattended")]
 #[derive(Clone, Copy, ValueEnum)]
 enum Auto {
     Approve,
@@ -74,7 +78,10 @@ async fn main() -> Result<()> {
             enrollment_url,
             label,
         } => cmd_pair(&identity_path, &enrollment_url, &label).await,
+        #[cfg(feature = "unattended")]
         Verb::Run { auto } => cmd_run(&identity_path, auto).await,
+        #[cfg(not(feature = "unattended"))]
+        Verb::Run {} => cmd_run(&identity_path).await,
         Verb::Show => {
             println!("{}", Identity::load(&identity_path)?.fingerprint());
             Ok(())
@@ -145,7 +152,10 @@ async fn cmd_pair(identity_path: &std::path::Path, url: &str, label: &str) -> Re
     Ok(())
 }
 
-async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<()> {
+async fn cmd_run(
+    identity_path: &std::path::Path,
+    #[cfg(feature = "unattended")] auto: Option<Auto>,
+) -> Result<()> {
     let identity = Arc::new(Identity::load(identity_path)?);
     let nats = connect_nats().await?;
     let mut requests = nats
@@ -154,13 +164,18 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
         .context("subscribe requests")?;
     nats.flush().await?;
     info!(fingerprint=%identity.fingerprint(), "watching for requests");
-    let (decider, stdin_closed) = match auto {
-        Some(Auto::Approve) => (Decider::Auto(true), None),
-        Some(Auto::Deny) => (Decider::Auto(false), None),
-        None => {
-            let (prompter, closed) = Prompter::from_stdin();
-            (Decider::Prompt(prompter), Some(closed))
-        }
+    #[cfg(feature = "unattended")]
+    let auto = auto.map(|auto| match auto {
+        Auto::Approve => true,
+        Auto::Deny => false,
+    });
+    #[cfg(not(feature = "unattended"))]
+    let auto: Option<bool> = None;
+    let (decider, stdin_closed) = if let Some(answer) = auto {
+        (Decider::Auto(answer), None)
+    } else {
+        let (prompter, closed) = Prompter::from_stdin();
+        (Decider::Prompt(prompter), Some(closed))
     };
     let decider = Arc::new(decider);
     // A prompt with no stdin behind it answers nothing, and the hook waits
@@ -175,8 +190,7 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
         let message = tokio::select! {
             () = &mut stdin_closed => bail!(
                 "stdin is closed, so no approval prompt can be answered and every request \
-                 would wait out its deadline; run the agent on a terminal, or with --auto \
-                 for unattended tests"
+                 would wait out its deadline; run the agent on a terminal"
             ),
             message = requests.next() => message.context("request stream closed")?,
         };
@@ -322,7 +336,8 @@ fn runas_label(runas_uid: u32) -> String {
     }
 }
 
-/// Where a verdict comes from: `--auto` for tests, otherwise the terminal.
+/// Where a verdict comes from: the terminal, or a fixed answer when the
+/// `unattended` feature's `--auto` flag was given.
 enum Decider {
     Auto(bool),
     Prompt(Prompter),
