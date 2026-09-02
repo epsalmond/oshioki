@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Read-only scan of the full git history for private identifiers and secret
+# shapes, ahead of making this repository public. Never rewrites history;
+# it only reports what it finds so a human can decide whether a
+# `git filter-repo` pass is needed first.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+cd "$REPO_ROOT"
+
+echo "== gitleaks (full history) =="
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --redact -v . || true
+elif command -v docker >/dev/null 2>&1; then
+  docker run --rm -v "$REPO_ROOT:/repo" -w /repo zricethezav/gitleaks:latest \
+    git --redact -v . || true
+else
+  echo "scan-history: gitleaks binary and docker are both unavailable" >&2
+  echo "scan-history: install a binary under ~/.bin/tmp/ and re-run" >&2
+  exit 2
+fi
+
+echo
+echo "== pattern scan (all historical blobs) =="
+PATTERN='tail88da26|psalmond|/home/eric|BEGIN (RSA|OPENSSH|EC) PRIVATE|AKIA|ghp_|xox[bp]-'
+
+git rev-list --all --objects |
+  git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' |
+  awk '$1 == "blob" { print $2, $3 }' |
+  while read -r blob path; do
+    if git cat-file -p "$blob" 2>/dev/null | grep -qE "$PATTERN"; then
+      git cat-file -p "$blob" 2>/dev/null |
+        grep -noE "$PATTERN" |
+        while IFS=: read -r line match; do
+          printf '%s:%s:%s: %s\n' "$blob" "$path" "$line" "$match"
+        done
+    fi
+  done
+
+echo
+echo "== commits touching each hit path =="
+git rev-list --all --objects |
+  git cat-file --batch-check='%(objecttype) %(objectname) %(rest)' |
+  awk '$1 == "blob" { print $2, $3 }' |
+  while read -r blob path; do
+    if git cat-file -p "$blob" 2>/dev/null | grep -qE "$PATTERN"; then
+      printf '%s:\n' "$path"
+      git log --all --oneline -- "$path" | sed 's/^/  /'
+    fi
+  done | sort -u

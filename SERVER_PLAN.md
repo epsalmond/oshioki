@@ -1,4 +1,4 @@
-# Sudo approval server architecture
+# Oshioki server architecture
 
 The server stores routing data and opaque ciphertext. It cannot produce an
 approval accepted by the hook.

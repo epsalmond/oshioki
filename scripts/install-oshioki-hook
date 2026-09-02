@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install, disable, or inspect the retained sudo-approve prelaunch block.
+# Install, disable, or inspect the retained oshioki prelaunch block.
 set -euo pipefail
 
 MODE=""
@@ -8,49 +8,46 @@ CONFIG_FILE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --prelaunch|--disable-prelaunch|--prelaunch-status|--standalone-e2e)
-      [ -z "$MODE" ] || { echo "install-sudo-hook: choose exactly one mode" >&2; exit 2; }
+      [ -z "$MODE" ] || { echo "install-oshioki-hook: choose exactly one mode" >&2; exit 2; }
       MODE="${1#--}"
       ;;
     --config-file)
-      [ "$#" -ge 2 ] || { echo "install-sudo-hook: --config-file requires a path" >&2; exit 2; }
+      [ "$#" -ge 2 ] || { echo "install-oshioki-hook: --config-file requires a path" >&2; exit 2; }
       CONFIG_FILE="$2"
       shift
       ;;
     --dry-run) DRY_RUN=1 ;;
-    *) echo "install-sudo-hook: unknown argument: $1" >&2; exit 2 ;;
+    *) echo "install-oshioki-hook: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
-[ -n "$MODE" ] || { echo "install-sudo-hook: choose exactly one mode" >&2; exit 2; }
+[ -n "$MODE" ] || { echo "install-oshioki-hook: choose exactly one mode" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SERVICE_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 SUDO_CONF="${SUDO_CONF:-/etc/sudo.conf}"
 SBIN_DIR="${SBIN_DIR:-/usr/local/sbin}"
-STATE_DIR="${SUDO_APPROVE_STATE_DIR:-/etc/sudo-approve}"
-LEGACY_STATE_DIR="${SUDO_APPROVE_LEGACY_STATE_DIR:-/etc/management-plane/sudo-approve}"
+STATE_DIR="${OSHIOKI_STATE_DIR:-/etc/oshioki}"
 SUDOERS_D="${SUDOERS_D:-/etc/sudoers.d}"
-ORIGIN="${SUDO_APPROVE_ORIGIN:-}"
-RP_ID="${SUDO_APPROVE_RP_ID:-}"
+ORIGIN="${OSHIOKI_ORIGIN:-}"
+RP_ID="${OSHIOKI_RP_ID:-}"
 NATS_URL="${NATS_URL:-}"
-NATS_USER="${NATS_USER:-sudo-approve}"
+NATS_USER="${NATS_USER:-oshioki}"
 NATS_PASS="${NATS_PASS:-}"
-BEGIN_MARK='# BEGIN sudo approve'
-END_MARK='# END sudo approve'
-LEGACY_BEGIN_MARK='# BEGIN management-plane sudo approve'
-LEGACY_END_MARK='# END management-plane sudo approve'
-LOCK_DIR="${SUDO_APPROVE_INSTALL_LOCK:-${STATE_DIR}.install.lock}"
+BEGIN_MARK='# BEGIN oshioki'
+END_MARK='# END oshioki'
+LOCK_DIR="${OSHIOKI_INSTALL_LOCK:-${STATE_DIR}.install.lock}"
 
 case "$(uname -s)" in
-  Linux) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=approval_exec.so; BUILD_PLUGIN=libplugin.so ;;
-  Darwin) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=approval_exec.dylib; BUILD_PLUGIN=libplugin.dylib ;;
-  *) echo "install-sudo-hook: unsupported operating system" >&2; exit 1 ;;
+  Linux) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=oshioki.so; BUILD_PLUGIN=liboshioki_plugin.so ;;
+  Darwin) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=oshioki.dylib; BUILD_PLUGIN=liboshioki_plugin.dylib ;;
+  *) echo "install-oshioki-hook: unsupported operating system" >&2; exit 1 ;;
 esac
-HOOK_BIN="$SERVICE_DIR/target/release/sudo-approve"
+HOOK_BIN="$SERVICE_DIR/target/release/oshioki"
 PLUGIN_BIN="$SERVICE_DIR/target/release/$BUILD_PLUGIN"
 PLUGIN_DEST="$PLUGIN_DIR/$PLUGIN_NAME"
 
-die() { echo "install-sudo-hook: $*" >&2; exit 1; }
+die() { echo "install-oshioki-hook: $*" >&2; exit 1; }
 run() { if [ "$DRY_RUN" -eq 1 ]; then printf 'DRY:'; printf ' %q' "$@"; printf '\n'; else "$@"; fi; }
 regular_or_absent() { [ ! -L "$1" ] || die "refusing unsafe target: $1"; [ ! -e "$1" ] || [ -f "$1" ] || die "refusing unsafe target: $1"; }
 safe_directory() { [ ! -L "$1" ] || die "refusing symlink directory: $1"; [ ! -e "$1" ] || [ -d "$1" ] || die "refusing non-directory: $1"; }
@@ -79,8 +76,8 @@ load_config_file() {
       [[:space:]]*|*[[:space:]]|\"*\"|\'*\') die "config value must be unquoted and untrimmed: $key" ;;
     esac
     case "$key" in
-      SUDO_APPROVE_ORIGIN) ORIGIN="$value" ;;
-      SUDO_APPROVE_RP_ID) RP_ID="$value" ;;
+      OSHIOKI_ORIGIN) ORIGIN="$value" ;;
+      OSHIOKI_RP_ID) RP_ID="$value" ;;
       NATS_URL) NATS_URL="$value" ;;
       NATS_USER) NATS_USER="$value" ;;
       NATS_PASS) NATS_PASS="$value" ;;
@@ -106,33 +103,22 @@ validate_marker_pair() {
 }
 
 validate_block() {
-  local source="$1" begin_line end_line legacy_begin_line legacy_end_line
+  local source="$1"
   validate_marker_pair "$source" "$BEGIN_MARK" "$END_MARK"
-  validate_marker_pair "$source" "$LEGACY_BEGIN_MARK" "$LEGACY_END_MARK"
-  if grep -Fq "$BEGIN_MARK" "$source" && grep -Fq "$LEGACY_BEGIN_MARK" "$source"; then
-    begin_line="$(grep -nF "$BEGIN_MARK" "$source" | cut -d: -f1)"
-    end_line="$(grep -nF "$END_MARK" "$source" | cut -d: -f1)"
-    legacy_begin_line="$(grep -nF "$LEGACY_BEGIN_MARK" "$source" | cut -d: -f1)"
-    legacy_end_line="$(grep -nF "$LEGACY_END_MARK" "$source" | cut -d: -f1)"
-    if [ "$end_line" -ge "$legacy_begin_line" ] && [ "$legacy_end_line" -ge "$begin_line" ]; then
-      die "overlapping managed blocks in $source"
-    fi
-  fi
 }
 
 if [ "$MODE" = prelaunch-status ]; then
   [ -f "$SUDO_CONF" ] || { echo "disabled"; exit 1; }
   validate_block "$SUDO_CONF"
   begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"
-  legacy_begins="$(grep -cF "$LEGACY_BEGIN_MARK" "$SUDO_CONF" || true)"
-  if [ $((begins + legacy_begins)) -gt 0 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
-  if [ $((begins + legacy_begins)) -eq 0 ]; then echo "disabled"; exit 1; fi
+  if [ "$begins" -gt 0 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
+  if [ "$begins" -eq 0 ]; then echo "disabled"; exit 1; fi
   die "malformed managed block in $SUDO_CONF"
 fi
 
 [ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || die "must run as root"
 safe_directory "$(dirname "$STATE_DIR")"; safe_directory "$STATE_DIR"; regular_or_absent "$SUDO_CONF"
-safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/sudo-approve"; regular_or_absent "$PLUGIN_DEST"
+safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/oshioki"; regular_or_absent "$PLUGIN_DEST"
 regular_or_absent "$STATE_DIR/config.env"; regular_or_absent "$STATE_DIR/hook.json"; regular_or_absent "$STATE_DIR/devices.json"
 
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -144,10 +130,9 @@ rewrite_block() {
   local action="$1" source="$2" destination="$3" tmp
   validate_block "$source"
   tmp="$(mktemp "${destination}.XXXXXX")"
-  awk -v begin="$BEGIN_MARK" -v end="$END_MARK" \
-      -v legacy_begin="$LEGACY_BEGIN_MARK" -v legacy_end="$LEGACY_END_MARK" '
-    $0 == begin || $0 == legacy_begin { inside=1; next }
-    $0 == end || $0 == legacy_end { inside=0; next }
+  awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+    $0 == begin { inside=1; next }
+    $0 == end { inside=0; next }
     !inside { print }
   ' "$source" > "$tmp"
   if grep -q '^Plugin approval_exec ' "$tmp"; then
@@ -159,30 +144,6 @@ rewrite_block() {
     printf '%s\nPlugin approval_exec %s\n%s\n' "$BEGIN_MARK" "$PLUGIN_DEST" "$END_MARK" >> "$tmp"
   fi
   chmod 0644 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$destination"
-}
-
-validate_legacy_state() {
-  [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] || return 0
-  [ ! -e "$LEGACY_STATE_DIR" ] || safe_directory "$LEGACY_STATE_DIR"
-  [ -d "$LEGACY_STATE_DIR" ] || return 0
-  local legacy="$LEGACY_STATE_DIR/devices.json" destination="$STATE_DIR/devices.json"
-  regular_or_absent "$legacy"
-  [ -f "$legacy" ] || return 0
-  if [ -f "$destination" ]; then
-    cmp -s "$legacy" "$destination" || die "conflicting legacy and current state for devices.json"
-  fi
-}
-
-migrate_legacy_state() {
-  validate_legacy_state
-  [ "$LEGACY_STATE_DIR" != "$STATE_DIR" ] || return 0
-  [ -d "$LEGACY_STATE_DIR" ] || return 0
-  local legacy="$LEGACY_STATE_DIR/devices.json" destination="$STATE_DIR/devices.json"
-  [ -f "$legacy" ] || return 0
-  [ ! -f "$destination" ] || return 0
-  run mv -- "$legacy" "$destination"
-  run chmod 0600 "$destination"
-  run chown root:root "$destination"
 }
 
 [ ! -f "$SUDO_CONF" ] || validate_block "$SUDO_CONF"
@@ -199,11 +160,11 @@ if [ "$MODE" = disable-prelaunch ]; then
   backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
   rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
   if ! validate_sudo; then cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"; die "sudo -V failed after disable; restored prior configuration"; fi
-  rm -f "$backup"; echo "install-sudo-hook: prelaunch disabled and sudo validated"; exit 0
+  rm -f "$backup"; echo "install-oshioki-hook: prelaunch disabled and sudo validated"; exit 0
 fi
 
-[ -n "$ORIGIN" ] || die "SUDO_APPROVE_ORIGIN is required"
-[ -n "$RP_ID" ] || die "SUDO_APPROVE_RP_ID is required"
+[ -n "$ORIGIN" ] || die "OSHIOKI_ORIGIN is required"
+[ -n "$RP_ID" ] || die "OSHIOKI_RP_ID is required"
 [ -n "$NATS_URL" ] || die "NATS_URL is required"
 [ -n "$NATS_PASS" ] || die "NATS_PASS is required"
 
@@ -219,7 +180,7 @@ case "$architecture" in
   *) die "unsupported architecture: $architecture" ;;
 esac
 
-CHECKSUMS="${SUDO_APPROVE_CHECKSUMS:-$SERVICE_DIR/target/release/SHA256SUMS}"
+CHECKSUMS="${OSHIOKI_CHECKSUMS:-$SERVICE_DIR/target/release/SHA256SUMS}"
 if [ ! -f "$CHECKSUMS" ] || [ -L "$CHECKSUMS" ]; then
   die "missing artifact checksum manifest: $CHECKSUMS"
 fi
@@ -229,13 +190,11 @@ for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do
   [ "$(hash_file "$artifact")" = "$expected" ] || die "checksum mismatch for $name"
 done
 
-validate_legacy_state
 
 run install -d -m 0755 "$SBIN_DIR" "$PLUGIN_DIR"
-run install -m 0755 -o root -g root "$HOOK_BIN" "$SBIN_DIR/sudo-approve"
+run install -m 0755 -o root -g root "$HOOK_BIN" "$SBIN_DIR/oshioki"
 run install -m 0755 -o root -g root "$PLUGIN_BIN" "$PLUGIN_DEST"
 run install -d -m 0750 -o root -g root "$STATE_DIR"
-migrate_legacy_state
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf 'DRY: write %s/config.env with NATS_PASS=<redacted>\n' "$STATE_DIR"
@@ -246,14 +205,10 @@ else
   if [ ! -e "$STATE_DIR/devices.json" ]; then printf '{"version":1,"devices":[]}\n' > "$STATE_DIR/devices.json"; chmod 0600 "$STATE_DIR/devices.json"; chown root:root "$STATE_DIR/devices.json"; fi
 fi
 
-if [ "$MODE" = prelaunch ]; then
-  stale="$SUDOERS_D/management-plane-sudo-approve"; regular_or_absent "$stale"; [ ! -f "$stale" ] || run rm -f -- "$stale"
-fi
-
 if [ "$DRY_RUN" -eq 1 ]; then echo "DRY: enable exact managed block in $SUDO_CONF"; validate_sudo; exit 0; fi
 [ -f "$SUDO_CONF" ] || install -m 0644 -o root -g root /dev/null "$SUDO_CONF"
 backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
 rewrite_block enable "$SUDO_CONF" "$SUDO_CONF"
 if ! validate_sudo; then rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"; cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"; die "sudo -V failed; restored prior configuration"; fi
 rm -f "$backup"
-echo "install-sudo-hook: $MODE installed and sudo validated"
+echo "install-oshioki-hook: $MODE installed and sudo validated"

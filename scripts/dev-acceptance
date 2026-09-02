@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# Design notes: ~/.claude/plans/sudo-approve-safari-acceptance.md
+# Design notes: ~/.claude/plans/oshioki-safari-acceptance.md
 set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-SESSION_FILE="${SUDO_APPROVE_ACCEPTANCE_SESSION_FILE:-$REPO_ROOT/.acceptance-session}"
-TAILSCALE_BIN="${SUDO_APPROVE_ACCEPTANCE_TAILSCALE_BIN:-tailscale}"
-PRIVILEGE_BIN="${SUDO_APPROVE_ACCEPTANCE_PRIVILEGE_BIN:-sudo}"
-NATS_SERVER_BIN="${SUDO_APPROVE_ACCEPTANCE_NATS_SERVER_BIN:-nats-server}"
-NATS_BIN="${SUDO_APPROVE_ACCEPTANCE_NATS_BIN:-nats}"
-CARGO_BIN="${SUDO_APPROVE_ACCEPTANCE_CARGO_BIN:-cargo}"
-CURL_BIN="${SUDO_APPROVE_ACCEPTANCE_CURL_BIN:-curl}"
-OPENSSL_BIN="${SUDO_APPROVE_ACCEPTANCE_OPENSSL_BIN:-openssl}"
-JQ_BIN="${SUDO_APPROVE_ACCEPTANCE_JQ_BIN:-jq}"
-NODE_BIN="${SUDO_APPROVE_ACCEPTANCE_NODE_BIN:-node}"
-SETSID_BIN="${SUDO_APPROVE_ACCEPTANCE_SETSID_BIN:-setsid}"
-SERVER_BIN="${SUDO_APPROVE_ACCEPTANCE_SERVER_BIN:-$REPO_ROOT/target/debug/sudo-approve-server}"
-HOOK_BIN="${SUDO_APPROVE_ACCEPTANCE_HOOK_BIN:-$REPO_ROOT/target/debug/sudo-approve}"
+SESSION_FILE="${OSHIOKI_ACCEPTANCE_SESSION_FILE:-$REPO_ROOT/.acceptance-session}"
+TAILSCALE_BIN="${OSHIOKI_ACCEPTANCE_TAILSCALE_BIN:-tailscale}"
+PRIVILEGE_BIN="${OSHIOKI_ACCEPTANCE_PRIVILEGE_BIN:-sudo}"
+NATS_SERVER_BIN="${OSHIOKI_ACCEPTANCE_NATS_SERVER_BIN:-nats-server}"
+NATS_BIN="${OSHIOKI_ACCEPTANCE_NATS_BIN:-nats}"
+CARGO_BIN="${OSHIOKI_ACCEPTANCE_CARGO_BIN:-cargo}"
+CURL_BIN="${OSHIOKI_ACCEPTANCE_CURL_BIN:-curl}"
+OPENSSL_BIN="${OSHIOKI_ACCEPTANCE_OPENSSL_BIN:-openssl}"
+JQ_BIN="${OSHIOKI_ACCEPTANCE_JQ_BIN:-jq}"
+NODE_BIN="${OSHIOKI_ACCEPTANCE_NODE_BIN:-node}"
+SETSID_BIN="${OSHIOKI_ACCEPTANCE_SETSID_BIN:-setsid}"
+SERVER_BIN="${OSHIOKI_ACCEPTANCE_SERVER_BIN:-$REPO_ROOT/target/debug/oshioki-server}"
+HOOK_BIN="${OSHIOKI_ACCEPTANCE_HOOK_BIN:-$REPO_ROOT/target/debug/oshioki}"
 
 usage() {
   printf 'usage: scripts/dev-acceptance up [--state-dir PATH] | enroll | test | status | down\n' >&2
@@ -115,7 +115,7 @@ free_port() {
 }
 
 allocate_ports() {
-  local fixed_nats="${SUDO_APPROVE_ACCEPTANCE_NATS_PORT:-}" fixed_server="${SUDO_APPROVE_ACCEPTANCE_SERVER_PORT:-}"
+  local fixed_nats="${OSHIOKI_ACCEPTANCE_NATS_PORT:-}" fixed_server="${OSHIOKI_ACCEPTANCE_SERVER_PORT:-}"
   for _ in $(seq 1 20); do
     nats_port="${fixed_nats:-$(free_port)}"
     server_port="${fixed_server:-$(free_port)}"
@@ -218,7 +218,7 @@ validate_state_root() {
     temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
     [ "$(dirname "$root")" = "$temp_root" ] || die "refusing unsafe managed state path: $root"
     case "$(basename "$root")" in
-      sudo-approve-acceptance.*) ;;
+      oshioki-acceptance.*) ;;
       *) die "refusing unsafe managed state path: $root" ;;
     esac
   fi
@@ -282,9 +282,9 @@ write_session() {
 
 wait_for_nats() {
   local password="$1"
-  for _ in $(seq 1 "${SUDO_APPROVE_ACCEPTANCE_READY_ATTEMPTS:-100}"); do
+  for _ in $(seq 1 "${OSHIOKI_ACCEPTANCE_READY_ATTEMPTS:-100}"); do
     process_is_owned "$nats_pid" "$nats_start" || die "NATS stopped during startup"
-    if NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user sudo-approve stream ls >/dev/null 2>&1; then
+    if NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user oshioki stream ls >/dev/null 2>&1; then
       return
     fi
     sleep 0.1
@@ -293,7 +293,7 @@ wait_for_nats() {
 }
 
 wait_for_server() {
-  for _ in $(seq 1 "${SUDO_APPROVE_ACCEPTANCE_READY_ATTEMPTS:-100}"); do
+  for _ in $(seq 1 "${OSHIOKI_ACCEPTANCE_READY_ATTEMPTS:-100}"); do
     process_is_owned "$server_pid" "$server_start" || die "server stopped during startup"
     if "$CURL_BIN" --fail --silent "http://127.0.0.1:$server_port/healthz" >/dev/null; then
       return
@@ -316,7 +316,7 @@ verify_serve_route() {
 }
 
 wait_for_origin() {
-  for _ in $(seq 1 "${SUDO_APPROVE_ACCEPTANCE_HTTPS_READY_ATTEMPTS:-300}"); do
+  for _ in $(seq 1 "${OSHIOKI_ACCEPTANCE_HTTPS_READY_ATTEMPTS:-300}"); do
     if verify_serve_route && "$CURL_BIN" --fail --silent "$origin/healthz" >/dev/null 2>&1; then
       return
     fi
@@ -339,7 +339,7 @@ start_session() {
   if [ "$#" -eq 0 ]; then
     local temp_root
     temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
-    state_root="$(mktemp -d "$temp_root/sudo-approve-acceptance.XXXXXX")"
+    state_root="$(mktemp -d "$temp_root/oshioki-acceptance.XXXXXX")"
   elif [ "$#" -eq 2 ] && [ "$1" = --state-dir ]; then
     mkdir -p "$2"
     state_root="$(cd "$2" && pwd -P)"
@@ -377,7 +377,7 @@ start_session() {
   rp_id="$($TAILSCALE_BIN status --json | "$JQ_BIN" -er '.Self.DNSName | select(type == "string" and length > 1)' | sed 's/\.$//')"
   [ -n "$rp_id" ] || die "Tailscale DNS name is unavailable"
   allocate_ports
-  https_port="${SUDO_APPROVE_ACCEPTANCE_HTTPS_PORT:-8443}"
+  https_port="${OSHIOKI_ACCEPTANCE_HTTPS_PORT:-8443}"
   validate_port "$nats_port"
   validate_port "$server_port"
   validate_port "$https_port"
@@ -396,23 +396,23 @@ start_session() {
 
   password="$($OPENSSL_BIN rand -hex 32)"
   nats_config="$state_root/nats/auth.conf"
-  printf 'authorization {\n  users = [{user: "sudo-approve", password: "%s"}]\n}\n' "$password" >"$nats_config"
+  printf 'authorization {\n  users = [{user: "oshioki", password: "%s"}]\n}\n' "$password" >"$nats_config"
   chmod 0600 "$nats_config"
   start_detached "$state_root/nats.pid" "$state_root/logs/nats.log" \
     "$NATS_SERVER_BIN" -c "$nats_config" -js -sd "$state_root/nats/store" -a 127.0.0.1 -p "$nats_port"
   nats_pid="$detached_pid"
   nats_start="$detached_start"
   wait_for_nats "$password"
-  NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user sudo-approve \
-    stream info SUDO_APPROVE >/dev/null 2>&1 || \
-    NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user sudo-approve \
-      stream add SUDO_APPROVE --subjects 'sudo.request.>' --storage file \
+  NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user oshioki \
+    stream info OSHIOKI >/dev/null 2>&1 || \
+    NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user oshioki \
+      stream add OSHIOKI --subjects 'oshioki.request.>' --storage file \
       --retention limits --discard old --max-age 10m --defaults >/dev/null
 
   # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
   "$JQ_BIN" -n --arg origin "$origin" --arg rp_id "$rp_id" \
     '{version:1,origin:$origin,rp_id:$rp_id,server_base_url:$origin}' >"$state_root/hook/hook.json"
-  printf 'NATS_URL=nats://127.0.0.1:%s\nNATS_USER=sudo-approve\nNATS_PASS=%s\n' \
+  printf 'NATS_URL=nats://127.0.0.1:%s\nNATS_USER=oshioki\nNATS_PASS=%s\n' \
     "$nats_port" "$password" >"$state_root/hook/config.env"
   if [ ! -e "$state_root/hook/devices.json" ]; then
     printf '%s\n' '{"version":1,"devices":[]}' >"$state_root/hook/devices.json"
@@ -420,12 +420,12 @@ start_session() {
   chmod 0600 "$state_root/hook/hook.json" "$state_root/hook/config.env" "$state_root/hook/devices.json"
 
   NATS_URL="nats://127.0.0.1:$nats_port" \
-  NATS_USER=sudo-approve \
+  NATS_USER=oshioki \
   NATS_PASS="$password" \
-  SUDO_APPROVE_STATE_PATH="$state_root/server/state.sqlite3" \
-  SUDO_APPROVE_LISTEN="127.0.0.1:$server_port" \
-  SUDO_APPROVE_ORIGIN="$origin" \
-  SUDO_APPROVE_RP_ID="$rp_id" \
+  OSHIOKI_STATE_PATH="$state_root/server/state.sqlite3" \
+  OSHIOKI_LISTEN="127.0.0.1:$server_port" \
+  OSHIOKI_ORIGIN="$origin" \
+  OSHIOKI_RP_ID="$rp_id" \
     start_detached "$state_root/server.pid" "$state_root/logs/server.log" "$SERVER_BIN"
   server_pid="$detached_pid"
   server_start="$detached_start"
@@ -445,7 +445,7 @@ run_hook() {
   read_session
   process_is_owned "$nats_pid" "$nats_start" || die "acceptance NATS is not running"
   process_is_owned "$server_pid" "$server_start" || die "acceptance server is not running"
-  SUDO_APPROVE_CONFIG_DIR="$state_root/hook" "$HOOK_BIN" "$verb"
+  OSHIOKI_CONFIG_DIR="$state_root/hook" "$HOOK_BIN" "$verb"
 }
 
 show_status() {

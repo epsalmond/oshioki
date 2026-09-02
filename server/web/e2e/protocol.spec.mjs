@@ -7,12 +7,12 @@ import https from "node:https";
 import { join } from "node:path";
 import { URL } from "node:url";
 
-const hookBinary = process.env.SUDO_APPROVE_HOOK ?? "/work/target/release/sudo-approve";
-const hookConfigDir = process.env.SUDO_APPROVE_TEST_CONFIG_DIR;
-const origin = process.env.SUDO_APPROVE_ORIGIN ?? "https://sudo.test";
+const hookBinary = process.env.OSHIOKI_HOOK ?? "/work/target/release/oshioki";
+const hookConfigDir = process.env.OSHIOKI_TEST_CONFIG_DIR;
+const origin = process.env.OSHIOKI_ORIGIN ?? "https://sudo.test";
 const natsOptions = {
   servers: process.env.NATS_URL ?? "nats://nats:4222",
-  user: process.env.NATS_USER ?? "sudo-approve",
+  user: process.env.NATS_USER ?? "oshioki",
   pass: process.env.NATS_PASS ?? "test-only",
 };
 let proxy;
@@ -20,10 +20,10 @@ const activeHooks = new Set();
 const enrolledFingerprints = new Set();
 
 test.beforeAll(async () => {
-  const target = new URL(process.env.SUDO_APPROVE_SERVER_HTTP ?? "http://server:8443");
+  const target = new URL(process.env.OSHIOKI_SERVER_HTTP ?? "http://server:8443");
   proxy = https.createServer({
-    key: readFileSync(process.env.SUDO_APPROVE_TLS_KEY),
-    cert: readFileSync(process.env.SUDO_APPROVE_TLS_CERT),
+    key: readFileSync(process.env.OSHIOKI_TLS_KEY),
+    cert: readFileSync(process.env.OSHIOKI_TLS_CERT),
   }, (request, response) => {
     const upstream = http.request({
       hostname: target.hostname,
@@ -43,7 +43,7 @@ test.beforeAll(async () => {
   });
   await new Promise((resolve, reject) => {
     proxy.once("error", reject);
-    proxy.listen(Number(process.env.SUDO_APPROVE_HTTPS_PORT ?? "443"), "127.0.0.1", resolve);
+    proxy.listen(Number(process.env.OSHIOKI_HTTPS_PORT ?? "443"), "127.0.0.1", resolve);
   });
 });
 
@@ -72,7 +72,7 @@ test.afterEach(async () => {
 function hook(args) {
   const child = spawn(hookBinary, args, {
     env: hookConfigDir
-      ? { ...process.env, SUDO_APPROVE_CONFIG_DIR: hookConfigDir }
+      ? { ...process.env, OSHIOKI_CONFIG_DIR: hookConfigDir }
       : process.env,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -139,7 +139,7 @@ async function virtualProfile(browser, consoleErrors) {
 async function enrolledDevice(page) {
   return page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("management-plane-sudo-approve", 1);
+      const request = indexedDB.open("oshioki", 1);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
@@ -217,7 +217,7 @@ async function pendingRequest() {
     resolveMessage = resolve;
     rejectMessage = reject;
   });
-  const subscription = connection.subscribe("sudo.request.>", {
+  const subscription = connection.subscribe("oshioki.request.>", {
     max: 1,
     callback: (error, value) => {
       if (error) rejectMessage(error);
@@ -239,7 +239,7 @@ async function apiRequest(requestId, token) {
   return new Promise((resolve, reject) => {
     const request = https.request({
       hostname: "127.0.0.1",
-      port: Number(process.env.SUDO_APPROVE_HTTPS_PORT ?? "443"),
+      port: Number(process.env.OSHIOKI_HTTPS_PORT ?? "443"),
       path: `/api/v1/requests/${requestId}`,
       method: "GET",
       servername: "sudo.test",

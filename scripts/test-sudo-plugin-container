@@ -3,7 +3,7 @@
 # approval-plugin payload-binding contract.
 #
 # Local mode creates a private Docker network containing NATS, the subscriber,
-# and the sudo test container. Compose sets SUDO_APPROVE_E2E_IN_CONTAINER=1;
+# and the sudo test container. Compose sets OSHIOKI_E2E_IN_CONTAINER=1;
 # its runner already reaches the project NATS service by DNS name.
 #
 # Usage: test-sudo-plugin-container
@@ -15,26 +15,26 @@ WORKSPACE="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 IMAGE="${IMAGE:-ubuntu:24.04}"
 PY_IMAGE="${PY_IMAGE:-python:3.12-slim}"
 NATS_IMAGE="${NATS_IMAGE:-nats:2.10}"
-IN_CONTAINER="${SUDO_APPROVE_E2E_IN_CONTAINER:-0}"
-SKIP_BUILD="${SUDO_APPROVE_E2E_SKIP_BUILD:-0}"
-KEEP_ARTIFACTS="${SUDO_APPROVE_E2E_KEEP_ARTIFACTS:-0}"
-ORIGIN_VALUE="${SUDO_APPROVE_ORIGIN:-https://sudo.test}"
-RP_ID_VALUE="${SUDO_APPROVE_RP_ID:-sudo.test}"
+IN_CONTAINER="${OSHIOKI_E2E_IN_CONTAINER:-0}"
+SKIP_BUILD="${OSHIOKI_E2E_SKIP_BUILD:-0}"
+KEEP_ARTIFACTS="${OSHIOKI_E2E_KEEP_ARTIFACTS:-0}"
+ORIGIN_VALUE="${OSHIOKI_ORIGIN:-https://sudo.test}"
+RP_ID_VALUE="${OSHIOKI_RP_ID:-sudo.test}"
 
-SHARE="$(mktemp -d -t sudo-approve-test.XXXXXX)"
+SHARE="$(mktemp -d -t oshioki-test.XXXXXX)"
 SHARE="$(cd "$SHARE" && pwd -P)"
 RUN_ID="${SHARE##*.}"
-NETWORK_NAME="sudo-approve-test-${RUN_ID}"
-NATS_NAME="sudo-approve-test-nats-${RUN_ID}"
-SUB_NAME="sudo-approve-test-sub-${RUN_ID}"
-SUDO_NAME="sudo-approve-test-sudo-${RUN_ID}"
+NETWORK_NAME="oshioki-test-${RUN_ID}"
+NATS_NAME="oshioki-test-nats-${RUN_ID}"
+SUB_NAME="oshioki-test-sub-${RUN_ID}"
+SUDO_NAME="oshioki-test-sudo-${RUN_ID}"
 
 TEST_SUCCEEDED=0
 NETWORK_CREATED=0
 SUBSCRIBER_PID=""
 
 run_docker() {
-  if [ "${SUDO_APPROVE_E2E_DOCKER_SUDO:-0}" = "1" ]; then
+  if [ "${OSHIOKI_E2E_DOCKER_SUDO:-0}" = "1" ]; then
     sudo -n docker "$@"
   else
     docker "$@"
@@ -80,8 +80,8 @@ echo "* share:     $SHARE"
 # A normal local run rebuilds immediately before exercising sudo. A caller may
 # skip this duplicate build only with the commit receipt written by its
 # prerequisite build step and a clean service checkout.
-BUILD_RECEIPT="$WORKSPACE/target/release/.sudo-approve-e2e-commit"
-if [ "$SKIP_BUILD" = "1" ] && [ "${SUDO_APPROVE_E2E_PREBUILT:-0}" = "1" ]; then
+BUILD_RECEIPT="$WORKSPACE/target/release/.oshioki-e2e-commit"
+if [ "$SKIP_BUILD" = "1" ] && [ "${OSHIOKI_E2E_PREBUILT:-0}" = "1" ]; then
   echo "* release:   using image-built E2E artifacts"
 elif [ "$SKIP_BUILD" = "1" ]; then
   EXPECTED_COMMIT="$(git -C "$WORKSPACE" rev-parse HEAD)"
@@ -94,27 +94,27 @@ elif [ "$SKIP_BUILD" = "1" ]; then
     exit 2
   }
   [ -z "$(git -C "$WORKSPACE" status --porcelain --untracked-files=all -- .)" ] || {
-    echo "cannot reuse CI build artifacts with a dirty sudo-approve checkout" >&2
+    echo "cannot reuse CI build artifacts with a dirty oshioki checkout" >&2
     exit 2
   }
   echo "* release:   verified CI build receipt for $EXPECTED_COMMIT"
 else
-  echo "* release:   rebuilding current sudo-approve workspace"
+  echo "* release:   rebuilding current oshioki workspace"
   (cd "$WORKSPACE" && cargo build --workspace --release)
   git -C "$WORKSPACE" rev-parse HEAD >"$BUILD_RECEIPT"
 fi
 
-for artifact in "$WORKSPACE/target/release/sudo-approve" \
-                "$WORKSPACE/target/release/libplugin.so"; do
+for artifact in "$WORKSPACE/target/release/oshioki" \
+                "$WORKSPACE/target/release/liboshioki_plugin.so"; do
   [ -f "$artifact" ] || {
     echo "missing build artifact after release build: $artifact" >&2
     exit 2
   }
 done
-if [ "${SUDO_APPROVE_E2E_PREBUILT:-0}" != "1" ]; then
+if [ "${OSHIOKI_E2E_PREBUILT:-0}" != "1" ]; then
   (
     cd "$WORKSPACE/target/release"
-    sha256sum sudo-approve libplugin.so > SHA256SUMS
+    sha256sum oshioki liboshioki_plugin.so > SHA256SUMS
   )
 fi
 
@@ -131,7 +131,7 @@ else
   NETWORK_CREATED=1
   run_docker run -d --name "$NATS_NAME" --network "$NETWORK_NAME" \
     "$NATS_IMAGE" -js \
-    --user "${NATS_USER:-sudo-approve}" \
+    --user "${NATS_USER:-oshioki}" \
     --pass "${NATS_PASS:-test}" >/dev/null
   NATS_HOST_VALUE="$NATS_NAME"
   NATS_PORT_VALUE=4222
@@ -172,10 +172,10 @@ if [ "$IN_CONTAINER" = "1" ]; then
   SHARE_DIR="$SHARE" \
   NATS_HOST="$NATS_HOST_VALUE" \
   NATS_PORT="$NATS_PORT_VALUE" \
-  NATS_USER="${NATS_USER:-sudo-approve}" \
+  NATS_USER="${NATS_USER:-oshioki}" \
   NATS_PASS="${NATS_PASS:-test}" \
-  SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
-  SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
+  OSHIOKI_ORIGIN="$ORIGIN_VALUE" \
+  OSHIOKI_RP_ID="$RP_ID_VALUE" \
   TIMEOUT=180 \
     python3 "$SHARE/test-sudo-plugin-subscriber.py" \
       >"$SHARE/subscriber.log" 2>&1 &
@@ -186,10 +186,10 @@ else
     -e SHARE_DIR=/share \
     -e NATS_HOST="$NATS_HOST_VALUE" \
     -e NATS_PORT="$NATS_PORT_VALUE" \
-    -e NATS_USER="${NATS_USER:-sudo-approve}" \
+    -e NATS_USER="${NATS_USER:-oshioki}" \
     -e NATS_PASS="${NATS_PASS:-test}" \
-    -e SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
-    -e SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
+    -e OSHIOKI_ORIGIN="$ORIGIN_VALUE" \
+    -e OSHIOKI_RP_ID="$RP_ID_VALUE" \
     -e TIMEOUT=180 \
     -v "$SHARE":/share \
     "$PY_IMAGE" \
@@ -237,7 +237,7 @@ if [ "$IN_CONTAINER" = "1" ]; then
   INNER_SERVICE_DIR="$WORKSPACE"
   INNER_SHARE_DIR="$SHARE"
 else
-  INNER_SERVICE_DIR=/sudo-approve
+  INNER_SERVICE_DIR=/oshioki
   INNER_SHARE_DIR=/share
 fi
 
@@ -261,22 +261,22 @@ if ! command -v sudo >/dev/null 2>&1 || ! command -v file >/dev/null 2>&1; then
   apt-get install -y -qq sudo file >/dev/null
 fi
 
-"$SERVICE_DIR/scripts/install-sudo-hook" --standalone-e2e
-echo "[inner] install-sudo-hook OK"
+"$SERVICE_DIR/scripts/install-oshioki-hook" --standalone-e2e
+echo "[inner] install-oshioki-hook OK"
 
-cp "$SHARE_DIR/devices.json" /etc/sudo-approve/devices.json
+cp "$SHARE_DIR/devices.json" /etc/oshioki/devices.json
 echo "[inner] devices.json planted"
 
 cleanup_e2e_sudoers() {
-  rm -f /etc/sudoers.d/sudo-approve-e2e
+  rm -f /etc/sudoers.d/oshioki-e2e
 }
 cleanup_e2e_sudoers
 trap cleanup_e2e_sudoers EXIT
 
 useradd --uid "$EXPECTED_UID" --create-home --shell /bin/bash "$EXPECTED_USER"
 printf '%s ALL=(root) NOPASSWD: %s\n' "$EXPECTED_USER" "$EXPECTED_CMD" \
-  > /etc/sudoers.d/sudo-approve-e2e
-chmod 0440 /etc/sudoers.d/sudo-approve-e2e
+  > /etc/sudoers.d/oshioki-e2e
+chmod 0440 /etc/sudoers.d/oshioki-e2e
 echo "[inner] caller $EXPECTED_USER uid=$EXPECTED_UID created"
 
 sudo -k || true
@@ -307,21 +307,21 @@ chmod +x "$INNER_SCRIPT"
 run_sudo() {
   if [ "$IN_CONTAINER" = "1" ]; then
     NATS_URL="$NATS_URL_VALUE" \
-    NATS_USER="${NATS_USER:-sudo-approve}" \
+    NATS_USER="${NATS_USER:-oshioki}" \
     NATS_PASS="${NATS_PASS:-test}" \
-    SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
-    SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
+    OSHIOKI_ORIGIN="$ORIGIN_VALUE" \
+    OSHIOKI_RP_ID="$RP_ID_VALUE" \
       bash -x "$INNER_SCRIPT" >"$SHARE/sudo-run.log" 2>&1
   else
     run_docker run --name "$SUDO_NAME" --network "$NETWORK_NAME" \
       -e NATS_URL="$NATS_URL_VALUE" \
-      -e NATS_USER="${NATS_USER:-sudo-approve}" \
+      -e NATS_USER="${NATS_USER:-oshioki}" \
       -e NATS_PASS="${NATS_PASS:-test}" \
-      -e SUDO_APPROVE_ORIGIN="$ORIGIN_VALUE" \
-      -e SUDO_APPROVE_RP_ID="$RP_ID_VALUE" \
+      -e OSHIOKI_ORIGIN="$ORIGIN_VALUE" \
+      -e OSHIOKI_RP_ID="$RP_ID_VALUE" \
       -v "$SHARE":/share \
-      -v "$WORKSPACE":/sudo-approve \
-      -w /sudo-approve \
+      -v "$WORKSPACE":/oshioki \
+      -w /oshioki \
       "$IMAGE" \
       bash -x /share/sudo-inner.sh \
       >"$SHARE/sudo-run.log" 2>&1

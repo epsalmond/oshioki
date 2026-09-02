@@ -1,4 +1,4 @@
-# Sudo approve runbook
+# Oshioki runbook
 
 The current workflow is local and prelaunch. It does not activate a production
 service or a permanent sudo plugin.
@@ -22,7 +22,7 @@ build:
 
 ```bash
 cd target/release
-sha256sum sudo-approve libplugin.so > SHA256SUMS
+sha256sum oshioki liboshioki_plugin.so > SHA256SUMS
 ```
 
 ## Retained development state
@@ -43,52 +43,45 @@ Keep a second root shell open during supervised acceptance. Create a root-owned
 installer configuration without putting the NATS password in command history:
 
 ```bash
-sudo install -d -m 0750 /etc/sudo-approve
-sudo install -m 0600 /dev/null /etc/sudo-approve/install.env
-sudoedit /etc/sudo-approve/install.env
+sudo install -d -m 0750 /etc/oshioki
+sudo install -m 0600 /dev/null /etc/oshioki/install.env
+sudoedit /etc/oshioki/install.env
 ```
 
 The file contains only these keys:
 
 ```text
-SUDO_APPROVE_ORIGIN=https://sudo.example
-SUDO_APPROVE_RP_ID=sudo.example
-NATS_URL=nats://nats.example:4222
-NATS_USER=sudo-approve
+OSHIOKI_ORIGIN=https://sudo.example.com
+OSHIOKI_RP_ID=sudo.example.com
+NATS_URL=nats://nats.example.com:4222
+NATS_USER=oshioki
 NATS_PASS=<secret>
 ```
 
 Run the dry run and install against that file:
 
 ```bash
-sudo scripts/install-sudo-hook --prelaunch --dry-run --config-file /etc/sudo-approve/install.env
-sudo scripts/install-sudo-hook --prelaunch --config-file /etc/sudo-approve/install.env
-sudo scripts/install-sudo-hook --prelaunch-status
+sudo scripts/install-oshioki-hook --prelaunch --dry-run --config-file /etc/oshioki/install.env
+sudo scripts/install-oshioki-hook --prelaunch --config-file /etc/oshioki/install.env
+sudo scripts/install-oshioki-hook --prelaunch-status
 ```
 
 The installer rejects unknown config keys, symlinks, non-root ownership, and
 modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
-Linux uses `/usr/local/libexec/sudo/approval_exec.so`. Darwin uses
-`approval_exec.dylib` in the same directory.
+Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
+`oshioki.dylib` in the same directory.
 
-The first standalone install moves the legacy `devices.json` into
-`/etc/sudo-approve` and normalizes its ownership and mode. It ignores the old
-derived NATS and hook configuration. After the install, confirm
-`--prelaunch-status`, inspect the enrolled devices, and run `sudo -V`. Then
-archive the remaining legacy directory if it exists:
-
-```bash
-sudo mv /etc/management-plane/sudo-approve /etc/management-plane/sudo-approve.retired
-```
+After the install, confirm `--prelaunch-status`, inspect the enrolled devices,
+and run `sudo -V`.
 
 Each browser profile enrolls separately:
 
 ```bash
-sudo-approve enroll
-sudo-approve enroll --resume <enrollment-id>
-sudo-approve status
-sudo-approve revoke <fingerprint>
-sudo-approve pin <fingerprint>
+oshioki enroll
+oshioki enroll --resume <enrollment-id>
+oshioki status
+oshioki revoke <fingerprint>
+oshioki pin <fingerprint>
 ```
 
 `test` publishes a synthetic request and waits for approve or deny. `watch`
@@ -97,7 +90,7 @@ opens each request URL on Darwin without a shell.
 Disable the managed block before stopping a supervised stack:
 
 ```bash
-sudo scripts/install-sudo-hook --disable-prelaunch
+sudo scripts/install-oshioki-hook --disable-prelaunch
 sudo -V
 ```
 

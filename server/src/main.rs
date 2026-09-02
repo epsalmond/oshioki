@@ -18,7 +18,7 @@ use axum::{
 };
 use db::{InsertResult, RequestLifecycle, Store};
 use futures::StreamExt as _;
-use protocol::{
+use oshioki_protocol::{
     ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
     RequestEnvelopeV1, SealedDeviceBodyV1,
 };
@@ -34,8 +34,8 @@ use std::{
 };
 use tracing::{error, info, warn};
 
-const REQUEST_STREAM: &str = "SUDO_APPROVE";
-const REQUEST_CONSUMER: &str = "sudo-approve-server-v1";
+const REQUEST_STREAM: &str = "OSHIOKI";
+const REQUEST_CONSUMER: &str = "oshioki-server-v1";
 const MAX_HTTP_BODY: usize = 3 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -68,18 +68,18 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("sudo_approve_server=info".parse().expect("valid directive")),
+                .add_directive("oshioki_server=info".parse().expect("valid directive")),
         )
         .init();
-    let database_path = required_env("SUDO_APPROVE_STATE_PATH")?;
-    let listen = std::env::var("SUDO_APPROVE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8443".into());
-    let dist_root = std::env::var("SUDO_APPROVE_DARWIN_DIST")
-        .unwrap_or_else(|_| "/opt/sudo-approve/dist/v1/darwin-arm64".into());
-    let origin = required_env("SUDO_APPROVE_ORIGIN")?;
-    let runtime_config = protocol::HookConfigV1 {
+    let database_path = required_env("OSHIOKI_STATE_PATH")?;
+    let listen = std::env::var("OSHIOKI_LISTEN").unwrap_or_else(|_| "127.0.0.1:8443".into());
+    let dist_root = std::env::var("OSHIOKI_DARWIN_DIST")
+        .unwrap_or_else(|_| "/opt/oshioki/dist/v1/darwin-arm64".into());
+    let origin = required_env("OSHIOKI_ORIGIN")?;
+    let runtime_config = oshioki_protocol::HookConfigV1 {
         version: 1,
         origin: origin.clone(),
-        rp_id: required_env("SUDO_APPROVE_RP_ID")?,
+        rp_id: required_env("OSHIOKI_RP_ID")?,
         server_base_url: origin,
     };
     runtime_config
@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
         consumer_last_ok: Arc::new(AtomicI64::new(0)),
         outbox_last_ok: Arc::new(AtomicI64::new(now())),
         origin: Arc::new(runtime_config.origin),
-        ntfy_url: std::env::var("SUDO_APPROVE_NTFY_URL").ok().map(Arc::new),
+        ntfy_url: std::env::var("OSHIOKI_NTFY_URL").ok().map(Arc::new),
     };
     spawn_workers(&state);
     let app = Router::new()
@@ -167,7 +167,7 @@ async fn request_consumer(state: AppState) -> Result<()> {
             REQUEST_CONSUMER,
             pull::Config {
                 durable_name: Some(REQUEST_CONSUMER.into()),
-                filter_subject: "sudo.request.>".into(),
+                filter_subject: "oshioki.request.>".into(),
                 ack_policy: AckPolicy::Explicit,
                 ..Default::default()
             },
@@ -187,7 +187,7 @@ async fn request_consumer(state: AppState) -> Result<()> {
         };
         let message = result?;
         let raw = message.payload.as_ref();
-        if raw.len() > protocol::v1::MAX_ENVELOPE_BYTES {
+        if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
             warn!(bytes = raw.len(), "terminating oversized request envelope");
             message
                 .ack_with(AckKind::Term)
@@ -238,9 +238,12 @@ async fn request_consumer(state: AppState) -> Result<()> {
 }
 
 async fn enrollment_consumer(state: AppState) -> Result<()> {
-    let mut intents = state.nats.subscribe("sudo.enrollment.intent").await?;
-    let mut activations = state.nats.subscribe("sudo.enrollment.activation.>").await?;
-    let mut revocations = state.nats.subscribe("sudo.device.revoke.>").await?;
+    let mut intents = state.nats.subscribe("oshioki.enrollment.intent").await?;
+    let mut activations = state
+        .nats
+        .subscribe("oshioki.enrollment.activation.>")
+        .await?;
+    let mut revocations = state.nats.subscribe("oshioki.device.revoke.>").await?;
     loop {
         tokio::select! {
             Some(message) = intents.next() => match serde_json::from_slice::<EnrollmentIntentV1>(&message.payload) {
@@ -250,7 +253,7 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
                         if intent.expires_at <= now() || intent.expires_at > now() + 300 {
                             bail!("invalid enrollment intent expiry");
                         }
-                        let hash = protocol::decode_base64url(&intent.secret_hash)?;
+                        let hash = oshioki_protocol::decode_base64url(&intent.secret_hash)?;
                         if let InsertResult::Conflict = state.store.create_enrollment(&intent.enrollment_id, &hash, intent.expires_at, &intent.reply_subject)? { warn!(enrollment_id=%intent.enrollment_id, "conflicting enrollment intent"); }
                         Ok(())
                     })();
@@ -266,13 +269,13 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
                 Err(error) => warn!(%error, "invalid enrollment activation"),
             },
             Some(message) = revocations.next() => {
-                if let Some(fingerprint) = message.subject.strip_prefix("sudo.device.revoke.") {
+                if let Some(fingerprint) = message.subject.strip_prefix("oshioki.device.revoke.") {
                     match state.store.set_device_active(fingerprint, false) {
                         Ok(false) => warn!(%fingerprint, "revocation named unknown device"),
                         Err(error) => { warn!(%error, %fingerprint, "revocation persistence failed"); continue; }
                         Ok(true) => {}
                     }
-                    state.nats.publish(format!("sudo.device.revoked.{fingerprint}"), Vec::new().into()).await?;
+                    state.nats.publish(format!("oshioki.device.revoked.{fingerprint}"), Vec::new().into()).await?;
                     state.nats.flush().await?;
                 }
             },
@@ -500,7 +503,7 @@ async fn enrollment_status(
 async fn get_device(
     State(state): State<AppState>,
     Path(fingerprint): Path<String>,
-) -> Result<Json<protocol::DevicePublicRecordV1>, ApiError> {
+) -> Result<Json<oshioki_protocol::DevicePublicRecordV1>, ApiError> {
     state
         .store
         .active_device(&fingerprint)
