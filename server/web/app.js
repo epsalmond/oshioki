@@ -83,7 +83,7 @@ async function enrollment() {
       const fields = [enc.encode(enrollmentId), new Uint8Array(credential.response.clientDataJSON), new Uint8Array(credential.response.attestationObject),
         new Uint8Array(proof.response.authenticatorData), new Uint8Array(proof.response.clientDataJSON), new Uint8Array(proof.response.signature),
         new Uint8Array(credential.rawId), box.publicKey, apiTokenHash, enc.encode(label)];
-      const submission = { version: 1, enrollment_id: enrollmentId, registration_client_data_json: b64(fields[1]), attestation_object: b64(fields[2]),
+      const submission = { kind: "webauthn", version: 1, enrollment_id: enrollmentId, registration_client_data_json: b64(fields[1]), attestation_object: b64(fields[2]),
         proof_authenticator_data: b64(fields[3]), proof_client_data_json: b64(fields[4]), proof_signature: b64(fields[5]), credential_id: b64(fields[6]),
         box_public_key: b64(fields[7]), api_token_hash: b64(fields[8]), label, transcript_hmac: b64(await enrollmentMac(secret, TRANSCRIPT_DOMAIN, fields)) };
       const response = await fetch(`/api/v1/enrollments/${enrollmentId}/submission`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(submission) });

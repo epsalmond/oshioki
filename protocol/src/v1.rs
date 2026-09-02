@@ -126,9 +126,27 @@ impl RequestEnvelopeV1 {
     }
 }
 
+/// How a device proves an approval.
+///
+/// `webauthn` devices sign `WebAuthn` assertions from a browser. `secure-enclave`
+/// devices sign the challenge directly with a P-256 key (the native agent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceKindV1 {
+    #[serde(rename = "webauthn")]
+    Webauthn,
+    #[serde(rename = "secure-enclave")]
+    SecureEnclave,
+}
+
+/// A pinned approval device.
+///
+/// For `secure-enclave` records `credential_public_key` is the 65-byte SEC1
+/// uncompressed P-256 point, `credential_id` is the SHA-256 of that point,
+/// and `sign_count` is always zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePublicRecordV1 {
     pub version: u8,
+    pub kind: DeviceKindV1,
     pub fingerprint: String,
     pub credential_id: String,
     pub credential_public_key: String,
@@ -152,9 +170,23 @@ impl DevicePublicRecordV1 {
         {
             return Err(Error::InvalidRequest("invalid device record".into()));
         }
-        crate::webauthn_v1::cose_p256_verifying_key(&decode_base64url(
-            &self.credential_public_key,
-        )?)?;
+        let public_key = decode_base64url(&self.credential_public_key)?;
+        match self.kind {
+            DeviceKindV1::Webauthn => {
+                crate::webauthn_v1::cose_p256_verifying_key(&public_key)?;
+            }
+            DeviceKindV1::SecureEnclave => {
+                crate::native_v1::sec1_p256_verifying_key(&public_key)?;
+                if decode_base64url(&self.credential_id)?
+                    != crate::native_v1::native_credential_id(&public_key)
+                    || self.sign_count != 0
+                {
+                    return Err(Error::InvalidRequest(
+                        "invalid secure-enclave device record".into(),
+                    ));
+                }
+            }
+        }
         let expected = device_fingerprint(
             &decode_base64url(&self.credential_id)?,
             &decode_base64url(&self.credential_public_key)?,
@@ -218,8 +250,76 @@ impl EnrollmentIntentV1 {
     }
 }
 
+/// An enrollment submission, tagged by device kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnrollmentSubmissionV1 {
+#[serde(tag = "kind")]
+pub enum EnrollmentSubmissionV1 {
+    #[serde(rename = "webauthn")]
+    Webauthn(WebauthnEnrollmentSubmissionV1),
+    #[serde(rename = "secure-enclave")]
+    SecureEnclave(NativeEnrollmentSubmissionV1),
+}
+
+impl EnrollmentSubmissionV1 {
+    pub fn enrollment_id(&self) -> &str {
+        match self {
+            Self::Webauthn(submission) => &submission.enrollment_id,
+            Self::SecureEnclave(submission) => &submission.enrollment_id,
+        }
+    }
+    pub fn kind(&self) -> DeviceKindV1 {
+        match self {
+            Self::Webauthn(_) => DeviceKindV1::Webauthn,
+            Self::SecureEnclave(_) => DeviceKindV1::SecureEnclave,
+        }
+    }
+    pub fn validate_shape(&self) -> Result<(), Error> {
+        match self {
+            Self::Webauthn(submission) => submission.validate_shape(),
+            Self::SecureEnclave(submission) => submission.validate_shape(),
+        }
+    }
+}
+
+/// Native enrollment: a P-256 public key plus an immediate proof signature.
+///
+/// `proof_signature` is DER ECDSA P-256 over the proof message from
+/// [`crate::native_v1::native_enrollment_proof`]. `credential_id` is not
+/// carried; it is derived from the public key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeEnrollmentSubmissionV1 {
+    pub version: u8,
+    pub enrollment_id: String,
+    pub credential_public_key: String,
+    pub box_public_key: String,
+    pub api_token_hash: String,
+    pub label: String,
+    pub proof_signature: String,
+    pub transcript_hmac: String,
+}
+
+impl NativeEnrollmentSubmissionV1 {
+    pub fn validate_shape(&self) -> Result<(), Error> {
+        if self.version != VERSION_V1
+            || !valid_id(&self.enrollment_id)
+            || decode_exact(&self.credential_public_key, 65).is_err()
+            || decode_exact(&self.box_public_key, 32).is_err()
+            || decode_exact(&self.api_token_hash, 32).is_err()
+            || self.label.is_empty()
+            || self.label.len() > 128
+            || !(8..=256).contains(&decode_base64url(&self.proof_signature)?.len())
+            || decode_exact(&self.transcript_hmac, 32).is_err()
+        {
+            return Err(Error::InvalidRequest(
+                "invalid native enrollment submission shape".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebauthnEnrollmentSubmissionV1 {
     pub version: u8,
     pub enrollment_id: String,
     pub registration_client_data_json: String,
@@ -234,7 +334,7 @@ pub struct EnrollmentSubmissionV1 {
     pub transcript_hmac: String,
 }
 
-impl EnrollmentSubmissionV1 {
+impl WebauthnEnrollmentSubmissionV1 {
     pub fn validate_shape(&self) -> Result<(), Error> {
         if self.version != VERSION_V1
             || !valid_id(&self.enrollment_id)
@@ -299,7 +399,30 @@ impl DeviceRegistryV1 {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum DecisionV1 {
     Approve(ApproveV1),
+    ApproveNative(ApproveNativeV1),
     Deny(DenyV1),
+}
+
+/// A native approval: DER ECDSA P-256 over the 32 challenge bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveNativeV1 {
+    pub version: u8,
+    pub request_id: String,
+    pub device_fingerprint: String,
+    pub signature: String,
+}
+
+impl ApproveNativeV1 {
+    pub fn validate_shape(&self) -> Result<(), Error> {
+        if self.version != VERSION_V1
+            || !valid_id(&self.request_id)
+            || !valid_fingerprint(&self.device_fingerprint)
+            || !(8..=256).contains(&decode_base64url(&self.signature)?.len())
+        {
+            return Err(Error::BadVerdict("invalid native approval shape".into()));
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApproveV1 {
@@ -425,7 +548,31 @@ fn seal_v1_with_material(
     })
 }
 
-fn decode_exact(value: &str, length: usize) -> Result<Vec<u8>, Error> {
+/// Opens a sealed body with the device's X25519 secret and returns the raw
+/// request bytes. The caller must still parse and validate them.
+pub fn unseal_v1(sealed: &SealedDeviceBodyV1, box_secret: &StaticSecret) -> Result<Vec<u8>, Error> {
+    let ephemeral: [u8; 32] = decode_exact(&sealed.ephemeral_pub, 32)?
+        .try_into()
+        .map_err(|_| Error::Decode("ephemeral key length".into()))?;
+    let nonce = decode_exact(&sealed.nonce, 12)?;
+    let ciphertext = decode_base64url(&sealed.ciphertext)?;
+    let shared = box_secret.diffie_hellman(&PublicKey::from(ephemeral));
+    if shared.as_bytes().iter().all(|byte| *byte == 0) {
+        return Err(Error::InvalidRequest(
+            "all-zero X25519 shared secret".into(),
+        ));
+    }
+    let cipher = ChaCha20Poly1305::new(shared.as_bytes().into());
+    let raw = cipher
+        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_slice())
+        .map_err(|_| Error::Decode("sealed body does not open".into()))?;
+    if raw.len() > MAX_REQUEST_BYTES {
+        return Err(Error::InvalidRequest("request exceeds 256 KiB".into()));
+    }
+    Ok(raw)
+}
+
+pub(crate) fn decode_exact(value: &str, length: usize) -> Result<Vec<u8>, Error> {
     let decoded = decode_base64url(value)?;
     if decoded.len() == length {
         Ok(decoded)
@@ -433,7 +580,7 @@ fn decode_exact(value: &str, length: usize) -> Result<Vec<u8>, Error> {
         Err(Error::Decode("invalid byte length".into()))
     }
 }
-fn valid_id(value: &str) -> bool {
+pub(crate) fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -469,6 +616,7 @@ mod tests {
             device_fingerprint(&credential_id, &credential_key, recipient_public.as_bytes());
         let device = DevicePublicRecordV1 {
             version: 1,
+            kind: DeviceKindV1::Webauthn,
             fingerprint,
             credential_id: encode_base64url(&credential_id),
             credential_public_key: encode_base64url(&credential_key),
@@ -498,5 +646,10 @@ mod tests {
             encode_base64url(&approve_challenge(raw)),
             "mTBOp81bPTi4PmjpqFmNPFz3vFWCzk1yBKBHmHEkWV4"
         );
+        assert_eq!(unseal_v1(&sealed, &recipient_secret).unwrap(), raw);
+        assert!(unseal_v1(&sealed, &StaticSecret::from([8; 32])).is_err());
+        let mut tampered = sealed.clone();
+        tampered.ciphertext = encode_base64url(&[0; 32]);
+        assert!(unseal_v1(&tampered, &recipient_secret).is_err());
     }
 }

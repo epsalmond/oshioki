@@ -20,9 +20,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use oshioki_protocol::{
-    ActivationV1, DecisionV1, DevicePublicRecordV1, DeviceRegistryV1, EnrollmentIntentV1,
-    EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1, RequestV1, VERSION_V1,
-    verify_approval_v1, verify_enrollment_v1,
+    ActivationV1, DecisionV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
+    EnrollmentIntentV1, EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1, RequestV1,
+    VERSION_V1, verify_approval_v1, verify_enrollment_v1, verify_native_approval_v1,
+    verify_native_enrollment_v1,
 };
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
@@ -139,6 +140,25 @@ async fn execute_request_at(
         timeout,
     )
     .await?;
+    apply_decision(
+        decision,
+        &request,
+        &raw_request,
+        &active,
+        &mut registry,
+        directory,
+    )
+}
+
+/// Applies one decision to a request. Invalid decisions fail closed.
+fn apply_decision(
+    decision: DecisionV1,
+    request: &RequestV1,
+    raw_request: &[u8],
+    active: &[DevicePublicRecordV1],
+    registry: &mut DeviceRegistryV1,
+    directory: &Path,
+) -> Result<()> {
     match decision {
         DecisionV1::Deny(denial) => {
             denial.validate_shape().context("validate deny decision")?;
@@ -163,13 +183,14 @@ async fn execute_request_at(
             let device = active
                 .iter()
                 .find(|device| {
-                    device.fingerprint == approval.device_fingerprint
+                    device.kind == DeviceKindV1::Webauthn
+                        && device.fingerprint == approval.device_fingerprint
                         && device.credential_id == approval.credential_id
                 })
                 .context("approval does not name one exact pinned credential")?;
             let outcome = verify_approval_v1(
                 &approval,
-                &raw_request,
+                raw_request,
                 device,
                 &load_hook_config_from(directory)?,
             )
@@ -185,9 +206,28 @@ async fn execute_request_at(
                 {
                     stored.sign_count = outcome.observed_sign_count;
                 }
-                write_registry_to(directory, &registry)?;
+                write_registry_to(directory, registry)?;
             }
             info!(request_id=%request.request_id, fingerprint=%device.fingerprint, "sudo request approved");
+            Ok(())
+        }
+        DecisionV1::ApproveNative(approval) => {
+            approval
+                .validate_shape()
+                .context("validate native approval decision")?;
+            if approval.request_id != request.request_id {
+                bail!("approval request id mismatch");
+            }
+            let device = active
+                .iter()
+                .find(|device| {
+                    device.kind == DeviceKindV1::SecureEnclave
+                        && device.fingerprint == approval.device_fingerprint
+                })
+                .context("native approval does not name one pinned secure-enclave device")?;
+            verify_native_approval_v1(&approval, raw_request, device)
+                .context("native approval verification failed")?;
+            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, kind="secure-enclave", "sudo request approved");
             Ok(())
         }
     }
@@ -270,9 +310,12 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     )
     .await?;
     nats.flush().await?;
-    println!(
-        "Enrollment URL (expires in five minutes):\n  {}/enroll/{}#{}",
+    let enrollment_url = format!(
+        "{}/enroll/{}#{}",
         config.server_base_url, state.enrollment_id, state.secret
+    );
+    println!(
+        "Enrollment URL (expires in five minutes):\n  {enrollment_url}\nNative agent:\n  oshioki-agent pair '{enrollment_url}'"
     );
     let remaining = u64::try_from(state.expires_at - now()).context("enrollment expiry")?;
     let message = tokio::time::timeout(
@@ -284,11 +327,18 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     .context("enrollment stream closed")?;
     let submission: EnrollmentSubmissionV1 =
         serde_json::from_slice(&message.payload).context("decode enrollment submission")?;
-    if submission.enrollment_id != state.enrollment_id {
+    if submission.enrollment_id() != state.enrollment_id {
         bail!("enrollment id mismatch");
     }
-    let device =
-        verify_enrollment_v1(&submission, &secret_bytes, &config).context("verify enrollment")?;
+    let device = match &submission {
+        EnrollmentSubmissionV1::Webauthn(submission) => {
+            verify_enrollment_v1(submission, &secret_bytes, &config).context("verify enrollment")?
+        }
+        EnrollmentSubmissionV1::SecureEnclave(submission) => {
+            verify_native_enrollment_v1(submission, &secret_bytes)
+                .context("verify native enrollment")?
+        }
+    };
     let mut registry = load_registry()?;
     if registry.devices.iter().any(|stored| {
         stored.credential_id == device.credential_id && stored.fingerprint != device.fingerprint
@@ -389,8 +439,12 @@ fn cmd_status() -> Result<()> {
     let registry = load_registry()?;
     println!("Enrolled devices ({}):", registry.devices.len());
     for device in registry.devices {
+        let kind = match device.kind {
+            DeviceKindV1::Webauthn => "webauthn",
+            DeviceKindV1::SecureEnclave => "secure-enclave",
+        };
         println!(
-            "  {}  {}  active={}",
+            "  {}  {}  kind={kind}  active={}",
             device.fingerprint, device.label, device.active
         );
     }
@@ -845,6 +899,7 @@ mod tests {
             oshioki_protocol::device_fingerprint(&credential, &public, box_public.as_bytes());
         let device = DevicePublicRecordV1 {
             version: 1,
+            kind: DeviceKindV1::Webauthn,
             fingerprint,
             credential_id: URL_SAFE_NO_PAD.encode(&credential),
             credential_public_key: URL_SAFE_NO_PAD.encode(&public),

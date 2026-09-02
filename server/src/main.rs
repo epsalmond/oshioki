@@ -475,7 +475,11 @@ async fn submit_enrollment(
     Path(id): Path<String>,
     Json(submission): Json<EnrollmentSubmissionV1>,
 ) -> Result<StatusCode, ApiError> {
-    if submission.enrollment_id != id {
+    // Native devices publish their submission straight to NATS; the HTTP
+    // path serves the browser only.
+    if submission.enrollment_id() != id
+        || !matches!(submission, EnrollmentSubmissionV1::Webauthn(_))
+    {
         return Err(ApiError(StatusCode::CONFLICT));
     }
     submission
