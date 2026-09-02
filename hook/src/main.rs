@@ -19,18 +19,18 @@ use std::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use protocol::{
+use oshioki_protocol::{
     ActivationV1, DecisionV1, DevicePublicRecordV1, DeviceRegistryV1, EnrollmentIntentV1,
     EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1, RequestV1, VERSION_V1,
     verify_approval_v1, verify_enrollment_v1,
 };
 
-const DEFAULT_CONFIG_DIR: &str = "/etc/sudo-approve";
+const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Parser)]
-#[command(name = "sudo-approve", about = "sudo approval hook")]
+#[command(name = "oshioki", about = "sudo approval hook")]
 struct Cli {
     #[command(subcommand)]
     verb: Verb,
@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("sudo_approve=info".parse().expect("valid directive")),
+                .add_directive("oshioki=info".parse().expect("valid directive")),
         )
         .with_writer(io::stdout)
         .init();
@@ -116,7 +116,7 @@ async fn execute_request_at(
     }
     let envelope = seal_request(&request, &raw_request, &active)?;
     let payload = serde_json::to_vec(&envelope)?;
-    if payload.len() > protocol::v1::MAX_ENVELOPE_BYTES {
+    if payload.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
         bail!("request envelope exceeds 3 MiB");
     }
     let nats = connect_nats_from(directory).await?;
@@ -131,8 +131,8 @@ async fn execute_request_at(
     }
     let decision = request_decision(
         &nats,
-        &format!("sudo.request.{}", request.host),
-        &format!("sudo.verdict.{}", request.request_id),
+        &format!("oshioki.request.{}", request.host),
+        &format!("oshioki.verdict.{}", request.request_id),
         payload,
         timeout,
     )
@@ -243,11 +243,11 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
         remove_enrollment_state(&state_path);
         bail!("enrollment expired");
     }
-    let secret_bytes: [u8; 32] = protocol::decode_base64url(&state.secret)?
+    let secret_bytes: [u8; 32] = oshioki_protocol::decode_base64url(&state.secret)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid enrollment secret"))?;
     let nats = connect_nats().await?;
-    let reply_subject = format!("sudo.enrollment.submission.{}", state.enrollment_id);
+    let reply_subject = format!("oshioki.enrollment.submission.{}", state.enrollment_id);
     let mut subscription = nats
         .subscribe(reply_subject.clone())
         .await
@@ -263,7 +263,7 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
         reply_subject,
     };
     nats.publish(
-        "sudo.enrollment.intent",
+        "oshioki.enrollment.intent",
         serde_json::to_vec(&intent)?.into(),
     )
     .await?;
@@ -305,7 +305,7 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
         device: device.clone(),
     };
     nats.publish(
-        format!("sudo.enrollment.activation.{}", state.enrollment_id),
+        format!("oshioki.enrollment.activation.{}", state.enrollment_id),
         serde_json::to_vec(&activation)?.into(),
     )
     .await?;
@@ -326,11 +326,11 @@ async fn cmd_revoke(fingerprint: &str) -> Result<()> {
         bail!("unknown device fingerprint");
     }
     let nats = connect_nats().await?;
-    let confirmation_subject = format!("sudo.device.revoked.{fingerprint}");
+    let confirmation_subject = format!("oshioki.device.revoked.{fingerprint}");
     let mut confirmation = nats.subscribe(confirmation_subject).await?;
     nats.flush().await?;
     nats.publish(
-        format!("sudo.device.revoke.{fingerprint}"),
+        format!("oshioki.device.revoke.{fingerprint}"),
         Vec::new().into(),
     )
     .await?;
@@ -402,7 +402,7 @@ async fn cmd_test() -> Result<()> {
 async fn cmd_watch() -> Result<()> {
     let config = load_hook_config()?;
     let nats = connect_nats().await?;
-    let mut subscription = nats.subscribe("sudo.request.>").await?;
+    let mut subscription = nats.subscribe("oshioki.request.>").await?;
     while let Some(message) = subscription.next().await {
         let envelope: RequestEnvelopeV1 = match serde_json::from_slice(&message.payload) {
             Ok(value) => value,
@@ -413,8 +413,7 @@ async fn cmd_watch() -> Result<()> {
         };
         envelope.validate()?;
         let url = approval_url(&config.server_base_url, &envelope.request_id);
-        let opener =
-            std::env::var("SUDO_APPROVE_OPENER").unwrap_or_else(|_| "/usr/bin/open".into());
+        let opener = std::env::var("OSHIOKI_OPENER").unwrap_or_else(|_| "/usr/bin/open".into());
         let status = opener_command(&opener, &url)
             .status()
             .context("launch approval URL")?;
@@ -511,7 +510,7 @@ fn seal_request(
     raw: &[u8],
     devices: &[DevicePublicRecordV1],
 ) -> Result<RequestEnvelopeV1> {
-    if devices.len() > protocol::v1::MAX_DEVICES {
+    if devices.len() > oshioki_protocol::v1::MAX_DEVICES {
         bail!("more than eight active devices");
     }
     let envelope = RequestEnvelopeV1 {
@@ -523,7 +522,7 @@ fn seal_request(
         expires_at: request.expires_at,
         sealed: devices
             .iter()
-            .map(|device| protocol::seal_v1(raw, device))
+            .map(|device| oshioki_protocol::seal_v1(raw, device))
             .collect::<Result<Vec<_>, _>>()?,
     };
     envelope.validate()?;
@@ -545,7 +544,7 @@ fn parse_sudo_stdin() -> Result<HashMap<String, String>> {
 }
 
 fn config_dir() -> PathBuf {
-    std::env::var_os("SUDO_APPROVE_CONFIG_DIR")
+    std::env::var_os("OSHIOKI_CONFIG_DIR")
         .map_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR), PathBuf::from)
 }
 fn check_config_dir() -> &'static Path {
@@ -828,7 +827,8 @@ mod tests {
         let public = serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap();
         let secret = x25519_dalek::StaticSecret::from([4; 32]);
         let box_public = x25519_dalek::PublicKey::from(&secret);
-        let fingerprint = protocol::device_fingerprint(&credential, &public, box_public.as_bytes());
+        let fingerprint =
+            oshioki_protocol::device_fingerprint(&credential, &public, box_public.as_bytes());
         let device = DevicePublicRecordV1 {
             version: 1,
             fingerprint,
@@ -848,15 +848,15 @@ mod tests {
     fn approval_url_uses_the_configured_origin_and_request_id() {
         assert_eq!(
             approval_url(
-                "https://nas.tail88da26.ts.net:8443",
+                "https://host.example.ts.net:8443",
                 "67767d61-bcea-4e2d-8f28-32270c34eb6d"
             ),
-            "https://nas.tail88da26.ts.net:8443/r/67767d61-bcea-4e2d-8f28-32270c34eb6d"
+            "https://host.example.ts.net:8443/r/67767d61-bcea-4e2d-8f28-32270c34eb6d"
         );
     }
     #[test]
     fn atomic_registry_round_trip() {
-        let root = std::env::temp_dir().join(format!("sudo-approve-hook-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("oshioki-hook-test-{}", Uuid::new_v4()));
         let path = root.join("devices.json");
         let registry = DeviceRegistryV1 {
             version: 1,
@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn check_uses_the_root_owned_config_directory() {
-        assert_eq!(check_config_dir(), Path::new("/etc/sudo-approve"));
+        assert_eq!(check_config_dir(), Path::new("/etc/oshioki"));
     }
 
     #[test]

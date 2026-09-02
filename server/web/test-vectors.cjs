@@ -9,9 +9,9 @@ const decode = value => Buffer.from(value, "base64url");
 sodium.ready.then(() => {
   const raw = Buffer.from('{"version":1,"request_id":"vector-1"}');
   const challenge = crypto.createHash("sha256")
-    .update(Buffer.from("management-plane-sudo-approve/approve/v1\0"))
+    .update(Buffer.from("oshioki/approve/v1\0"))
     .update(raw).digest("base64url");
-  assert.equal(challenge, "5VNwjeIaxy3rOFXvz7lUoZvgjLjgWdxzU3255JY4qBI");
+  assert.equal(challenge, "mTBOp81bPTi4PmjpqFmNPFz3vFWCzk1yBKBHmHEkWV4");
 
   const shared = sodium.crypto_scalarmult(
     decode("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"),
