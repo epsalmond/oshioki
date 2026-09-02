@@ -89,6 +89,18 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj /CN=sudo.test -addext subjectAltName=DNS:sudo.test \
   -keyout "$STATE_ROOT/tls/key.pem" -out "$STATE_ROOT/tls/cert.pem" >/dev/null 2>&1
 
+# `enroll` confirms an activation by reading the device back from the server
+# over HTTPS at the configured origin, so the hook's curl has to reach
+# https://sudo.test:$HTTPS_PORT and trust the throwaway CA. The Compose run
+# gets both from /etc/hosts and CURL_CA_BUNDLE; on a developer's machine
+# /etc/hosts needs root, so the name is mapped in curl's own config file
+# instead. Chromium is mapped separately, by --host-resolver-rules in the
+# Playwright config.
+mkdir -p "$STATE_ROOT/curl"
+printf 'resolve = "sudo.test:%s:127.0.0.1"\n' "$HTTPS_PORT" >"$STATE_ROOT/curl/.curlrc"
+export CURL_HOME="$STATE_ROOT/curl"
+export CURL_CA_BUNDLE="$STATE_ROOT/tls/cert.pem"
+
 OSHIOKI_HOOK="$REPO_ROOT/target/debug/oshioki" \
 OSHIOKI_TEST_CONFIG_DIR="$STATE_ROOT/hook" \
 OSHIOKI_ORIGIN="$origin" \
