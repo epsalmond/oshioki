@@ -263,7 +263,15 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
             },
             Some(message) = activations.next() => match serde_json::from_slice::<ActivationV1>(&message.payload) {
                 Ok(activation) if activation.version == 1 && !activation.enrollment_id.is_empty() => {
-                    if let Err(error) = state.store.activate_enrollment(&activation.enrollment_id, &activation.device) { warn!(%error, "invalid enrollment activation"); }
+                    // The hook waits for this confirmation before it calls
+                    // the device enrolled, so a record this server cannot
+                    // store is never reported as a success.
+                    if let Err(error) = state.store.activate_enrollment(&activation.enrollment_id, &activation.device) {
+                        warn!(%error, "invalid enrollment activation");
+                    } else {
+                        state.nats.publish(format!("oshioki.device.activated.{}", activation.device.fingerprint), Vec::new().into()).await?;
+                        state.nats.flush().await?;
+                    }
                 },
                 Ok(_) => warn!("invalid enrollment activation"),
                 Err(error) => warn!(%error, "invalid enrollment activation"),

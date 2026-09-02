@@ -29,6 +29,8 @@ use oshioki_protocol::{
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long enroll waits for the server to confirm it stored the device.
+const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Parser)]
 #[command(name = "oshioki", about = "sudo approval hook")]
@@ -351,19 +353,52 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     registry.devices.push(device.clone());
     registry.validate()?;
     write_registry(&registry)?;
+    activate_device(&nats, &state.enrollment_id, &device).await?;
+    remove_enrollment_state(&state_path);
+    println!("Device enrolled: {} ({})", device.fingerprint, device.label);
+    Ok(())
+}
+
+/// Publishes the activation and waits for the server to confirm it stored the
+/// device record.
+///
+/// Nothing else acknowledges an activation, so a server that cannot store the
+/// record — one predating this device kind, say — would drop it silently
+/// while both `enroll` and the agent reported success.
+async fn activate_device(
+    nats: &async_nats::Client,
+    enrollment_id: &str,
+    device: &DevicePublicRecordV1,
+) -> Result<()> {
     let activation = ActivationV1 {
         version: VERSION_V1,
-        enrollment_id: state.enrollment_id.clone(),
+        enrollment_id: enrollment_id.to_owned(),
         device: device.clone(),
     };
+    let mut activated = nats
+        .subscribe(format!("oshioki.device.activated.{}", device.fingerprint))
+        .await
+        .context("subscribe activation confirmation")?;
+    nats.flush().await?;
     nats.publish(
-        format!("oshioki.enrollment.activation.{}", state.enrollment_id),
+        format!("oshioki.enrollment.activation.{enrollment_id}"),
         serde_json::to_vec(&activation)?.into(),
     )
     .await?;
     nats.flush().await?;
-    remove_enrollment_state(&state_path);
-    println!("Device enrolled: {} ({})", device.fingerprint, device.label);
+    if tokio::time::timeout(ACTIVATION_TIMEOUT, activated.next())
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        bail!(
+            "the server did not confirm device {} ({:?}); it is pinned on this host, but the \
+             server either rejected the record or is too old to understand it",
+            device.fingerprint,
+            device.kind
+        );
+    }
     Ok(())
 }
 
