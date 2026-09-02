@@ -89,15 +89,20 @@ async fn main() -> Result<()> {
 
 async fn cmd_check() -> Result<()> {
     let request = build_request(&parse_sudo_stdin()?)?;
-    execute_request_at(request, APPROVAL_TIMEOUT, check_config_dir()).await
+    execute_request_at(request, APPROVAL_TIMEOUT, check_config_dir(), false).await
 }
 
 async fn execute_request(request: RequestV1, timeout: Duration) -> Result<()> {
     let directory = config_dir();
-    execute_request_at(request, timeout, &directory).await
+    execute_request_at(request, timeout, &directory, true).await
 }
 
-async fn execute_request_at(request: RequestV1, timeout: Duration, directory: &Path) -> Result<()> {
+async fn execute_request_at(
+    request: RequestV1,
+    timeout: Duration,
+    directory: &Path,
+    announce_url: bool,
+) -> Result<()> {
     let raw_request = request.raw_json()?;
     let mut registry = load_registry_from(directory)?;
     let active = registry
@@ -115,6 +120,15 @@ async fn execute_request_at(request: RequestV1, timeout: Duration, directory: &P
         bail!("request envelope exceeds 3 MiB");
     }
     let nats = connect_nats_from(directory).await?;
+    if announce_url {
+        let config = load_hook_config_from(directory)?;
+        println!(
+            "Approval URL (expires in {} seconds):\n  {}",
+            timeout.as_secs(),
+            approval_url(&config.server_base_url, &request.request_id)
+        );
+        io::stdout().flush()?;
+    }
     let decision = request_decision(
         &nats,
         &format!("sudo.request.{}", request.host),
@@ -175,6 +189,10 @@ async fn execute_request_at(request: RequestV1, timeout: Duration, directory: &P
             Ok(())
         }
     }
+}
+
+fn approval_url(server_base_url: &str, request_id: &str) -> String {
+    format!("{server_base_url}/r/{request_id}")
 }
 
 async fn request_decision(
@@ -394,7 +412,7 @@ async fn cmd_watch() -> Result<()> {
             }
         };
         envelope.validate()?;
-        let url = format!("{}/r/{}", config.server_base_url, envelope.request_id);
+        let url = approval_url(&config.server_base_url, &envelope.request_id);
         let opener =
             std::env::var("SUDO_APPROVE_OPENER").unwrap_or_else(|_| "/usr/bin/open".into());
         let status = opener_command(&opener, &url)
@@ -825,6 +843,16 @@ mod tests {
         let envelope = seal_request(&request, &raw, &[device]).unwrap();
         assert_eq!(envelope.request_id, request.request_id);
         assert_eq!(envelope.sealed.len(), 1);
+    }
+    #[test]
+    fn approval_url_uses_the_configured_origin_and_request_id() {
+        assert_eq!(
+            approval_url(
+                "https://nas.tail88da26.ts.net:8443",
+                "67767d61-bcea-4e2d-8f28-32270c34eb6d"
+            ),
+            "https://nas.tail88da26.ts.net:8443/r/67767d61-bcea-4e2d-8f28-32270c34eb6d"
+        );
     }
     #[test]
     fn atomic_registry_round_trip() {

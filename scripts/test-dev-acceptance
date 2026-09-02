@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SCRIPT="$REPO_ROOT/scripts/dev-acceptance"
+TEST_ROOT="$(mktemp -d -t sudo-approve-dev-acceptance-test.XXXXXX)"
+SESSION_FILE="$TEST_ROOT/session.json"
+FAKE_BIN="$TEST_ROOT/bin"
+TAILSCALE_LOG="$TEST_ROOT/tailscale.log"
+PRIVILEGE_LOG="$TEST_ROOT/privilege.log"
+PROCESS_LOG="$TEST_ROOT/process.log"
+SERVE_STATE="$TEST_ROOT/serve-state.json"
+EXPECTED_SERVE_STATE="$TEST_ROOT/expected-serve-state.json"
+NATS_PID=""
+SERVER_PID=""
+
+cleanup() {
+  set +e
+  [ -z "$SERVER_PID" ] || kill "$SERVER_PID" >/dev/null 2>&1 || true
+  [ -z "$NATS_PID" ] || kill "$NATS_PID" >/dev/null 2>&1 || true
+  rm -rf -- "$TEST_ROOT"
+}
+trap cleanup EXIT
+
+fail() {
+  echo "test-dev-acceptance: $*" >&2
+  exit 1
+}
+
+[ -x "$SCRIPT" ] || fail "missing executable scripts/dev-acceptance"
+mkdir -p "$FAKE_BIN"
+
+cat >"$FAKE_BIN/cargo" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$FAKE_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$FAKE_BIN/nats" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$FAKE_BIN/nats-server" <<'EOF'
+#!/usr/bin/env bash
+printf 'nats %s\n' "$$" >>"$FAKE_PROCESS_LOG"
+exec sleep 300
+EOF
+cat >"$FAKE_BIN/sudo-approve-server" <<'EOF'
+#!/usr/bin/env bash
+printf 'server %s\n' "$$" >>"$FAKE_PROCESS_LOG"
+exec sleep 300
+EOF
+cat >"$FAKE_BIN/sudo-approve" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  enroll) echo "Enrollment URL: https://nas.example.test/enroll/test#secret" ;;
+  test) echo "synthetic request complete" ;;
+  *) exit 2 ;;
+esac
+EOF
+cat >"$FAKE_BIN/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$FAKE_PRIVILEGE_LOG"
+exec "$@"
+EOF
+cat >"$FAKE_BIN/tailscale" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1 $2" in
+  "status --json")
+    printf '%s\n' '{"Self":{"DNSName":"nas.example.test.","Online":true}}'
+    ;;
+  "serve status")
+    [ "$3" = --json ]
+    if [ -f "$FAKE_SERVE_STATE" ]; then
+      cat "$FAKE_SERVE_STATE"
+    elif [ -n "${FAKE_SERVE_SNAPSHOT:-}" ]; then
+      printf '%s\n' "$FAKE_SERVE_SNAPSHOT"
+    else
+      printf '%s\n' 'null'
+    fi
+    printf 'snapshot\n' >>"$FAKE_TAILSCALE_LOG"
+    ;;
+  "serve reset")
+    printf 'reset\n' >>"$FAKE_TAILSCALE_LOG"
+    printf '%s\n' '{}' >"$FAKE_SERVE_STATE"
+    ;;
+  "serve --bg")
+    printf 'serve %s\n' "${*:3}" >>"$FAKE_TAILSCALE_LOG"
+    [ "${FAKE_FAIL_SERVE:-0}" = 0 ] || exit 1
+    [ "$3" = --yes ]
+    https_port="${4#--https=}"
+    proxy="$5"
+    printf '{"TCP":{"%s":{"HTTPS":true}},"Web":{"nas.example.test:%s":{"Handlers":{"/":{"Proxy":"%s"}}}}}\n' \
+      "$https_port" "$https_port" "$proxy" >"$FAKE_SERVE_STATE"
+    ;;
+  *)
+    printf 'unexpected tailscale call: %s\n' "$*" >&2
+    exit 2
+    ;;
+esac
+EOF
+chmod 0755 "$FAKE_BIN"/*
+
+export PATH="$FAKE_BIN:$PATH"
+export FAKE_TAILSCALE_LOG="$TAILSCALE_LOG"
+export FAKE_PRIVILEGE_LOG="$PRIVILEGE_LOG"
+export FAKE_PROCESS_LOG="$PROCESS_LOG"
+export FAKE_SERVE_STATE="$SERVE_STATE"
+export SUDO_APPROVE_ACCEPTANCE_SESSION_FILE="$SESSION_FILE"
+export SUDO_APPROVE_ACCEPTANCE_TAILSCALE_BIN="$FAKE_BIN/tailscale"
+export SUDO_APPROVE_ACCEPTANCE_PRIVILEGE_BIN="$FAKE_BIN/sudo"
+export SUDO_APPROVE_ACCEPTANCE_NATS_PORT=14222
+export SUDO_APPROVE_ACCEPTANCE_SERVER_PORT=18443
+export SUDO_APPROVE_ACCEPTANCE_HTTPS_PORT=18444
+export SUDO_APPROVE_ACCEPTANCE_SERVER_BIN="$FAKE_BIN/sudo-approve-server"
+export SUDO_APPROVE_ACCEPTANCE_HOOK_BIN="$FAKE_BIN/sudo-approve"
+
+"$SCRIPT" up --state-dir "$TEST_ROOT/state"
+[ -f "$SESSION_FILE" ] || fail "session file was not created"
+[ "$(stat -c %a "$SESSION_FILE")" = 600 ] || fail "session file mode is not 0600"
+[ -f "$TEST_ROOT/state/hook/hook.json" ] || fail "hook config was not created"
+[ -f "$TEST_ROOT/state/hook/config.env" ] || fail "hook environment was not created"
+[ -f "$TEST_ROOT/state/hook/devices.json" ] || fail "device registry was not created"
+jq -e '.origin == "https://nas.example.test:18444" and .rp_id == "nas.example.test"' \
+  "$TEST_ROOT/state/hook/hook.json" >/dev/null || fail "hook origin or RP ID is wrong"
+NATS_PID="$(jq -r .nats_pid "$SESSION_FILE")"
+SERVER_PID="$(jq -r .server_pid "$SESSION_FILE")"
+kill -0 "$NATS_PID"
+kill -0 "$SERVER_PID"
+PARENT_SID="$(ps -o sid= -p "$$" | tr -d ' ')"
+NATS_SID="$(ps -o sid= -p "$NATS_PID" | tr -d ' ')"
+SERVER_SID="$(ps -o sid= -p "$SERVER_PID" | tr -d ' ')"
+[ "$NATS_SID" != "$PARENT_SID" ] || fail "NATS shares the launcher session"
+[ "$SERVER_SID" != "$PARENT_SID" ] || fail "server shares the launcher session"
+NATS_PASSWORD_VALUE="$(sed -n 's/^NATS_PASS=//p' "$TEST_ROOT/state/hook/config.env")"
+case "$(tr '\0' ' ' <"/proc/$NATS_PID/cmdline")" in
+  *"$NATS_PASSWORD_VALUE"*) fail "NATS password appears in process arguments" ;;
+esac
+"$SCRIPT" status | grep -Fq 'https://nas.example.test:18444'
+"$SCRIPT" enroll | grep -Fq 'Enrollment URL:'
+"$SCRIPT" test | grep -Fq 'synthetic request complete'
+cp "$SERVE_STATE" "$EXPECTED_SERVE_STATE"
+jq '.TCP["9443"] = {"HTTPS":true}' "$SERVE_STATE" >"$SERVE_STATE.tmp"
+mv "$SERVE_STATE.tmp" "$SERVE_STATE"
+if "$SCRIPT" down >"$TEST_ROOT/mismatched-down.log" 2>&1; then
+  fail "down reset an unexpected Serve configuration"
+fi
+[ -e "$SESSION_FILE" ] || fail "failed restoration discarded the acceptance session"
+grep -Fq 'Serve restoration must be retried' "$TEST_ROOT/mismatched-down.log"
+if grep -Fq 'reset' "$TAILSCALE_LOG"; then
+  fail "failed restoration reset an unexpected Serve configuration"
+fi
+cp "$EXPECTED_SERVE_STATE" "$SERVE_STATE"
+"$SCRIPT" down
+[ ! -e "$SESSION_FILE" ] || fail "session file remains after down"
+[ -d "$TEST_ROOT/state" ] || fail "operator state directory was removed"
+NATS_STATE="$(awk '{print $3}' "/proc/$NATS_PID/stat" 2>/dev/null || true)"
+SERVER_STATE="$(awk '{print $3}' "/proc/$SERVER_PID/stat" 2>/dev/null || true)"
+[ -z "$NATS_STATE" ] || [ "$NATS_STATE" = Z ] || fail "NATS process remains after down"
+[ -z "$SERVER_STATE" ] || [ "$SERVER_STATE" = Z ] || fail "server process remains after down"
+NATS_PID=""
+SERVER_PID=""
+grep -Fq 'serve --yes --https=18444 http://127.0.0.1:18443' "$TAILSCALE_LOG"
+grep -Fq 'reset' "$TAILSCALE_LOG"
+grep -Fxq 'null' "$TEST_ROOT/state/serve-config.json"
+grep -Fq "$FAKE_BIN/tailscale serve --bg --yes --https=18444 http://127.0.0.1:18443" "$PRIVILEGE_LOG"
+grep -Fq "$FAKE_BIN/tailscale serve reset" "$PRIVILEGE_LOG"
+[ "$(wc -l <"$PRIVILEGE_LOG")" -eq 2 ] || fail "unexpected privileged command count"
+
+: >"$TAILSCALE_LOG"
+: >"$PRIVILEGE_LOG"
+: >"$PROCESS_LOG"
+printf '%s\n' '{"TCP":{"443":{"HTTPS":true}}}' >"$SERVE_STATE"
+if "$SCRIPT" up --state-dir "$TEST_ROOT/existing-state" >"$TEST_ROOT/existing-start.log" 2>&1; then
+  fail "pre-existing Serve configuration was accepted"
+fi
+[ ! -e "$SESSION_FILE" ] || fail "refused startup left a session file"
+[ ! -s "$PRIVILEGE_LOG" ] || fail "refused startup mutated Serve configuration"
+grep -Fq 'pre-existing Tailscale Serve configuration' "$TEST_ROOT/existing-start.log"
+
+: >"$TAILSCALE_LOG"
+: >"$PRIVILEGE_LOG"
+: >"$PROCESS_LOG"
+printf '%s\n' '{}' >"$SERVE_STATE"
+export FAKE_FAIL_SERVE=1
+if "$SCRIPT" up --state-dir "$TEST_ROOT/failed-state" >"$TEST_ROOT/failed-start.log" 2>&1; then
+  fail "failed Serve startup was accepted"
+fi
+unset FAKE_FAIL_SERVE
+[ ! -e "$SESSION_FILE" ] || fail "failed startup left a session file"
+grep -Fxq '{}' "$SERVE_STATE" || fail "failed Serve startup changed node configuration"
+while read -r _ failed_pid; do
+  failed_state="$(awk '{print $3}' "/proc/$failed_pid/stat" 2>/dev/null || true)"
+  [ -z "$failed_state" ] || [ "$failed_state" = Z ] || fail "failed startup left process $failed_pid running"
+done <"$PROCESS_LOG"
+
+printf '%s\n' '{"version":1,"state_root":"/","managed_state":true,"nats_pid":1,"nats_start":"1","server_pid":1,"server_start":"1","nats_port":1,"server_port":1,"https_port":443,"origin":"https://nas.example.test","rp_id":"nas.example.test","serve_snapshot":"/serve.json"}' >"$SESSION_FILE"
+chmod 0600 "$SESSION_FILE"
+if "$SCRIPT" down >"$TEST_ROOT/unsafe.log" 2>&1; then
+  fail "unsafe managed state path was accepted"
+fi
+grep -Fq 'refusing unsafe managed state path' "$TEST_ROOT/unsafe.log"
+
+echo "test-dev-acceptance: PASS"
