@@ -1,12 +1,14 @@
 # Oshioki
 
+<p align="center"><img src="assets/oshioki.svg" alt="Oshioki logo" width="160"></p>
+
 Oshioki (お仕置き): the sound of a keypress, and a pun on "punishment" for when
 root misbehaves.
 
-Oshioki asks an enrolled browser to approve one exact sudo request. The
-hook encrypts the request for each enrolled browser. The server stores routing
-data and ciphertext. A valid approval still requires the browser's WebAuthn
-credential.
+Oshioki asks an enrolled device to approve one exact sudo request. The hook
+encrypts the request for each enrolled device. The server stores routing data
+and ciphertext. A device is either a browser using WebAuthn or a native agent
+signing directly with a Secure Enclave key.
 
 This repository owns the protocol, hook, sudo plugin, server, browser app, and
 local test environment. Production deployment belongs to the consuming
@@ -71,12 +73,44 @@ invoking user.
 
 ## Repository layout
 
-- `protocol/` defines v1 messages, validation, sealing, and WebAuthn checks.
+- `protocol/` defines v1 messages, validation, sealing, WebAuthn checks, and
+  native (Secure Enclave) checks.
 - `hook/` publishes requests and verifies enrollment and approval results.
 - `plugin/` connects sudo's approval plugin ABI to the hook.
+- `agent/` is the native approval agent (`oshioki-agent`): pairs a device
+  with a host and answers sudo requests over NATS with a P-256 signature.
 - `server/` contains the HTTP app, NATS relay, and SQLite state.
 - `server/web/` contains the locally bundled browser UI and Playwright tests.
 - `scripts/` contains the development loop, installer, and E2E runners.
+
+## Native agent
+
+A native device signs approvals directly with a P-256 key instead of using a
+browser and WebAuthn. Enroll one from the host:
+
+```bash
+oshioki enroll
+```
+
+`enroll` prints an enrollment URL and, below it, the `oshioki-agent` command
+that consumes it. On the device:
+
+```bash
+oshioki-agent pair '<enrollment-url>' --label <label>
+oshioki-agent run
+```
+
+`pair` creates a 0600 identity file (`agent.json`, under
+`$OSHIOKI_AGENT_STATE` or `~/.config/oshioki` by default) on first use, then
+submits the enrollment and waits for the host to activate it. `run` watches
+for sudo requests and prompts on the terminal; `run --auto approve` and
+`run --auto deny` decide every request without prompting, for tests only.
+The agent needs the same `NATS_URL`, and optionally `NATS_USER` and
+`NATS_PASS`, as the hook.
+
+The current `oshioki-agent` binary uses a software P-256 key. It is the
+Linux and test build of the macOS agent (issue #9), which will add a Secure
+Enclave backend and a native prompt behind the same signing interface.
 
 SQLite is the server's local source of truth. It commits request ciphertext and
 outbox work before the JetStream message is acknowledged. The expected runtime
@@ -87,6 +121,9 @@ is one active server with one persistent database file.
 The v1 cryptographic domain strings use `oshioki/...` values. Changing those
 values would change the protocol and existing test vectors. The executable is
 `oshioki`, and local hook state defaults to `/etc/oshioki`.
+
+No wire compatibility with records enrolled before the `secure-enclave`
+device kind is kept. Upgrade the hook before the first native enrollment.
 
 OCI publication and CI are outside the current iteration loop. Homebrew and
 Debian packages will be designed after the protocol and local E2E stabilize.

@@ -18,6 +18,11 @@ The deploying infrastructure supplies the production runtime. It must provide:
 The runtime must not log or notify with request plaintext. An ntfy message may
 contain host, user, request ID, and `/r/<id>` URL only.
 
+A device is either kind `webauthn` (a browser) or kind `secure-enclave` (the
+native agent). The native agent is a NATS consumer only; it never calls the
+server over HTTP. The deploying infrastructure's NATS permissions above must
+cover it the same as any other consumer.
+
 ## The Mac installer
 
 The Mac installer installs the packaged Darwin client. It owns the read-only
