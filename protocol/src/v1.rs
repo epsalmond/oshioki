@@ -130,8 +130,9 @@ impl RequestEnvelopeV1 {
 ///
 /// `webauthn` devices sign `WebAuthn` assertions from a browser. `secure-enclave`
 /// devices sign the challenge directly with a P-256 key (the native agent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceKindV1 {
+    #[default]
     #[serde(rename = "webauthn")]
     Webauthn,
     #[serde(rename = "secure-enclave")]
@@ -146,6 +147,9 @@ pub enum DeviceKindV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePublicRecordV1 {
     pub version: u8,
+    /// Absent from records written before native devices existed; those are
+    /// `WebAuthn`, so the field defaults rather than failing the load.
+    #[serde(default)]
     pub kind: DeviceKindV1,
     pub fingerprint: String,
     pub credential_id: String,
@@ -604,6 +608,35 @@ mod tests {
     #[test]
     fn rejects_padded_base64url() {
         assert!(decode_base64url("AA==").is_err());
+    }
+
+    /// A record written before the `kind` field existed must still load, as
+    /// `WebAuthn`. Both the host's `devices.json` and the server's
+    /// `public_record_json` column hold exactly this shape.
+    #[test]
+    fn pre_kind_device_record_loads_as_webauthn() {
+        use p256::ecdsa::SigningKey;
+        let signing = SigningKey::from_slice(&[0x33; 32]).unwrap();
+        let point = signing.verifying_key().to_encoded_point(false);
+        let cose = crate::webauthn_v1::tests::cose_key(point.x().unwrap(), point.y().unwrap());
+        let credential_id = [7; 32];
+        let box_key = [8; 32];
+        let record_json = format!(
+            r#"{{"version":1,"fingerprint":"{}","credential_id":"{}","credential_public_key":"{}","box_public_key":"{}","label":"laptop","api_token_hash":"{}","sign_count":4,"active":true}}"#,
+            device_fingerprint(&credential_id, &cose, &box_key),
+            encode_base64url(&credential_id),
+            encode_base64url(&cose),
+            encode_base64url(&box_key),
+            encode_base64url(&[9; 32]),
+        );
+        let device: DevicePublicRecordV1 = serde_json::from_str(&record_json).unwrap();
+        assert_eq!(device.kind, DeviceKindV1::Webauthn);
+        device.validate().unwrap();
+
+        let registry: DeviceRegistryV1 =
+            serde_json::from_str(&format!(r#"{{"version":1,"devices":[{record_json}]}}"#)).unwrap();
+        registry.validate().unwrap();
+        assert_eq!(registry.devices[0].kind, DeviceKindV1::Webauthn);
     }
 
     #[test]
