@@ -40,13 +40,15 @@ struct Cli {
 enum Verb {
     Check,
     Enroll {
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         resume: Option<String>,
     },
     Revoke {
+        #[arg(allow_hyphen_values = true)]
         fingerprint: String,
     },
     Pin {
+        #[arg(allow_hyphen_values = true)]
         fingerprint: String,
     },
     Status,
@@ -799,6 +801,18 @@ mod tests {
     use super::*;
     use p256::ecdsa::SigningKey;
     use std::collections::BTreeMap;
+    #[test]
+    fn fingerprint_arguments_may_start_with_a_hyphen() {
+        for verb in ["revoke", "pin"] {
+            let cli = Cli::try_parse_from(["oshioki", verb, "-8lGYGvNFgwWqSSFS3yv1Q"]).unwrap();
+            let (Verb::Revoke { fingerprint } | Verb::Pin { fingerprint }) = cli.verb else {
+                panic!("unexpected verb")
+            };
+            assert_eq!(fingerprint, "-8lGYGvNFgwWqSSFS3yv1Q");
+        }
+        let cli = Cli::try_parse_from(["oshioki", "enroll", "--resume", "-abc"]).unwrap();
+        assert!(matches!(cli.verb, Verb::Enroll { resume: Some(ref r) } if r == "-abc"));
+    }
     #[test]
     fn request_bytes_are_retained_in_every_sealed_body() {
         let request = build_synthetic_request();
