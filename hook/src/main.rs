@@ -210,7 +210,7 @@ fn apply_decision(
                 }
                 write_registry_to(directory, registry)?;
             }
-            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, "sudo request approved");
+            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
             Ok(())
         }
         DecisionV1::ApproveNative(approval) => {
