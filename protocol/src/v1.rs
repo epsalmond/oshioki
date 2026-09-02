@@ -255,13 +255,42 @@ impl EnrollmentIntentV1 {
 }
 
 /// An enrollment submission, tagged by device kind.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind")]
 pub enum EnrollmentSubmissionV1 {
     #[serde(rename = "webauthn")]
     Webauthn(WebauthnEnrollmentSubmissionV1),
     #[serde(rename = "secure-enclave")]
     SecureEnclave(NativeEnrollmentSubmissionV1),
+}
+
+/// Deserialization also accepts the untagged shape browsers sent before
+/// native devices existed: a submission with no `kind` is a `WebAuthn` one,
+/// so a cached page still gets the 202 or 409 it expects rather than a raw
+/// deserialization failure.
+impl<'de> Deserialize<'de> for EnrollmentSubmissionV1 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind")]
+        enum Tagged {
+            #[serde(rename = "webauthn")]
+            Webauthn(WebauthnEnrollmentSubmissionV1),
+            #[serde(rename = "secure-enclave")]
+            SecureEnclave(NativeEnrollmentSubmissionV1),
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Tagged(Tagged),
+            UntaggedWebauthn(WebauthnEnrollmentSubmissionV1),
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Tagged(Tagged::Webauthn(submission)) | Wire::UntaggedWebauthn(submission) => {
+                Self::Webauthn(submission)
+            }
+            Wire::Tagged(Tagged::SecureEnclave(submission)) => Self::SecureEnclave(submission),
+        })
+    }
 }
 
 impl EnrollmentSubmissionV1 {
@@ -637,6 +666,27 @@ mod tests {
             serde_json::from_str(&format!(r#"{{"version":1,"devices":[{record_json}]}}"#)).unwrap();
         registry.validate().unwrap();
         assert_eq!(registry.devices[0].kind, DeviceKindV1::Webauthn);
+    }
+
+    /// Browser pages cached before the `kind` tag existed post a
+    /// bare `WebAuthn` submission; it must still parse as one.
+    #[test]
+    fn enrollment_submission_without_kind_is_webauthn() {
+        let untagged = r#"{"version":1,"enrollment_id":"e1","registration_client_data_json":"AA","attestation_object":"AQ","proof_authenticator_data":"Ag","proof_client_data_json":"Aw","proof_signature":"BA","credential_id":"BQ","box_public_key":"Bg","api_token_hash":"Bw","label":"laptop","transcript_hmac":"CA"}"#;
+        let submission: EnrollmentSubmissionV1 = serde_json::from_str(untagged).unwrap();
+        assert_eq!(submission.kind(), DeviceKindV1::Webauthn);
+        assert_eq!(submission.enrollment_id(), "e1");
+
+        let tagged = serde_json::to_string(&submission).unwrap();
+        assert!(tagged.contains(r#""kind":"webauthn""#));
+        assert_eq!(
+            serde_json::from_str::<EnrollmentSubmissionV1>(&tagged).unwrap(),
+            submission
+        );
+
+        let native = r#"{"kind":"secure-enclave","version":1,"enrollment_id":"e1","credential_public_key":"AA","box_public_key":"AQ","api_token_hash":"Ag","label":"mac","proof_signature":"Aw","transcript_hmac":"BA"}"#;
+        let native: EnrollmentSubmissionV1 = serde_json::from_str(native).unwrap();
+        assert_eq!(native.kind(), DeviceKindV1::SecureEnclave);
     }
 
     #[test]
