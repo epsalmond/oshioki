@@ -6,6 +6,7 @@
 //! backend and a native prompt on top of the same library.
 
 use std::{
+    fmt::Write as _,
     io::{self, BufRead as _, Write as _},
     path::PathBuf,
     sync::Arc,
@@ -199,12 +200,12 @@ async fn decide(
             let _serialized = prompt.lock().await;
             let summary = format!(
                 "sudo on {}: {} wants to run {} {}\n  cwd: {}\n  callers: {}\n",
-                request.host,
-                request.user,
-                request.command,
-                request.argv.join(" "),
-                request.cwd,
-                request.pid_chain.join(" <- "),
+                escape_for_terminal(&request.host),
+                escape_for_terminal(&request.user),
+                escape_for_terminal(&request.command),
+                escape_for_terminal(&request.argv.join(" ")),
+                escape_for_terminal(&request.cwd),
+                escape_for_terminal(&request.pid_chain.join(" <- ")),
             );
             tokio::time::timeout(Duration::from_secs(remaining), ask(summary))
                 .await
@@ -232,6 +233,27 @@ async fn decide(
     Ok(())
 }
 
+/// Renders untrusted request text for a terminal.
+///
+/// Every field in the prompt comes from the requesting host: the command
+/// line, the working directory, and process names read out of `/proc`. A
+/// control character in any of them can repaint the screen and hide what is
+/// really being approved, so escape the C0 and C1 ranges (ESC, CR, DEL and
+/// friends) and the backslash that introduces them.
+fn escape_for_terminal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == '\\' {
+            escaped.push_str("\\\\");
+        } else if character.is_control() {
+            let _ = write!(escaped, "\\u{{{:04x}}}", character as u32);
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 /// Terminal prompt. Any answer other than `y` denies.
 async fn ask(summary: String) -> Result<bool> {
     tokio::task::spawn_blocking(move || {
@@ -257,4 +279,30 @@ async fn connect_nats() -> Result<async_nats::Client> {
 
 fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_for_terminal;
+
+    #[test]
+    fn escapes_terminal_control_sequences() {
+        // A command that clears the line and prints a harmless one instead.
+        assert_eq!(
+            escape_for_terminal("/bin/rm -rf /\x1b[2K\rls"),
+            "/bin/rm -rf /\\u{001b}[2K\\u{000d}ls"
+        );
+        // C1 controls have a one-byte escape in some terminals too.
+        assert_eq!(
+            escape_for_terminal("a\u{9b}b\u{7f}"),
+            "a\\u{009b}b\\u{007f}"
+        );
+        // Backslashes are escaped so the rendering is unambiguous.
+        assert_eq!(escape_for_terminal(r"C:\x1b"), r"C:\\x1b");
+        // Ordinary text, including non-ASCII, passes through.
+        assert_eq!(
+            escape_for_terminal("お仕置き /usr/bin/id"),
+            "お仕置き /usr/bin/id"
+        );
+    }
 }
