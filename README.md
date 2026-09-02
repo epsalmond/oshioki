@@ -108,7 +108,9 @@ for sudo requests and prompts on the terminal; `run --auto approve` and
 The prompt and the browser page render the same request: the host, the
 invoking user with their uid, the target account the command would run as
 (`root (uid 0)` for sudo's default, otherwise the bare uid), the command, its
-arguments, the working directory, and the caller process chain.
+arguments, the working directory, and the caller process chain. An argument
+that is empty or holds anything but plainly printable characters is shown in
+shell single quotes, so one argument holding a space never reads as two.
 A prompt nobody answers before the request expires publishes no verdict at
 all, and the hook fails closed on its own deadline. `run` without `--auto`
 needs a terminal: with stdin closed nothing could answer, so it stops rather

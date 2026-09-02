@@ -56,6 +56,13 @@ function requestId() { return location.pathname.split("/").filter(Boolean).at(-1
 // including sudo's implicit root default. The number is not resolved to a
 // name here: the account lives on the requesting host, not in this browser.
 function runAsLabel(uid) { return uid === 0 ? "root (uid 0)" : `uid ${uid}`; }
+// One argument per line already separates them, but an argument holding a
+// newline would still split in two. Anything not plainly printable, the empty
+// argument included, is wrapped in shell single quotes.
+const PLAIN_ARGUMENT = /^[A-Za-z0-9@%+=:,./_-]+$/;
+function quoteArgument(argument) {
+  return PLAIN_ARGUMENT.test(argument) ? argument : `'${argument.split("'").join("'\\''")}'`;
+}
 function text(id, value) { document.getElementById(id).textContent = value; }
 function failure(error) { console.error(error); text("status", "This request could not be verified."); }
 
@@ -117,7 +124,7 @@ async function approval() {
   const raw = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, unb64(sealed.ciphertext), null, unb64(sealed.nonce), shared);
   const request = JSON.parse(dec.decode(raw)); if (request.version !== 1 || request.request_id !== id) throw new Error("request mismatch");
   text("host", request.host); text("user", `${request.user} / ${request.uid}`); text("runas", runAsLabel(request.runas_uid)); text("command", request.command);
-  text("argv", request.argv.join("\n")); text("cwd", request.cwd); text("process-chain", request.pid_chain.join("\n"));
+  text("argv", request.argv.map(quoteArgument).join("\n")); text("cwd", request.cwd); text("process-chain", request.pid_chain.join("\n"));
   text("status", `Expires ${new Date(request.expires_at * 1000).toLocaleTimeString()}`); document.getElementById("request").hidden = false; document.getElementById("actions").hidden = false;
   const headers = { authorization: `Bearer ${selected.device.apiToken}`, "content-type": "application/json" };
   document.getElementById("deny").addEventListener("click", async () => {

@@ -234,7 +234,7 @@ async fn decide(
                 request.uid,
                 runas_label(request.runas_uid),
                 escape_for_terminal(&request.command),
-                escape_for_terminal(&request.argv.join(" ")),
+                escape_for_terminal(&quote_argv(&request.argv)),
                 escape_for_terminal(&request.cwd),
                 escape_for_terminal(&request.pid_chain.join(" <- ")),
             );
@@ -276,6 +276,35 @@ async fn decide(
         "decision published"
     );
     Ok(())
+}
+
+/// Renders argv so the boundaries between arguments are visible.
+///
+/// Joined with plain spaces, `["/tmp/a b"]` and `["/tmp/a", "b"]` render
+/// identically, and the operator approves the wrong one of the two. Every
+/// argument that is not plainly printable, including the empty one, is
+/// wrapped in shell single quotes instead.
+fn quote_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| quote_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Single-quotes one argument unless every byte of it is unambiguous.
+///
+/// The escape is the shell's own: a single quote ends the quoted run, adds a
+/// backslash-escaped quote, and opens the next run.
+fn quote_argument(argument: &str) -> String {
+    let plain = !argument.is_empty()
+        && argument
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "@%+=:,./-_".contains(character));
+    if plain {
+        argument.to_owned()
+    } else {
+        format!("'{}'", argument.replace('\'', r"'\''"))
+    }
 }
 
 /// Names the account the command would run as.
@@ -384,8 +413,38 @@ fn now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Prompter, now, runas_label};
+    use super::{Prompter, now, quote_argv, runas_label};
     use tokio::sync::mpsc;
+
+    /// One argument holding a space and two arguments are different requests,
+    /// so they must not render as the same line.
+    #[test]
+    fn argument_boundaries_survive_rendering() {
+        assert_ne!(
+            quote_argv(&["/tmp/a b".to_owned()]),
+            quote_argv(&["/tmp/a".to_owned(), "b".to_owned()])
+        );
+        assert_eq!(quote_argv(&["/tmp/a b".to_owned()]), "'/tmp/a b'");
+        assert_eq!(
+            quote_argv(&["/tmp/a".to_owned(), "b".to_owned()]),
+            "/tmp/a b"
+        );
+        // An empty argument is a real argument and has to be visible.
+        assert_eq!(
+            quote_argv(&["rm".to_owned(), String::new(), "-rf".to_owned()]),
+            "rm '' -rf"
+        );
+        // The shell's own escape for a quote inside a quoted run.
+        assert_eq!(quote_argv(&["it's".to_owned()]), r"'it'\''s'");
+        // Anything not plainly printable is quoted, quotation marks included.
+        assert_eq!(quote_argv(&["a\"b".to_owned()]), "'a\"b'");
+        assert_eq!(quote_argv(&["a\tb".to_owned()]), "'a\tb'");
+        assert_eq!(
+            quote_argv(&["-rf".to_owned(), "/var/log".to_owned()]),
+            "-rf /var/log"
+        );
+        assert_eq!(quote_argv(&[]), "");
+    }
 
     /// The prompt names the target account for every request, including the
     /// root default that sudo leaves implicit.
