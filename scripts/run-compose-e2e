@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOOK_CONFIG_DIR="${SUDO_APPROVE_TEST_CONFIG_DIR:?set SUDO_APPROVE_TEST_CONFIG_DIR}"
+HOOK_CONFIG_DIR="${OSHIOKI_TEST_CONFIG_DIR:?set OSHIOKI_TEST_CONFIG_DIR}"
 STATE_ROOT="${HOOK_CONFIG_DIR%/hook}"
-HOST_UID="${SUDO_APPROVE_HOST_UID:?set SUDO_APPROVE_HOST_UID}"
-TLS_ROOT=/tmp/sudo-approve-e2e-tls
+HOST_UID="${OSHIOKI_HOST_UID:?set OSHIOKI_HOST_UID}"
+TLS_ROOT=/tmp/oshioki-e2e-tls
 case "$HOST_UID" in
   ''|*[!0-9]*) echo "invalid host UID: $HOST_UID" >&2; exit 2 ;;
 esac
@@ -24,7 +24,7 @@ mkdir -p "$HOOK_CONFIG_DIR" "$TLS_ROOT"
 chmod 0700 "$HOOK_CONFIG_DIR"
 
 printf '{"version":1,"origin":"%s","rp_id":"%s","server_base_url":"%s"}\n' \
-  "$SUDO_APPROVE_ORIGIN" "$SUDO_APPROVE_RP_ID" "$SUDO_APPROVE_ORIGIN" \
+  "$OSHIOKI_ORIGIN" "$OSHIOKI_RP_ID" "$OSHIOKI_ORIGIN" \
   >"$HOOK_CONFIG_DIR/hook.json"
 printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\n' \
   "$NATS_URL" "$NATS_USER" "$NATS_PASS" \
@@ -35,17 +35,17 @@ chmod 0600 "$HOOK_CONFIG_DIR"/*.json "$HOOK_CONFIG_DIR/config.env"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj /CN=sudo.test -addext subjectAltName=DNS:sudo.test \
   -keyout "$TLS_ROOT/key.pem" -out "$TLS_ROOT/cert.pem" >/dev/null 2>&1
-export SUDO_APPROVE_TLS_KEY="$TLS_ROOT/key.pem"
-export SUDO_APPROVE_TLS_CERT="$TLS_ROOT/cert.pem"
-export SUDO_APPROVE_HTTPS_PORT=443
+export OSHIOKI_TLS_KEY="$TLS_ROOT/key.pem"
+export OSHIOKI_TLS_CERT="$TLS_ROOT/cert.pem"
+export OSHIOKI_HTTPS_PORT=443
 
 cd /work/server/web
 npm run test:e2e
 
 cd /work
-SUDO_APPROVE_E2E_IN_CONTAINER=1 \
-SUDO_APPROVE_E2E_SKIP_BUILD=1 \
-SUDO_APPROVE_E2E_PREBUILT=1 \
+OSHIOKI_E2E_IN_CONTAINER=1 \
+OSHIOKI_E2E_SKIP_BUILD=1 \
+OSHIOKI_E2E_PREBUILT=1 \
   scripts/test-sudo-plugin-container
 
 printf 'compose e2e passed; state root: %s\n' "$STATE_ROOT"

@@ -1,6 +1,9 @@
-# Sudo approve
+# Oshioki
 
-Sudo approve asks an enrolled browser to approve one exact sudo request. The
+Oshioki (お仕置き): the sound of a keypress, and a pun on "punishment" for when
+root misbehaves.
+
+Oshioki asks an enrolled browser to approve one exact sudo request. The
 hook encrypts the request for each enrolled browser. The server stores routing
 data and ciphertext. A valid approval still requires the browser's WebAuthn
 credential.
@@ -40,7 +43,7 @@ Without `--state-dir`, `up` creates disposable state and `down` removes it.
 The server listens on `http://127.0.0.1:8443` in this development mode.
 `scripts/dev` maps the server to the invoking user under rootful Docker and to
 container UID 0 under rootless Docker. Direct Compose callers must set
-`SUDO_APPROVE_UID` to the host UID for rootful Docker or `0` for rootless
+`OSHIOKI_UID` to the host UID for rootful Docker or `0` for rootless
 Docker.
 
 Run a supervised Safari acceptance session on a Linux Tailscale host with:
@@ -81,10 +84,9 @@ is one active server with one persistent database file.
 
 ## Compatibility
 
-The v1 cryptographic domain strings retain their
-`management-plane-sudo-approve/...` values. Changing those values would change
-the protocol and existing test vectors. The executable is `sudo-approve`, and
-local hook state defaults to `/etc/sudo-approve`.
+The v1 cryptographic domain strings use `oshioki/...` values. Changing those
+values would change the protocol and existing test vectors. The executable is
+`oshioki`, and local hook state defaults to `/etc/oshioki`.
 
 OCI publication and CI are outside the current iteration loop. Homebrew and
 Debian packages will be designed after the protocol and local E2E stabilize.

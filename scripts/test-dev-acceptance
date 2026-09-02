@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SCRIPT="$REPO_ROOT/scripts/dev-acceptance"
-TEST_ROOT="$(mktemp -d -t sudo-approve-dev-acceptance-test.XXXXXX)"
+TEST_ROOT="$(mktemp -d -t oshioki-dev-acceptance-test.XXXXXX)"
 SESSION_FILE="$TEST_ROOT/session.json"
 FAKE_BIN="$TEST_ROOT/bin"
 TAILSCALE_LOG="$TEST_ROOT/tailscale.log"
@@ -47,12 +47,12 @@ cat >"$FAKE_BIN/nats-server" <<'EOF'
 printf 'nats %s\n' "$$" >>"$FAKE_PROCESS_LOG"
 exec sleep 300
 EOF
-cat >"$FAKE_BIN/sudo-approve-server" <<'EOF'
+cat >"$FAKE_BIN/oshioki-server" <<'EOF'
 #!/usr/bin/env bash
 printf 'server %s\n' "$$" >>"$FAKE_PROCESS_LOG"
 exec sleep 300
 EOF
-cat >"$FAKE_BIN/sudo-approve" <<'EOF'
+cat >"$FAKE_BIN/oshioki" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
   enroll) echo "Enrollment URL: https://nas.example.test/enroll/test#secret" ;;
@@ -109,14 +109,14 @@ export FAKE_TAILSCALE_LOG="$TAILSCALE_LOG"
 export FAKE_PRIVILEGE_LOG="$PRIVILEGE_LOG"
 export FAKE_PROCESS_LOG="$PROCESS_LOG"
 export FAKE_SERVE_STATE="$SERVE_STATE"
-export SUDO_APPROVE_ACCEPTANCE_SESSION_FILE="$SESSION_FILE"
-export SUDO_APPROVE_ACCEPTANCE_TAILSCALE_BIN="$FAKE_BIN/tailscale"
-export SUDO_APPROVE_ACCEPTANCE_PRIVILEGE_BIN="$FAKE_BIN/sudo"
-export SUDO_APPROVE_ACCEPTANCE_NATS_PORT=14222
-export SUDO_APPROVE_ACCEPTANCE_SERVER_PORT=18443
-export SUDO_APPROVE_ACCEPTANCE_HTTPS_PORT=18444
-export SUDO_APPROVE_ACCEPTANCE_SERVER_BIN="$FAKE_BIN/sudo-approve-server"
-export SUDO_APPROVE_ACCEPTANCE_HOOK_BIN="$FAKE_BIN/sudo-approve"
+export OSHIOKI_ACCEPTANCE_SESSION_FILE="$SESSION_FILE"
+export OSHIOKI_ACCEPTANCE_TAILSCALE_BIN="$FAKE_BIN/tailscale"
+export OSHIOKI_ACCEPTANCE_PRIVILEGE_BIN="$FAKE_BIN/sudo"
+export OSHIOKI_ACCEPTANCE_NATS_PORT=14222
+export OSHIOKI_ACCEPTANCE_SERVER_PORT=18443
+export OSHIOKI_ACCEPTANCE_HTTPS_PORT=18444
+export OSHIOKI_ACCEPTANCE_SERVER_BIN="$FAKE_BIN/oshioki-server"
+export OSHIOKI_ACCEPTANCE_HOOK_BIN="$FAKE_BIN/oshioki"
 
 "$SCRIPT" up --state-dir "$TEST_ROOT/state"
 [ -f "$SESSION_FILE" ] || fail "session file was not created"
