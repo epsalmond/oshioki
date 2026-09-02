@@ -15,7 +15,9 @@ const proxy = https.createServer({
 }, (request, response) => {
   const upstream = http.request({
     hostname: target.hostname,
-    port: target.port,
+    // A URL with no explicit port leaves target.port empty; the upstream is
+    // plain HTTP, so that means 80.
+    port: target.port || 80,
     path: request.url,
     method: request.method,
     headers: { ...request.headers, host: target.host },

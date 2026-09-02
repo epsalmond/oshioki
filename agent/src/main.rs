@@ -326,8 +326,12 @@ impl Prompter {
 async fn connect_nats() -> Result<async_nats::Client> {
     let url = std::env::var("NATS_URL").context("NATS_URL is not set")?;
     let mut options = async_nats::ConnectOptions::new();
-    if let (Ok(user), Ok(pass)) = (std::env::var("NATS_USER"), std::env::var("NATS_PASS")) {
-        options = options.user_and_password(user, pass);
+    // Half a credential is a misconfiguration, not a request for an anonymous
+    // connection; the hook and the server both require the pair.
+    match (std::env::var("NATS_USER"), std::env::var("NATS_PASS")) {
+        (Ok(user), Ok(pass)) => options = options.user_and_password(user, pass),
+        (Err(_), Err(_)) => {}
+        _ => bail!("set both NATS_USER and NATS_PASS, or neither"),
     }
     options.connect(&url).await.context("connect to NATS")
 }
