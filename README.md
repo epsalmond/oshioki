@@ -105,8 +105,12 @@ oshioki-agent run
 submits the enrollment and waits for the host to activate it. `run` watches
 for sudo requests and prompts on the terminal; `run --auto approve` and
 `run --auto deny` decide every request without prompting, for tests only.
-The agent needs the same `NATS_URL`, and optionally `NATS_USER` and
-`NATS_PASS`, as the hook.
+A prompt nobody answers before the request expires publishes no verdict at
+all, and the hook fails closed on its own deadline.
+
+The agent needs the same `NATS_URL` as the hook, plus `NATS_USER` and
+`NATS_PASS` together where the server wants credentials; setting only one of
+the pair is an error.
 
 The current `oshioki-agent` binary uses a software P-256 key. It is the
 Linux and test build of the macOS agent (issue #9), which will add a Secure
@@ -122,8 +126,11 @@ The v1 cryptographic domain strings use `oshioki/...` values. Changing those
 values would change the protocol and existing test vectors. The executable is
 `oshioki`, and local hook state defaults to `/etc/oshioki`.
 
-No wire compatibility with records enrolled before the `secure-enclave`
-device kind is kept. Upgrade the hook before the first native enrollment.
+Records enrolled before the `secure-enclave` device kind still load: a device
+record with no `kind` field is a `webauthn` one, in `devices.json` on the host
+and in the server database alike, and an enrollment submission with no `kind`
+is read the same way, so a browser page cached from before the change still
+enrolls.
 
 OCI publication and CI are outside the current iteration loop. Homebrew and
 Debian packages will be designed after the protocol and local E2E stabilize.

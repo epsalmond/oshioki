@@ -74,7 +74,10 @@ signing key.
 
 Activation is idempotent. A resumed hook updates the reply subject and causes
 an already stored submission to be relayed again. The server exposes a device
-only after activation confirmation.
+only after activation confirmation, and publishes
+`oshioki.device.activated.<fingerprint>` once it has stored the record.
+`enroll` waits for that before it reports the device enrolled, so a server
+that cannot store the record fails the enrollment instead of dropping it.
 
 ## Persistence
 
