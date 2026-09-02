@@ -263,7 +263,13 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
             },
             Some(message) = activations.next() => match serde_json::from_slice::<ActivationV1>(&message.payload) {
                 Ok(activation) if activation.version == 1 && !activation.enrollment_id.is_empty() => {
-                    if let Err(error) = state.store.activate_enrollment(&activation.enrollment_id, &activation.device) { warn!(%error, "invalid enrollment activation"); }
+                    // No acknowledgement goes back on NATS: the hook confirms
+                    // the enrollment by reading the device back over HTTPS,
+                    // which is the only answer that says what this server
+                    // actually stored.
+                    if let Err(error) = state.store.activate_enrollment(&activation.enrollment_id, &activation.device) {
+                        warn!(%error, "invalid enrollment activation");
+                    }
                 },
                 Ok(_) => warn!("invalid enrollment activation"),
                 Err(error) => warn!(%error, "invalid enrollment activation"),
@@ -475,7 +481,11 @@ async fn submit_enrollment(
     Path(id): Path<String>,
     Json(submission): Json<EnrollmentSubmissionV1>,
 ) -> Result<StatusCode, ApiError> {
-    if submission.enrollment_id != id {
+    // Native devices publish their submission straight to NATS; the HTTP
+    // path serves the browser only.
+    if submission.enrollment_id() != id
+        || !matches!(submission, EnrollmentSubmissionV1::Webauthn(_))
+    {
         return Err(ApiError(StatusCode::CONFLICT));
     }
     submission

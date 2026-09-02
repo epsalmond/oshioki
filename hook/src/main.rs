@@ -20,14 +20,17 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use oshioki_protocol::{
-    ActivationV1, DecisionV1, DevicePublicRecordV1, DeviceRegistryV1, EnrollmentIntentV1,
-    EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1, RequestV1, VERSION_V1,
-    verify_approval_v1, verify_enrollment_v1,
+    ActivationV1, DecisionV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
+    EnrollmentIntentV1, EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1, RequestV1,
+    VERSION_V1, escape_for_terminal, verify_approval_v1, verify_enrollment_v1,
+    verify_native_approval_v1, verify_native_enrollment_v1,
 };
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long enroll waits for the server to confirm it stored the device.
+const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Parser)]
 #[command(name = "oshioki", about = "sudo approval hook")]
@@ -139,6 +142,31 @@ async fn execute_request_at(
         timeout,
     )
     .await?;
+    apply_decision(
+        decision,
+        &request,
+        &raw_request,
+        &active,
+        &mut registry,
+        directory,
+    )
+}
+
+/// Applies one decision to a request. Invalid decisions fail closed.
+fn apply_decision(
+    decision: DecisionV1,
+    request: &RequestV1,
+    raw_request: &[u8],
+    active: &[DevicePublicRecordV1],
+    registry: &mut DeviceRegistryV1,
+    directory: &Path,
+) -> Result<()> {
+    // A verdict is an answer about one request during its lifetime. Once the
+    // request has expired there is nothing left to decide, and a signature
+    // that arrives late must not stand in for one that arrived in time.
+    if request.expires_at <= now() {
+        bail!("request expired before its verdict was applied");
+    }
     match decision {
         DecisionV1::Deny(denial) => {
             denial.validate_shape().context("validate deny decision")?;
@@ -163,13 +191,14 @@ async fn execute_request_at(
             let device = active
                 .iter()
                 .find(|device| {
-                    device.fingerprint == approval.device_fingerprint
+                    device.kind == DeviceKindV1::Webauthn
+                        && device.fingerprint == approval.device_fingerprint
                         && device.credential_id == approval.credential_id
                 })
                 .context("approval does not name one exact pinned credential")?;
             let outcome = verify_approval_v1(
                 &approval,
-                &raw_request,
+                raw_request,
                 device,
                 &load_hook_config_from(directory)?,
             )
@@ -185,9 +214,28 @@ async fn execute_request_at(
                 {
                     stored.sign_count = outcome.observed_sign_count;
                 }
-                write_registry_to(directory, &registry)?;
+                write_registry_to(directory, registry)?;
             }
-            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, "sudo request approved");
+            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
+            Ok(())
+        }
+        DecisionV1::ApproveNative(approval) => {
+            approval
+                .validate_shape()
+                .context("validate native approval decision")?;
+            if approval.request_id != request.request_id {
+                bail!("approval request id mismatch");
+            }
+            let device = active
+                .iter()
+                .find(|device| {
+                    device.kind == DeviceKindV1::SecureEnclave
+                        && device.fingerprint == approval.device_fingerprint
+                })
+                .context("native approval does not name one pinned secure-enclave device")?;
+            verify_native_approval_v1(&approval, raw_request, device)
+                .context("native approval verification failed")?;
+            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
             Ok(())
         }
     }
@@ -270,9 +318,12 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     )
     .await?;
     nats.flush().await?;
-    println!(
-        "Enrollment URL (expires in five minutes):\n  {}/enroll/{}#{}",
+    let enrollment_url = format!(
+        "{}/enroll/{}#{}",
         config.server_base_url, state.enrollment_id, state.secret
+    );
+    println!(
+        "Enrollment URL (expires in five minutes):\n  {enrollment_url}\nNative agent:\n  oshioki-agent pair '{enrollment_url}'"
     );
     let remaining = u64::try_from(state.expires_at - now()).context("enrollment expiry")?;
     let message = tokio::time::timeout(
@@ -284,11 +335,18 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     .context("enrollment stream closed")?;
     let submission: EnrollmentSubmissionV1 =
         serde_json::from_slice(&message.payload).context("decode enrollment submission")?;
-    if submission.enrollment_id != state.enrollment_id {
+    if submission.enrollment_id() != state.enrollment_id {
         bail!("enrollment id mismatch");
     }
-    let device =
-        verify_enrollment_v1(&submission, &secret_bytes, &config).context("verify enrollment")?;
+    let device = match &submission {
+        EnrollmentSubmissionV1::Webauthn(submission) => {
+            verify_enrollment_v1(submission, &secret_bytes, &config).context("verify enrollment")?
+        }
+        EnrollmentSubmissionV1::SecureEnclave(submission) => {
+            verify_native_enrollment_v1(submission, &secret_bytes)
+                .context("verify native enrollment")?
+        }
+    };
     let mut registry = load_registry()?;
     if registry.devices.iter().any(|stored| {
         stored.credential_id == device.credential_id && stored.fingerprint != device.fingerprint
@@ -301,20 +359,92 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     registry.devices.push(device.clone());
     registry.validate()?;
     write_registry(&registry)?;
+    let confirmation = activate_device(&nats, &state.enrollment_id, &device, &config).await;
+    // The enrollment itself is spent either way: the device is pinned here
+    // and the server has consumed the intent, so there is nothing for
+    // `--resume` to redo. What may still be missing is the server's copy.
+    remove_enrollment_state(&state_path);
+    confirmation?;
+    println!(
+        "Device enrolled: {} ({})",
+        device.fingerprint,
+        escape_for_terminal(&device.label)
+    );
+    Ok(())
+}
+
+/// Publishes the activation, then reads the device back from the server until
+/// the record it serves is the one that was just enrolled.
+///
+/// The read-back is the confirmation. A message on NATS would be cheaper, but
+/// every consumer can publish on the device subjects, so the device being
+/// enrolled could acknowledge its own activation; only the server's own HTTPS
+/// answer says what the server actually stored. A server that predates this
+/// device kind, or that cannot store the record at all, drops the activation
+/// silently, and without this check both `enroll` and the agent would report
+/// success.
+async fn activate_device(
+    nats: &async_nats::Client,
+    enrollment_id: &str,
+    device: &DevicePublicRecordV1,
+    config: &HookConfigV1,
+) -> Result<()> {
     let activation = ActivationV1 {
         version: VERSION_V1,
-        enrollment_id: state.enrollment_id.clone(),
+        enrollment_id: enrollment_id.to_owned(),
         device: device.clone(),
     };
     nats.publish(
-        format!("oshioki.enrollment.activation.{}", state.enrollment_id),
+        format!("oshioki.enrollment.activation.{enrollment_id}"),
         serde_json::to_vec(&activation)?.into(),
     )
     .await?;
     nats.flush().await?;
-    remove_enrollment_state(&state_path);
-    println!("Device enrolled: {} ({})", device.fingerprint, device.label);
-    Ok(())
+    let url = format!(
+        "{}/api/v1/devices/{}",
+        config.server_base_url, device.fingerprint
+    );
+    let deadline = tokio::time::Instant::now() + ACTIVATION_TIMEOUT;
+    let mut last_error;
+    loop {
+        match server_device_matches(&url, device).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => last_error = "the server serves a different record".into(),
+            Err(error) => last_error = format!("{error:#}"),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(500)).min(deadline),
+        )
+        .await;
+    }
+    bail!(
+        "device {} ({}) is pinned on this host and can approve sudo here, but the server did \
+         not serve it within {} seconds ({}): the server state is unknown, not rejected. \
+         Check it with `curl {}`; if the record is missing, run `oshioki enroll` again for \
+         this device once the server is healthy",
+        device.fingerprint,
+        device.kind,
+        ACTIVATION_TIMEOUT.as_secs(),
+        escape_for_terminal(&last_error),
+        url
+    )
+}
+
+/// Whether the server serves exactly the record that was just enrolled.
+async fn server_device_matches(url: &str, device: &DevicePublicRecordV1) -> Result<bool> {
+    let body = http_get(url).await?;
+    let served: DevicePublicRecordV1 =
+        serde_json::from_slice(&body).context("decode device record")?;
+    served.validate()?;
+    // Every field, not the identifying ones alone: the server stores the
+    // activation record verbatim and never advances the signature counter, so
+    // a served record that differs anywhere -- a rewritten label, another
+    // device's API token hash -- is not the record that was just enrolled.
+    // `active` is part of that: this record has to be servable right now.
+    Ok(served == *device && served.active)
 }
 
 async fn cmd_revoke(fingerprint: &str) -> Result<()> {
@@ -365,7 +495,9 @@ async fn cmd_pin(expected: &str) -> Result<()> {
     }
     println!(
         "Fingerprint: {}\nLabel: {}\nCredential: {}",
-        device.fingerprint, device.label, device.credential_id
+        device.fingerprint,
+        escape_for_terminal(&device.label),
+        device.credential_id
     );
     print!("Type the full fingerprint to confirm: ");
     io::stdout().flush()?;
@@ -390,8 +522,11 @@ fn cmd_status() -> Result<()> {
     println!("Enrolled devices ({}):", registry.devices.len());
     for device in registry.devices {
         println!(
-            "  {}  {}  active={}",
-            device.fingerprint, device.label, device.active
+            "  {}  {}  kind={}  active={}",
+            device.fingerprint,
+            escape_for_terminal(&device.label),
+            device.kind,
+            device.active
         );
     }
     Ok(())
@@ -709,7 +844,8 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
         .output()
         .await?;
     if !output.status.success() {
-        bail!("device lookup failed");
+        let detail = String::from_utf8_lossy(&output.stderr);
+        bail!("device lookup failed: {}", detail.trim());
     }
     if output.stdout.len() > 256 * 1024 {
         bail!("device response too large");
@@ -845,6 +981,7 @@ mod tests {
             oshioki_protocol::device_fingerprint(&credential, &public, box_public.as_bytes());
         let device = DevicePublicRecordV1 {
             version: 1,
+            kind: DeviceKindV1::Webauthn,
             fingerprint,
             credential_id: URL_SAFE_NO_PAD.encode(&credential),
             credential_public_key: URL_SAFE_NO_PAD.encode(&public),
@@ -879,6 +1016,56 @@ mod tests {
         atomic_write_json(&path, &registry, 0o600).unwrap();
         assert_eq!(read_json::<DeviceRegistryV1>(&path).unwrap(), registry);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Nothing decides a request that is already dead, whatever the verdict
+    /// says and whichever device kind signed it.
+    #[test]
+    fn an_expired_request_rejects_every_verdict() {
+        let mut request = build_synthetic_request();
+        request.expires_at = now() - 1;
+        let fingerprint = URL_SAFE_NO_PAD.encode([1; 16]);
+        let mut registry = DeviceRegistryV1 {
+            version: 1,
+            devices: Vec::new(),
+        };
+        let decisions = [
+            DecisionV1::Deny(oshioki_protocol::DenyV1 {
+                version: VERSION_V1,
+                request_id: request.request_id.clone(),
+                device_fingerprint: fingerprint.clone(),
+            }),
+            DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
+                version: VERSION_V1,
+                request_id: request.request_id.clone(),
+                device_fingerprint: fingerprint.clone(),
+                signature: URL_SAFE_NO_PAD.encode([2; 64]),
+            }),
+            DecisionV1::Approve(oshioki_protocol::ApproveV1 {
+                version: VERSION_V1,
+                request_id: request.request_id.clone(),
+                device_fingerprint: fingerprint,
+                credential_id: URL_SAFE_NO_PAD.encode([3; 16]),
+                authenticator_data: URL_SAFE_NO_PAD.encode([4; 37]),
+                client_data_json: URL_SAFE_NO_PAD.encode(b"{}"),
+                signature: URL_SAFE_NO_PAD.encode([5; 64]),
+            }),
+        ];
+        for decision in decisions {
+            let error = apply_decision(
+                decision,
+                &request,
+                &[],
+                &[],
+                &mut registry,
+                Path::new("/nonexistent"),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("expired before its verdict"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]

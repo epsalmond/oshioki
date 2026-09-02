@@ -582,6 +582,7 @@ mod tests {
         );
         DevicePublicRecordV1 {
             version: 1,
+            kind: oshioki_protocol::DeviceKindV1::Webauthn,
             fingerprint,
             credential_id: encode_base64url(&credential_id),
             credential_public_key: encode_base64url(&credential_public_key),
