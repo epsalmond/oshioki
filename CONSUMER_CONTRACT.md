@@ -9,7 +9,7 @@ The deploying infrastructure supplies the production runtime. It must provide:
 - Publish and subscribe permissions for `oshioki.verdict.*` and
   `oshioki.enrollment.*`.
 - Publish and subscribe permissions for `oshioki.device.>` (revocations and
-  their confirmations, and enrollment activation confirmations).
+  their confirmations).
 - A writable SQLite path set by `OSHIOKI_STATE_PATH`.
 - `OSHIOKI_ORIGIN=https://sudo.example.com` and
   `OSHIOKI_RP_ID=sudo.example.com`.

@@ -353,8 +353,12 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     registry.devices.push(device.clone());
     registry.validate()?;
     write_registry(&registry)?;
-    activate_device(&nats, &state.enrollment_id, &device).await?;
+    let confirmation = activate_device(&nats, &state.enrollment_id, &device, &config).await;
+    // The enrollment itself is spent either way: the device is pinned here
+    // and the server has consumed the intent, so there is nothing for
+    // `--resume` to redo. What may still be missing is the server's copy.
     remove_enrollment_state(&state_path);
+    confirmation?;
     println!(
         "Device enrolled: {} ({})",
         device.fingerprint,
@@ -363,47 +367,77 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Publishes the activation and waits for the server to confirm it stored the
-/// device record.
+/// Publishes the activation, then reads the device back from the server until
+/// the record it serves is the one that was just enrolled.
 ///
-/// Nothing else acknowledges an activation, so a server that cannot store the
-/// record — one predating this device kind, say — would drop it silently
-/// while both `enroll` and the agent reported success.
+/// The read-back is the confirmation. A message on NATS would be cheaper, but
+/// every consumer can publish on the device subjects, so the device being
+/// enrolled could acknowledge its own activation; only the server's own HTTPS
+/// answer says what the server actually stored. A server that predates this
+/// device kind, or that cannot store the record at all, drops the activation
+/// silently, and without this check both `enroll` and the agent would report
+/// success.
 async fn activate_device(
     nats: &async_nats::Client,
     enrollment_id: &str,
     device: &DevicePublicRecordV1,
+    config: &HookConfigV1,
 ) -> Result<()> {
     let activation = ActivationV1 {
         version: VERSION_V1,
         enrollment_id: enrollment_id.to_owned(),
         device: device.clone(),
     };
-    let mut activated = nats
-        .subscribe(format!("oshioki.device.activated.{}", device.fingerprint))
-        .await
-        .context("subscribe activation confirmation")?;
-    nats.flush().await?;
     nats.publish(
         format!("oshioki.enrollment.activation.{enrollment_id}"),
         serde_json::to_vec(&activation)?.into(),
     )
     .await?;
     nats.flush().await?;
-    if tokio::time::timeout(ACTIVATION_TIMEOUT, activated.next())
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        bail!(
-            "the server did not confirm device {} ({}); it is pinned on this host, but the \
-             server either rejected the record or is too old to understand it",
-            device.fingerprint,
-            device.kind
-        );
+    let url = format!(
+        "{}/api/v1/devices/{}",
+        config.server_base_url, device.fingerprint
+    );
+    let deadline = tokio::time::Instant::now() + ACTIVATION_TIMEOUT;
+    let mut last_error;
+    loop {
+        match server_device_matches(&url, device).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => last_error = "the server serves a different record".into(),
+            Err(error) => last_error = format!("{error:#}"),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(500)).min(deadline),
+        )
+        .await;
     }
-    Ok(())
+    bail!(
+        "device {} ({}) is pinned on this host and can approve sudo here, but the server did \
+         not serve it within {} seconds ({}): the server state is unknown, not rejected. \
+         Check it with `curl {}`; if the record is missing, run `oshioki enroll` again for \
+         this device once the server is healthy",
+        device.fingerprint,
+        device.kind,
+        ACTIVATION_TIMEOUT.as_secs(),
+        escape_for_terminal(&last_error),
+        url
+    )
+}
+
+/// Whether the server serves exactly the record that was just enrolled.
+async fn server_device_matches(url: &str, device: &DevicePublicRecordV1) -> Result<bool> {
+    let body = http_get(url).await?;
+    let served: DevicePublicRecordV1 =
+        serde_json::from_slice(&body).context("decode device record")?;
+    served.validate()?;
+    Ok(served.fingerprint == device.fingerprint
+        && served.kind == device.kind
+        && served.credential_id == device.credential_id
+        && served.credential_public_key == device.credential_public_key
+        && served.active)
 }
 
 async fn cmd_revoke(fingerprint: &str) -> Result<()> {

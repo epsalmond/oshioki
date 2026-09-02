@@ -263,14 +263,12 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
             },
             Some(message) = activations.next() => match serde_json::from_slice::<ActivationV1>(&message.payload) {
                 Ok(activation) if activation.version == 1 && !activation.enrollment_id.is_empty() => {
-                    // The hook waits for this confirmation before it calls
-                    // the device enrolled, so a record this server cannot
-                    // store is never reported as a success.
+                    // No acknowledgement goes back on NATS: the hook confirms
+                    // the enrollment by reading the device back over HTTPS,
+                    // which is the only answer that says what this server
+                    // actually stored.
                     if let Err(error) = state.store.activate_enrollment(&activation.enrollment_id, &activation.device) {
                         warn!(%error, "invalid enrollment activation");
-                    } else {
-                        state.nats.publish(format!("oshioki.device.activated.{}", activation.device.fingerprint), Vec::new().into()).await?;
-                        state.nats.flush().await?;
                     }
                 },
                 Ok(_) => warn!("invalid enrollment activation"),

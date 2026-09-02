@@ -74,10 +74,19 @@ signing key.
 
 Activation is idempotent. A resumed hook updates the reply subject and causes
 an already stored submission to be relayed again. The server exposes a device
-only after activation confirmation, and publishes
-`oshioki.device.activated.<fingerprint>` once it has stored the record.
-`enroll` waits for that before it reports the device enrolled, so a server
-that cannot store the record fails the enrollment instead of dropping it.
+only after activation and acknowledges nothing on NATS. `enroll` confirms the
+activation by reading the device back from `GET /api/v1/devices/<fingerprint>`
+over HTTPS, polling for up to fifteen seconds until the served record matches
+the one it just enrolled, so a server that cannot store the record fails the
+enrollment instead of dropping it. The read-back, not a message, is the
+confirmation: every consumer can publish on the device subjects, so a NATS
+acknowledgement could come from the device being enrolled rather than from the
+server.
+
+A confirmation that times out is not a rejection. The device is pinned on the
+host and can approve sudo there; what is unknown is the server's copy. `enroll`
+says so and names the recovery, which is a fresh `oshioki enroll` for that
+device once the server is healthy.
 
 ## Persistence
 

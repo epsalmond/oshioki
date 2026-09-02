@@ -21,6 +21,15 @@ stop_background() {
   BACKGROUND_PIDS=()
 }
 
+# Drops one pid from the cleanup list, leaving the rest to the exit trap.
+forget_pid() {
+  local remaining=() pid
+  for pid in ${BACKGROUND_PIDS+"${BACKGROUND_PIDS[@]}"}; do
+    [ "$pid" = "$1" ] || remaining+=("$pid")
+  done
+  BACKGROUND_PIDS=(${remaining+"${remaining[@]}"})
+}
+
 restore_state_ownership() {
   local exit_status=$?
   trap - EXIT
@@ -51,6 +60,12 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 export OSHIOKI_TLS_KEY="$TLS_ROOT/key.pem"
 export OSHIOKI_TLS_CERT="$TLS_ROOT/cert.pem"
 export OSHIOKI_HTTPS_PORT=443
+# `enroll` confirms an activation by reading the device back from the server
+# over HTTPS, so the hook's curl needs the origin name and the throwaway CA.
+# A container does not resolve its own Compose network alias, and every TLS
+# listener here binds loopback.
+export CURL_CA_BUNDLE="$OSHIOKI_TLS_CERT"
+grep -q 'sudo\.test$' /etc/hosts || printf '127.0.0.1 sudo.test\n' >>/etc/hosts
 
 cd /work/server/web
 npm run test:e2e
@@ -80,6 +95,15 @@ wait_for_line() {
   return 1
 }
 
+# Playwright served the origin in-process; it is gone once the suite exits, so
+# serve it again for the hook's enrollment read-back and, later, `pin`.
+PROXY_LOG="$STATE_ROOT/tls-proxy.log"
+: >"$PROXY_LOG"
+node /work/scripts/e2e-tls-proxy.mjs >"$PROXY_LOG" 2>&1 &
+proxy_pid=$!
+BACKGROUND_PIDS+=("$proxy_pid")
+wait_for_line "$PROXY_LOG" 'tls proxy listening'
+
 agent_pid=
 
 start_agent() {
@@ -94,7 +118,7 @@ stop_agent() {
   [ -n "$agent_pid" ] || return 0
   kill "$agent_pid" 2>/dev/null || true
   wait "$agent_pid" 2>/dev/null || true
-  BACKGROUND_PIDS=()
+  forget_pid "$agent_pid"
   agent_pid=
 }
 
@@ -110,9 +134,10 @@ wait_for_line "$ENROLL_LOG" '^Device enrolled: '
 if ! wait "$enroll_pid"; then
   echo "oshioki enroll failed" >&2
   cat "$ENROLL_LOG" >&2
+  cat "$PROXY_LOG" >&2
   exit 1
 fi
-BACKGROUND_PIDS=()
+forget_pid "$enroll_pid"
 cat "$ENROLL_LOG"
 
 fingerprint="$("$AGENT_BIN" show --state "$AGENT_STATE")"
@@ -146,18 +171,9 @@ if ! "$HOOK_BIN" status | grep -Fq "$fingerprint  native-e2e  kind=secure-enclav
 fi
 printf 'native agent approved and denied a request: %s\n' "$fingerprint"
 
-# `pin` must accept a secure-enclave record served by the server. The hook
-# only talks to the server at the WebAuthn origin, so serve that origin over
-# TLS again (Playwright's in-process proxy is gone) and start from a config
-# dir without the native device.
-# A container does not resolve its own Compose network alias, so point the
-# origin name at loopback for the proxy started below.
-grep -q 'sudo\.test$' /etc/hosts || printf '127.0.0.1 sudo.test\n' >>/etc/hosts
-PROXY_LOG="$STATE_ROOT/tls-proxy.log"
-: >"$PROXY_LOG"
-node /work/scripts/e2e-tls-proxy.mjs >"$PROXY_LOG" 2>&1 &
-BACKGROUND_PIDS+=("$!")
-wait_for_line "$PROXY_LOG" 'tls proxy listening'
+# `pin` must accept a secure-enclave record served by the server, starting
+# from a config dir without the native device. The TLS proxy started for the
+# enrollment read-back still serves the origin.
 PIN_CONFIG_DIR="$STATE_ROOT/pin"
 rm -rf "$PIN_CONFIG_DIR"
 mkdir -p "$PIN_CONFIG_DIR"
@@ -166,8 +182,7 @@ cp "$HOOK_CONFIG_DIR/config.env" "$HOOK_CONFIG_DIR/hook.json" "$PIN_CONFIG_DIR/"
 printf '{"version":1,"devices":[]}\n' >"$PIN_CONFIG_DIR/devices.json"
 chmod 0600 "$PIN_CONFIG_DIR"/*.json "$PIN_CONFIG_DIR/config.env"
 if ! printf '%s\n' "$fingerprint" \
-  | CURL_CA_BUNDLE="$OSHIOKI_TLS_CERT" OSHIOKI_CONFIG_DIR="$PIN_CONFIG_DIR" \
-    "$HOOK_BIN" pin "$fingerprint"; then
+  | OSHIOKI_CONFIG_DIR="$PIN_CONFIG_DIR" "$HOOK_BIN" pin "$fingerprint"; then
   echo "pin rejected the secure-enclave record" >&2
   cat "$PROXY_LOG" >&2
   exit 1

@@ -106,7 +106,16 @@ submits the enrollment and waits for the host to activate it. `run` watches
 for sudo requests and prompts on the terminal; `run --auto approve` and
 `run --auto deny` decide every request without prompting, for tests only.
 A prompt nobody answers before the request expires publishes no verdict at
-all, and the hook fails closed on its own deadline.
+all, and the hook fails closed on its own deadline. `run` without `--auto`
+needs a terminal: with stdin closed nothing could answer, so it stops rather
+than leaving every request to time out.
+
+`enroll` pins the device locally and then confirms the server stored it by
+reading `GET /api/v1/devices/<fingerprint>` back over HTTPS for up to fifteen
+seconds. If that confirmation times out, the device is still pinned and can
+approve sudo on the host; only the server's copy is unknown. The error says
+so, and the fix is another `oshioki enroll` for that device once the server
+is reachable.
 
 The agent needs the same `NATS_URL` as the hook, plus `NATS_USER` and
 `NATS_PASS` together where the server wants credentials; setting only one of
