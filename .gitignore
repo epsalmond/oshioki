@@ -3,6 +3,7 @@ target/
 dist/
 server/web/node_modules/
 .dev-session
+.acceptance-session
 server/web/test-results/
 server/web/playwright-report/
 

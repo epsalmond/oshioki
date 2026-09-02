@@ -1,0 +1,493 @@
+#!/usr/bin/env bash
+# Design notes: ~/.claude/plans/sudo-approve-safari-acceptance.md
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+SESSION_FILE="${SUDO_APPROVE_ACCEPTANCE_SESSION_FILE:-$REPO_ROOT/.acceptance-session}"
+TAILSCALE_BIN="${SUDO_APPROVE_ACCEPTANCE_TAILSCALE_BIN:-tailscale}"
+PRIVILEGE_BIN="${SUDO_APPROVE_ACCEPTANCE_PRIVILEGE_BIN:-sudo}"
+NATS_SERVER_BIN="${SUDO_APPROVE_ACCEPTANCE_NATS_SERVER_BIN:-nats-server}"
+NATS_BIN="${SUDO_APPROVE_ACCEPTANCE_NATS_BIN:-nats}"
+CARGO_BIN="${SUDO_APPROVE_ACCEPTANCE_CARGO_BIN:-cargo}"
+CURL_BIN="${SUDO_APPROVE_ACCEPTANCE_CURL_BIN:-curl}"
+OPENSSL_BIN="${SUDO_APPROVE_ACCEPTANCE_OPENSSL_BIN:-openssl}"
+JQ_BIN="${SUDO_APPROVE_ACCEPTANCE_JQ_BIN:-jq}"
+NODE_BIN="${SUDO_APPROVE_ACCEPTANCE_NODE_BIN:-node}"
+SETSID_BIN="${SUDO_APPROVE_ACCEPTANCE_SETSID_BIN:-setsid}"
+SERVER_BIN="${SUDO_APPROVE_ACCEPTANCE_SERVER_BIN:-$REPO_ROOT/target/debug/sudo-approve-server}"
+HOOK_BIN="${SUDO_APPROVE_ACCEPTANCE_HOOK_BIN:-$REPO_ROOT/target/debug/sudo-approve}"
+
+usage() {
+  printf 'usage: scripts/dev-acceptance up [--state-dir PATH] | enroll | test | status | down\n' >&2
+  exit 2
+}
+
+die() {
+  echo "dev-acceptance: $*" >&2
+  exit 1
+}
+
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || die "missing prerequisite: $1"
+}
+
+mutate_serve() {
+  "$PRIVILEGE_BIN" "$TAILSCALE_BIN" serve "$@"
+}
+
+normalize_serve_config() {
+  "$JQ_BIN" -S '(. // {}) | del(.version) | walk(if type == "object" then with_entries(select(.value != null and .value != {})) else . end)' "$1"
+}
+
+serve_configs_match() {
+  local left="$1" right="$2" left_normalized right_normalized compare_status=0
+  left_normalized="$(mktemp "$state_root/.serve-left.XXXXXX")"
+  right_normalized="$(mktemp "$state_root/.serve-right.XXXXXX")"
+  if ! normalize_serve_config "$left" >"$left_normalized" ||
+     ! normalize_serve_config "$right" >"$right_normalized" ||
+     ! cmp -s "$left_normalized" "$right_normalized"; then
+    compare_status=1
+  fi
+  rm -f -- "$left_normalized" "$right_normalized"
+  return "$compare_status"
+}
+
+expected_serve_config() {
+  local destination="$1" route_key="$rp_id:$https_port" proxy="http://127.0.0.1:$server_port"
+  # shellcheck disable=SC2016 # jq variables must not expand in the shell.
+  "$JQ_BIN" -n --arg port "$https_port" --arg route_key "$route_key" --arg proxy "$proxy" \
+    '{TCP:{($port):{HTTPS:true}},Web:{($route_key):{Handlers:{"/":{Proxy:$proxy}}}}}' >"$destination"
+}
+
+serve_config_is_empty() {
+  local normalized
+  normalized="$(mktemp "$state_root/.serve-empty.XXXXXX")"
+  normalize_serve_config "$1" >"$normalized"
+  if "$JQ_BIN" -e 'type == "object" and length == 0' "$normalized" >/dev/null; then
+    rm -f -- "$normalized"
+    return 0
+  fi
+  rm -f -- "$normalized"
+  return 1
+}
+
+current_serve_matches_acceptance() {
+  local current_config expected_config compare_status=0
+  current_config="$(mktemp "$state_root/.serve-current.XXXXXX")"
+  expected_config="$(mktemp "$state_root/.serve-expected.XXXXXX")"
+  if ! "$TAILSCALE_BIN" serve status --json >"$current_config" ||
+     ! expected_serve_config "$expected_config" ||
+     ! serve_configs_match "$current_config" "$expected_config"; then
+    compare_status=1
+  fi
+  rm -f -- "$current_config" "$expected_config"
+  return "$compare_status"
+}
+
+restore_serve() {
+  local current_config compare_status=0
+  current_config="$(mktemp "$state_root/.serve-current.XXXXXX")"
+  if ! "$TAILSCALE_BIN" serve status --json >"$current_config"; then
+    rm -f -- "$current_config"
+    return 1
+  fi
+  if serve_configs_match "$current_config" "$serve_snapshot"; then
+    rm -f -- "$current_config"
+    return 0
+  fi
+  rm -f -- "$current_config"
+  current_serve_matches_acceptance || return 1
+  mutate_serve reset || return 1
+
+  current_config="$(mktemp "$state_root/.serve-current.XXXXXX")"
+  if ! "$TAILSCALE_BIN" serve status --json >"$current_config" ||
+     ! serve_configs_match "$current_config" "$serve_snapshot"; then
+    compare_status=1
+  fi
+  rm -f -- "$current_config"
+  return "$compare_status"
+}
+
+free_port() {
+  "$NODE_BIN" -e 'const net=require("node:net"); const server=net.createServer(); server.listen(0,"127.0.0.1",()=>{ console.log(server.address().port); server.close(); });'
+}
+
+allocate_ports() {
+  local fixed_nats="${SUDO_APPROVE_ACCEPTANCE_NATS_PORT:-}" fixed_server="${SUDO_APPROVE_ACCEPTANCE_SERVER_PORT:-}"
+  for _ in $(seq 1 20); do
+    nats_port="${fixed_nats:-$(free_port)}"
+    server_port="${fixed_server:-$(free_port)}"
+    [ "$nats_port" = "$server_port" ] || return 0
+    [ -z "$fixed_nats" ] || [ -z "$fixed_server" ] || break
+  done
+  die "could not allocate distinct NATS and server ports"
+}
+
+validate_port() {
+  case "$1" in
+    ''|*[!0-9]*) die "invalid loopback port: $1" ;;
+  esac
+  if [ "$1" -lt 1 ] || [ "$1" -gt 65535 ]; then
+    die "invalid loopback port: $1"
+  fi
+}
+
+regular_or_absent() {
+  [ ! -L "$1" ] || die "refusing symlink target: $1"
+  [ ! -e "$1" ] || [ -f "$1" ] || die "refusing non-regular target: $1"
+}
+
+process_start() {
+  [ -r "/proc/$1/stat" ] || return 1
+  awk '{print $22}' "/proc/$1/stat"
+}
+
+start_detached() {
+  local pid_file="$1" log_file="$2" candidate_pid candidate_start
+  shift 2
+  regular_or_absent "$pid_file"
+  rm -f -- "$pid_file"
+  # shellcheck disable=SC2016 # The detached shell expands its own PID and arguments.
+  "$SETSID_BIN" --fork sh -c 'umask 077; printf "%s\n" "$$" >"$1"; shift; exec "$@"' \
+    sh "$pid_file" "$@" </dev/null >"$log_file" 2>&1
+  for _ in $(seq 1 100); do
+    if [ -s "$pid_file" ]; then
+      candidate_pid="$(sed -n '1p' "$pid_file")"
+      case "$candidate_pid" in
+        ''|*[!0-9]*) die "detached process wrote an invalid PID" ;;
+      esac
+      candidate_start="$(process_start "$candidate_pid" || true)"
+      if [ -n "$candidate_start" ]; then
+        detached_pid="$candidate_pid"
+        detached_start="$candidate_start"
+        return 0
+      fi
+    fi
+    sleep 0.01
+  done
+  die "detached process did not publish a live PID"
+}
+
+process_is_owned() {
+  local pid="$1" expected_start="$2" state observed_start
+  read -r state observed_start < <(awk '{print $3, $22}' "/proc/$pid/stat" 2>/dev/null || true)
+  [ -n "${observed_start:-}" ] && [ "$state" != Z ] && [ "$observed_start" = "$expected_start" ]
+}
+
+stop_owned_process() {
+  local pid="$1" expected_start="$2" label="$3"
+  if ! process_is_owned "$pid" "$expected_start"; then
+    printf '%s already stopped or no longer owned by this session\n' "$label" >&2
+    return
+  fi
+  kill "$pid"
+  for _ in $(seq 1 50); do
+    process_is_owned "$pid" "$expected_start" || return 0
+    sleep 0.1
+  done
+  die "$label did not stop"
+}
+
+cleanup_owned_process() {
+  local pid="$1" expected_start="$2" label="$3"
+  process_is_owned "$pid" "$expected_start" || return 0
+  kill "$pid" || return 0
+  for _ in $(seq 1 50); do
+    process_is_owned "$pid" "$expected_start" || return 0
+    sleep 0.1
+  done
+  echo "dev-acceptance: $label did not stop during startup cleanup" >&2
+  return 1
+}
+
+session_value() {
+  # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
+  "$JQ_BIN" -r --arg field "$1" 'if has($field) then .[$field] else error("missing session field") end' "$SESSION_FILE"
+}
+
+validate_state_root() {
+  local root="$1" managed="$2" temp_root
+  case "$root" in
+    /*) ;;
+    *) die "refusing unsafe state path: $root" ;;
+  esac
+  [ "$root" != / ] || die "refusing unsafe managed state path: $root"
+  if [ "$managed" = true ]; then
+    temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+    [ "$(dirname "$root")" = "$temp_root" ] || die "refusing unsafe managed state path: $root"
+    case "$(basename "$root")" in
+      sudo-approve-acceptance.*) ;;
+      *) die "refusing unsafe managed state path: $root" ;;
+    esac
+  fi
+}
+
+read_session() {
+  if [ ! -f "$SESSION_FILE" ] || [ -L "$SESSION_FILE" ]; then
+    die "no active acceptance session"
+  fi
+  [ "$(session_value version)" = 1 ] || die "unsupported acceptance session version"
+  state_root="$(session_value state_root)"
+  managed_state="$(session_value managed_state)"
+  case "$managed_state" in
+    true|false) ;;
+    *) die "invalid managed-state marker" ;;
+  esac
+  validate_state_root "$state_root" "$managed_state"
+  nats_pid="$(session_value nats_pid)"
+  nats_start="$(session_value nats_start)"
+  server_pid="$(session_value server_pid)"
+  server_start="$(session_value server_start)"
+  nats_port="$(session_value nats_port)"
+  server_port="$(session_value server_port)"
+  https_port="$(session_value https_port)"
+  case "$nats_pid:$nats_start:$server_pid:$server_start" in
+    *[!0-9:]*) die "invalid recorded process identity" ;;
+  esac
+  if [ "$nats_pid" -le 1 ] || [ "$server_pid" -le 1 ]; then
+    die "invalid recorded process ID"
+  fi
+  validate_port "$nats_port"
+  validate_port "$server_port"
+  validate_port "$https_port"
+  origin="$(session_value origin)"
+  rp_id="$(session_value rp_id)"
+  serve_snapshot="$(session_value serve_snapshot)"
+  [ "$serve_snapshot" = "$state_root/serve-config.json" ] || die "invalid Serve snapshot path"
+}
+
+write_session() {
+  local temporary="$SESSION_FILE.$$"
+  # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
+  "$JQ_BIN" -n \
+    --arg state_root "$state_root" \
+    --argjson managed_state "$managed_state" \
+    --argjson nats_pid "$nats_pid" \
+    --arg nats_start "$nats_start" \
+    --argjson server_pid "$server_pid" \
+    --arg server_start "$server_start" \
+    --argjson nats_port "$nats_port" \
+    --argjson server_port "$server_port" \
+    --argjson https_port "$https_port" \
+    --arg origin "$origin" \
+    --arg rp_id "$rp_id" \
+    --arg serve_snapshot "$serve_snapshot" \
+    '{version:1,state_root:$state_root,managed_state:$managed_state,nats_pid:$nats_pid,nats_start:$nats_start,server_pid:$server_pid,server_start:$server_start,nats_port:$nats_port,server_port:$server_port,https_port:$https_port,origin:$origin,rp_id:$rp_id,serve_snapshot:$serve_snapshot}' \
+    >"$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$SESSION_FILE"
+}
+
+wait_for_nats() {
+  local password="$1"
+  for _ in $(seq 1 "${SUDO_APPROVE_ACCEPTANCE_READY_ATTEMPTS:-100}"); do
+    process_is_owned "$nats_pid" "$nats_start" || die "NATS stopped during startup"
+    if NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user sudo-approve stream ls >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.1
+  done
+  die "NATS did not become ready"
+}
+
+wait_for_server() {
+  for _ in $(seq 1 "${SUDO_APPROVE_ACCEPTANCE_READY_ATTEMPTS:-100}"); do
+    process_is_owned "$server_pid" "$server_start" || die "server stopped during startup"
+    if "$CURL_BIN" --fail --silent "http://127.0.0.1:$server_port/healthz" >/dev/null; then
+      return
+    fi
+    sleep 0.1
+  done
+  die "server did not become ready"
+}
+
+verify_serve_route() {
+  local route_key="$rp_id:$https_port" proxy="http://127.0.0.1:$server_port"
+  # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
+  "$TAILSCALE_BIN" serve status --json |
+    "$JQ_BIN" -e --arg port "$https_port" --arg route_key "$route_key" --arg proxy "$proxy" \
+      '.TCP[$port].HTTPS == true and
+       .Web[$route_key].Handlers["/"].Proxy == $proxy and
+       ((.TCP // {}) | length == 1) and
+       ((.Web // {}) | length == 1) and
+       ((.AllowFunnel // {}) | length == 0)' >/dev/null
+}
+
+wait_for_origin() {
+  for _ in $(seq 1 "${SUDO_APPROVE_ACCEPTANCE_HTTPS_READY_ATTEMPTS:-300}"); do
+    if verify_serve_route && "$CURL_BIN" --fail --silent "$origin/healthz" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.1
+  done
+  die "tailnet HTTPS origin did not become ready: $origin"
+}
+
+start_session() {
+  local password nats_config
+  acceptance_started_serve=0
+  acceptance_startup_complete=0
+  [ ! -e "$SESSION_FILE" ] || die "an acceptance session already exists; run scripts/dev-acceptance down first"
+  for tool in "$CARGO_BIN" "$CURL_BIN" "$JQ_BIN" "$NATS_BIN" "$NATS_SERVER_BIN" "$NODE_BIN" "$OPENSSL_BIN" "$PRIVILEGE_BIN" "$SETSID_BIN" "$TAILSCALE_BIN"; do
+    require_tool "$tool"
+  done
+  [ -d /proc/self ] || die "acceptance sessions currently require Linux process identity from /proc"
+
+  managed_state=true
+  if [ "$#" -eq 0 ]; then
+    local temp_root
+    temp_root="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+    state_root="$(mktemp -d "$temp_root/sudo-approve-acceptance.XXXXXX")"
+  elif [ "$#" -eq 2 ] && [ "$1" = --state-dir ]; then
+    mkdir -p "$2"
+    state_root="$(cd "$2" && pwd -P)"
+    managed_state=false
+  else
+    usage
+  fi
+  validate_state_root "$state_root" "$managed_state"
+  install -d -m 0700 "$state_root" "$state_root/hook" "$state_root/logs" "$state_root/nats" "$state_root/server"
+  serve_snapshot="$state_root/serve-config.json"
+  regular_or_absent "$serve_snapshot"
+  regular_or_absent "$state_root/hook/hook.json"
+  regular_or_absent "$state_root/hook/config.env"
+  regular_or_absent "$state_root/hook/devices.json"
+
+  cleanup_startup() {
+    local exit_status=$?
+    if [ "$acceptance_startup_complete" -ne 1 ]; then
+      set +e
+      if [ "$acceptance_started_serve" -eq 1 ] && [ -f "$serve_snapshot" ]; then
+        restore_serve >/dev/null 2>&1 || echo "dev-acceptance: failed to restore Tailscale Serve configuration" >&2
+      fi
+      [ -z "${server_pid:-}" ] || [ -z "${server_start:-}" ] ||
+        cleanup_owned_process "$server_pid" "$server_start" server || true
+      [ -z "${nats_pid:-}" ] || [ -z "${nats_start:-}" ] ||
+        cleanup_owned_process "$nats_pid" "$nats_start" NATS || true
+      rm -f -- "$state_root/server.pid" "$state_root/nats.pid"
+      [ "$managed_state" = false ] || rm -rf -- "$state_root"
+    fi
+    return "$exit_status"
+  }
+  trap cleanup_startup EXIT
+
+  "$TAILSCALE_BIN" status --json | "$JQ_BIN" -e '.Self.Online == true' >/dev/null || die "Tailscale is not online"
+  rp_id="$($TAILSCALE_BIN status --json | "$JQ_BIN" -er '.Self.DNSName | select(type == "string" and length > 1)' | sed 's/\.$//')"
+  [ -n "$rp_id" ] || die "Tailscale DNS name is unavailable"
+  allocate_ports
+  https_port="${SUDO_APPROVE_ACCEPTANCE_HTTPS_PORT:-8443}"
+  validate_port "$nats_port"
+  validate_port "$server_port"
+  validate_port "$https_port"
+  origin="https://$rp_id:$https_port"
+
+  "$TAILSCALE_BIN" serve status --json >"$serve_snapshot"
+  if [ ! -f "$serve_snapshot" ] || [ -L "$serve_snapshot" ]; then
+    die "Tailscale Serve snapshot was not created"
+  fi
+  serve_config_is_empty "$serve_snapshot" ||
+    die "pre-existing Tailscale Serve configuration must be removed or handled by the operator"
+
+  "$CARGO_BIN" build --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --locked
+  [ -x "$SERVER_BIN" ] || die "server binary is missing after build: $SERVER_BIN"
+  [ -x "$HOOK_BIN" ] || die "hook binary is missing after build: $HOOK_BIN"
+
+  password="$($OPENSSL_BIN rand -hex 32)"
+  nats_config="$state_root/nats/auth.conf"
+  printf 'authorization {\n  users = [{user: "sudo-approve", password: "%s"}]\n}\n' "$password" >"$nats_config"
+  chmod 0600 "$nats_config"
+  start_detached "$state_root/nats.pid" "$state_root/logs/nats.log" \
+    "$NATS_SERVER_BIN" -c "$nats_config" -js -sd "$state_root/nats/store" -a 127.0.0.1 -p "$nats_port"
+  nats_pid="$detached_pid"
+  nats_start="$detached_start"
+  wait_for_nats "$password"
+  NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user sudo-approve \
+    stream info SUDO_APPROVE >/dev/null 2>&1 || \
+    NATS_PASSWORD="$password" "$NATS_BIN" --server "nats://127.0.0.1:$nats_port" --user sudo-approve \
+      stream add SUDO_APPROVE --subjects 'sudo.request.>' --storage file \
+      --retention limits --discard old --max-age 10m --defaults >/dev/null
+
+  # shellcheck disable=SC2016 # jq fields use jq variables, not shell expansion.
+  "$JQ_BIN" -n --arg origin "$origin" --arg rp_id "$rp_id" \
+    '{version:1,origin:$origin,rp_id:$rp_id,server_base_url:$origin}' >"$state_root/hook/hook.json"
+  printf 'NATS_URL=nats://127.0.0.1:%s\nNATS_USER=sudo-approve\nNATS_PASS=%s\n' \
+    "$nats_port" "$password" >"$state_root/hook/config.env"
+  if [ ! -e "$state_root/hook/devices.json" ]; then
+    printf '%s\n' '{"version":1,"devices":[]}' >"$state_root/hook/devices.json"
+  fi
+  chmod 0600 "$state_root/hook/hook.json" "$state_root/hook/config.env" "$state_root/hook/devices.json"
+
+  NATS_URL="nats://127.0.0.1:$nats_port" \
+  NATS_USER=sudo-approve \
+  NATS_PASS="$password" \
+  SUDO_APPROVE_STATE_PATH="$state_root/server/state.sqlite3" \
+  SUDO_APPROVE_LISTEN="127.0.0.1:$server_port" \
+  SUDO_APPROVE_ORIGIN="$origin" \
+  SUDO_APPROVE_RP_ID="$rp_id" \
+    start_detached "$state_root/server.pid" "$state_root/logs/server.log" "$SERVER_BIN"
+  server_pid="$detached_pid"
+  server_start="$detached_start"
+  wait_for_server
+
+  acceptance_started_serve=1
+  mutate_serve --bg --yes "--https=$https_port" "http://127.0.0.1:$server_port"
+  wait_for_origin
+  write_session
+  acceptance_startup_complete=1
+  trap - EXIT
+  printf 'acceptance origin: %s\nstate: %s\nnext: scripts/dev-acceptance enroll\n' "$origin" "$state_root"
+}
+
+run_hook() {
+  local verb="$1"
+  read_session
+  process_is_owned "$nats_pid" "$nats_start" || die "acceptance NATS is not running"
+  process_is_owned "$server_pid" "$server_start" || die "acceptance server is not running"
+  SUDO_APPROVE_CONFIG_DIR="$state_root/hook" "$HOOK_BIN" "$verb"
+}
+
+show_status() {
+  read_session
+  process_is_owned "$nats_pid" "$nats_start" || die "acceptance NATS is not running"
+  process_is_owned "$server_pid" "$server_start" || die "acceptance server is not running"
+  "$CURL_BIN" --fail --silent "http://127.0.0.1:$server_port/healthz" >/dev/null || die "acceptance server is unhealthy"
+  verify_serve_route || die "acceptance Tailscale Serve route is missing"
+  "$CURL_BIN" --fail --silent "$origin/healthz" >/dev/null || die "acceptance tailnet HTTPS origin is unhealthy"
+  printf 'origin: %s\nstate: %s\nNATS PID: %s\nserver PID: %s\n' "$origin" "$state_root" "$nats_pid" "$server_pid"
+}
+
+stop_session() {
+  local restore_ok=1
+  read_session
+  if [ ! -f "$serve_snapshot" ] || [ -L "$serve_snapshot" ]; then
+    die "Serve snapshot is missing or unsafe"
+  fi
+  if ! restore_serve; then
+    restore_ok=0
+    echo "dev-acceptance: failed to restore Tailscale Serve configuration" >&2
+  fi
+  stop_owned_process "$server_pid" "$server_start" server
+  stop_owned_process "$nats_pid" "$nats_start" NATS
+  rm -f -- "$state_root/server.pid" "$state_root/nats.pid"
+  [ "$restore_ok" -eq 1 ] || die "acceptance services stopped but Serve restoration must be retried"
+  rm -f -- "$SESSION_FILE"
+  if [ "$managed_state" = true ]; then
+    validate_state_root "$state_root" true
+    rm -rf -- "$state_root"
+  fi
+  echo "acceptance session stopped; Tailscale Serve configuration restored"
+}
+
+command_name="${1:-}"
+[ -n "$command_name" ] || usage
+shift
+case "$command_name" in
+  up) start_session "$@" ;;
+  enroll) [ "$#" -eq 0 ] || usage; run_hook enroll ;;
+  test) [ "$#" -eq 0 ] || usage; run_hook test ;;
+  status) [ "$#" -eq 0 ] || usage; show_status ;;
+  down) [ "$#" -eq 0 ] || usage; stop_session ;;
+  *) usage ;;
+esac

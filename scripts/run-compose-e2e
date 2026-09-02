@@ -3,7 +3,23 @@ set -euo pipefail
 
 HOOK_CONFIG_DIR="${SUDO_APPROVE_TEST_CONFIG_DIR:?set SUDO_APPROVE_TEST_CONFIG_DIR}"
 STATE_ROOT="${HOOK_CONFIG_DIR%/hook}"
+HOST_UID="${SUDO_APPROVE_HOST_UID:?set SUDO_APPROVE_HOST_UID}"
 TLS_ROOT=/tmp/sudo-approve-e2e-tls
+case "$HOST_UID" in
+  ''|*[!0-9]*) echo "invalid host UID: $HOST_UID" >&2; exit 2 ;;
+esac
+
+restore_state_ownership() {
+  local exit_status=$?
+  trap - EXIT
+  if ! chown -R "$HOST_UID:$HOST_UID" "$STATE_ROOT"; then
+    echo "failed to restore E2E state ownership to UID $HOST_UID" >&2
+    exit_status=1
+  fi
+  exit "$exit_status"
+}
+trap restore_state_ownership EXIT
+
 mkdir -p "$HOOK_CONFIG_DIR" "$TLS_ROOT"
 chmod 0700 "$HOOK_CONFIG_DIR"
 
