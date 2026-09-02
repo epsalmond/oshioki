@@ -139,6 +139,23 @@ pub enum DeviceKindV1 {
     SecureEnclave,
 }
 
+impl DeviceKindV1 {
+    /// The wire spelling of the kind, identical to its serde tag.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Webauthn => "webauthn",
+            Self::SecureEnclave => "secure-enclave",
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceKindV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// A pinned approval device.
 ///
 /// For `secure-enclave` records `credential_public_key` is the 65-byte SEC1
@@ -666,6 +683,16 @@ mod tests {
             serde_json::from_str(&format!(r#"{{"version":1,"devices":[{record_json}]}}"#)).unwrap();
         registry.validate().unwrap();
         assert_eq!(registry.devices[0].kind, DeviceKindV1::Webauthn);
+    }
+
+    /// `as_str` is the serde tag: the transcript HMAC and the device list
+    /// both depend on the two staying the same string.
+    #[test]
+    fn kind_renders_as_its_serde_tag() {
+        for kind in [DeviceKindV1::Webauthn, DeviceKindV1::SecureEnclave] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{kind}\""));
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
     }
 
     /// Browser pages cached before the `kind` tag existed post a

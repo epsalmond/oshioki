@@ -20,7 +20,7 @@ use crate::{
 };
 
 const NATIVE_PROOF_DOMAIN: &[u8] = b"oshioki/enroll/native-proof/v1\0";
-const NATIVE_KIND_TAG: &[u8] = b"secure-enclave";
+const NATIVE_KIND_TAG: &[u8] = DeviceKindV1::SecureEnclave.as_str().as_bytes();
 
 /// Parses a 65-byte SEC1 uncompressed P-256 point.
 pub fn sec1_p256_verifying_key(sec1: &[u8]) -> Result<VerifyingKey, Error> {

@@ -229,7 +229,7 @@ fn apply_decision(
                 .context("native approval does not name one pinned secure-enclave device")?;
             verify_native_approval_v1(&approval, raw_request, device)
                 .context("native approval verification failed")?;
-            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, kind="secure-enclave", "sudo request approved");
+            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
             Ok(())
         }
     }
@@ -393,7 +393,7 @@ async fn activate_device(
         .is_none()
     {
         bail!(
-            "the server did not confirm device {} ({:?}); it is pinned on this host, but the \
+            "the server did not confirm device {} ({}); it is pinned on this host, but the \
              server either rejected the record or is too old to understand it",
             device.fingerprint,
             device.kind
@@ -474,13 +474,9 @@ fn cmd_status() -> Result<()> {
     let registry = load_registry()?;
     println!("Enrolled devices ({}):", registry.devices.len());
     for device in registry.devices {
-        let kind = match device.kind {
-            DeviceKindV1::Webauthn => "webauthn",
-            DeviceKindV1::SecureEnclave => "secure-enclave",
-        };
         println!(
-            "  {}  {}  kind={kind}  active={}",
-            device.fingerprint, device.label, device.active
+            "  {}  {}  kind={}  active={}",
+            device.fingerprint, device.label, device.kind, device.active
         );
     }
     Ok(())
