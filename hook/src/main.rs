@@ -161,6 +161,12 @@ fn apply_decision(
     registry: &mut DeviceRegistryV1,
     directory: &Path,
 ) -> Result<()> {
+    // A verdict is an answer about one request during its lifetime. Once the
+    // request has expired there is nothing left to decide, and a signature
+    // that arrives late must not stand in for one that arrived in time.
+    if request.expires_at <= now() {
+        bail!("request expired before its verdict was applied");
+    }
     match decision {
         DecisionV1::Deny(denial) => {
             denial.validate_shape().context("validate deny decision")?;
@@ -1009,6 +1015,56 @@ mod tests {
         atomic_write_json(&path, &registry, 0o600).unwrap();
         assert_eq!(read_json::<DeviceRegistryV1>(&path).unwrap(), registry);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Nothing decides a request that is already dead, whatever the verdict
+    /// says and whichever device kind signed it.
+    #[test]
+    fn an_expired_request_rejects_every_verdict() {
+        let mut request = build_synthetic_request();
+        request.expires_at = now() - 1;
+        let fingerprint = URL_SAFE_NO_PAD.encode([1; 16]);
+        let mut registry = DeviceRegistryV1 {
+            version: 1,
+            devices: Vec::new(),
+        };
+        let decisions = [
+            DecisionV1::Deny(oshioki_protocol::DenyV1 {
+                version: VERSION_V1,
+                request_id: request.request_id.clone(),
+                device_fingerprint: fingerprint.clone(),
+            }),
+            DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
+                version: VERSION_V1,
+                request_id: request.request_id.clone(),
+                device_fingerprint: fingerprint.clone(),
+                signature: URL_SAFE_NO_PAD.encode([2; 64]),
+            }),
+            DecisionV1::Approve(oshioki_protocol::ApproveV1 {
+                version: VERSION_V1,
+                request_id: request.request_id.clone(),
+                device_fingerprint: fingerprint,
+                credential_id: URL_SAFE_NO_PAD.encode([3; 16]),
+                authenticator_data: URL_SAFE_NO_PAD.encode([4; 37]),
+                client_data_json: URL_SAFE_NO_PAD.encode(b"{}"),
+                signature: URL_SAFE_NO_PAD.encode([5; 64]),
+            }),
+        ];
+        for decision in decisions {
+            let error = apply_decision(
+                decision,
+                &request,
+                &[],
+                &[],
+                &mut registry,
+                Path::new("/nonexistent"),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("expired before its verdict"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]

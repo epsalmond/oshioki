@@ -374,16 +374,13 @@ impl Prompter {
     /// decides a later request.
     async fn ask(&self, summary: &str, expires_at: i64) -> Result<Option<bool>> {
         let mut lines = self.lines.lock().await;
-        let Ok(remaining) = u64::try_from(expires_at - now()) else {
+        let Some(remaining) = remaining_until(expires_at) else {
             return Ok(None);
         };
-        if remaining == 0 {
-            return Ok(None);
-        }
         while lines.try_recv().is_ok() {}
         print!("{summary}Approve? [y/N] ");
         io::stdout().flush()?;
-        match tokio::time::timeout(Duration::from_secs(remaining), lines.recv()).await {
+        match tokio::time::timeout(remaining, lines.recv()).await {
             Ok(Some(answer)) => Ok(Some(answer.trim().eq_ignore_ascii_case("y"))),
             Ok(None) => bail!("stdin closed"),
             Err(_) => {
@@ -409,6 +406,22 @@ async fn connect_nats() -> Result<async_nats::Client> {
 
 fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// How long is left before `expires_at`, to sub-second precision, or `None`
+/// once that instant has passed.
+///
+/// Whole-second arithmetic rounds the wait up: a request expiring in 200ms
+/// reads as one second left, and the prompt would keep accepting an answer
+/// long after the hook stopped listening for one.
+fn remaining_until(expires_at: i64) -> Option<Duration> {
+    let deadline = time::OffsetDateTime::from_unix_timestamp(expires_at).ok()?;
+    let remaining = deadline - time::OffsetDateTime::now_utc();
+    if remaining.is_positive() {
+        Duration::try_from(remaining).ok()
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -494,6 +507,24 @@ mod tests {
         let (prompter, closed) = Prompter::from_reader(std::io::empty());
         closed.await.unwrap();
         assert!(prompter.ask("summary\n", now() + 30).await.is_err());
+    }
+
+    /// The prompt stops at the expiry instant itself. Whole-second
+    /// arithmetic let it wait most of a second past a dead request and sign
+    /// for it.
+    #[tokio::test]
+    async fn prompt_stops_at_the_exact_deadline() {
+        let (sender, receiver) = mpsc::channel(8);
+        let prompter = Prompter::new(receiver);
+        let expires_at = now() + 1;
+        assert_eq!(prompter.ask("summary\n", expires_at).await.unwrap(), None);
+        let overshoot = time::OffsetDateTime::now_utc()
+            - time::OffsetDateTime::from_unix_timestamp(expires_at).unwrap();
+        assert!(
+            overshoot < time::Duration::milliseconds(250),
+            "waited {overshoot} past the deadline"
+        );
+        drop(sender);
     }
 
     /// Waiting out the deadline is silence, not a denial.
