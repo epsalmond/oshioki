@@ -15,3 +15,6 @@ server/web/playwright-report/
 .vscode/
 *.swp
 *.swo
+
+# Session working notes, not part of the project
+continue.md

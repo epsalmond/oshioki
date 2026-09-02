@@ -84,6 +84,10 @@ oshioki revoke <fingerprint>
 oshioki pin <fingerprint>
 ```
 
+`enroll` prints an enrollment URL, and below it the `oshioki-agent pair`
+command a native device runs to consume the same URL. `status` prints each
+device's `kind` (`webauthn` or `secure-enclave`) next to its fingerprint.
+
 `test` publishes a synthetic request and waits for approve or deny. `watch`
 opens each request URL on Darwin without a shell.
 

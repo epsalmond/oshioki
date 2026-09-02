@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     Error,
     v1::{
-        ApproveV1, DevicePublicRecordV1, HookConfigV1, VERSION_V1, approve_challenge,
+        ApproveV1, DeviceKindV1, DevicePublicRecordV1, HookConfigV1, VERSION_V1, approve_challenge,
         decode_base64url,
     },
 };
@@ -39,6 +39,7 @@ pub fn verify_approval_v1(
     device.validate()?;
     if approval.version != VERSION_V1
         || approval.request_id.is_empty()
+        || device.kind != DeviceKindV1::Webauthn
         || approval.device_fingerprint != device.fingerprint
         || approval.credential_id != device.credential_id
     {
@@ -141,7 +142,7 @@ pub fn cose_p256_verifying_key(cose_bytes: &[u8]) -> Result<VerifyingKey, Error>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::v1::{device_fingerprint, encode_base64url};
     use p256::{
@@ -150,9 +151,8 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
-    fn fixture() -> (SigningKey, DevicePublicRecordV1, HookConfigV1) {
-        let signing = SigningKey::random(&mut OsRng);
-        let point = signing.verifying_key().to_encoded_point(false);
+    /// Encodes a P-256 point as a COSE ES256 key, for fixtures.
+    pub(crate) fn cose_key(x: &[u8], y: &[u8]) -> Vec<u8> {
         let mut cose = BTreeMap::new();
         cose.insert(serde_cbor::Value::Integer(1), serde_cbor::Value::Integer(2));
         cose.insert(
@@ -165,18 +165,25 @@ mod tests {
         );
         cose.insert(
             serde_cbor::Value::Integer(-2),
-            serde_cbor::Value::Bytes(point.x().unwrap().to_vec()),
+            serde_cbor::Value::Bytes(x.to_vec()),
         );
         cose.insert(
             serde_cbor::Value::Integer(-3),
-            serde_cbor::Value::Bytes(point.y().unwrap().to_vec()),
+            serde_cbor::Value::Bytes(y.to_vec()),
         );
-        let cose = serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap();
+        serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap()
+    }
+
+    fn fixture() -> (SigningKey, DevicePublicRecordV1, HookConfigV1) {
+        let signing = SigningKey::random(&mut OsRng);
+        let point = signing.verifying_key().to_encoded_point(false);
+        let cose = cose_key(point.x().unwrap(), point.y().unwrap());
         let credential_id = vec![7; 32];
         let box_key = vec![8; 32];
         let fp = device_fingerprint(&credential_id, &cose, &box_key);
         let device = DevicePublicRecordV1 {
             version: 1,
+            kind: DeviceKindV1::Webauthn,
             fingerprint: fp,
             credential_id: encode_base64url(&credential_id),
             credential_public_key: encode_base64url(&cose),

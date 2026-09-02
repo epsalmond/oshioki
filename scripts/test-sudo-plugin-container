@@ -230,7 +230,7 @@ EXPECTED_ARGV=("$EXPECTED_CMD" "${ARGS[@]}")
 
 FINGERPRINT="$(cat "$SHARE/fingerprint")"
 cat >"$SHARE/devices.json" <<EOF
-{"version":1,"devices":[{"version":1,"fingerprint":"$FINGERPRINT","credential_id":"AQID","credential_public_key":"$CREDENTIAL_PUB","box_public_key":"$BOX_PUB","label":"container-e2e","api_token_hash":"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM","sign_count":0,"active":true}]}
+{"version":1,"devices":[{"version":1,"kind":"webauthn","fingerprint":"$FINGERPRINT","credential_id":"AQID","credential_public_key":"$CREDENTIAL_PUB","box_public_key":"$BOX_PUB","label":"container-e2e","api_token_hash":"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM","sign_count":0,"active":true}]}
 EOF
 
 if [ "$IN_CONTAINER" = "1" ]; then

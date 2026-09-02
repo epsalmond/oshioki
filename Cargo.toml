@@ -5,6 +5,7 @@ members = [
     "hook",
     "server",
     "plugin",
+    "agent",
 ]
 
 # All version numbers and shared features live here. Member crates reference

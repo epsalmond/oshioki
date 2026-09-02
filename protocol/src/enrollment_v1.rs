@@ -11,8 +11,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     Error,
     v1::{
-        DevicePublicRecordV1, EnrollmentSubmissionV1, HookConfigV1, VERSION_V1, decode_base64url,
-        device_fingerprint, encode_base64url,
+        DeviceKindV1, DevicePublicRecordV1, HookConfigV1, VERSION_V1,
+        WebauthnEnrollmentSubmissionV1, decode_base64url, device_fingerprint, encode_base64url,
     },
     webauthn_v1::cose_p256_verifying_key,
 };
@@ -20,7 +20,7 @@ use crate::{
 type HmacSha256 = Hmac<Sha256>;
 const REGISTRATION_DOMAIN: &[u8] = b"oshioki/enroll/registration/v1\0";
 const PROOF_DOMAIN: &[u8] = b"oshioki/enroll/proof/v1\0";
-const TRANSCRIPT_DOMAIN: &[u8] = b"oshioki/enroll/transcript/v1\0";
+pub(crate) const TRANSCRIPT_DOMAIN: &[u8] = b"oshioki/enroll/transcript/v1\0";
 
 #[derive(Deserialize)]
 struct ClientData {
@@ -39,7 +39,7 @@ pub fn enrollment_hmac(secret: &[u8; 32], domain: &[u8], fields: &[&[u8]]) -> [u
         .into()
 }
 
-fn transcript_mac(secret: &[u8; 32], domain: &[u8], fields: &[&[u8]]) -> HmacSha256 {
+pub(crate) fn transcript_mac(secret: &[u8; 32], domain: &[u8], fields: &[&[u8]]) -> HmacSha256 {
     let mut key_derivation = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key");
     key_derivation.update(domain);
     let derived = key_derivation.finalize().into_bytes();
@@ -52,7 +52,7 @@ fn transcript_mac(secret: &[u8; 32], domain: &[u8], fields: &[&[u8]]) -> HmacSha
 }
 
 pub fn verify_enrollment_v1(
-    submission: &EnrollmentSubmissionV1,
+    submission: &WebauthnEnrollmentSubmissionV1,
     secret: &[u8; 32],
     config: &HookConfigV1,
 ) -> Result<DevicePublicRecordV1, Error> {
@@ -141,6 +141,7 @@ pub fn verify_enrollment_v1(
     let fingerprint = device_fingerprint(&credential_id, &cose_key, &box_public_key);
     let device = DevicePublicRecordV1 {
         version: VERSION_V1,
+        kind: DeviceKindV1::Webauthn,
         fingerprint,
         credential_id: encode_base64url(&credential_id),
         credential_public_key: encode_base64url(&cose_key),
@@ -262,7 +263,7 @@ mod tests {
     use serde_cbor::Value;
     use std::collections::BTreeMap;
 
-    fn fixture() -> (EnrollmentSubmissionV1, [u8; 32], HookConfigV1) {
+    fn fixture() -> (WebauthnEnrollmentSubmissionV1, [u8; 32], HookConfigV1) {
         let secret = [9; 32];
         let config = HookConfigV1 {
             version: 1,
@@ -342,7 +343,7 @@ mod tests {
             label.as_bytes(),
         ];
         let transcript_hmac = enrollment_hmac(&secret, TRANSCRIPT_DOMAIN, &fields);
-        let submission = EnrollmentSubmissionV1 {
+        let submission = WebauthnEnrollmentSubmissionV1 {
             version: 1,
             enrollment_id: "enrollment-1".into(),
             registration_client_data_json: encode_base64url(&registration_client),

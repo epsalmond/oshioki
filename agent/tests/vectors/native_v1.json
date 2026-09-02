@@ -1,0 +1,18 @@
+{
+  "signing_scalar": "ERERERERERERERERERERERERERERERERERERERERERE",
+  "box_secret": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+  "api_token_hash": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM",
+  "enrollment_secret": "REREREREREREREREREREREREREREREREREREREREREQ",
+  "enrollment_id": "vector-enrollment",
+  "label": "vector laptop",
+  "credential_public_key": "BAIX5hfwtkQ5KCePlpmeaaI6TywVK99tbN9m5bgCgtTtGUp968uXcS0t2jyoWqh2Wlb0X8dYWZZS8ol8ZTBuV5Q",
+  "credential_id": "K60P1hDZnq5EPpMqJhQryh5fqZW0UYRSgn547x8xf_A",
+  "box_public_key": "D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyA",
+  "fingerprint": "23d5DG4zOMRbr6Q3dpIDZA",
+  "proof_message": "lAty6xfh2N5nA4yIa5_NUCjSykfdJThFvjwTvRaaQZk",
+  "proof_signature": "MEYCIQDmU5H18XrlMt2DHXIA-4h-tMML5tcoBlGwDn2-goO1gAIhAM-HKqK5iEkzyZS-ilLW1ej2CuGxSlzHHKYXj3rrkf7J",
+  "transcript_hmac": "GS5lcCUIHhIqNm5DuensJIZh7BWEdpT4BYXLCHMVXBA",
+  "raw_request": "{\"version\":1,\"request_id\":\"vector-request\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAw\",\"host\":\"host.example\",\"user\":\"eric\",\"uid\":1000,\"runas_uid\":0,\"cwd\":\"/home/eric\",\"tty\":\"/dev/pts/0\",\"command\":\"/usr/bin/true\",\"argv\":[\"true\"],\"pid_chain\":[\"1 systemd\"],\"issued_at\":1700000000,\"expires_at\":1700000090}",
+  "challenge": "B02cRRWCKyk06zgc_0TM61snnew5XlQ53Bz0VSQPFAA",
+  "approval_signature": "MEUCIQDBxWKvH1W59l-rnKKLB1_lrROa-RGoeTDMKDfJVeV96wIgK_ssGwu0xsEgfnfa8Nh6_TazhSokOkY9VAD2423_aos"
+}

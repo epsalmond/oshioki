@@ -2,10 +2,10 @@ import { expect, test } from "@playwright/test";
 import { connect } from "@nats-io/transport-node";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import http from "node:http";
 import https from "node:https";
 import { join } from "node:path";
 import { URL } from "node:url";
+import { startTlsProxy } from "../../../scripts/e2e-tls-proxy.mjs";
 
 const hookBinary = process.env.OSHIOKI_HOOK ?? "/work/target/release/oshioki";
 const hookConfigDir = process.env.OSHIOKI_TEST_CONFIG_DIR;
@@ -19,32 +19,9 @@ let proxy;
 const activeHooks = new Set();
 const enrolledFingerprints = new Set();
 
+// The same proxy the rest of the E2E runs as a standalone process.
 test.beforeAll(async () => {
-  const target = new URL(process.env.OSHIOKI_SERVER_HTTP ?? "http://server:8443");
-  proxy = https.createServer({
-    key: readFileSync(process.env.OSHIOKI_TLS_KEY),
-    cert: readFileSync(process.env.OSHIOKI_TLS_CERT),
-  }, (request, response) => {
-    const upstream = http.request({
-      hostname: target.hostname,
-      port: target.port,
-      path: request.url,
-      method: request.method,
-      headers: { ...request.headers, host: target.host },
-    }, (upstreamResponse) => {
-      response.writeHead(upstreamResponse.statusCode, upstreamResponse.headers);
-      upstreamResponse.pipe(response);
-    });
-    upstream.on("error", () => {
-      response.writeHead(502, { "content-type": "text/plain" });
-      response.end("upstream unavailable");
-    });
-    request.pipe(upstream);
-  });
-  await new Promise((resolve, reject) => {
-    proxy.once("error", reject);
-    proxy.listen(Number(process.env.OSHIOKI_HTTPS_PORT ?? "443"), "127.0.0.1", resolve);
-  });
+  proxy = await startTlsProxy();
 });
 
 test.afterAll(async () => {
@@ -294,6 +271,9 @@ async function requestWith(profile, device, action) {
   await navigate(profile.page, `${origin}/r/${envelope.request_id}`);
   await expect(profile.page.locator("#request")).toBeVisible();
   await expect(profile.page.locator("#actions")).toBeVisible();
+  // `oshioki test` builds a request that targets root, and the page names the
+  // target rather than leaving sudo's default implicit.
+  await expect(profile.page.locator("#runas")).toHaveText("root (uid 0)");
   await expect(profile.page.locator("#command")).toHaveText("/usr/bin/true");
   await expect(profile.page.locator("#argv")).toHaveText("/usr/bin/true");
 
