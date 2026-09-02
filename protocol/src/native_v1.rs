@@ -78,24 +78,32 @@ pub fn native_enrollment_proof(
     )
 }
 
+/// The transcript fields, in the order both sides feed them to the HMAC.
+///
+/// Signer and verifier read this one list; a field added to only one of them
+/// would make every enrollment fail with no explanation.
+fn native_transcript_fields(
+    submission: &NativeEnrollmentSubmissionV1,
+) -> Result<Vec<Vec<u8>>, Error> {
+    Ok(vec![
+        submission.enrollment_id.as_bytes().to_vec(),
+        NATIVE_KIND_TAG.to_vec(),
+        decode_base64url(&submission.credential_public_key)?,
+        decode_base64url(&submission.box_public_key)?,
+        decode_base64url(&submission.api_token_hash)?,
+        submission.label.as_bytes().to_vec(),
+        decode_base64url(&submission.proof_signature)?,
+    ])
+}
+
 /// The transcript HMAC over a native submission, computed by both sides.
 pub fn native_transcript_hmac(
     secret: &[u8; 32],
     submission: &NativeEnrollmentSubmissionV1,
 ) -> Result<[u8; 32], Error> {
-    Ok(enrollment_hmac(
-        secret,
-        TRANSCRIPT_DOMAIN,
-        &[
-            submission.enrollment_id.as_bytes(),
-            NATIVE_KIND_TAG,
-            &decode_base64url(&submission.credential_public_key)?,
-            &decode_base64url(&submission.box_public_key)?,
-            &decode_base64url(&submission.api_token_hash)?,
-            submission.label.as_bytes(),
-            &decode_base64url(&submission.proof_signature)?,
-        ],
-    ))
+    let fields = native_transcript_fields(submission)?;
+    let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    Ok(enrollment_hmac(secret, TRANSCRIPT_DOMAIN, &fields))
 }
 
 /// Verifies a native enrollment and returns the device record to pin.
@@ -110,21 +118,11 @@ pub fn verify_native_enrollment_v1(
     let proof_signature = decode_base64url(&submission.proof_signature)?;
     let supplied_hmac = decode_base64url(&submission.transcript_hmac)?;
 
-    transcript_mac(
-        secret,
-        TRANSCRIPT_DOMAIN,
-        &[
-            submission.enrollment_id.as_bytes(),
-            NATIVE_KIND_TAG,
-            &credential_public_key,
-            &box_public_key,
-            &api_token_hash,
-            submission.label.as_bytes(),
-            &proof_signature,
-        ],
-    )
-    .verify_slice(&supplied_hmac)
-    .map_err(|_| Error::BadVerdict("transcript HMAC mismatch".into()))?;
+    let fields = native_transcript_fields(submission)?;
+    let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    transcript_mac(secret, TRANSCRIPT_DOMAIN, &fields)
+        .verify_slice(&supplied_hmac)
+        .map_err(|_| Error::BadVerdict("transcript HMAC mismatch".into()))?;
 
     let key = sec1_p256_verifying_key(&credential_public_key)?;
     let proof = native_enrollment_proof(
