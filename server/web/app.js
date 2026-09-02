@@ -52,6 +52,10 @@ async function allDevices() {
   db.close(); return devices;
 }
 function requestId() { return location.pathname.split("/").filter(Boolean).at(-1); }
+// The target account is what the approval grants, so it is always shown,
+// including sudo's implicit root default. The number is not resolved to a
+// name here: the account lives on the requesting host, not in this browser.
+function runAsLabel(uid) { return uid === 0 ? "root (uid 0)" : `uid ${uid}`; }
 function text(id, value) { document.getElementById(id).textContent = value; }
 function failure(error) { console.error(error); text("status", "This request could not be verified."); }
 
@@ -112,7 +116,7 @@ async function approval() {
   if (shared.every(value => value === 0)) throw new Error("invalid shared secret");
   const raw = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, unb64(sealed.ciphertext), null, unb64(sealed.nonce), shared);
   const request = JSON.parse(dec.decode(raw)); if (request.version !== 1 || request.request_id !== id) throw new Error("request mismatch");
-  text("host", request.host); text("user", `${request.user} / ${request.uid}`); text("command", request.command);
+  text("host", request.host); text("user", `${request.user} / ${request.uid}`); text("runas", runAsLabel(request.runas_uid)); text("command", request.command);
   text("argv", request.argv.join("\n")); text("cwd", request.cwd); text("process-chain", request.pid_chain.join("\n"));
   text("status", `Expires ${new Date(request.expires_at * 1000).toLocaleTimeString()}`); document.getElementById("request").hidden = false; document.getElementById("actions").hidden = false;
   const headers = { authorization: `Bearer ${selected.device.apiToken}`, "content-type": "application/json" };

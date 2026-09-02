@@ -271,6 +271,9 @@ async function requestWith(profile, device, action) {
   await navigate(profile.page, `${origin}/r/${envelope.request_id}`);
   await expect(profile.page.locator("#request")).toBeVisible();
   await expect(profile.page.locator("#actions")).toBeVisible();
+  // `oshioki test` builds a request that targets root, and the page names the
+  // target rather than leaving sudo's default implicit.
+  await expect(profile.page.locator("#runas")).toHaveText("root (uid 0)");
   await expect(profile.page.locator("#command")).toHaveText("/usr/bin/true");
   await expect(profile.page.locator("#argv")).toHaveText("/usr/bin/true");
 

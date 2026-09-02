@@ -228,9 +228,11 @@ async fn decide(
         Decider::Auto(answer) => *answer,
         Decider::Prompt(prompter) => {
             let summary = format!(
-                "sudo on {}: {} wants to run {} {}\n  cwd: {}\n  callers: {}\n",
+                "sudo on {}: {} (uid {}) wants to run as {}: {} {}\n  cwd: {}\n  callers: {}\n",
                 escape_for_terminal(&request.host),
                 escape_for_terminal(&request.user),
+                request.uid,
+                runas_label(request.runas_uid),
                 escape_for_terminal(&request.command),
                 escape_for_terminal(&request.argv.join(" ")),
                 escape_for_terminal(&request.cwd),
@@ -274,6 +276,21 @@ async fn decide(
         "decision published"
     );
     Ok(())
+}
+
+/// Names the account the command would run as.
+///
+/// The target is what the approval actually grants, so the prompt always
+/// shows it, including sudo's default of root. The name is derived from the
+/// number rather than resolved on this device: the account lives on the
+/// requesting host, whose passwd file this device cannot read, and only uid 0
+/// means the same thing everywhere.
+fn runas_label(runas_uid: u32) -> String {
+    if runas_uid == 0 {
+        "root (uid 0)".to_owned()
+    } else {
+        format!("uid {runas_uid}")
+    }
 }
 
 /// Where a verdict comes from: `--auto` for tests, otherwise the terminal.
@@ -367,8 +384,16 @@ fn now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Prompter, now};
+    use super::{Prompter, now, runas_label};
     use tokio::sync::mpsc;
+
+    /// The prompt names the target account for every request, including the
+    /// root default that sudo leaves implicit.
+    #[test]
+    fn target_account_is_always_named() {
+        assert_eq!(runas_label(0), "root (uid 0)");
+        assert_eq!(runas_label(1000), "uid 1000");
+    }
 
     /// An answer typed before the prompt appeared belongs to whatever the
     /// operator was looking at then, not to this request.
