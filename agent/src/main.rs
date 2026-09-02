@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, parse_enrollment_url};
 use oshioki_protocol::{ActivationV1, DecisionV1, RequestEnvelopeV1};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 const PAIR_TIMEOUT: Duration = Duration::from_secs(300);
@@ -152,7 +152,11 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
         .context("subscribe requests")?;
     nats.flush().await?;
     info!(fingerprint=%identity.fingerprint(), "watching for requests");
-    let prompt = Arc::new(Mutex::new(()));
+    let decider = Arc::new(match auto {
+        Some(Auto::Approve) => Decider::Auto(true),
+        Some(Auto::Deny) => Decider::Auto(false),
+        None => Decider::Prompt(Prompter::from_stdin()),
+    });
     while let Some(message) = requests.next().await {
         let envelope: RequestEnvelopeV1 = match serde_json::from_slice(&message.payload) {
             Ok(envelope) => envelope,
@@ -171,9 +175,9 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
         };
         let identity = Arc::clone(&identity);
         let nats = nats.clone();
-        let prompt = Arc::clone(&prompt);
+        let decider = Arc::clone(&decider);
         tokio::spawn(async move {
-            if let Err(error) = decide(&identity, &nats, &prompt, &opened, auto).await {
+            if let Err(error) = decide(&identity, &nats, &decider, &opened).await {
                 warn!(request_id=%opened.request.request_id, %error, "decision failed");
             }
         });
@@ -184,20 +188,16 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
 async fn decide(
     identity: &Identity,
     nats: &async_nats::Client,
-    prompt: &Mutex<()>,
+    decider: &Decider,
     opened: &OpenedRequest,
-    auto: Option<Auto>,
 ) -> Result<()> {
     let request = &opened.request;
-    let remaining = u64::try_from(request.expires_at - now()).unwrap_or(0);
-    if remaining == 0 {
+    if request.expires_at <= now() {
         bail!("request already expired");
     }
-    let approve = match auto {
-        Some(Auto::Approve) => true,
-        Some(Auto::Deny) => false,
-        None => {
-            let _serialized = prompt.lock().await;
+    let approve = match decider {
+        Decider::Auto(answer) => *answer,
+        Decider::Prompt(prompter) => {
             let summary = format!(
                 "sudo on {}: {} wants to run {} {}\n  cwd: {}\n  callers: {}\n",
                 escape_for_terminal(&request.host),
@@ -207,9 +207,14 @@ async fn decide(
                 escape_for_terminal(&request.cwd),
                 escape_for_terminal(&request.pid_chain.join(" <- ")),
             );
-            tokio::time::timeout(Duration::from_secs(remaining), ask(summary))
-                .await
-                .unwrap_or(Ok(false))?
+            // No answer means no signed verdict: the hook fails closed when
+            // the deadline passes, and a Deny nobody typed would be a lie
+            // about a request nobody read.
+            let Some(answer) = prompter.ask(&summary, request.expires_at).await? else {
+                info!(request_id=%request.request_id, host=%request.host, "request expired unanswered");
+                return Ok(());
+            };
+            answer
         }
     };
     let decision = if approve {
@@ -254,18 +259,68 @@ fn escape_for_terminal(value: &str) -> String {
     escaped
 }
 
-/// Terminal prompt. Any answer other than `y` denies.
-async fn ask(summary: String) -> Result<bool> {
-    tokio::task::spawn_blocking(move || {
-        let mut stdout = io::stdout().lock();
-        write!(stdout, "{summary}Approve? [y/N] ")?;
-        stdout.flush()?;
-        let mut answer = String::new();
-        io::stdin().lock().read_line(&mut answer)?;
-        Ok(answer.trim().eq_ignore_ascii_case("y"))
-    })
-    .await
-    .context("prompt task")?
+/// Where a verdict comes from: `--auto` for tests, otherwise the terminal.
+enum Decider {
+    Auto(bool),
+    Prompt(Prompter),
+}
+
+/// The terminal prompt, serialized across concurrent requests.
+///
+/// Stdin is read by one long-lived task feeding a channel. A reader started
+/// per prompt would outlive a timed-out prompt and swallow the answer meant
+/// for the next one.
+struct Prompter {
+    lines: Mutex<mpsc::Receiver<String>>,
+}
+
+impl Prompter {
+    fn from_stdin() -> Self {
+        let (sender, receiver) = mpsc::channel(8);
+        std::thread::spawn(move || {
+            for line in io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if sender.blocking_send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self::new(receiver)
+    }
+
+    fn new(lines: mpsc::Receiver<String>) -> Self {
+        Self {
+            lines: Mutex::new(lines),
+        }
+    }
+
+    /// Asks the terminal about one request. Any answer other than `y` denies.
+    ///
+    /// Returns `None` when `expires_at` passes first, either while queued
+    /// behind another prompt or while waiting for an answer: the request is
+    /// dead by then and the caller must not sign anything for it. Lines typed
+    /// before the prompt appeared are discarded, so a stale answer never
+    /// decides a later request.
+    async fn ask(&self, summary: &str, expires_at: i64) -> Result<Option<bool>> {
+        let mut lines = self.lines.lock().await;
+        let Ok(remaining) = u64::try_from(expires_at - now()) else {
+            return Ok(None);
+        };
+        if remaining == 0 {
+            return Ok(None);
+        }
+        while lines.try_recv().is_ok() {}
+        print!("{summary}Approve? [y/N] ");
+        io::stdout().flush()?;
+        match tokio::time::timeout(Duration::from_secs(remaining), lines.recv()).await {
+            Ok(Some(answer)) => Ok(Some(answer.trim().eq_ignore_ascii_case("y"))),
+            Ok(None) => bail!("stdin closed"),
+            Err(_) => {
+                println!("\nrequest expired before it was answered");
+                Ok(None)
+            }
+        }
+    }
 }
 
 async fn connect_nats() -> Result<async_nats::Client> {
@@ -283,7 +338,8 @@ fn now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_for_terminal;
+    use super::{Prompter, escape_for_terminal, now};
+    use tokio::sync::mpsc;
 
     #[test]
     fn escapes_terminal_control_sequences() {
@@ -304,5 +360,48 @@ mod tests {
             escape_for_terminal("お仕置き /usr/bin/id"),
             "お仕置き /usr/bin/id"
         );
+    }
+
+    /// An answer typed before the prompt appeared belongs to whatever the
+    /// operator was looking at then, not to this request.
+    #[tokio::test]
+    async fn discards_answers_typed_before_the_prompt() {
+        let (sender, receiver) = mpsc::channel(8);
+        let prompter = Prompter::new(receiver);
+        sender.send("y".into()).await.unwrap();
+        let typed = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sender.send("n".into()).await.unwrap();
+            sender
+        });
+        assert_eq!(
+            prompter.ask("summary\n", now() + 30).await.unwrap(),
+            Some(false)
+        );
+        drop(typed.await.unwrap());
+    }
+
+    /// A request whose deadline passed while it queued behind another prompt
+    /// is never shown and never answered, so nothing gets signed for it.
+    #[tokio::test]
+    async fn skips_an_expired_request_without_reading_stdin() {
+        let (sender, receiver) = mpsc::channel(8);
+        let prompter = Prompter::new(receiver);
+        sender.send("y".into()).await.unwrap();
+        assert_eq!(prompter.ask("summary\n", now() - 1).await.unwrap(), None);
+        // The queued line is still there: no answer was consumed.
+        assert_eq!(
+            prompter.lines.lock().await.try_recv().unwrap(),
+            "y".to_owned()
+        );
+    }
+
+    /// Waiting out the deadline is silence, not a denial.
+    #[tokio::test]
+    async fn unanswered_prompt_yields_no_verdict() {
+        let (sender, receiver) = mpsc::channel(8);
+        let prompter = Prompter::new(receiver);
+        assert_eq!(prompter.ask("summary\n", now() + 1).await.unwrap(), None);
+        drop(sender);
     }
 }
