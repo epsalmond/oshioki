@@ -285,28 +285,45 @@ pub enum EnrollmentSubmissionV1 {
 /// native devices existed: a submission with no `kind` is a `WebAuthn` one,
 /// so a cached page still gets the 202 or 409 it expects rather than a raw
 /// deserialization failure.
+///
+/// The `kind` field decides which variant is parsed and nothing falls back to
+/// the other: a submission tagged `secure-enclave` that carries `WebAuthn`
+/// fields is an error, not a `WebAuthn` enrollment. Parsing the chosen variant
+/// on its own also keeps serde's own message ("missing field
+/// `proof_signature`"), which an untagged enum would replace with "data did
+/// not match any variant".
 impl<'de> Deserialize<'de> for EnrollmentSubmissionV1 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(tag = "kind")]
-        enum Tagged {
-            #[serde(rename = "webauthn")]
-            Webauthn(WebauthnEnrollmentSubmissionV1),
-            #[serde(rename = "secure-enclave")]
-            SecureEnclave(NativeEnrollmentSubmissionV1),
-        }
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Wire {
-            Tagged(Tagged),
-            UntaggedWebauthn(WebauthnEnrollmentSubmissionV1),
-        }
-        Ok(match Wire::deserialize(deserializer)? {
-            Wire::Tagged(Tagged::Webauthn(submission)) | Wire::UntaggedWebauthn(submission) => {
-                Self::Webauthn(submission)
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let kind = match value.get("kind") {
+            None | Some(serde_json::Value::Null) => DeviceKindV1::Webauthn,
+            Some(serde_json::Value::String(tag)) if tag == DeviceKindV1::Webauthn.as_str() => {
+                DeviceKindV1::Webauthn
             }
-            Wire::Tagged(Tagged::SecureEnclave(submission)) => Self::SecureEnclave(submission),
-        })
+            Some(serde_json::Value::String(tag)) if tag == DeviceKindV1::SecureEnclave.as_str() => {
+                DeviceKindV1::SecureEnclave
+            }
+            Some(tag) => {
+                // The tag is whatever the peer sent, and this message ends up
+                // in a log or on an operator's terminal.
+                let rendered: String = crate::escape_for_terminal(&tag.to_string())
+                    .chars()
+                    .take(64)
+                    .collect();
+                return Err(D::Error::custom(format!(
+                    "unknown enrollment submission kind {rendered}"
+                )));
+            }
+        };
+        match kind {
+            DeviceKindV1::Webauthn => serde_json::from_value(value)
+                .map(Self::Webauthn)
+                .map_err(D::Error::custom),
+            DeviceKindV1::SecureEnclave => serde_json::from_value(value)
+                .map(Self::SecureEnclave)
+                .map_err(D::Error::custom),
+        }
     }
 }
 
@@ -714,6 +731,64 @@ mod tests {
         let native = r#"{"kind":"secure-enclave","version":1,"enrollment_id":"e1","credential_public_key":"AA","box_public_key":"AQ","api_token_hash":"Ag","label":"mac","proof_signature":"Aw","transcript_hmac":"BA"}"#;
         let native: EnrollmentSubmissionV1 = serde_json::from_str(native).unwrap();
         assert_eq!(native.kind(), DeviceKindV1::SecureEnclave);
+    }
+
+    /// A malformed submission must say which field is wrong. An untagged
+    /// enum answers "data did not match any variant" instead, which names
+    /// nothing an operator can act on.
+    #[test]
+    fn malformed_native_submission_names_the_missing_field() {
+        let native = r#"{"kind":"secure-enclave","version":1,"enrollment_id":"e1","credential_public_key":"AA","box_public_key":"AQ","api_token_hash":"Ag","label":"mac","transcript_hmac":"BA"}"#;
+        let error = serde_json::from_str::<EnrollmentSubmissionV1>(native).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `proof_signature`"),
+            "{error}"
+        );
+    }
+
+    /// The tag decides the variant. A submission that claims to be native
+    /// but carries `WebAuthn` fields is rejected rather than parsed as the
+    /// other kind.
+    #[test]
+    fn kind_is_authoritative_over_the_fields() {
+        let mislabelled = r#"{"kind":"secure-enclave","version":1,"enrollment_id":"e1","registration_client_data_json":"AA","attestation_object":"AQ","proof_authenticator_data":"Ag","proof_client_data_json":"Aw","proof_signature":"BA","credential_id":"BQ","box_public_key":"Bg","api_token_hash":"Bw","label":"laptop","transcript_hmac":"CA"}"#;
+        let error = serde_json::from_str::<EnrollmentSubmissionV1>(mislabelled).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `credential_public_key`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unknown_kind_is_rejected() {
+        let unknown = r#"{"kind":"totp","version":1,"enrollment_id":"e1"}"#;
+        let error = serde_json::from_str::<EnrollmentSubmissionV1>(unknown).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(r#"unknown enrollment submission kind "totp""#),
+            "{error}"
+        );
+        // A tag that is not a string is unknown too.
+        let not_a_string =
+            serde_json::from_str::<EnrollmentSubmissionV1>(r#"{"kind":7,"version":1}"#)
+                .unwrap_err();
+        assert!(
+            not_a_string
+                .to_string()
+                .contains("unknown enrollment submission kind 7"),
+            "{not_a_string}"
+        );
+        // An escape sequence in the tag does not reach the terminal raw.
+        let escaped = serde_json::from_str::<EnrollmentSubmissionV1>(
+            "{\"kind\":\"a\\u001b[2Kb\",\"version\":1}",
+        )
+        .unwrap_err();
+        assert!(escaped.to_string().contains(r"a\\u001b[2Kb"), "{escaped}");
     }
 
     #[test]
