@@ -22,8 +22,8 @@ use uuid::Uuid;
 use oshioki_protocol::{
     ActivationV1, DecisionV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
     EnrollmentIntentV1, EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1, RequestV1,
-    VERSION_V1, verify_approval_v1, verify_enrollment_v1, verify_native_approval_v1,
-    verify_native_enrollment_v1,
+    VERSION_V1, escape_for_terminal, verify_approval_v1, verify_enrollment_v1,
+    verify_native_approval_v1, verify_native_enrollment_v1,
 };
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
@@ -355,7 +355,11 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     write_registry(&registry)?;
     activate_device(&nats, &state.enrollment_id, &device).await?;
     remove_enrollment_state(&state_path);
-    println!("Device enrolled: {} ({})", device.fingerprint, device.label);
+    println!(
+        "Device enrolled: {} ({})",
+        device.fingerprint,
+        escape_for_terminal(&device.label)
+    );
     Ok(())
 }
 
@@ -450,7 +454,9 @@ async fn cmd_pin(expected: &str) -> Result<()> {
     }
     println!(
         "Fingerprint: {}\nLabel: {}\nCredential: {}",
-        device.fingerprint, device.label, device.credential_id
+        device.fingerprint,
+        escape_for_terminal(&device.label),
+        device.credential_id
     );
     print!("Type the full fingerprint to confirm: ");
     io::stdout().flush()?;
@@ -476,7 +482,10 @@ fn cmd_status() -> Result<()> {
     for device in registry.devices {
         println!(
             "  {}  {}  kind={}  active={}",
-            device.fingerprint, device.label, device.kind, device.active
+            device.fingerprint,
+            escape_for_terminal(&device.label),
+            device.kind,
+            device.active
         );
     }
     Ok(())

@@ -6,7 +6,6 @@
 //! backend and a native prompt on top of the same library.
 
 use std::{
-    fmt::Write as _,
     io::{self, BufRead as _, Write as _},
     path::PathBuf,
     sync::Arc,
@@ -17,7 +16,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, parse_enrollment_url};
-use oshioki_protocol::{ActivationV1, DecisionV1, RequestEnvelopeV1};
+use oshioki_protocol::{ActivationV1, DecisionV1, RequestEnvelopeV1, escape_for_terminal};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
@@ -138,7 +137,8 @@ async fn cmd_pair(identity_path: &std::path::Path, url: &str, label: &str) -> Re
     activation.device.validate().context("activated record")?;
     println!(
         "Paired: {} ({})",
-        activation.device.fingerprint, activation.device.label
+        activation.device.fingerprint,
+        escape_for_terminal(&activation.device.label)
     );
     Ok(())
 }
@@ -161,7 +161,7 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
         let envelope: RequestEnvelopeV1 = match serde_json::from_slice(&message.payload) {
             Ok(envelope) => envelope,
             Err(error) => {
-                warn!(%error, "ignoring malformed request");
+                warn!(error = %escape_for_terminal(&error.to_string()), "ignoring malformed request");
                 continue;
             }
         };
@@ -169,7 +169,11 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
             Ok(Some(opened)) => opened,
             Ok(None) => continue,
             Err(error) => {
-                warn!(request_id=%envelope.request_id, %error, "ignoring request");
+                warn!(
+                    request_id = %escape_for_terminal(&envelope.request_id),
+                    error = %escape_for_terminal(&error.to_string()),
+                    "ignoring request"
+                );
                 continue;
             }
         };
@@ -178,7 +182,11 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
         let decider = Arc::clone(&decider);
         tokio::spawn(async move {
             if let Err(error) = decide(&identity, &nats, &decider, &opened).await {
-                warn!(request_id=%opened.request.request_id, %error, "decision failed");
+                warn!(
+                    request_id = %escape_for_terminal(&opened.request.request_id),
+                    error = %escape_for_terminal(&error.to_string()),
+                    "decision failed"
+                );
             }
         });
     }
@@ -211,7 +219,11 @@ async fn decide(
             // the deadline passes, and a Deny nobody typed would be a lie
             // about a request nobody read.
             let Some(answer) = prompter.ask(&summary, request.expires_at).await? else {
-                info!(request_id=%request.request_id, host=%request.host, "request expired unanswered");
+                info!(
+                    request_id = %escape_for_terminal(&request.request_id),
+                    host = %escape_for_terminal(&request.host),
+                    "request expired unanswered"
+                );
                 return Ok(());
             };
             answer
@@ -234,29 +246,13 @@ async fn decide(
         DecisionV1::Approve(_) => unreachable!("agent never builds WebAuthn approvals"),
         DecisionV1::Deny(_) => "denied",
     };
-    info!(request_id=%request.request_id, host=%request.host, verb, "decision published");
+    info!(
+        request_id = %escape_for_terminal(&request.request_id),
+        host = %escape_for_terminal(&request.host),
+        verb,
+        "decision published"
+    );
     Ok(())
-}
-
-/// Renders untrusted request text for a terminal.
-///
-/// Every field in the prompt comes from the requesting host: the command
-/// line, the working directory, and process names read out of `/proc`. A
-/// control character in any of them can repaint the screen and hide what is
-/// really being approved, so escape the C0 and C1 ranges (ESC, CR, DEL and
-/// friends) and the backslash that introduces them.
-fn escape_for_terminal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        if character == '\\' {
-            escaped.push_str("\\\\");
-        } else if character.is_control() {
-            let _ = write!(escaped, "\\u{{{:04x}}}", character as u32);
-        } else {
-            escaped.push(character);
-        }
-    }
-    escaped
 }
 
 /// Where a verdict comes from: `--auto` for tests, otherwise the terminal.
@@ -342,29 +338,8 @@ fn now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Prompter, escape_for_terminal, now};
+    use super::{Prompter, now};
     use tokio::sync::mpsc;
-
-    #[test]
-    fn escapes_terminal_control_sequences() {
-        // A command that clears the line and prints a harmless one instead.
-        assert_eq!(
-            escape_for_terminal("/bin/rm -rf /\x1b[2K\rls"),
-            "/bin/rm -rf /\\u{001b}[2K\\u{000d}ls"
-        );
-        // C1 controls have a one-byte escape in some terminals too.
-        assert_eq!(
-            escape_for_terminal("a\u{9b}b\u{7f}"),
-            "a\\u{009b}b\\u{007f}"
-        );
-        // Backslashes are escaped so the rendering is unambiguous.
-        assert_eq!(escape_for_terminal(r"C:\x1b"), r"C:\\x1b");
-        // Ordinary text, including non-ASCII, passes through.
-        assert_eq!(
-            escape_for_terminal("お仕置き /usr/bin/id"),
-            "お仕置き /usr/bin/id"
-        );
-    }
 
     /// An answer typed before the prompt appeared belongs to whatever the
     /// operator was looking at then, not to this request.

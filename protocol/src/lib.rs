@@ -10,6 +10,7 @@
 pub mod enrollment_v1;
 pub mod error;
 pub mod native_v1;
+pub mod terminal;
 pub mod v1;
 pub mod webauthn_v1;
 
@@ -19,6 +20,7 @@ pub use native_v1::{
     native_credential_id, native_enrollment_proof, sec1_p256_verifying_key,
     verify_native_approval_v1, verify_native_enrollment_v1,
 };
+pub use terminal::escape_for_terminal;
 pub use v1::{
     ActivationV1, ApproveNativeV1, ApproveV1, DecisionV1, DenyV1, DeviceKindV1,
     DevicePublicRecordV1, DeviceRegistryV1, EnrollmentIntentV1, EnrollmentStatusV1,
