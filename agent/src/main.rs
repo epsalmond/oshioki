@@ -6,8 +6,10 @@
 //! backend and a native prompt on top of the same library.
 
 use std::{
-    io::{self, BufRead as _, Write as _},
+    future::Future,
+    io::{self, BufRead, Write as _},
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -17,7 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, parse_enrollment_url};
 use oshioki_protocol::{ActivationV1, DecisionV1, RequestEnvelopeV1, escape_for_terminal};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 
 const PAIR_TIMEOUT: Duration = Duration::from_secs(300);
@@ -152,12 +154,32 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
         .context("subscribe requests")?;
     nats.flush().await?;
     info!(fingerprint=%identity.fingerprint(), "watching for requests");
-    let decider = Arc::new(match auto {
-        Some(Auto::Approve) => Decider::Auto(true),
-        Some(Auto::Deny) => Decider::Auto(false),
-        None => Decider::Prompt(Prompter::from_stdin()),
-    });
-    while let Some(message) = requests.next().await {
+    let (decider, stdin_closed) = match auto {
+        Some(Auto::Approve) => (Decider::Auto(true), None),
+        Some(Auto::Deny) => (Decider::Auto(false), None),
+        None => {
+            let (prompter, closed) = Prompter::from_stdin();
+            (Decider::Prompt(prompter), Some(closed))
+        }
+    };
+    let decider = Arc::new(decider);
+    // A prompt with no stdin behind it answers nothing, and the hook waits
+    // out its full deadline on every request. Say so and stop instead.
+    let mut stdin_closed: Pin<Box<dyn Future<Output = ()> + Send>> = match stdin_closed {
+        Some(closed) => Box::pin(async move {
+            let _ = closed.await;
+        }),
+        None => Box::pin(std::future::pending()),
+    };
+    loop {
+        let message = tokio::select! {
+            () = &mut stdin_closed => bail!(
+                "stdin is closed, so no approval prompt can be answered and every request \
+                 would wait out its deadline; run the agent on a terminal, or with --auto \
+                 for unattended tests"
+            ),
+            message = requests.next() => message.context("request stream closed")?,
+        };
         let envelope: RequestEnvelopeV1 = match serde_json::from_slice(&message.payload) {
             Ok(envelope) => envelope,
             Err(error) => {
@@ -190,7 +212,6 @@ async fn cmd_run(identity_path: &std::path::Path, auto: Option<Auto>) -> Result<
             }
         });
     }
-    bail!("request stream closed")
 }
 
 async fn decide(
@@ -271,17 +292,25 @@ struct Prompter {
 }
 
 impl Prompter {
-    fn from_stdin() -> Self {
+    /// Reads lines from stdin. The returned receiver fires when the reader
+    /// reaches end of file, which with a closed stdin happens at startup.
+    fn from_stdin() -> (Self, oneshot::Receiver<()>) {
+        Self::from_reader(io::BufReader::new(io::stdin()))
+    }
+
+    fn from_reader(reader: impl BufRead + Send + 'static) -> (Self, oneshot::Receiver<()>) {
         let (sender, receiver) = mpsc::channel(8);
+        let (closed_sender, closed_receiver) = oneshot::channel();
         std::thread::spawn(move || {
-            for line in io::stdin().lock().lines() {
+            for line in reader.lines() {
                 let Ok(line) = line else { break };
                 if sender.blocking_send(line).is_err() {
-                    break;
+                    return;
                 }
             }
+            let _ = closed_sender.send(());
         });
-        Self::new(receiver)
+        (Self::new(receiver), closed_receiver)
     }
 
     fn new(lines: mpsc::Receiver<String>) -> Self {
@@ -373,6 +402,14 @@ mod tests {
             prompter.lines.lock().await.try_recv().unwrap(),
             "y".to_owned()
         );
+    }
+
+    /// A closed stdin is reported at once, not one hung request at a time.
+    #[tokio::test]
+    async fn reports_a_reader_that_cannot_answer() {
+        let (prompter, closed) = Prompter::from_reader(std::io::empty());
+        closed.await.unwrap();
+        assert!(prompter.ask("summary\n", now() + 30).await.is_err());
     }
 
     /// Waiting out the deadline is silence, not a denial.
