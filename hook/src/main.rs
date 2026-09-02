@@ -439,11 +439,12 @@ async fn server_device_matches(url: &str, device: &DevicePublicRecordV1) -> Resu
     let served: DevicePublicRecordV1 =
         serde_json::from_slice(&body).context("decode device record")?;
     served.validate()?;
-    Ok(served.fingerprint == device.fingerprint
-        && served.kind == device.kind
-        && served.credential_id == device.credential_id
-        && served.credential_public_key == device.credential_public_key
-        && served.active)
+    // Every field, not the identifying ones alone: the server stores the
+    // activation record verbatim and never advances the signature counter, so
+    // a served record that differs anywhere -- a rewritten label, another
+    // device's API token hash -- is not the record that was just enrolled.
+    // `active` is part of that: this record has to be servable right now.
+    Ok(served == *device && served.active)
 }
 
 async fn cmd_revoke(fingerprint: &str) -> Result<()> {
