@@ -9,9 +9,22 @@ case "$HOST_UID" in
   ''|*[!0-9]*) echo "invalid host UID: $HOST_UID" >&2; exit 2 ;;
 esac
 
+BACKGROUND_PIDS=()
+
+# Kills every process this script started in the background.
+stop_background() {
+  local pid
+  for pid in ${BACKGROUND_PIDS+"${BACKGROUND_PIDS[@]}"}; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  BACKGROUND_PIDS=()
+}
+
 restore_state_ownership() {
   local exit_status=$?
   trap - EXIT
+  stop_background
   if ! chown -R "$HOST_UID:$HOST_UID" "$STATE_ROOT"; then
     echo "failed to restore E2E state ownership to UID $HOST_UID" >&2
     exit_status=1
@@ -41,6 +54,132 @@ export OSHIOKI_HTTPS_PORT=443
 
 cd /work/server/web
 npm run test:e2e
+
+# --- native agent phase -------------------------------------------------
+AGENT_STATE="$STATE_ROOT/agent"
+AGENT_LOG=/tmp/oshioki-agent.log
+ENROLL_LOG=/tmp/oshioki-enroll.log
+HOOK_BIN=/work/target/release/oshioki
+AGENT_BIN=/work/target/release/oshioki-agent
+rm -rf "$AGENT_STATE"
+install -d -m 0700 "$AGENT_STATE"
+export OSHIOKI_CONFIG_DIR="$HOOK_CONFIG_DIR"
+
+# Polls a log for a line matching an extended regex, up to 30 seconds.
+wait_for_line() {
+  local file="$1" pattern="$2" attempt=0
+  while [ "$attempt" -lt 300 ]; do
+    if grep -Eq -- "$pattern" "$file" 2>/dev/null; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  echo "timed out waiting for /$pattern/ in $file" >&2
+  cat "$file" >&2 || true
+  return 1
+}
+
+agent_pid=
+
+start_agent() {
+  : >"$AGENT_LOG"
+  RUST_LOG=info "$AGENT_BIN" run --state "$AGENT_STATE" --auto "$1" >"$AGENT_LOG" 2>&1 &
+  agent_pid=$!
+  BACKGROUND_PIDS+=("$agent_pid")
+  wait_for_line "$AGENT_LOG" 'watching for requests'
+}
+
+stop_agent() {
+  [ -n "$agent_pid" ] || return 0
+  kill "$agent_pid" 2>/dev/null || true
+  wait "$agent_pid" 2>/dev/null || true
+  BACKGROUND_PIDS=()
+  agent_pid=
+}
+
+: >"$ENROLL_LOG"
+"$HOOK_BIN" enroll >"$ENROLL_LOG" 2>&1 &
+enroll_pid=$!
+BACKGROUND_PIDS+=("$enroll_pid")
+wait_for_line "$ENROLL_LOG" 'https://sudo\.test(:[0-9]+)?/enroll/'
+enrollment_url="$(grep -Eom1 'https://sudo\.test(:[0-9]+)?/enroll/[0-9a-f-]+#[A-Za-z0-9_-]+' "$ENROLL_LOG")"
+
+"$AGENT_BIN" pair "$enrollment_url" --label native-e2e --state "$AGENT_STATE"
+wait_for_line "$ENROLL_LOG" '^Device enrolled: '
+if ! wait "$enroll_pid"; then
+  echo "oshioki enroll failed" >&2
+  cat "$ENROLL_LOG" >&2
+  exit 1
+fi
+BACKGROUND_PIDS=()
+cat "$ENROLL_LOG"
+
+fingerprint="$("$AGENT_BIN" show --state "$AGENT_STATE")"
+
+start_agent approve
+if ! "$HOOK_BIN" test; then
+  echo "native agent failed to approve a request" >&2
+  cat "$AGENT_LOG" >&2
+  exit 1
+fi
+stop_agent
+
+start_agent deny
+deny_status=0
+timeout 5 "$HOOK_BIN" test || deny_status=$?
+stop_agent
+if [ "$deny_status" -eq 0 ]; then
+  echo "native deny was treated as an approval" >&2
+  exit 1
+fi
+if [ "$deny_status" -eq 124 ]; then
+  echo "native deny did not reach the hook within five seconds" >&2
+  cat "$AGENT_LOG" >&2
+  exit 1
+fi
+
+if ! "$HOOK_BIN" status | grep -Fq "$fingerprint  native-e2e  kind=secure-enclave  active=true"; then
+  echo "status does not show the native device as a secure-enclave record" >&2
+  "$HOOK_BIN" status >&2
+  exit 1
+fi
+printf 'native agent approved and denied a request: %s\n' "$fingerprint"
+
+# `pin` must accept a secure-enclave record served by the server. The hook
+# only talks to the server at the WebAuthn origin, so serve that origin over
+# TLS again (Playwright's in-process proxy is gone) and start from a config
+# dir without the native device.
+# A container does not resolve its own Compose network alias, so point the
+# origin name at loopback for the proxy started below.
+grep -q 'sudo\.test$' /etc/hosts || printf '127.0.0.1 sudo.test\n' >>/etc/hosts
+PROXY_LOG="$STATE_ROOT/tls-proxy.log"
+: >"$PROXY_LOG"
+node /work/scripts/e2e-tls-proxy.mjs >"$PROXY_LOG" 2>&1 &
+BACKGROUND_PIDS+=("$!")
+wait_for_line "$PROXY_LOG" 'tls proxy listening'
+PIN_CONFIG_DIR="$STATE_ROOT/pin"
+rm -rf "$PIN_CONFIG_DIR"
+mkdir -p "$PIN_CONFIG_DIR"
+chmod 0700 "$PIN_CONFIG_DIR"
+cp "$HOOK_CONFIG_DIR/config.env" "$HOOK_CONFIG_DIR/hook.json" "$PIN_CONFIG_DIR/"
+printf '{"version":1,"devices":[]}\n' >"$PIN_CONFIG_DIR/devices.json"
+chmod 0600 "$PIN_CONFIG_DIR"/*.json "$PIN_CONFIG_DIR/config.env"
+if ! printf '%s\n' "$fingerprint" \
+  | CURL_CA_BUNDLE="$OSHIOKI_TLS_CERT" OSHIOKI_CONFIG_DIR="$PIN_CONFIG_DIR" \
+    "$HOOK_BIN" pin "$fingerprint"; then
+  echo "pin rejected the secure-enclave record" >&2
+  cat "$PROXY_LOG" >&2
+  exit 1
+fi
+if ! OSHIOKI_CONFIG_DIR="$PIN_CONFIG_DIR" "$HOOK_BIN" status \
+  | grep -Fq "$fingerprint  native-e2e  kind=secure-enclave  active=true"; then
+  echo "pinned secure-enclave record missing from status" >&2
+  exit 1
+fi
+stop_background
+printf 'pin accepted the secure-enclave record: %s\n' "$fingerprint"
+unset OSHIOKI_CONFIG_DIR
 
 cd /work
 OSHIOKI_E2E_IN_CONTAINER=1 \

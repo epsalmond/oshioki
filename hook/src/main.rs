@@ -763,7 +763,8 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
         .output()
         .await?;
     if !output.status.success() {
-        bail!("device lookup failed");
+        let detail = String::from_utf8_lossy(&output.stderr);
+        bail!("device lookup failed: {}", detail.trim());
     }
     if output.stdout.len() > 256 * 1024 {
         bail!("device response too large");
