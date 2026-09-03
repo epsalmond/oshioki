@@ -79,6 +79,8 @@ invoking user.
 - `plugin/` connects sudo's approval plugin ABI to the hook.
 - `agent/` is the native approval agent (`oshioki-agent`): pairs a device
   with a host and answers sudo requests over NATS with a P-256 signature.
+- `enclave/` holds the macOS Secure Enclave signer and the Touch ID sheet.
+  Every `unsafe` call in the workspace is in this crate, and only on macOS.
 - `server/` contains the HTTP app, NATS relay, and SQLite state.
 - `server/web/` contains the locally bundled browser UI and Playwright tests.
 - `scripts/` contains the development loop, installer, and E2E runners.
@@ -102,21 +104,27 @@ oshioki-agent run
 
 `pair` creates a 0600 identity file (`agent.json`, under
 `$OSHIOKI_AGENT_STATE` or `~/.config/oshioki` by default) on first use, then
-submits the enrollment and waits for the host to activate it. `run` watches
-for sudo requests and prompts on the terminal. A release build has no way
+submits the enrollment and waits for the host to activate it. On a Mac the
+signing key is created in the Secure Enclave; everywhere else it is a P-256
+key in that file. `pair --signer software` forces the software key on a Mac
+too, which is what the tests use. `show` prints the fingerprint and which of
+the two backends this device has.
+
+`run` watches for sudo requests and prompts. A release build has no way
 to skip the prompt: `run --auto approve` and `run --auto deny`, which decide
 every request without asking, exist only when the agent is built with
 `--features unattended`, as the Compose E2E does.
-The prompt and the browser page render the same request: the host, the
+The terminal prompt and the browser page render the same request: the host, the
 invoking user with their uid, the target account the command would run as
 (`root (uid 0)` for sudo's default, otherwise the bare uid), the command, its
 arguments, the working directory, and the caller process chain. An argument
 that is empty or holds anything but plainly printable characters is shown in
 shell single quotes, so one argument holding a space never reads as two.
 A prompt nobody answers before the request expires publishes no verdict at
-all, and the hook fails closed on its own deadline. `run` needs a terminal:
-with stdin closed nothing could answer, so it stops rather than leaving every
-request to time out.
+all, and the hook fails closed on its own deadline. The terminal prompt needs
+a terminal: with stdin closed nothing could answer, so `run` stops rather than
+leaving every request to time out. A Mac with an enclave key reads no stdin
+and does not check this.
 
 `enroll` pins the device locally and then confirms the server stored it by
 reading `GET /api/v1/devices/<fingerprint>` back over HTTPS for up to fifteen
@@ -129,13 +137,49 @@ The agent needs the same `NATS_URL` as the hook, plus `NATS_USER` and
 `NATS_PASS` together where the server wants credentials; setting only one of
 the pair is an error.
 
-The current `oshioki-agent` binary uses a software P-256 key. It is the
-Linux and test build of the macOS agent (issue #9), which will add a Secure
-Enclave backend and a native prompt behind the same signing interface.
-
 SQLite is the server's local source of truth. It commits request ciphertext and
 outbox work before the JetStream message is acknowledged. The expected runtime
 is one active server with one persistent database file.
+
+## Mac approvals
+
+On a Mac the Touch ID sheet is the approval. The signing key lives in the
+Secure Enclave behind `biometryCurrentSet`, so the signature cannot exist
+without the fingerprint, and there is no second confirmation to give. The
+sheet reads "Oshioki is trying to run `<command>` as `<account>` on `<host>`.
+Touch ID to allow this." The working directory and the caller process chain
+go to the log, where there is room for them.
+
+```bash
+scripts/mac/bundle-agent
+oshioki-agent pair '<enrollment-url>' --label mbp
+scripts/mac/install-agent
+```
+
+`bundle-agent` wraps the binary in an unsigned `Oshioki.app`. The sheet takes
+its title and icon from the calling process's bundle, so without it the sheet
+shows the binary's file name and a generic badge. `install-agent` writes
+`~/Library/LaunchAgents/dev.oshioki.agent.plist` and loads it. It runs as the
+user, needs no sudo, and logs to `~/Library/Logs/oshioki-agent.log`.
+
+Pairing signs an enrollment proof, so it shows one Touch ID sheet of its own.
+
+Three timing rules sit around the sheet. Only one sheet is up at a time, so
+two requests at once cannot race for the sensor. A locked screen raises no
+sheet: the enclave reports a dismissed sheet and an absent operator
+identically, and a sheet nobody sees would turn into a denial nobody made.
+The request's deadline tears down a waiting sheet and publishes nothing, the
+same rule the terminal prompt follows. Dismissing the sheet denies at once.
+
+A key is bound to the fingerprints enrolled when it was made. Adding or
+removing a fingerprint invalidates it for good. The agent logs that and asks
+for a re-pair; it is not something a retry fixes.
+
+The X25519 key that opens sealed requests stays a software key in the same
+0600 file. The enclave holds P-256 and nothing else. The login keychain was
+the original plan, and the spike found the Data Protection keychain closed to
+bare CLIs without a provisioned entitlement, which the agent cannot carry
+until it ships as a signed app (#5).
 
 ## Compatibility
 
