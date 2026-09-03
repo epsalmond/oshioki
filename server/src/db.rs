@@ -2,7 +2,8 @@ use std::{path::Path, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use oshioki_protocol::{
-    DecisionV1, DevicePublicRecordV1, EnrollmentStatusV1, EnrollmentSubmissionV1, RequestEnvelopeV1,
+    DecisionV1, DeviceKindV1, DevicePublicRecordV1, EnrollmentStatusV1, EnrollmentSubmissionV1,
+    RequestEnvelopeV1, native_credential_id,
 };
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::Serialize;
@@ -209,32 +210,142 @@ impl Store {
         Ok(InsertResult::Inserted)
     }
 
-    pub fn activate_enrollment(&self, id: &str, device: &DevicePublicRecordV1) -> Result<()> {
+    pub fn activate_enrollment(
+        &self,
+        id: &str,
+        device: &DevicePublicRecordV1,
+        now: i64,
+    ) -> Result<()> {
         device.validate().context("validate activated device")?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, i64, Option<Vec<u8>>)> = transaction
+            .query_row(
+                "SELECT status, expires_at, submission_json FROM enrollments WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((status, expires_at, submission_json)) = row else {
+            bail!("unknown enrollment");
+        };
+        // Only a live, pending enrollment activates. A replayed activation
+        // for an already-active or expired enrollment is not a second device;
+        // it is either a duplicate delivery or someone else's enrollment id.
+        if status != "pending" {
+            bail!("enrollment is not pending");
+        }
+        if expires_at <= now {
+            bail!("enrollment expired");
+        }
+        let raw = submission_json.context("enrollment has no submission")?;
+        let submission: EnrollmentSubmissionV1 =
+            serde_json::from_slice(&raw).context("decode stored submission")?;
+        if !submission_binds_device(&submission, device)? {
+            bail!("activation does not match the stored submission");
+        }
         let api_token_hash = oshioki_protocol::decode_base64url(&device.api_token_hash)?;
         let public_json = serde_json::to_string(device)?;
+        // Insert-only: an activation must never rewrite an enrolled record. A
+        // replay naming an existing fingerprint either matches the stored row
+        // (the same device enrolling again) or fails the check below instead
+        // of replacing its API token.
         transaction.execute(
             "INSERT INTO devices(fingerprint, credential_id, api_token_hash, public_record_json, active, updated_at)
              VALUES (?1, ?2, ?3, ?4, 1, unixepoch())
-             ON CONFLICT(fingerprint) DO UPDATE SET credential_id=excluded.credential_id,
-               api_token_hash=excluded.api_token_hash, public_record_json=excluded.public_record_json,
-               active=1, updated_at=unixepoch()",
+             ON CONFLICT(fingerprint) DO NOTHING",
             params![device.fingerprint, device.credential_id, api_token_hash, public_json],
+        )?;
+        let stored: Option<(String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT credential_id, api_token_hash FROM devices WHERE fingerprint=?1",
+                [&device.fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored_credential, stored_token)) = stored else {
+            bail!("device insert failed");
+        };
+        if stored_credential != device.credential_id || stored_token != api_token_hash {
+            bail!("activation names a different record for an enrolled device");
+        }
+        // Re-enrollment after revocation reactivates; a live row is untouched.
+        transaction.execute(
+            "UPDATE devices SET active=1, updated_at=unixepoch() WHERE fingerprint=?1",
+            [&device.fingerprint],
         )?;
         let changed = transaction.execute(
             "UPDATE enrollments SET status='active', fingerprint=?2, updated_at=unixepoch()
-             WHERE id=?1 AND status IN ('pending','active')",
+             WHERE id=?1 AND status='pending'",
             params![id, device.fingerprint],
         )?;
         if changed != 1 {
-            bail!("unknown or rejected enrollment");
+            bail!("enrollment is not pending");
         }
         transaction.commit()?;
         Ok(())
     }
+}
 
+/// Whether an activation names the device its enrollment submitted. The
+/// server never sees the enrollment secret, so it cannot re-verify the
+/// submission's proof the way the hook does; what it can do is refuse an
+/// activation for any other device than the submitted one. The credential
+/// id, box key, API token hash, and label all have to match, and a native
+/// submission additionally pins the credential key itself.
+///
+/// The `WebAuthn` credential key is deliberately not covered: it lives inside
+/// the attestation object, which only the hook (with its RP ID) can parse.
+/// What remains for a forged `WebAuthn` activation is a shadow record nobody
+/// can authenticate as — the token hash is bound — and the hook's read-back
+/// rejects it before the enrollment completes.
+fn submission_binds_device(
+    submission: &EnrollmentSubmissionV1,
+    device: &DevicePublicRecordV1,
+) -> Result<bool> {
+    let expected_kind = match submission {
+        EnrollmentSubmissionV1::Webauthn(_) => DeviceKindV1::Webauthn,
+        EnrollmentSubmissionV1::SecureEnclave(_) => DeviceKindV1::SecureEnclave,
+    };
+    if device.kind != expected_kind {
+        return Ok(false);
+    }
+    let (credential_id, credential_public_key, box_public_key, api_token_hash, label) =
+        match submission {
+            EnrollmentSubmissionV1::Webauthn(submission) => (
+                submission.credential_id.clone(),
+                None,
+                submission.box_public_key.clone(),
+                submission.api_token_hash.clone(),
+                submission.label.clone(),
+            ),
+            EnrollmentSubmissionV1::SecureEnclave(submission) => {
+                let public_key =
+                    oshioki_protocol::decode_base64url(&submission.credential_public_key)
+                        .context("decode submitted credential key")?;
+                let credential_id =
+                    oshioki_protocol::encode_base64url(&native_credential_id(&public_key));
+                (
+                    credential_id,
+                    Some(submission.credential_public_key.clone()),
+                    submission.box_public_key.clone(),
+                    submission.api_token_hash.clone(),
+                    submission.label.clone(),
+                )
+            }
+        };
+    if let Some(expected) = credential_public_key {
+        if device.credential_public_key != expected {
+            return Ok(false);
+        }
+    }
+    Ok(device.credential_id == credential_id
+        && device.box_public_key == box_public_key
+        && device.api_token_hash == api_token_hash
+        && device.label == label)
+}
+
+impl Store {
     pub fn enrollment_status(&self, id: &str, now: i64) -> Result<Option<EnrollmentView>> {
         let row = self
             .lock()?
@@ -524,7 +635,8 @@ COMMIT;
 mod tests {
     use super::*;
     use oshioki_protocol::{
-        DenyV1, SealedDeviceBodyV1,
+        DenyV1, DeviceKindV1, EnrollmentSubmissionV1, NativeEnrollmentSubmissionV1,
+        SealedDeviceBodyV1, WebauthnEnrollmentSubmissionV1, native_credential_id,
         v1::{VERSION_V1, encode_base64url},
     };
     use p256::ecdsa::SigningKey;
@@ -731,5 +843,223 @@ mod tests {
         }
 
         remove_database(&path);
+    }
+
+    /// One native device with caller-chosen keys and API token: varying the
+    /// token while the keys stay put builds exactly the replay shape that
+    /// must not rewrite the stored record.
+    fn native_pair(
+        enrollment_id: &str,
+        key_byte: u8,
+        token: &[u8],
+        label: &str,
+    ) -> (EnrollmentSubmissionV1, DevicePublicRecordV1) {
+        let signing = SigningKey::from_bytes((&[key_byte; 32]).into()).unwrap();
+        let public = signing
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        assert_eq!(public.len(), 65);
+        let box_key = vec![key_byte ^ 0xa5; 32];
+        let token_hash = Sha256::digest(token).to_vec();
+        let credential_id = native_credential_id(&public);
+        let fingerprint = oshioki_protocol::device_fingerprint(&credential_id, &public, &box_key);
+        let submission = NativeEnrollmentSubmissionV1 {
+            version: VERSION_V1,
+            enrollment_id: enrollment_id.into(),
+            credential_public_key: encode_base64url(&public),
+            box_public_key: encode_base64url(&box_key),
+            api_token_hash: encode_base64url(&token_hash),
+            label: label.into(),
+            proof_signature: encode_base64url(&[8; 32]),
+            transcript_hmac: encode_base64url(&[0; 32]),
+        };
+        let device = DevicePublicRecordV1 {
+            version: VERSION_V1,
+            kind: DeviceKindV1::SecureEnclave,
+            fingerprint,
+            credential_id: encode_base64url(&credential_id),
+            credential_public_key: encode_base64url(&public),
+            box_public_key: encode_base64url(&box_key),
+            label: label.into(),
+            api_token_hash: encode_base64url(&token_hash),
+            sign_count: 0,
+            active: true,
+        };
+        device.validate().unwrap();
+        (EnrollmentSubmissionV1::SecureEnclave(submission), device)
+    }
+
+    fn pending_enrollment(store: &Store, id: &str, expires_at: i64) {
+        let secret_hash = Sha256::digest(b"enrollment-secret").to_vec();
+        assert_eq!(
+            store
+                .create_enrollment(
+                    id,
+                    &secret_hash,
+                    expires_at,
+                    &format!("oshioki.enrollment.submission.{id}")
+                )
+                .unwrap(),
+            InsertResult::Inserted
+        );
+    }
+
+    fn submit(store: &Store, id: &str, submission: &EnrollmentSubmissionV1, now: i64) {
+        assert_eq!(
+            store.submit_enrollment(id, submission, now).unwrap(),
+            InsertResult::Inserted
+        );
+    }
+
+    /// The bound device activates: the row is inserted and the enrollment
+    /// flips to active pointing at it.
+    #[test]
+    fn activation_inserts_the_submitted_device() {
+        let store = Store::memory().unwrap();
+        let (submission, device) = native_pair("enroll-1", 9, b"token-one", "laptop");
+        pending_enrollment(&store, "enroll-1", 300);
+        submit(&store, "enroll-1", &submission, 100);
+        store.activate_enrollment("enroll-1", &device, 100).unwrap();
+        assert_eq!(
+            store.active_device(&device.fingerprint).unwrap(),
+            Some(device.clone())
+        );
+        let view = store.enrollment_status("enroll-1", 100).unwrap().unwrap();
+        assert_eq!(view.status, EnrollmentStatusV1::Active);
+        assert_eq!(
+            view.fingerprint.as_deref(),
+            Some(device.fingerprint.as_str())
+        );
+    }
+
+    /// A replay after success is rejected and leaves the device row exactly
+    /// as the first activation wrote it.
+    #[test]
+    fn activation_replay_changes_nothing() {
+        let store = Store::memory().unwrap();
+        let (submission, device) = native_pair("enroll-1", 9, b"token-one", "laptop");
+        pending_enrollment(&store, "enroll-1", 300);
+        submit(&store, "enroll-1", &submission, 100);
+        store.activate_enrollment("enroll-1", &device, 100).unwrap();
+        let stored_before = store.active_device(&device.fingerprint).unwrap();
+        let error = store
+            .activate_enrollment("enroll-1", &device, 100)
+            .unwrap_err();
+        assert!(error.to_string().contains("not pending"), "{error:?}");
+        assert_eq!(
+            store.active_device(&device.fingerprint).unwrap(),
+            stored_before
+        );
+        let view = store.enrollment_status("enroll-1", 100).unwrap().unwrap();
+        assert_eq!(view.status, EnrollmentStatusV1::Active);
+    }
+
+    /// An enrollment that expired before the activation arrived stays dead,
+    /// and no device row is created for it.
+    #[test]
+    fn activation_rejects_an_expired_enrollment() {
+        let store = Store::memory().unwrap();
+        let (submission, device) = native_pair("enroll-1", 9, b"token-one", "laptop");
+        pending_enrollment(&store, "enroll-1", 150);
+        submit(&store, "enroll-1", &submission, 100);
+        let error = store
+            .activate_enrollment("enroll-1", &device, 150)
+            .unwrap_err();
+        assert!(error.to_string().contains("expired"), "{error:?}");
+        assert!(store.active_device(&device.fingerprint).unwrap().is_none());
+    }
+
+    /// Same keys, different API token: a second enrollment's activation must
+    /// not replace the enrolled record's token, which would let the replay's
+    /// author authenticate as the device.
+    #[test]
+    fn activation_rejects_a_token_replacement() {
+        let store = Store::memory().unwrap();
+        let (submission_one, device_one) = native_pair("enroll-1", 9, b"token-one", "laptop");
+        pending_enrollment(&store, "enroll-1", 300);
+        submit(&store, "enroll-1", &submission_one, 100);
+        store
+            .activate_enrollment("enroll-1", &device_one, 100)
+            .unwrap();
+        let (submission_two, device_two) = native_pair("enroll-2", 9, b"token-two", "laptop");
+        pending_enrollment(&store, "enroll-2", 300);
+        submit(&store, "enroll-2", &submission_two, 100);
+        let error = store
+            .activate_enrollment("enroll-2", &device_two, 100)
+            .unwrap_err();
+        assert!(error.to_string().contains("different record"), "{error:?}");
+        assert_eq!(
+            store.active_device(&device_one.fingerprint).unwrap(),
+            Some(device_one.clone())
+        );
+        let view = store.enrollment_status("enroll-2", 100).unwrap().unwrap();
+        assert_eq!(view.status, EnrollmentStatusV1::Pending);
+    }
+
+    /// An activation for another device than the submitted one is refused,
+    /// even while its enrollment is pending and unexpired.
+    #[test]
+    fn activation_rejects_an_unbound_device() {
+        let store = Store::memory().unwrap();
+        let (submission, _) = native_pair("enroll-1", 9, b"token-one", "laptop");
+        let (_, stranger) = native_pair("enroll-1", 11, b"token-two", "other");
+        pending_enrollment(&store, "enroll-1", 300);
+        submit(&store, "enroll-1", &submission, 100);
+        let error = store
+            .activate_enrollment("enroll-1", &stranger, 100)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error:?}");
+        assert!(
+            store
+                .active_device(&stranger.fingerprint)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Without a stored submission there is nothing to bind the activation
+    /// to, so there is nothing to activate.
+    #[test]
+    fn activation_needs_a_stored_submission() {
+        let store = Store::memory().unwrap();
+        let (_, device) = native_pair("enroll-1", 9, b"token-one", "laptop");
+        pending_enrollment(&store, "enroll-1", 300);
+        let error = store
+            .activate_enrollment("enroll-1", &device, 100)
+            .unwrap_err();
+        assert!(error.to_string().contains("no submission"), "{error:?}");
+        assert!(store.active_device(&device.fingerprint).unwrap().is_none());
+    }
+
+    /// The submission kind and the device kind travel together: a `WebAuthn`
+    /// submission never binds a Secure Enclave record, even when every
+    /// compared field agrees.
+    #[test]
+    fn activation_rejects_a_kind_mismatch() {
+        let store = Store::memory().unwrap();
+        let (_, device) = native_pair("enroll-1", 9, b"token-one", "laptop");
+        let submission = EnrollmentSubmissionV1::Webauthn(WebauthnEnrollmentSubmissionV1 {
+            version: VERSION_V1,
+            enrollment_id: "enroll-1".into(),
+            registration_client_data_json: encode_base64url(b"{}"),
+            attestation_object: encode_base64url(&[0]),
+            proof_authenticator_data: encode_base64url(&[0]),
+            proof_client_data_json: encode_base64url(b"{}"),
+            proof_signature: encode_base64url(&[0; 32]),
+            credential_id: device.credential_id.clone(),
+            box_public_key: device.box_public_key.clone(),
+            api_token_hash: device.api_token_hash.clone(),
+            label: device.label.clone(),
+            transcript_hmac: encode_base64url(&[0; 32]),
+        });
+        pending_enrollment(&store, "enroll-1", 300);
+        submit(&store, "enroll-1", &submission, 100);
+        let error = store
+            .activate_enrollment("enroll-1", &device, 100)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error:?}");
+        assert!(store.active_device(&device.fingerprint).unwrap().is_none());
     }
 }

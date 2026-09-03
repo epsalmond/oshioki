@@ -239,6 +239,10 @@ async fn request_consumer(state: AppState) -> Result<()> {
 
 async fn enrollment_consumer(state: AppState) -> Result<()> {
     let mut intents = state.nats.subscribe("oshioki.enrollment.intent").await?;
+    let mut submissions = state
+        .nats
+        .subscribe("oshioki.enrollment.submission.>")
+        .await?;
     let mut activations = state
         .nats
         .subscribe("oshioki.enrollment.activation.>")
@@ -261,13 +265,31 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
                 }
                 Err(error) => warn!(%error, "invalid enrollment intent"),
             },
+            Some(message) = submissions.next() => match serde_json::from_slice::<EnrollmentSubmissionV1>(&message.payload) {
+                // Native devices publish here; the hook reads the same
+                // subject, and the stored submission is what a later
+                // activation is bound to. Storage verifies nothing: the
+                // hook's cryptographic check is what admits a device, and
+                // first-wins keeps a later forgery from displacing it.
+                Ok(submission) => {
+                    match state.store.submit_enrollment(submission.enrollment_id(), &submission, now()) {
+                        Err(error) => warn!(%error, "invalid enrollment submission"),
+                        Ok(InsertResult::Conflict) => warn!(enrollment_id=%submission.enrollment_id(), "conflicting enrollment submission"),
+                        Ok(_) => {}
+                    }
+                }
+                Err(error) => warn!(%error, "invalid enrollment submission"),
+            },
             Some(message) = activations.next() => match serde_json::from_slice::<ActivationV1>(&message.payload) {
                 Ok(activation) if activation.version == 1 && !activation.enrollment_id.is_empty() => {
                     // No acknowledgement goes back on NATS: the hook confirms
                     // the enrollment by reading the device back over HTTPS,
                     // which is the only answer that says what this server
-                    // actually stored.
-                    if let Err(error) = state.store.activate_enrollment(&activation.enrollment_id, &activation.device) {
+                    // actually stored. The hook restates the activation while
+                    // the read-back says the record is missing, so an
+                    // activation that arrives before its submission is stored
+                    // heals on the next pass instead of failing the enroll.
+                    if let Err(error) = state.store.activate_enrollment(&activation.enrollment_id, &activation.device, now()) {
                         warn!(%error, "invalid enrollment activation");
                     }
                 },

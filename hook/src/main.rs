@@ -495,11 +495,10 @@ async fn activate_device(
         enrollment_id: enrollment_id.to_owned(),
         device: device.clone(),
     };
-    nats.publish(
-        format!("oshioki.enrollment.activation.{enrollment_id}"),
-        serde_json::to_vec(&activation)?.into(),
-    )
-    .await?;
+    let subject = format!("oshioki.enrollment.activation.{enrollment_id}");
+    let payload = serde_json::to_vec(&activation)?;
+    nats.publish(subject.clone(), payload.clone().into())
+        .await?;
     nats.flush().await?;
     let url = format!(
         "{}/api/v1/devices/{}",
@@ -510,8 +509,20 @@ async fn activate_device(
     loop {
         match server_device_matches(&url, device).await {
             Ok(true) => return Ok(()),
+            // A different record is settled state, not a missing message:
+            // restating the activation cannot change what is stored.
             Ok(false) => last_error = "the server serves a different record".into(),
-            Err(error) => last_error = format!("{error:#}"),
+            Err(error) => {
+                last_error = format!("{error:#}");
+                // The server only activates against the stored submission,
+                // which travels over NATS on its own subject; this restatement
+                // may overtake it, and the first publish may have been lost.
+                // Restating is safe — a stored activation is idempotent — so
+                // a slow submission heals here instead of failing the enroll.
+                nats.publish(subject.clone(), payload.clone().into())
+                    .await?;
+                nats.flush().await?;
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             break;
