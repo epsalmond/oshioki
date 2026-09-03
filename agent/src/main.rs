@@ -741,18 +741,47 @@ fn approval_reason(request: &oshioki_protocol::RequestV1) -> String {
 /// The bound environment as approver-visible lines, empty when the request
 /// carries none. Terminal prompts show these; the Touch ID sheet only has
 /// room for a count (see [`approval_reason`]).
+///
+/// Both dimensions are bounded: values are attacker-controlled and can be
+/// kilobytes each, and lines print after the command block just before the
+/// prompt, so an unbounded environment would scroll the command off the
+/// approver's screen. Truncation is display-only; the signature still binds
+/// the whole values.
 fn format_env(request: &oshioki_protocol::RequestV1) -> String {
     use std::fmt::Write as _;
-    request.env.iter().fold(String::new(), |mut shown, entry| {
+    let mut shown = String::new();
+    for entry in request.env.iter().take(MAX_ENV_LINES_SHOWN) {
+        // Truncate before escaping, as in approval_reason: escaping turns
+        // one byte into several characters, and a cut through the middle of
+        // one would put half an escape on the screen.
         let _ = writeln!(
             shown,
             "  env {}={}",
-            escape_for_terminal(&entry.name),
-            escape_for_terminal(&entry.value)
+            escape_for_terminal(&truncate(&entry.name, MAX_ENV_NAME_CHARS)),
+            escape_for_terminal(&truncate(&entry.value, MAX_ENV_VALUE_CHARS))
         );
-        shown
-    })
+    }
+    if request.env.len() > MAX_ENV_LINES_SHOWN {
+        let _ = writeln!(
+            shown,
+            "  ... ({} more)",
+            request.env.len() - MAX_ENV_LINES_SHOWN
+        );
+    }
+    shown
 }
+
+/// How much of one environment name the terminal prompt shows. Allowlisted
+/// names are short; this only caps a hostile one.
+const MAX_ENV_NAME_CHARS: usize = 64;
+
+/// How much of one environment value the terminal prompt shows. Enough to
+/// recognize a PATH, not enough to fill a screen.
+const MAX_ENV_VALUE_CHARS: usize = 128;
+
+/// How many bound variables the terminal prompt lists before summarizing
+/// the rest.
+const MAX_ENV_LINES_SHOWN: usize = 10;
 
 /// How much of the command line the sheet gets. Past this it is not a sentence
 /// anybody reads before touching the sensor.
@@ -955,8 +984,8 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::{
-        Pairing, Prompter, approval_reason, bind_socket, format_env, load_or_create, now,
-        quote_argv, runas_label, socket_path, truncate,
+        MAX_ENV_LINES_SHOWN, Pairing, Prompter, approval_reason, bind_socket, format_env,
+        load_or_create, now, quote_argv, runas_label, socket_path, truncate,
     };
     use oshioki_agent::SignerKind;
     use oshioki_protocol::{EnvEntryV1, RequestV1, VERSION_V1, encode_base64url};
@@ -1073,6 +1102,26 @@ mod tests {
         assert!(shown.contains("  env PATH=/tmp/bin:/usr/bin\n"), "{shown}");
         let reason = approval_reason(&request);
         assert!(reason.ends_with(" (+2 env)"), "{reason}");
+    }
+
+    /// A hostile environment cannot scroll the command off the screen: long
+    /// values are cut and the list is capped with a count of what is hidden.
+    #[test]
+    fn a_hostile_environment_stays_bounded() {
+        let mut request = request_for_reason();
+        request.env = (0..64)
+            .map(|n| EnvEntryV1 {
+                name: format!("PATH{n}"),
+                value: "x".repeat(1024),
+            })
+            .collect();
+        let shown = format_env(&request);
+        assert_eq!(shown.lines().count(), MAX_ENV_LINES_SHOWN + 1, "{shown}");
+        assert!(shown.ends_with("  ... (54 more)\n"), "{shown}");
+        assert!(shown.contains("..."), "{shown}");
+        assert!(!shown.contains(&"x".repeat(129)), "{shown}");
+        // The count still announces the binding on the one-line sheet.
+        assert!(approval_reason(&request).ends_with(" (+64 env)"));
     }
 
     /// Same command, different environments: the signatures differ, because
