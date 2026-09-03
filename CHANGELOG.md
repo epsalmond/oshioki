@@ -39,6 +39,10 @@ protocol and local E2E stabilize.
   inside one shared approval deadline, and the agent starts without NATS to
   answer socket requests only. Verdicts stay signature-verified on both
   transports; only Secure Enclave approvals travel the socket.
+- One-line laptop setup: `oshioki-laptop-setup` (shipped in the macOS
+  artifact) writes `install.env`, applies the prelaunch install, enrolls and
+  pairs the agent, installs autostart, and proves it with a real `sudo true`.
+  Idempotent for post-upgrade re-runs.
 
 ### Changed
 

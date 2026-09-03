@@ -17,6 +17,22 @@ cd target/release
 sha256sum oshioki liboshioki_plugin.so > SHA256SUMS
 ```
 
+## One-line laptop setup
+
+```bash
+brew install epsalmond/oshioki/oshioki && oshioki-laptop-setup
+```
+
+The setup script walks through five steps and is idempotent, so re-running
+it after a `brew upgrade` applies the new bottle and restarts the agent:
+writes `/etc/oshioki/install.env` (prompting for values on first run,
+`--reconfigure` to redo), dry-runs then applies the prelaunch install,
+enrolls and pairs the agent when there is no identity, installs a
+LaunchAgent (Darwin) or user systemd unit (Linux) for `oshioki-agent run`,
+and finishes with a real `sudo true` as proof. Non-interactive with `--yes`
+plus values in the environment. The manual steps below remain for
+non-brew layouts.
+
 ## Prelaunch installer
 
 Keep a second root shell open during supervised acceptance. Create a root-owned

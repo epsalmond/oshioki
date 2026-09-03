@@ -66,7 +66,7 @@ jobs:
       - run: scripts/build-darwin-artifact dist
       - run: |
           tar -czf "oshioki-macos-arm64-${{ needs.gate.outputs.version }}.tar.gz" -C dist \
-            oshioki oshioki.dylib oshioki-agent install-oshioki-hook manifest.json SHA256SUMS
+            oshioki oshioki.dylib oshioki-agent install-oshioki-hook oshioki-laptop-setup manifest.json SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: mac
