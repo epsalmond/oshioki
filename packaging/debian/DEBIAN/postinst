@@ -1,0 +1,37 @@
+#!/bin/sh
+# oshioki postinst: create the service user and state, wire the hook when the
+# operator has provided /etc/oshioki/install.env, enable the server unit.
+set -e
+
+installer_hook() {
+  HOOK_BIN=/usr/share/oshioki/oshioki \
+  PLUGIN_BIN=/usr/share/oshioki/liboshioki_plugin.so \
+  OSHIOKI_CHECKSUMS=/usr/share/oshioki/SHA256SUMS \
+    /usr/share/oshioki/install-oshioki-hook "$@"
+}
+
+case "$1" in
+  configure)
+    if ! getent passwd oshioki >/dev/null; then
+      adduser --system --no-create-home --group \
+        --home /var/lib/oshioki --gecos "Oshioki approval server" oshioki
+    fi
+    install -d -m 0750 -o oshioki -g oshioki /var/lib/oshioki
+    install -d -m 0750 -o root -g root /etc/oshioki
+
+    if [ -f /etc/oshioki/install.env ]; then
+      installer_hook --prelaunch --config-file /etc/oshioki/install.env
+    else
+      echo "oshioki: hook not enabled (no /etc/oshioki/install.env)." >&2
+      echo "oshioki: create it, then run: /usr/share/oshioki/install-oshioki-hook --prelaunch --config-file /etc/oshioki/install.env" >&2
+    fi
+
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload
+      systemctl enable oshioki-server.service
+    fi
+    ;;
+esac
+
+
+exit 0

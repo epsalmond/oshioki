@@ -1,0 +1,12 @@
+#!/bin/sh
+# oshioki postrm: drop server state on purge. The oshioki system user stays.
+set -e
+
+case "$1" in
+  purge)
+    rm -rf /var/lib/oshioki
+    ;;
+esac
+
+
+exit 0

@@ -1,0 +1,14 @@
+#!/bin/sh
+# oshioki prerm: remove the sudo managed block this package enabled, if any.
+set -e
+
+case "$1" in
+  remove|purge)
+    if /usr/share/oshioki/install-oshioki-hook --prelaunch-status >/dev/null 2>&1; then
+      /usr/share/oshioki/install-oshioki-hook --disable-prelaunch || true
+    fi
+    ;;
+esac
+
+
+exit 0

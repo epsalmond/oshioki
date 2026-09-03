@@ -1,0 +1,12 @@
+Package: oshioki
+Version: @VERSION@
+Architecture: amd64
+Maintainer: Oshioki contributors
+Section: admin
+Priority: optional
+Depends: adduser, file
+Description: Touch ID or WebAuthn approval for sudo requests
+ Oshioki asks an enrolled device to approve one exact sudo request.
+ The hook encrypts the request for each enrolled device; the server
+ stores routing data and ciphertext. Devices approve from a browser
+ via WebAuthn or from the native agent via Secure Enclave.

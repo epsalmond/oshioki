@@ -33,7 +33,7 @@ const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Parser)]
-#[command(name = "oshioki", about = "sudo approval hook")]
+#[command(name = "oshioki", about = "sudo approval hook", version)]
 struct Cli {
     #[command(subcommand)]
     verb: Verb,

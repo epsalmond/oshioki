@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Assemble the oshioki .deb from release binaries.
+#
+#   packaging/build-deb STAGE_DIR VERSION OUTPUT_DEB
+#
+# STAGE_DIR holds the release artifacts built for the target architecture:
+# oshioki, liboshioki_plugin.so, oshioki-server, and a SHA256SUMS whose
+# entries are named exactly oshioki and liboshioki_plugin.so (what
+# scripts/install-oshioki-hook verifies). VERSION is the Debian version,
+# e.g. 0.1.0 for tag v0.1.0.
+set -euo pipefail
+
+[ "$#" -eq 3 ] || { echo "usage: packaging/build-deb STAGE_DIR VERSION OUTPUT_DEB" >&2; exit 2; }
+STAGE_DIR="$(cd "$1" && pwd -P)"
+VERSION="$2"
+OUTPUT_DEB="$3"
+case "$OUTPUT_DEB" in /*) ;; *) OUTPUT_DEB="$(pwd -P)/$OUTPUT_DEB" ;; esac
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+for artifact in oshioki liboshioki_plugin.so oshioki-server SHA256SUMS; do
+  [ -f "$STAGE_DIR/$artifact" ] || { echo "build-deb: missing $STAGE_DIR/$artifact" >&2; exit 1; }
+done
+for name in oshioki liboshioki_plugin.so; do
+  awk -v name="$name" '$2 == name {found=1} END {exit !found}' "$STAGE_DIR/SHA256SUMS" \
+    || { echo "build-deb: SHA256SUMS has no entry for $name" >&2; exit 1; }
+done
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+TREE="$WORK/oshioki_$VERSION"
+ARCH="${DEB_ARCH:-amd64}"
+
+cp -r "$ROOT/packaging/debian" "$TREE"
+sed -i "s/@VERSION@/$VERSION/g; s/^Architecture: .*/Architecture: $ARCH/" "$TREE/DEBIAN/control"
+
+install -d "$TREE/usr/share/oshioki" "$TREE/usr/local/sbin"
+install -m 0755 "$STAGE_DIR/oshioki" "$STAGE_DIR/oshioki-server" "$TREE/usr/share/oshioki/"
+install -m 0755 -o root -g root "$STAGE_DIR/oshioki-server" "$TREE/usr/local/sbin/oshioki-server"
+install -m 0644 "$STAGE_DIR/liboshioki_plugin.so" "$STAGE_DIR/SHA256SUMS" "$TREE/usr/share/oshioki/"
+install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$TREE/usr/share/oshioki/install-oshioki-hook"
+
+chmod 0755 "$TREE/DEBIAN/postinst" "$TREE/DEBIAN/prerm" "$TREE/DEBIAN/postrm"
+
+dpkg-deb --build --root-owner-group "$TREE" "$OUTPUT_DEB"
+echo "built $OUTPUT_DEB"
