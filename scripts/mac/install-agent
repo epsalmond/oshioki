@@ -132,7 +132,8 @@ render_plist() {
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-$environment  </dict>
+$environment
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Interactive</string>
