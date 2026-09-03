@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Wraps oshioki-agent in a minimal unsigned Oshioki.app.
+#
+# The Touch ID sheet takes its title and icon from the calling process's app
+# bundle. A bare binary gets its file name and the generic executable badge; the
+# bundle makes the sheet read "Oshioki is trying to run ... on ...". No
+# signing is involved: the name and the icon do not need it.
+#
+# Rebuilds the bundle from scratch on every run.
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+usage: scripts/mac/bundle-agent [--binary PATH] [--output DIR]
+
+  --binary PATH   agent binary to wrap (default: target/release/oshioki-agent,
+                  built with `cargo build --release -p oshioki-agent` if absent)
+  --output DIR    where Oshioki.app is written (default: target/mac)
+
+Prints the path of the binary inside the bundle, which is what the LaunchAgent
+should run.
+USAGE
+}
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+BINARY=""
+OUTPUT="$ROOT/target/mac"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
+    --output) OUTPUT="${2:?--output needs a path}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[ "$(uname -s)" = "Darwin" ] || { echo "bundle-agent only runs on macOS" >&2; exit 1; }
+
+if [ -z "$BINARY" ]; then
+  BINARY="$ROOT/target/release/oshioki-agent"
+  if [ ! -x "$BINARY" ]; then
+    ( cd "$ROOT" && cargo build --release -p oshioki-agent )
+  fi
+fi
+[ -x "$BINARY" ] || { echo "no agent binary at $BINARY" >&2; exit 1; }
+
+APP="$OUTPUT/Oshioki.app"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+install -m 0755 "$BINARY" "$APP/Contents/MacOS/oshioki-agent"
+
+cat > "$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>dev.oshioki.agent</string>
+  <key>CFBundleName</key><string>Oshioki</string>
+  <key>CFBundleDisplayName</key><string>Oshioki</string>
+  <key>CFBundleExecutable</key><string>oshioki-agent</string>
+  <key>CFBundleIconFile</key><string>Oshioki</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+PLIST
+
+# The icon is what the sheet shows next to the name. Losing it costs the logo
+# and nothing else, so a machine with no renderer still gets a working bundle.
+icon_source="$ROOT/assets/oshioki.svg"
+png="$(mktemp -d)/oshioki.png"
+rendered=false
+if command -v rsvg-convert >/dev/null 2>&1; then
+  rsvg-convert -w 1024 -h 1024 "$icon_source" -o "$png" && rendered=true
+elif command -v qlmanage >/dev/null 2>&1; then
+  # qlmanage writes <name>.png into the output directory it is given.
+  if qlmanage -t -s 1024 -o "$(dirname "$png")" "$icon_source" >/dev/null 2>&1 \
+    && [ -f "$(dirname "$png")/oshioki.svg.png" ]; then
+    mv "$(dirname "$png")/oshioki.svg.png" "$png"
+    rendered=true
+  fi
+fi
+
+if [ "$rendered" = true ]; then
+  iconset="$(dirname "$png")/Oshioki.iconset"
+  mkdir -p "$iconset"
+  for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    sips -z $((size * 2)) $((size * 2)) "$png" \
+      --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$iconset" -o "$APP/Contents/Resources/Oshioki.icns"
+else
+  echo "note: no SVG renderer found, so the sheet shows the name without the logo" >&2
+fi
+rm -rf "$(dirname "$png")"
+
+# Touch the bundle so Launch Services notices a rebuilt app at the same path.
+touch "$APP"
+echo "$APP/Contents/MacOS/oshioki-agent"

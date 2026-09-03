@@ -34,5 +34,10 @@ sha2 = { workspace = true }
 futures = { workspace = true }
 time = { workspace = true }
 
+# The Secure Enclave backend and the Touch ID sheet. Linux builds, including
+# the Compose E2E and the container image, never see it.
+[target.'cfg(target_os = "macos")'.dependencies]
+oshioki-enclave = { path = "../enclave" }
+
 [lints]
 workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "oshioki-enclave"
+edition = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+description = "Secure Enclave signing backend for the macOS approval agent"
+
+[dependencies]
+anyhow = { workspace = true }
+
+# Every Security.framework and LocalAuthentication call in the workspace lives
+# in this crate, and only on macOS. Other targets build an empty library.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext"] }
+
+[lints]
+workspace = true

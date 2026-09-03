@@ -6,6 +6,7 @@ members = [
     "server",
     "plugin",
     "agent",
+    "enclave",
 ]
 
 # All version numbers and shared features live here. Member crates reference

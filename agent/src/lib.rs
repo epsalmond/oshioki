@@ -8,7 +8,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::{fs, io::Write as _, os::unix::fs::OpenOptionsExt as _, path::Path};
+pub mod touchid;
+
+use std::{fmt, fs, io::Write as _, os::unix::fs::OpenOptionsExt as _, path::Path, time::Duration};
 
 use anyhow::{Context as _, Result, bail};
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
@@ -24,12 +26,29 @@ use oshioki_protocol::{
     native_enrollment_proof, native_v1::native_transcript_hmac, unseal_v1,
 };
 
+/// What the enrollment proof signature approves, for a backend that asks.
+const ENROLL_REASON: &str = "enroll this device with a host";
+
 /// Signs approval challenges and enrollment proofs. DER ECDSA P-256 with
 /// SHA-256 as the message hash.
 pub trait Signer {
     /// The 65-byte SEC1 uncompressed public point.
     fn public_key_sec1(&self) -> Vec<u8>;
-    fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>>;
+
+    /// Signs `message`. `reason` says what the signature approves, in the
+    /// second person: a backend that asks the operator shows it, and one that
+    /// does not ignores it.
+    fn sign_der(&self, message: &[u8], reason: &str) -> Result<Vec<u8>>;
+
+    /// Starts a prompt attempt and returns its number. A backend that shows
+    /// nothing has nothing to number.
+    fn begin_prompt(&self) -> u64 {
+        0
+    }
+
+    /// Dismisses that attempt's prompt, and only that attempt's. A number
+    /// from an attempt that is already over does nothing.
+    fn cancel_prompt(&self, _attempt: u64) {}
 }
 
 /// A P-256 key held in process memory.
@@ -43,30 +62,95 @@ impl Signer for SoftwareSigner {
             .as_bytes()
             .to_vec()
     }
-    fn sign_der(&self, message: &[u8]) -> Result<Vec<u8>> {
+    fn sign_der(&self, message: &[u8], _reason: &str) -> Result<Vec<u8>> {
         let signature: Signature = self.0.sign(message);
         Ok(signature.to_der().as_bytes().to_vec())
     }
 }
 
-/// On-disk form of the software identity. Mode 0600.
+/// A P-256 key in this Mac's Secure Enclave, used only after Touch ID.
+#[cfg(target_os = "macos")]
+struct EnclaveBackend(oshioki_enclave::EnclaveSigner);
+
+#[cfg(target_os = "macos")]
+impl Signer for EnclaveBackend {
+    fn public_key_sec1(&self) -> Vec<u8> {
+        self.0.public_key_sec1().to_vec()
+    }
+    fn sign_der(&self, message: &[u8], reason: &str) -> Result<Vec<u8>> {
+        // The variant survives into the caller's anyhow chain, which is how
+        // the prompt tells a dismissed sheet from an unusable key.
+        self.0.sign_der(message, reason).map_err(anyhow::Error::new)
+    }
+    fn begin_prompt(&self) -> u64 {
+        self.0.canceller().begin()
+    }
+    fn cancel_prompt(&self, attempt: u64) {
+        self.0.canceller().cancel(attempt);
+    }
+}
+
+/// Which backend holds the signing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignerKind {
+    /// A P-256 key in the identity file, readable by anything that reads the
+    /// file. The only kind outside macOS.
+    Software,
+    /// A P-256 key in the Mac's Secure Enclave, behind Touch ID.
+    Enclave,
+}
+
+impl fmt::Display for SignerKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Software => "software",
+            Self::Enclave => "enclave",
+        })
+    }
+}
+
+/// The signing key as the identity file stores it.
+///
+/// The software key is the secret scalar. The enclave key is the
+/// enclave-encrypted blob, which is useless anywhere but the Mac that made it.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum SigningFileV1 {
+    Software { key: String },
+    Enclave { blob: String },
+}
+
+impl SigningFileV1 {
+    fn kind(&self) -> SignerKind {
+        match self {
+            Self::Software { .. } => SignerKind::Software,
+            Self::Enclave { .. } => SignerKind::Enclave,
+        }
+    }
+}
+
+/// On-disk form of the identity. Mode 0600.
 #[derive(Serialize, Deserialize)]
 struct IdentityFileV1 {
     version: u8,
-    signing_key: String,
+    signing: SigningFileV1,
     box_secret: String,
     api_token_hash: String,
 }
 
 /// The agent's device identity: signer, box key, and API token hash.
+///
+/// The box key is always a software key in the same file: the enclave holds
+/// P-256 and nothing else, so X25519 has nowhere else to live.
 pub struct Identity {
     signer: Box<dyn Signer + Send + Sync>,
+    signing: SigningFileV1,
     box_secret: StaticSecret,
     api_token_hash: [u8; 32],
 }
 
 impl Identity {
-    /// Builds an identity from fixed material, for tests and vectors.
+    /// Builds a software identity from fixed material, for tests and vectors.
     pub fn from_material(
         signing: [u8; 32],
         box_secret: [u8; 32],
@@ -76,6 +160,9 @@ impl Identity {
             signer: Box::new(SoftwareSigner(
                 SigningKey::from_slice(&signing).context("invalid signing scalar")?,
             )),
+            signing: SigningFileV1::Software {
+                key: encode_base64url(&signing),
+            },
             box_secret: StaticSecret::from(box_secret),
             api_token_hash,
         })
@@ -89,18 +176,22 @@ impl Identity {
         if file.version != VERSION_V1 {
             bail!("unsupported identity file version");
         }
-        Self::from_material(
-            exact_32(&file.signing_key)?,
-            exact_32(&file.box_secret)?,
-            exact_32(&file.api_token_hash)?,
-        )
+        Ok(Self {
+            signer: signer_from_file(&file.signing)?,
+            signing: file.signing,
+            box_secret: StaticSecret::from(exact_32(&file.box_secret)?),
+            api_token_hash: exact_32(&file.api_token_hash)?,
+        })
     }
 
     /// Writes the identity with mode 0600. Fails if the file exists.
-    pub fn save_new(&self, path: &Path, signing: &SigningKey) -> Result<()> {
+    pub fn save_new(&self, path: &Path) -> Result<()> {
         let file = IdentityFileV1 {
             version: VERSION_V1,
-            signing_key: encode_base64url(&signing.to_bytes()),
+            signing: match &self.signing {
+                SigningFileV1::Software { key } => SigningFileV1::Software { key: key.clone() },
+                SigningFileV1::Enclave { blob } => SigningFileV1::Enclave { blob: blob.clone() },
+            },
             box_secret: encode_base64url(self.box_secret.as_bytes()),
             api_token_hash: encode_base64url(&self.api_token_hash),
         };
@@ -118,19 +209,38 @@ impl Identity {
         Ok(())
     }
 
-    /// Generates and persists a software identity in one step.
-    pub fn generate_to(path: &Path) -> Result<Self> {
+    /// Generates a key of the requested kind and persists it in one step.
+    ///
+    /// Creating an enclave key shows no Touch ID sheet: the access control is
+    /// checked when the key signs, not when it is made.
+    pub fn generate_to(path: &Path, kind: SignerKind) -> Result<Self> {
         let mut rng = rand::thread_rng();
-        let signing = SigningKey::random(&mut rng);
         let mut token = [0_u8; 32];
         rng.fill_bytes(&mut token);
+        let (signer, signing) = new_signer(kind, &mut rng)?;
         let identity = Self {
-            signer: Box::new(SoftwareSigner(signing.clone())),
+            signer,
+            signing,
             box_secret: StaticSecret::random_from_rng(rng),
             api_token_hash: Sha256::digest(token).into(),
         };
-        identity.save_new(path, &signing)?;
+        identity.save_new(path)?;
         Ok(identity)
+    }
+
+    /// Which backend holds the signing key.
+    pub fn signer_kind(&self) -> SignerKind {
+        self.signing.kind()
+    }
+
+    /// Starts a prompt attempt on the signing backend and returns its number.
+    pub fn begin_prompt(&self) -> u64 {
+        self.signer.begin_prompt()
+    }
+
+    /// Dismisses that attempt's prompt. See [`Signer::cancel_prompt`].
+    pub fn cancel_prompt(&self, attempt: u64) {
+        self.signer.cancel_prompt(attempt);
     }
 
     pub fn public_key_sec1(&self) -> Vec<u8> {
@@ -184,7 +294,7 @@ impl Identity {
             box_public_key: encode_base64url(&box_public),
             api_token_hash: encode_base64url(&self.api_token_hash),
             label: label.to_owned(),
-            proof_signature: encode_base64url(&self.signer.sign_der(&proof)?),
+            proof_signature: encode_base64url(&self.signer.sign_der(&proof, ENROLL_REASON)?),
             transcript_hmac: String::new(),
         };
         submission.transcript_hmac =
@@ -220,8 +330,14 @@ impl Identity {
     }
 
     /// Signs an approval over the retained raw bytes of an opened request.
-    pub fn approve(&self, opened: &OpenedRequest) -> Result<DecisionV1> {
-        let signature = self.signer.sign_der(&approve_challenge(&opened.raw))?;
+    ///
+    /// `reason` is what a backend that asks the operator puts on screen. With
+    /// the enclave backend this call blocks for the whole Touch ID interaction,
+    /// so callers keep it off the async runtime.
+    pub fn approve(&self, opened: &OpenedRequest, reason: &str) -> Result<DecisionV1> {
+        let signature = self
+            .signer
+            .sign_der(&approve_challenge(&opened.raw), reason)?;
         Ok(DecisionV1::ApproveNative(ApproveNativeV1 {
             version: VERSION_V1,
             request_id: opened.request.request_id.clone(),
@@ -240,6 +356,7 @@ impl Identity {
 }
 
 /// A request this device may decide on, with the exact bytes to sign.
+#[derive(Clone)]
 pub struct OpenedRequest {
     pub request: RequestV1,
     pub raw: Vec<u8>,
@@ -259,6 +376,78 @@ pub fn parse_enrollment_url(url: &str) -> Result<(String, [u8; 32])> {
         bail!("enrollment URL has an empty id");
     }
     Ok((enrollment_id.to_owned(), exact_32(fragment)?))
+}
+
+/// Rebuilds the signing backend the identity file names.
+fn signer_from_file(signing: &SigningFileV1) -> Result<Box<dyn Signer + Send + Sync>> {
+    match signing {
+        SigningFileV1::Software { key } => Ok(Box::new(SoftwareSigner(
+            SigningKey::from_slice(&exact_32(key)?).context("invalid signing scalar")?,
+        ))),
+        SigningFileV1::Enclave { blob } => {
+            enclave_signer(decode_base64url(blob).context("enclave key blob")?)
+        }
+    }
+}
+
+/// Creates a signing key of the requested kind, and its persistable form.
+fn new_signer(
+    kind: SignerKind,
+    rng: &mut (impl rand::CryptoRng + rand::RngCore),
+) -> Result<(Box<dyn Signer + Send + Sync>, SigningFileV1)> {
+    match kind {
+        SignerKind::Software => {
+            let signing = SigningKey::random(rng);
+            let file = SigningFileV1::Software {
+                key: encode_base64url(&signing.to_bytes()),
+            };
+            Ok((Box::new(SoftwareSigner(signing)), file))
+        }
+        SignerKind::Enclave => new_enclave_signer(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn new_enclave_signer() -> Result<(Box<dyn Signer + Send + Sync>, SigningFileV1)> {
+    let signer = oshioki_enclave::EnclaveSigner::create().context("create a Secure Enclave key")?;
+    let file = SigningFileV1::Enclave {
+        blob: encode_base64url(signer.blob()),
+    };
+    Ok((Box::new(EnclaveBackend(signer)), file))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn new_enclave_signer() -> Result<(Box<dyn Signer + Send + Sync>, SigningFileV1)> {
+    bail!("a Secure Enclave key needs macOS; pair with --signer software instead")
+}
+
+#[cfg(target_os = "macos")]
+fn enclave_signer(blob: Vec<u8>) -> Result<Box<dyn Signer + Send + Sync>> {
+    Ok(Box::new(EnclaveBackend(
+        oshioki_enclave::EnclaveSigner::from_blob(blob)
+            .context("reattach this Mac's Secure Enclave key")?,
+    )))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn enclave_signer(_blob: Vec<u8>) -> Result<Box<dyn Signer + Send + Sync>> {
+    bail!("this identity holds a Secure Enclave key, which only the Mac that made it can use")
+}
+
+/// How long is left before `expires_at`, to sub-second precision, or `None`
+/// once that instant has passed.
+///
+/// Whole-second arithmetic rounds the wait up: a request expiring in 200ms
+/// reads as one second left, and a prompt would keep accepting an answer long
+/// after the hook stopped listening for one.
+pub fn remaining_until(expires_at: i64) -> Option<Duration> {
+    let deadline = time::OffsetDateTime::from_unix_timestamp(expires_at).ok()?;
+    let remaining = deadline - time::OffsetDateTime::now_utc();
+    if remaining.is_positive() {
+        Duration::try_from(remaining).ok()
+    } else {
+        None
+    }
 }
 
 fn exact_32(value: &str) -> Result<[u8; 32]> {
@@ -349,7 +538,8 @@ mod tests {
         let opened = identity.open_request(&envelope).unwrap().unwrap();
         assert_eq!(opened.raw, raw);
         assert_eq!(opened.request, request);
-        let DecisionV1::ApproveNative(approval) = identity.approve(&opened).unwrap() else {
+        let DecisionV1::ApproveNative(approval) = identity.approve(&opened, "run true").unwrap()
+        else {
             panic!("expected native approval");
         };
         verify_native_approval_v1(&approval, &raw, &device).unwrap();
@@ -392,14 +582,60 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oshioki-agent-{}", std::process::id()));
         let path = dir.join("agent.json");
         let _ = fs::remove_dir_all(&dir);
-        let generated = Identity::generate_to(&path).unwrap();
+        let generated = Identity::generate_to(&path, SignerKind::Software).unwrap();
         let loaded = Identity::load(&path).unwrap();
         assert_eq!(generated.fingerprint(), loaded.fingerprint());
-        assert!(Identity::generate_to(&path).is_err());
+        assert_eq!(loaded.signer_kind(), SignerKind::Software);
+        assert!(Identity::generate_to(&path, SignerKind::Software).is_err());
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The signing key is a tagged field, so the file says which backend holds
+    /// it. A file that only carried bytes could not describe an enclave key.
+    #[test]
+    fn the_identity_file_names_its_signing_backend() {
+        let dir = std::env::temp_dir().join(format!("oshioki-tagged-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = fs::remove_dir_all(&dir);
+        Identity::generate_to(&path, SignerKind::Software).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["signing"]["kind"], "software");
+        assert!(stored["signing"]["key"].is_string());
+        assert!(stored.get("signing_key").is_none());
+
+        // An enclave record loads only on the Mac that made the blob. Anywhere
+        // else the agent has to say so rather than start with no signer.
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": VERSION_V1,
+                "signing": {"kind": "enclave", "blob": encode_base64url(&[9_u8; 32])},
+                "box_secret": stored["box_secret"],
+                "api_token_hash": stored["api_token_hash"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(Identity::load(&path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A Secure Enclave key cannot be conjured on a machine without one.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_enclave_key_is_refused_off_macos() {
+        let dir = std::env::temp_dir().join(format!("oshioki-noenclave-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = fs::remove_dir_all(&dir);
+        let Err(error) = Identity::generate_to(&path, SignerKind::Enclave) else {
+            panic!("this machine has no Secure Enclave");
+        };
+        assert!(error.to_string().contains("macOS"));
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
