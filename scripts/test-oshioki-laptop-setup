@@ -203,4 +203,24 @@ else
   [ "$(file_mode "$agent_env")" = 600 ] || fail "agent.env is not 0600"
 fi
 
+# Self-policing teardown: the EXIT trap removes the tree, but rm succeeds
+# even with live holders (open files unlink), so leaked processes would go
+# unnoticed behind a green run. Prove every holder died instead.
+if [ -f "$TEST_ROOT/holder-pids" ]; then
+  stop_holders
+  tries=0
+  live=1
+  while [ "$tries" -lt 50 ] && [ "$live" -eq 1 ]; do
+    live=0
+    while read -r pid; do
+      if kill -0 "$pid" 2>/dev/null && [ -n "$(ps -p "$pid" -o comm= 2>/dev/null | grep -i ython || true)" ]; then
+        live=1
+      fi
+    done < "$TEST_ROOT/holder-pids"
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  [ "$live" -eq 0 ] || fail "socket holders survived cleanup"
+fi
+
 echo "test-oshioki-laptop-setup: PASS"
