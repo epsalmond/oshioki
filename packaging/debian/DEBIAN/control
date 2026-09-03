@@ -4,7 +4,7 @@ Architecture: amd64
 Maintainer: Oshioki contributors
 Section: admin
 Priority: optional
-Depends: adduser, file
+Depends: adduser, file, sudo
 Description: Touch ID or WebAuthn approval for sudo requests
  Oshioki asks an enrolled device to approve one exact sudo request.
  The hook encrypts the request for each enrolled device; the server

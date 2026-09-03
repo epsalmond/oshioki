@@ -9,8 +9,9 @@ Type=simple
 User=oshioki
 Group=oshioki
 EnvironmentFile=/etc/oshioki/server.env
-ExecStart=/usr/local/sbin/oshioki-server
+ExecStart=/usr/sbin/oshioki-server
 StateDirectory=oshioki
+StateDirectoryMode=0750
 Restart=on-failure
 
 [Install]

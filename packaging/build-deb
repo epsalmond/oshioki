@@ -7,7 +7,8 @@
 # oshioki, liboshioki_plugin.so, oshioki-server, and a SHA256SUMS whose
 # entries are named exactly oshioki and liboshioki_plugin.so (what
 # scripts/install-oshioki-hook verifies). VERSION is the Debian version,
-# e.g. 0.1.0 for tag v0.1.0.
+# e.g. 0.1.0 for tag v0.1.0. DEB_ARCH overrides the target architecture
+# (default amd64) for local validation; the staged binaries must match it.
 set -euo pipefail
 
 [ "$#" -eq 3 ] || { echo "usage: packaging/build-deb STAGE_DIR VERSION OUTPUT_DEB" >&2; exit 2; }
@@ -16,6 +17,7 @@ VERSION="$2"
 OUTPUT_DEB="$3"
 case "$OUTPUT_DEB" in /*) ;; *) OUTPUT_DEB="$(pwd -P)/$OUTPUT_DEB" ;; esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ARCH="${DEB_ARCH:-amd64}"
 
 for artifact in oshioki liboshioki_plugin.so oshioki-server SHA256SUMS; do
   [ -f "$STAGE_DIR/$artifact" ] || { echo "build-deb: missing $STAGE_DIR/$artifact" >&2; exit 1; }
@@ -25,19 +27,49 @@ for name in oshioki liboshioki_plugin.so; do
     || { echo "build-deb: SHA256SUMS has no entry for $name" >&2; exit 1; }
 done
 
+# The arch label must describe the staged binaries: an arm64 build stamped
+# amd64 would install on x86_64 and then fail to exec.
+case "$ARCH" in
+  amd64) arch_probe='x86-64' ;;
+  arm64) arch_probe='aarch64|arm64' ;;
+  *) echo "build-deb: unsupported DEB_ARCH $ARCH" >&2; exit 1 ;;
+esac
+command -v file >/dev/null || { echo "build-deb: need the file command" >&2; exit 1; }
+for artifact in oshioki liboshioki_plugin.so oshioki-server; do
+  file -b "$STAGE_DIR/$artifact" | grep -Eq "$arch_probe" \
+    || { echo "build-deb: $artifact does not match DEB_ARCH=$ARCH" >&2; exit 1; }
+done
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 TREE="$WORK/oshioki_$VERSION"
-ARCH="${DEB_ARCH:-amd64}"
 
 cp -r "$ROOT/packaging/debian" "$TREE"
 sed -i "s/@VERSION@/$VERSION/g; s/^Architecture: .*/Architecture: $ARCH/" "$TREE/DEBIAN/control"
 
-install -d "$TREE/usr/share/oshioki" "$TREE/usr/local/sbin"
-install -m 0755 "$STAGE_DIR/oshioki" "$STAGE_DIR/oshioki-server" "$TREE/usr/share/oshioki/"
-install -m 0755 -o root -g root "$STAGE_DIR/oshioki-server" "$TREE/usr/local/sbin/oshioki-server"
+install -d "$TREE/usr/share/oshioki" "$TREE/usr/sbin"
+install -m 0755 "$STAGE_DIR/oshioki" "$TREE/usr/share/oshioki/"
 install -m 0644 "$STAGE_DIR/liboshioki_plugin.so" "$STAGE_DIR/SHA256SUMS" "$TREE/usr/share/oshioki/"
+install -m 0755 "$STAGE_DIR/oshioki-server" "$TREE/usr/sbin/oshioki-server"
 install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$TREE/usr/share/oshioki/install-oshioki-hook"
+install -d -m 0750 "$TREE/etc/oshioki"
+
+# Versioned libc dependency from the actual binaries. Rust links libc, and a
+# deb that installs on an older distro than the build host must say so.
+# dpkg-shlibdeps insists on a source-format debian/control in the working
+# directory, so give it a scratch one; the binaries may live anywhere.
+command -v dpkg-shlibdeps >/dev/null || { echo "build-deb: need dpkg-shlibdeps (dpkg-dev)" >&2; exit 1; }
+mkdir -p "$WORK/scan/debian"
+printf 'Source: oshioki\nMaintainer: Oshioki contributors\n\nPackage: oshioki\nArchitecture: any\n' > "$WORK/scan/debian/control"
+shlib_log="$WORK/shlib-errors.log"
+shlib_depends="$(
+  cd "$WORK/scan" && dpkg-shlibdeps -O "$TREE/usr/sbin/oshioki-server" "$TREE/usr/share/oshioki/oshioki" 2>"$shlib_log" | sed 's/^shlibs:Depends=//'
+)" || { cat "$shlib_log" >&2; echo "build-deb: dpkg-shlibdeps failed" >&2; exit 1; }
+[ -n "$shlib_depends" ] || { cat "$shlib_log" >&2; echo "build-deb: dpkg-shlibdeps produced no Depends" >&2; exit 1; }
+sed -i "s/^Depends: \(.*\)/Depends: \1, $shlib_depends/" "$TREE/DEBIAN/control"
+
+# So dpkg -V and debsums can verify the installed files.
+(cd "$TREE" && find . -type f ! -path './DEBIAN/*' -exec md5sum {} + | sed 's| \./| |' > DEBIAN/md5sums)
 
 chmod 0755 "$TREE/DEBIAN/postinst" "$TREE/DEBIAN/prerm" "$TREE/DEBIAN/postrm"
 

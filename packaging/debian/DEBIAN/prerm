@@ -1,14 +1,26 @@
 #!/bin/sh
-# oshioki prerm: remove the sudo managed block this package enabled, if any.
+# oshioki prerm: stop the server and remove the sudo managed block this
+# package enabled, if any. Both steps fail loudly: removing the package
+# while the server still runs or the hook still manages sudo.conf would
+# strand a live system with its manager deleted.
 set -e
 
 case "$1" in
   remove|purge)
+    if [ -d /run/systemd/system ] && systemctl is-active -q oshioki-server.service; then
+      systemctl stop oshioki-server.service || {
+        echo "oshioki: cannot stop oshioki-server; refusing to remove a running server" >&2
+        exit 1
+      }
+    fi
     if /usr/share/oshioki/install-oshioki-hook --prelaunch-status >/dev/null 2>&1; then
-      /usr/share/oshioki/install-oshioki-hook --disable-prelaunch || true
+      /usr/share/oshioki/install-oshioki-hook --disable-prelaunch || {
+        echo "oshioki: failed to disable the sudo hook; resolve it first with:" >&2
+        echo "oshioki:   /usr/share/oshioki/install-oshioki-hook --disable-prelaunch" >&2
+        exit 1
+      }
     fi
     ;;
 esac
-
 
 exit 0

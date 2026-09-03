@@ -1,6 +1,8 @@
 #!/bin/sh
 # oshioki postinst: create the service user and state, wire the hook when the
 # operator has provided /etc/oshioki/install.env, enable the server unit.
+# The unit is only restarted below on upgrade ($2 non-empty): a fresh install
+# enables without starting, and the operator starts it once server.env exists.
 set -e
 
 installer_hook() {
@@ -23,15 +25,21 @@ case "$1" in
       installer_hook --prelaunch --config-file /etc/oshioki/install.env
     else
       echo "oshioki: hook not enabled (no /etc/oshioki/install.env)." >&2
-      echo "oshioki: create it, then run: /usr/share/oshioki/install-oshioki-hook --prelaunch --config-file /etc/oshioki/install.env" >&2
+      echo "oshioki: pre-seed that file (0600, root-owned) before installing," >&2
+      echo "oshioki: or create it now and run: /usr/share/oshioki/install-oshioki-hook --prelaunch --config-file /etc/oshioki/install.env" >&2
     fi
 
     if [ -d /run/systemd/system ]; then
       systemctl daemon-reload
       systemctl enable oshioki-server.service
+      if [ -n "${2:-}" ]; then
+        systemctl try-restart oshioki-server.service || {
+          echo "oshioki: upgraded but failed to restart oshioki-server; the old binary is still running" >&2
+          exit 1
+        }
+      fi
     fi
     ;;
 esac
-
 
 exit 0

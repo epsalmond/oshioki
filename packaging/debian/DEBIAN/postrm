@@ -1,12 +1,26 @@
 #!/bin/sh
-# oshioki postrm: drop server state on purge. The oshioki system user stays.
+# oshioki postrm: drop the systemd enablement on remove; on purge also drop
+# server state, hook state (including cleartext NATS credentials), and the
+# hook/plugin files the installer placed outside dpkg's manifest.
 set -e
 
 case "$1" in
-  purge)
-    rm -rf /var/lib/oshioki
+  remove|purge)
+    if [ -d /run/systemd/system ]; then
+      systemctl disable oshioki-server.service >/dev/null 2>&1 || {
+        echo "oshioki: failed to disable oshioki-server.service" >&2
+        exit 1
+      }
+      systemctl daemon-reload || true
+    fi
     ;;
 esac
 
+case "$1" in
+  purge)
+    rm -rf /etc/oshioki /var/lib/oshioki
+    rm -f /usr/local/sbin/oshioki /usr/local/libexec/sudo/oshioki.so
+    ;;
+esac
 
 exit 0
