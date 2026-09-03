@@ -246,14 +246,17 @@ impl Store {
         }
         let api_token_hash = oshioki_protocol::decode_base64url(&device.api_token_hash)?;
         let public_json = serde_json::to_string(device)?;
-        // Insert-only: an activation must never rewrite an enrolled record. A
-        // replay naming an existing fingerprint either matches the stored row
-        // (the same device enrolling again) or fails the check below instead
-        // of replacing its API token.
+        // The upsert refreshes the public record but never the pinned
+        // credential: a re-enrollment with a new label converges the served
+        // record, while a replay naming an existing fingerprint keeps the
+        // stored credential_id and api_token_hash and fails the check below
+        // instead of replacing the API token. Reactivation rides along, so
+        // re-enrollment after revocation needs no second write.
         transaction.execute(
             "INSERT INTO devices(fingerprint, credential_id, api_token_hash, public_record_json, active, updated_at)
              VALUES (?1, ?2, ?3, ?4, 1, unixepoch())
-             ON CONFLICT(fingerprint) DO NOTHING",
+             ON CONFLICT(fingerprint) DO UPDATE SET public_record_json=excluded.public_record_json,
+                active=1, updated_at=unixepoch()",
             params![device.fingerprint, device.credential_id, api_token_hash, public_json],
         )?;
         let stored: Option<(String, Vec<u8>)> = transaction
@@ -269,11 +272,6 @@ impl Store {
         if stored_credential != device.credential_id || stored_token != api_token_hash {
             bail!("activation names a different record for an enrolled device");
         }
-        // Re-enrollment after revocation reactivates; a live row is untouched.
-        transaction.execute(
-            "UPDATE devices SET active=1, updated_at=unixepoch() WHERE fingerprint=?1",
-            [&device.fingerprint],
-        )?;
         let changed = transaction.execute(
             "UPDATE enrollments SET status='active', fingerprint=?2, updated_at=unixepoch()
              WHERE id=?1 AND status='pending'",
@@ -1036,6 +1034,70 @@ mod tests {
     /// The submission kind and the device kind travel together: a `WebAuthn`
     /// submission never binds a Secure Enclave record, even when every
     /// compared field agrees.
+    /// Re-enrolling the same identity with a new label converges the served
+    /// record: the enrollment activates and the hook's whole-record match
+    /// sees the new label, instead of consuming the enrollment on a stale
+    /// record and failing after the activation timeout.
+    #[test]
+    fn a_relabel_reenrollment_converges_the_served_record() {
+        let store = Store::memory().unwrap();
+        let (submission, device) = native_pair("enroll-1", 9, b"token-one", "laptop");
+        pending_enrollment(&store, "enroll-1", 300);
+        submit(&store, "enroll-1", &submission, 100);
+        store.activate_enrollment("enroll-1", &device, 100).unwrap();
+        assert_eq!(
+            store
+                .active_device(&device.fingerprint)
+                .unwrap()
+                .unwrap()
+                .label,
+            "laptop"
+        );
+
+        let (resubmission, relabeled) = native_pair("enroll-2", 9, b"token-one", "work laptop");
+        assert_eq!(relabeled.fingerprint, device.fingerprint);
+        pending_enrollment(&store, "enroll-2", 300);
+        submit(&store, "enroll-2", &resubmission, 100);
+        store
+            .activate_enrollment("enroll-2", &relabeled, 100)
+            .unwrap();
+        assert_eq!(
+            store
+                .active_device(&device.fingerprint)
+                .unwrap()
+                .unwrap()
+                .label,
+            "work laptop"
+        );
+    }
+
+    /// The converged record still pins the credential: the same label move
+    /// with a different API token fails instead of replacing the token.
+    #[test]
+    fn a_relabel_with_a_new_token_still_fails() {
+        let store = Store::memory().unwrap();
+        let (submission, device) = native_pair("enroll-1", 9, b"token-one", "laptop");
+        pending_enrollment(&store, "enroll-1", 300);
+        submit(&store, "enroll-1", &submission, 100);
+        store.activate_enrollment("enroll-1", &device, 100).unwrap();
+
+        let (resubmission, relabeled) = native_pair("enroll-2", 9, b"token-two", "work laptop");
+        pending_enrollment(&store, "enroll-2", 300);
+        submit(&store, "enroll-2", &resubmission, 100);
+        let error = store
+            .activate_enrollment("enroll-2", &relabeled, 100)
+            .unwrap_err();
+        assert!(error.to_string().contains("different record"), "{error:?}");
+        assert_eq!(
+            store
+                .active_device(&device.fingerprint)
+                .unwrap()
+                .unwrap()
+                .label,
+            "laptop"
+        );
+    }
+
     #[test]
     fn activation_rejects_a_kind_mismatch() {
         let store = Store::memory().unwrap();
