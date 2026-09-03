@@ -10,12 +10,26 @@ on:
 
 permissions:
   contents: read
+  # Scopes rustsec/audit-check documents as required: checks: write for the
+  # status check, issues: write because a scheduled run files issues for the
+  # advisories it finds.
+  checks: write
+  issues: write
 
 jobs:
   cargo-audit:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # The action installs cargo-audit from source with the repo checked
+      # out, so the workspace pin in rust-toolchain.toml leaks into the tool
+      # build and it dies on dependencies the pin cannot compile (tinyvec).
+      # The audited lockfile stays exactly as committed; only the tool build
+      # runs on stable. RUSTUP_TOOLCHAIN beats the toolchain file by
+      # documented rustup precedence.
+      - run: rustup toolchain install stable --profile minimal
       - uses: rustsec/audit-check@v2
+        env:
+          RUSTUP_TOOLCHAIN: stable
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
