@@ -13,6 +13,13 @@ LABEL="dev.oshioki.agent"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/oshioki-agent.log"
 
+# The half-written plist holds the NATS password. A failed lint or an
+# interrupt must not leave it behind.
+cleanup() {
+  rm -f "$PLIST.partial"
+}
+trap cleanup EXIT
+
 usage() {
   cat <<'USAGE'
 usage: scripts/mac/install-agent [options]
@@ -125,10 +132,10 @@ render_plist() {
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$BINARY</string>
+    <string>$(xml_escape "$BINARY")</string>
     <string>run</string>
     <string>--state</string>
-    <string>$STATE</string>
+    <string>$(xml_escape "$STATE")</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
