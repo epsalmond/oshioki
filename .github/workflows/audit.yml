@@ -10,26 +10,22 @@ on:
 
 permissions:
   contents: read
-  # Scopes rustsec/audit-check documents as required: checks: write for the
-  # status check, issues: write because a scheduled run files issues for the
-  # advisories it finds.
-  checks: write
-  issues: write
 
 jobs:
   cargo-audit:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      # The action installs cargo-audit from source with the repo checked
-      # out, so the workspace pin in rust-toolchain.toml leaks into the tool
-      # build and it dies on dependencies the pin cannot compile (tinyvec).
-      # The audited lockfile stays exactly as committed; only the tool build
-      # runs on stable. RUSTUP_TOOLCHAIN beats the toolchain file by
-      # documented rustup precedence.
-      - run: rustup toolchain install stable --profile minimal
-      - uses: rustsec/audit-check@v2
-        env:
-          RUSTUP_TOOLCHAIN: stable
+      # A prebuilt cargo-audit, deliberately: the previous revision let
+      # rustsec/audit-check build it from source with the repo checked out,
+      # so the workspace pin in rust-toolchain.toml leaked into the tool
+      # build and it died on tinyvec before auditing anything. An override
+      # via RUSTUP_TOOLCHAIN was tried and did not propagate into the
+      # action's install step (same failure, run 33819503340), so there is
+      # no source build left to leak into. No extra scopes either: without
+      # the action nothing creates check runs or files issues; a scheduled
+      # finding shows up as a failed run.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit
