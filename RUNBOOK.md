@@ -38,6 +38,12 @@ NATS_USER=oshioki
 NATS_PASS=<secret>
 ```
 
+For socket mode (below), also add:
+
+```text
+OSHIOKI_AGENT_SOCKET=/Users/<you>/.config/oshioki/agent.sock
+```
+
 Run the dry run and install against that file:
 
 ```bash
@@ -66,6 +72,30 @@ sudo HOOK_BIN="$(brew --prefix)/bin/oshioki" \
 
 After the install, confirm `--prelaunch-status`, inspect the enrolled devices,
 and run `sudo -V`.
+
+### Local agent socket (no network in the sudo path)
+
+The hook reaches the agent over NATS by default, which puts the network in
+every sudo. For a laptop, point the hook at the agent's Unix socket instead:
+
+1. Run the agent as your user. It listens at `agent.sock` in its state
+   directory (`~/.config/oshioki` by default, `OSHIOKI_AGENT_SOCKET`
+   overrides it):
+
+   ```bash
+   oshioki-agent run
+   ```
+
+2. Put that socket path in `/etc/oshioki/install.env` as
+   `OSHIOKI_AGENT_SOCKET` (see above) and re-run the installer, dry-run
+   first. The installer copies the key into `/etc/oshioki/config.env`.
+
+The hook tries the socket first and falls back to NATS while the approval
+deadline allows, so a stopped agent degrades to the network path instead of
+hanging sudo. Verdicts are signature-checked on both transports. The agent
+itself starts without NATS and answers socket requests only until it is
+restarted with the network back. Only Secure Enclave (Touch ID) approvals
+travel the socket; browser WebAuthn and enrollment still need the server.
 
 Each browser profile enrolls separately:
 
