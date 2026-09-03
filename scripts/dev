@@ -17,9 +17,13 @@ compose() {
   if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q rootless; then
     compose_uid=0
   fi
+  extra_files=()
+  if [ -n "${OSHIOKI_PUBLISH_NATS:-}" ]; then
+    extra_files=(-f "$REPO_ROOT/compose.nats-port.yaml")
+  fi
   OSHIOKI_STATE_ROOT="$state_root" OSHIOKI_HTTP_PORT="${http_port:-8443}" \
     OSHIOKI_UID="$compose_uid" OSHIOKI_HOST_UID="$host_uid" \
-    docker compose -f "$REPO_ROOT/compose.yaml" -p "$project_name" "$@"
+    docker compose -f "$REPO_ROOT/compose.yaml" "${extra_files[@]}" -p "$project_name" "$@"
 }
 
 local_checks() {
@@ -33,6 +37,7 @@ local_checks() {
     echo "test-dev-acceptance: SKIP (Linux only)"
   fi
   "$REPO_ROOT/scripts/test-install-oshioki-hook"
+  "$REPO_ROOT/scripts/test-oshioki-laptop-setup"
 }
 
 read_session() {
@@ -80,7 +85,10 @@ case "$command_name" in
     session_tmp="$SESSION_FILE.$$"
     printf '%s\n%s\n%s\n' "$project_name" "$state_root" "$managed_state" >"$session_tmp"
     mv "$session_tmp" "$SESSION_FILE"
-    if ! compose up --detach server; then
+    # The retained server is also the Mac hook's backend: publish NATS on
+    # loopback so host-side clients can reach it. Disposable `test`
+    # projects never set this, so they cannot collide on the port.
+    if ! OSHIOKI_PUBLISH_NATS=1 compose up --detach server; then
       rm -f "$SESSION_FILE"
       [ "$managed_state" = 0 ] || rm -rf -- "$state_root"
       exit 1

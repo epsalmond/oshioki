@@ -1,0 +1,7 @@
+# Exposes NATS on loopback for host-side clients (the macOS hook and
+# native agent). Used only by `scripts/dev up`; the E2E `test` path never
+# includes this file, so disposable test projects cannot collide on 4222.
+services:
+  nats:
+    ports:
+      - "127.0.0.1:4222:4222"

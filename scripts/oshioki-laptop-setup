@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# One-command laptop setup for local sudo approvals.
+#
+# brew install epsalmond/oshioki/oshioki && oshioki-laptop-setup
+#
+# Idempotent: re-running after a brew upgrade reinstalls the hook and plugin
+# from the new bottle and restarts the agent. Everything needing privilege
+# goes through sudo; the NATS password never appears in output or arguments.
+#
+# Portable to the stock macOS bash 3.2: no arrays, no associative arrays,
+# no process substitution.
+set -euo pipefail
+
+# Owner-only by default: install.env, agent.env, and the plist all hold the
+# NATS password, and creating them at the ambient umask would leave each
+# briefly world-readable before its explicit chmod runs.
+umask 077
+
+YES=0
+RECONFIGURE=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --yes) YES=1 ;;
+    --reconfigure) RECONFIGURE=1 ;;
+    -h|--help)
+      echo "usage: oshioki-laptop-setup [--yes] [--reconfigure]" >&2
+      echo "  --yes          accept defaults and prompts without asking" >&2
+      echo "  --reconfigure  re-enter /etc/oshioki/install.env from scratch" >&2
+      exit 0
+      ;;
+    *) echo "oshioki-laptop-setup: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+die() { echo "oshioki-laptop-setup: $*" >&2; exit 1; }
+info() { echo "oshioki-laptop-setup: $*"; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+INSTALLER="${INSTALLER:-$SCRIPT_DIR/install-oshioki-hook}"
+AGENT_BIN="${AGENT_BIN:-$SCRIPT_DIR/oshioki-agent}"
+# Brew layout keeps binaries next to this script and data one level up in
+# libexec. HOOK_BIN and friends stay empty outside that layout so the
+# installer falls back to its own repo defaults.
+HOOK_BIN=""
+PLUGIN_BIN=""
+OSHIOKI_CHECKSUMS=""
+if [ -x "$SCRIPT_DIR/oshioki" ] && [ -f "$SCRIPT_DIR/../libexec/SHA256SUMS" ]; then
+  HOOK_BIN="${HOOK_BIN:-$SCRIPT_DIR/oshioki}"
+  PLUGIN_BIN="${PLUGIN_BIN:-$SCRIPT_DIR/../libexec/oshioki.dylib}"
+  OSHIOKI_CHECKSUMS="${OSHIOKI_CHECKSUMS:-$SCRIPT_DIR/../libexec/SHA256SUMS}"
+fi
+HOOK_BIN="${HOOK_BIN:-}"
+PLUGIN_BIN="${PLUGIN_BIN:-}"
+OSHIOKI_CHECKSUMS="${OSHIOKI_CHECKSUMS:-}"
+INSTALLED_HOOK="${INSTALLED_HOOK:-/usr/local/sbin/oshioki}"
+SUDO="${SUDO:-sudo}"
+LAUNCHCTL="${LAUNCHCTL:-launchctl}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+
+INSTALL_ENV="${OSHIOKI_INSTALL_ENV:-/etc/oshioki/install.env}"
+AGENT_STATE="${OSHIOKI_AGENT_STATE:-$HOME/.config/oshioki}"
+DEFAULT_SOCKET="$AGENT_STATE/agent.sock"
+LABEL="com.oshioki.agent"
+
+[ -x "$INSTALLER" ] || die "installer not found: $INSTALLER (set INSTALLER)"
+[ -x "$AGENT_BIN" ] || die "agent not found: $AGENT_BIN (set AGENT_BIN)"
+
+prompt() {
+  local label="$1" def="$2" var="$3" secret="$4" value
+  if [ "$YES" -eq 1 ]; then
+    [ -n "$def" ] || die "$label has no default; set it in the environment or re-run without --yes"
+    printf -v "$var" '%s' "$def"
+    return 0
+  fi
+  if [ ! -t 0 ]; then
+    [ -n "$def" ] || die "$label has no default and stdin is not a terminal"
+    printf -v "$var" '%s' "$def"
+    return 0
+  fi
+  if [ "$secret" -eq 1 ]; then
+    printf '%s: ' "$label" >&2
+    IFS= read -r -s value || true
+    echo >&2
+    [ -n "$value" ] || value="$def"
+  elif [ -n "$def" ]; then
+    printf '%s [%s]: ' "$label" "$def" >&2
+    IFS= read -r value || true
+    [ -n "$value" ] || value="$def"
+  else
+    printf '%s: ' "$label" >&2
+    IFS= read -r value || true
+  fi
+  [ -n "$value" ] || die "$label is required"
+  printf -v "$var" '%s' "$value"
+}
+
+# Read one key out of install.env without sourcing it.
+env_key() {
+  $SUDO cat "$INSTALL_ENV" 2>/dev/null | awk -F= -v key="$1" '$1 == key { print substr($0, length($1) + 2); exit }'
+}
+
+run_installer() {
+  $SUDO HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
+    "$INSTALLER" "$@" --config-file "$INSTALL_ENV"
+}
+
+info "step 1/5: installer configuration in $INSTALL_ENV"
+$SUDO mkdir -p "$(dirname "$INSTALL_ENV")"
+if [ ! -f "$INSTALL_ENV" ] || [ "$RECONFIGURE" -eq 1 ]; then
+  prompt "WebAuthn origin" "${OSHIOKI_ORIGIN:-}" ORIGIN 0
+  prompt "WebAuthn RP ID" "${OSHIOKI_RP_ID:-}" RP_ID 0
+  prompt "NATS URL" "${NATS_URL:-nats://127.0.0.1:4222}" NATS_URL_V 0
+  prompt "NATS user" "${NATS_USER:-oshioki}" NATS_USER_V 0
+  prompt "NATS password" "${NATS_PASS:-}" NATS_PASS_V 1
+  prompt "Agent socket" "${OSHIOKI_AGENT_SOCKET:-$DEFAULT_SOCKET}" AGENT_SOCKET_V 0
+  {
+    printf 'OSHIOKI_ORIGIN=%s\n' "$ORIGIN"
+    printf 'OSHIOKI_RP_ID=%s\n' "$RP_ID"
+    printf 'NATS_URL=%s\n' "$NATS_URL_V"
+    printf 'NATS_USER=%s\n' "$NATS_USER_V"
+    printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
+    printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET_V"
+  } | $SUDO tee "$INSTALL_ENV" >/dev/null
+  $SUDO chmod 0600 "$INSTALL_ENV"
+else
+  info "reusing existing $INSTALL_ENV (pass --reconfigure to redo it)"
+fi
+ORIGIN="$(env_key OSHIOKI_ORIGIN)"
+NATS_URL_V="$(env_key NATS_URL)"
+NATS_USER_V="$(env_key NATS_USER)"
+NATS_PASS_V="$(env_key NATS_PASS)"
+AGENT_SOCKET_V="$(env_key OSHIOKI_AGENT_SOCKET)"
+[ -n "$ORIGIN" ] || die "$INSTALL_ENV has no OSHIOKI_ORIGIN"
+[ -n "$NATS_URL_V" ] || die "$INSTALL_ENV has no NATS_URL"
+[ -n "$AGENT_SOCKET_V" ] || AGENT_SOCKET_V="$DEFAULT_SOCKET"
+
+info "step 2/5: prelaunch install"
+run_installer --prelaunch --dry-run
+if [ "$YES" -eq 0 ]; then
+  printf 'Apply the plan above? [y/N]: ' >&2
+  IFS= read -r answer || true
+  [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "aborted; re-run when ready"
+fi
+run_installer --prelaunch
+
+info "step 3/5: agent identity"
+[ -x "$INSTALLED_HOOK" ] || die "installed hook not found: $INSTALLED_HOOK (set INSTALLED_HOOK)"
+mkdir -p "$AGENT_STATE"
+cleanup_enroll() {
+  if [ -n "${enroll_pid:-}" ]; then kill "$enroll_pid" 2>/dev/null || true; fi
+}
+trap cleanup_enroll EXIT
+if ! "$AGENT_BIN" show >/dev/null 2>&1; then
+  info "no agent identity; enrolling a new device (needs the server reachable)"
+  $SUDO -v
+  enroll_log="$(mktemp -t oshioki-enroll.XXXXXX)"
+  $SUDO "$INSTALLED_HOOK" enroll >"$enroll_log" 2>&1 &
+  enroll_pid=$!
+  url=""
+  for _ in $(seq 1 60); do
+    url="$(grep -oE 'https?://[^[:space:]'\'']+' "$enroll_log" 2>/dev/null | head -1 || true)"
+    [ -n "$url" ] && break
+    kill -0 "$enroll_pid" 2>/dev/null || break
+    sleep 1
+  done
+  if [ -z "$url" ]; then cat "$enroll_log" >&2; rm -f "$enroll_log"; die "enrollment produced no URL"; fi
+  NATS_URL="$NATS_URL_V" NATS_USER="$NATS_USER_V" NATS_PASS="$NATS_PASS_V" \
+    "$AGENT_BIN" pair "$url" --label "$(hostname -s 2>/dev/null || hostname)"
+  wait "$enroll_pid" || { cat "$enroll_log" >&2; rm -f "$enroll_log"; die "enrollment failed"; }
+  rm -f "$enroll_log"
+  enroll_pid=""
+  info "device paired"
+else
+  info "agent identity present"
+fi
+if $SUDO "$INSTALLED_HOOK" status 2>/dev/null | grep -q 'active=true'; then
+  info "host has active devices"
+else
+  info "host has no active devices yet; pair a device to approve requests"
+fi
+
+info "step 4/5: agent autostart"
+case "$(uname -s)" in
+  Darwin)
+    plist_dir="${LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"
+    mkdir -p "$plist_dir"
+    plist="$plist_dir/$LABEL.plist"
+    xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+    {
+      printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+      printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+      printf '%s\n' '<plist version="1.0"><dict>'
+      printf '  <key>Label</key><string>%s</string>\n' "$LABEL"
+      printf '  <key>ProgramArguments</key><array><string>%s</string><string>run</string></array>\n' "$(xml_escape "$AGENT_BIN")"
+      printf '%s\n' '  <key>EnvironmentVariables</key><dict>'
+      printf '    <key>NATS_URL</key><string>%s</string>\n' "$(xml_escape "$NATS_URL_V")"
+      printf '    <key>NATS_USER</key><string>%s</string>\n' "$(xml_escape "$NATS_USER_V")"
+      printf '    <key>NATS_PASS</key><string>%s</string>\n' "$(xml_escape "$NATS_PASS_V")"
+      printf '    <key>OSHIOKI_AGENT_SOCKET</key><string>%s</string>\n' "$(xml_escape "$AGENT_SOCKET_V")"
+      printf '    <key>OSHIOKI_AGENT_STATE</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE")"
+      printf '%s\n' '  </dict>'
+      printf '%s\n' '  <key>RunAtLoad</key><true/>'
+      printf '%s\n' '  <key>KeepAlive</key><true/>'
+      printf '  <key>StandardOutPath</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE/agent.log")"
+      printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE/agent.log")"
+      printf '%s\n' '</dict></plist>'
+    } > "$plist"
+    chmod 0600 "$plist"
+    $LAUNCHCTL bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    $LAUNCHCTL bootstrap "gui/$(id -u)" "$plist"
+    ;;
+  Linux)
+    unit_dir="$HOME/.config/systemd/user"
+    if command -v "$SYSTEMCTL" >/dev/null 2>&1 && mkdir -p "$unit_dir" 2>/dev/null; then
+      # One EnvironmentFile instead of Environment= lines: Environment=
+      # whitespace-splits and expands % specifiers, so values with spaces
+      # or % would be mangled. The env file is line-based like install.env,
+      # so values travel literally; it also carries the socket and state
+      # dir the booted agent must agree on with the hook.
+      agent_env="$AGENT_STATE/agent.env"
+      {
+        printf 'NATS_URL=%s\n' "$NATS_URL_V"
+        printf 'NATS_USER=%s\n' "$NATS_USER_V"
+        printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
+        printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET_V"
+        printf 'OSHIOKI_AGENT_STATE=%s\n' "$AGENT_STATE"
+      } > "$agent_env"
+      chmod 0600 "$agent_env"
+      systemd_escape() { printf '%s' "$1" | sed -e 's/%/%%/g'; }
+      unit="$unit_dir/$LABEL.service"
+      {
+        printf '%s\n' '[Unit]' 'Description=oshioki sudo approval agent' '' '[Service]'
+        printf 'ExecStart="%s" run\n' "$(systemd_escape "$AGENT_BIN")"
+        printf 'EnvironmentFile=%s\n' "$(systemd_escape "$agent_env")"
+        printf '%s\n' 'Restart=always' '' '[Install]' 'WantedBy=default.target'
+      } > "$unit"
+      chmod 0600 "$unit"
+      $SYSTEMCTL --user daemon-reload
+      $SYSTEMCTL --user enable --now "$LABEL"
+    else
+      info "no user systemd; start '$AGENT_BIN run' yourself (with NATS_* in the environment)"
+    fi
+    ;;
+  *) die "unsupported operating system: $(uname -s)" ;;
+esac
+
+info "step 5/5: verify"
+run_installer --prelaunch-status
+for _ in $(seq 1 15); do
+  [ -S "$AGENT_SOCKET_V" ] && break
+  sleep 1
+done
+[ -S "$AGENT_SOCKET_V" ] || die "agent socket never appeared at $AGENT_SOCKET_V; see $AGENT_STATE/agent.log"
+$SUDO -V >/dev/null
+if [ -t 0 ]; then
+  info "final proof: one real sudo (a Touch ID prompt is coming)"
+  $SUDO true || die "sudo true was denied; see $AGENT_STATE/agent.log"
+  info "ready: sudo approved through the agent socket."
+else
+  info "ready: the agent socket is live and sudo validates. Run 'sudo true'."
+fi
