@@ -192,6 +192,8 @@ case "$(uname -s)" in
       printf '    <key>NATS_URL</key><string>%s</string>\n' "$(xml_escape "$NATS_URL_V")"
       printf '    <key>NATS_USER</key><string>%s</string>\n' "$(xml_escape "$NATS_USER_V")"
       printf '    <key>NATS_PASS</key><string>%s</string>\n' "$(xml_escape "$NATS_PASS_V")"
+      printf '    <key>OSHIOKI_AGENT_SOCKET</key><string>%s</string>\n' "$(xml_escape "$AGENT_SOCKET_V")"
+      printf '    <key>OSHIOKI_AGENT_STATE</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE")"
       printf '%s\n' '  </dict>'
       printf '%s\n' '  <key>RunAtLoad</key><true/>'
       printf '%s\n' '  <key>KeepAlive</key><true/>'
@@ -206,11 +208,26 @@ case "$(uname -s)" in
   Linux)
     unit_dir="$HOME/.config/systemd/user"
     if command -v "$SYSTEMCTL" >/dev/null 2>&1 && mkdir -p "$unit_dir" 2>/dev/null; then
+      # One EnvironmentFile instead of Environment= lines: Environment=
+      # whitespace-splits and expands % specifiers, so values with spaces
+      # or % would be mangled. The env file is line-based like install.env,
+      # so values travel literally; it also carries the socket and state
+      # dir the booted agent must agree on with the hook.
+      agent_env="$AGENT_STATE/agent.env"
+      {
+        printf 'NATS_URL=%s\n' "$NATS_URL_V"
+        printf 'NATS_USER=%s\n' "$NATS_USER_V"
+        printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
+        printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET_V"
+        printf 'OSHIOKI_AGENT_STATE=%s\n' "$AGENT_STATE"
+      } > "$agent_env"
+      chmod 0600 "$agent_env"
+      systemd_escape() { printf '%s' "$1" | sed -e 's/%/%%/g'; }
       unit="$unit_dir/$LABEL.service"
       {
         printf '%s\n' '[Unit]' 'Description=oshioki sudo approval agent' '' '[Service]'
-        printf 'ExecStart=%s run\n' "$AGENT_BIN"
-        printf 'Environment=NATS_URL=%s NATS_USER=%s NATS_PASS=%s\n' "$NATS_URL_V" "$NATS_USER_V" "$NATS_PASS_V"
+        printf 'ExecStart="%s" run\n' "$(systemd_escape "$AGENT_BIN")"
+        printf 'EnvironmentFile="%s"\n' "$(systemd_escape "$agent_env")"
         printf '%s\n' 'Restart=always' '' '[Install]' 'WantedBy=default.target'
       } > "$unit"
       chmod 0600 "$unit"

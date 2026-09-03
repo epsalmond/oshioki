@@ -96,6 +96,10 @@ SH
 cat > "$TEST_ROOT/fake-bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$CALL_LOG"
+if [ "${1:-} ${2:-}" = "--user enable" ] && [ -n "${SOCKET_TO_MAKE:-}" ]; then
+  python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(120)' "$SOCKET_TO_MAKE" &
+  echo "$!" > "$HOLDER_PID_FILE"
+fi
 SH
 chmod 0755 "$TEST_ROOT/fake-bin"/*
 
@@ -121,7 +125,7 @@ run_setup() {
     INSTALLED_HOOK="$TEST_ROOT/fake-bin/oshioki" \
     OSHIOKI_INSTALL_ENV="$TEST_ROOT/etc/install.env" \
     OSHIOKI_ORIGIN="${OSHIOKI_ORIGIN:-https://laptop.test}" OSHIOKI_RP_ID="laptop.test" \
-    NATS_URL="nats://127.0.0.1:4222" NATS_USER="oshioki" NATS_PASS="test-secret" \
+    NATS_URL="nats://127.0.0.1:4222" NATS_USER="oshioki" NATS_PASS="${NATS_PASS:-test-secret}" \
     DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
     "$TEST_ROOT/stage/oshioki-laptop-setup" "$@" </dev/null
 }
@@ -145,9 +149,12 @@ if [ "$(uname -s)" = Darwin ]; then
   plist="$TEST_ROOT/home/Library/LaunchAgents/com.oshioki.agent.plist"
   [ -f "$plist" ] || fail "LaunchAgent plist missing"
   grep -Fq '<string>test-secret</string>' "$plist" || fail "plist missing NATS password"
+  grep -Fq '<key>OSHIOKI_AGENT_SOCKET</key>' "$plist" || fail "plist missing agent socket"
+  grep -Fq '<key>OSHIOKI_AGENT_STATE</key>' "$plist" || fail "plist missing agent state"
   grep -Fq 'bootstrap' "$CALL_LOG" || fail "launchctl bootstrap never ran"
 else
-  [ -f "$TEST_ROOT/home/.config/systemd/user/com.oshioki.agent.service" ] || fail "systemd unit missing"
+  unit="$TEST_ROOT/home/.config/systemd/user/com.oshioki.agent.service"
+  [ -f "$unit" ] || fail "systemd unit missing"
   grep -Fq 'enable --now' "$CALL_LOG" || fail "systemctl enable never ran"
 fi
 grep -Fq 'agent socket is live' "$TEST_ROOT/fresh.log" || fail "verify never completed"
@@ -170,5 +177,20 @@ fi
 # Scenario C: --reconfigure rewrites install.env from current values.
 OSHIOKI_ORIGIN="https://reconfigured.test" run_setup --yes --reconfigure >"$TEST_ROOT/reconf.log" 2>&1 || fail "reconfigure failed"
 grep -Fq 'OSHIOKI_ORIGIN=https://reconfigured.test' "$TEST_ROOT/etc/install.env" || fail "reconfigure kept stale origin"
+
+# Scenario D: a password with spaces and % reaches the autostart config
+# literally instead of being split or expanded.
+NASTY='p% a%s s'
+NATS_PASS="$NASTY" run_setup --yes --reconfigure >"$TEST_ROOT/nasty.log" 2>&1 || fail "nasty password setup failed"
+if [ "$(uname -s)" = Darwin ]; then
+  grep -Fq "<string>$NASTY</string>" "$plist" || fail "plist mangled the password"
+else
+  agent_env="$TEST_ROOT/home/.config/oshioki/agent.env"
+  grep -Fq "NATS_PASS=$NASTY" "$agent_env" || fail "agent.env mangled the password"
+  grep -Fq 'EnvironmentFile=' "$unit" || fail "unit lost its EnvironmentFile"
+  if grep -Eq '^Environment=[^=]* ' "$unit"; then fail "unit packs values into one Environment line"; fi
+  grep -Fq 'OSHIOKI_AGENT_SOCKET=' "$agent_env" || fail "agent.env missing agent socket"
+  grep -Fq 'OSHIOKI_AGENT_STATE=' "$agent_env" || fail "agent.env missing agent state"
+fi
 
 echo "test-oshioki-laptop-setup: PASS"
