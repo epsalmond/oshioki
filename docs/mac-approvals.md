@@ -39,4 +39,4 @@ The X25519 key that opens sealed requests stays a software key in the same
 0600 file. The enclave holds P-256 and nothing else. The login keychain was
 the original plan, and an early experiment found the Data Protection keychain
 closed to unsigned command-line tools without a provisioned entitlement, which
-the agent cannot carry until it ships as a signed app (#5).
+the agent cannot carry until it ships as a signed app (#23).

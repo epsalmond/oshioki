@@ -51,6 +51,19 @@ modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
 Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 `oshioki.dylib` in the same directory.
 
+Outside a repo checkout the installer needs its inputs pointed at the
+installed files: set `HOOK_BIN` and `PLUGIN_BIN` to the installed hook and
+plugin and `OSHIOKI_CHECKSUMS` to the shipped `SHA256SUMS`, whose entries
+are keyed by file name. For a Homebrew install at `$(brew --prefix)`:
+
+```bash
+sudo HOOK_BIN="$(brew --prefix)/bin/oshioki" \
+  PLUGIN_BIN="$(brew --prefix)/libexec/oshioki.dylib" \
+  OSHIOKI_CHECKSUMS="$(brew --prefix)/libexec/SHA256SUMS" \
+  "$(brew --prefix)/bin/install-oshioki-hook" --prelaunch \
+  --config-file /etc/oshioki/install.env
+```
+
 After the install, confirm `--prelaunch-status`, inspect the enrolled devices,
 and run `sudo -V`.
 

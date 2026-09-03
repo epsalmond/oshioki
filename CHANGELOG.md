@@ -31,6 +31,8 @@ protocol and local E2E stabilize.
   `oshioki.dylib` approval plugin, with a prelaunch installer, supervised
   acceptance loops (`scripts/dev-acceptance`, including Mac approver over
   Tailscale), and production requirements for running it for real.
+- Release packaging: amd64 `.deb` with systemd unit and postinst hooks, plus
+  a Homebrew tap with bottles, published by CI from a version tag.
 
 ### Changed
 
