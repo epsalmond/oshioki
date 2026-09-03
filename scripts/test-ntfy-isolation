@@ -16,6 +16,15 @@ for tool in cargo nats-server sqlite3 curl python3; do
     exit 2
   }
 done
+# Stock macOS has no sha256sum; shasum (Perl) reads stdin identically.
+command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || {
+  echo "missing ntfy isolation prerequisite: sha256sum or shasum" >&2
+  exit 2
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi
+}
 
 free_port() {
   python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
@@ -186,8 +195,8 @@ curl --fail --silent "http://127.0.0.1:$SERVER_PORT/healthz" >/dev/null \
 REQUEST_ID="ntfy-test-1"
 TOKEN="test-token-ntfy-1-0123456789abcdef"
 FINGERPRINT="$(python3 -c 'import base64; print(base64.urlsafe_b64encode(bytes(range(16))).rstrip(b"=").decode())')"
-TOKEN_HEX="$(printf '%s' "$TOKEN" | sha256sum | awk '{print $1}')"
-ENVELOPE_HEX="$(printf '%s' "$REQUEST_ID" | sha256sum | awk '{print $1}')"
+TOKEN_HEX="$(printf '%s' "$TOKEN" | sha256_of)"
+ENVELOPE_HEX="$(printf '%s' "$REQUEST_ID" | sha256_of)"
 NTFY_HEX="$(python3 -c 'import sys; print(sys.argv[1].encode().hex())' '{"title":"sudo on nas"}')"
 NOW="$(date +%s)"
 EXPIRY="$((NOW + 180))"
