@@ -47,6 +47,15 @@ oshioki revoke <fingerprint> # remove one
 Installing the hook and running acceptance sessions is covered in the
 [runbook](RUNBOOK.md).
 
+### Run your own server
+
+The server needs NATS with JetStream next to it. Everything production must
+provide is in [docs/requirements.md](docs/requirements.md); every variable is
+in [docs/configuration.md](docs/configuration.md). Either install the `.deb`
+and create `/etc/oshioki/server.env`, then
+`systemctl enable --now oshioki-server`, or build from source with
+`cargo build --locked --release -p oshioki-server`.
+
 ## Develop it
 
 Start with [CONTRIBUTING.md](CONTRIBUTING.md). Internals live in

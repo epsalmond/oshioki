@@ -43,8 +43,8 @@ case "$(uname -s)" in
   Darwin) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=oshioki.dylib; BUILD_PLUGIN=liboshioki_plugin.dylib ;;
   *) echo "install-oshioki-hook: unsupported operating system" >&2; exit 1 ;;
 esac
-HOOK_BIN="$SERVICE_DIR/target/release/oshioki"
-PLUGIN_BIN="$SERVICE_DIR/target/release/$BUILD_PLUGIN"
+HOOK_BIN="${HOOK_BIN:-$SERVICE_DIR/target/release/oshioki}"
+PLUGIN_BIN="${PLUGIN_BIN:-$SERVICE_DIR/target/release/$BUILD_PLUGIN}"
 PLUGIN_DEST="$PLUGIN_DIR/$PLUGIN_NAME"
 
 die() { echo "install-oshioki-hook: $*" >&2; exit 1; }

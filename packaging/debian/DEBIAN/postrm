@@ -1,0 +1,30 @@
+#!/bin/sh
+# oshioki postrm: drop the systemd enablement on remove; on purge also drop
+# server state, hook state (including cleartext NATS credentials), and the
+# hook/plugin files the installer placed outside dpkg's manifest.
+#
+# Enablement is removed through deb-systemd-helper, which recorded it at
+# install time: by now dpkg has already deleted the unit file, so plain
+# `systemctl disable` cannot resolve the name. Nothing here may fail.
+set -e
+
+case "$1" in
+  remove)
+    # Mask, don't disable: the unit file is already deleted, so only a
+    # mask (a symlink to /dev/null, no unit resolution) can neutralize
+    # the dangling wants/ symlink. Reinstall unmasks and re-enables.
+    deb-systemd-helper mask oshioki-server.service >/dev/null || true
+    ;;
+  purge)
+    deb-systemd-helper purge oshioki-server.service >/dev/null || true
+    deb-systemd-helper unmask oshioki-server.service >/dev/null || true
+    rm -rf /etc/oshioki /var/lib/oshioki
+    rm -f /usr/local/sbin/oshioki /usr/local/libexec/sudo/oshioki.so
+    ;;
+esac
+
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload || true
+fi
+
+exit 0

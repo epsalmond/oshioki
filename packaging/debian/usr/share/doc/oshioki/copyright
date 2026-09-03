@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Source: https://github.com/epsalmond/oshioki
+
+Files: *
+Copyright: 2026 Oshioki contributors
+License: MIT or Apache-2.0
+  On Debian systems the full text of the Apache License 2.0 can be found in
+  /usr/share/common-licenses/Apache-2.0 and the MIT license in
+  /usr/share/common-licenses/MIT.

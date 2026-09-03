@@ -1,0 +1,91 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    # Manual run builds everything without publishing. Tag pushes publish.
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            [ "$tag" = "v$cargo_version" ] || {
+              echo "tag $tag does not match Cargo version $cargo_version" >&2
+              exit 1
+            }
+            echo "version=$cargo_version" >>"$GITHUB_OUTPUT"
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "version=$cargo_version" >>"$GITHUB_OUTPUT"
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+          fi
+
+  build-deb:
+    needs: gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - run: cargo build --locked --release -p oshioki-hook -p oshioki-server -p oshioki-plugin
+      - run: |
+          mkdir -p stage
+          install -m 0755 target/release/oshioki target/release/oshioki-server stage/
+          install -m 0644 target/release/liboshioki_plugin.so stage/
+          (cd stage && sha256sum oshioki liboshioki_plugin.so > SHA256SUMS)
+          ./packaging/build-deb stage "${{ needs.gate.outputs.version }}" \
+            "oshioki_${{ needs.gate.outputs.version }}_amd64.deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: oshioki_*_amd64.deb
+
+  build-mac:
+    needs: gate
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - run: scripts/build-darwin-artifact dist
+      - run: |
+          tar -czf "oshioki-macos-arm64-${{ needs.gate.outputs.version }}.tar.gz" -C dist \
+            oshioki oshioki.dylib oshioki-agent install-oshioki-hook manifest.json SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: oshioki-macos-arm64-*.tar.gz
+
+  release:
+    needs: [gate, build-deb, build-mac]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: |
+          (cd artifacts && sha256sum oshioki_*_amd64.deb oshioki-macos-arm64-*.tar.gz > SHA256SUMS)
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "Oshioki ${GITHUB_REF#refs/tags/}" \
+            --notes "See CHANGELOG.md for what is in this release." \
+            artifacts/oshioki_*_amd64.deb "artifacts/oshioki-macos-arm64-${{ needs.gate.outputs.version }}.tar.gz" artifacts/SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
