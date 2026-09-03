@@ -487,7 +487,7 @@ print_mac_command() {
   password="$(sed -n 's/^NATS_PASS=//p' "$state_root/hook/config.env")"
   [ -n "$password" ] || die "no NATS password in $state_root/hook/config.env"
   printf '\n--- paste this on the Mac ---\n'
-  printf "NATS_URL=nats://%s:%s NATS_USER=oshioki NATS_PASS=%s sh -c 'cd ~/git/oshioki && git pull --ff-only && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p oshioki-agent && scripts/mac/bundle-agent && target/release/oshioki-agent pair \"%s\" --label %s && exec target/mac/Oshioki.app/Contents/MacOS/oshioki-agent run'\n" \
+  printf "NATS_URL=nats://%s:%s NATS_USER=oshioki NATS_PASS=%s sh -c 'cd ~/git/oshioki && git pull --ff-only && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p oshioki-agent && scripts/mac/bundle-agent && target/mac/Oshioki.app/Contents/MacOS/oshioki-agent pair \"%s\" --label %s && exec target/mac/Oshioki.app/Contents/MacOS/oshioki-agent run'\n" \
     "$nats_host" "$nats_port" "$password" "$url" "$label"
   printf -- '--- end ---\n\nwaiting for the Mac to pair\n\n'
 }
