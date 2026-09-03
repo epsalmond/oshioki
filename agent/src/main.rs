@@ -573,8 +573,11 @@ mod mac {
     pub struct Canceller(pub Arc<Identity>);
 
     impl PromptCancel for Canceller {
-        fn cancel(&self) {
-            self.0.cancel_prompt();
+        fn begin(&self) -> u64 {
+            self.0.begin_prompt()
+        }
+        fn cancel(&self, attempt: u64) {
+            self.0.cancel_prompt(attempt);
         }
     }
 
@@ -604,7 +607,10 @@ mod mac {
             let (identity, opened, reason) = (Arc::clone(identity), opened.clone(), reason.clone());
             move || identity.approve(&opened, &reason).map_err(classify)
         };
-        match prompt.ask(request.expires_at, sign).await {
+        match prompt
+            .ask(&request.request_id, request.expires_at, sign)
+            .await
+        {
             Ok(Outcome::Approved(decision)) => Ok(Some(decision)),
             Ok(Outcome::Denied) => Ok(Some(identity.deny(&request.request_id))),
             Ok(Outcome::Expired) => {

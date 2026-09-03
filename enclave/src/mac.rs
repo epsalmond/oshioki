@@ -192,13 +192,20 @@ impl EnclaveSigner {
 /// The deadline lives on the async side and the sheet on a blocking thread, so
 /// the timer needs a way in. A cancellation that arrives before the sheet is up
 /// is remembered and applied as soon as it is.
+///
+/// Every cancellation names the attempt it belongs to. A deadline timer cannot
+/// be stopped once it has entered its last few instructions, so a timer for a
+/// request that was just answered can still fire. Without the number that
+/// cancellation would land on the next request and tear down a sheet nobody
+/// had seen yet, which the agent would then publish as a denial.
 #[derive(Clone, Default)]
 pub struct PromptCanceller(Arc<Mutex<CancelState>>);
 
 #[derive(Default)]
 struct CancelState {
+    attempt: u64,
     context: Option<ContextHandle>,
-    requested: bool,
+    cancelled: bool,
 }
 
 /// An `LAContext` that may be invalidated from another thread.
@@ -211,10 +218,26 @@ struct ContextHandle(Retained<LAContext>);
 unsafe impl Send for ContextHandle {}
 
 impl PromptCanceller {
-    /// Dismisses the sheet now, or as soon as one appears.
-    pub fn cancel(&self) {
+    /// Starts an attempt and returns its number, which is what a later
+    /// [`Self::cancel`] has to name. Whatever an earlier attempt left behind
+    /// is dropped here.
+    pub fn begin(&self) -> u64 {
         let mut state = self.lock();
-        state.requested = true;
+        state.attempt = state.attempt.wrapping_add(1);
+        state.context = None;
+        state.cancelled = false;
+        state.attempt
+    }
+
+    /// Dismisses `attempt`'s sheet now, or as soon as it appears. A number
+    /// that is not the current attempt is a timer that fired too late, and it
+    /// does nothing.
+    pub fn cancel(&self, attempt: u64) {
+        let mut state = self.lock();
+        if state.attempt != attempt {
+            return;
+        }
+        state.cancelled = true;
         if let Some(handle) = state.context.as_ref() {
             // SAFETY: the handle owns a live retained LAContext.
             unsafe { handle.0.invalidate() };
@@ -223,7 +246,7 @@ impl PromptCanceller {
 
     fn arm(&self, context: Retained<LAContext>) {
         let mut state = self.lock();
-        if state.requested {
+        if state.cancelled {
             // SAFETY: the context was just created and is still retained here.
             unsafe { context.invalidate() };
         }
@@ -231,13 +254,11 @@ impl PromptCanceller {
     }
 
     fn disarm(&self) {
-        let mut state = self.lock();
-        state.context = None;
-        state.requested = false;
+        self.lock().context = None;
     }
 
-    /// A poisoned lock would mean a panic while holding it; the state is two
-    /// fields and neither is left half-written, so recovering is correct.
+    /// A poisoned lock would mean a panic while holding it; the state is three
+    /// fields and none is left half-written, so recovering is correct.
     fn lock(&self) -> std::sync::MutexGuard<'_, CancelState> {
         self.0
             .lock()
@@ -415,6 +436,26 @@ mod tests {
     #[test]
     fn a_corrupt_blob_is_refused() {
         assert!(EnclaveSigner::from_blob(vec![0; 569]).is_err());
+    }
+
+    /// A timer that fires just after its own attempt ended must not reach the
+    /// next one. This needs no enclave, only the bookkeeping.
+    #[test]
+    fn a_late_cancellation_does_not_carry_into_the_next_attempt() {
+        let canceller = super::PromptCanceller::default();
+        let first = canceller.begin();
+        canceller.cancel(first);
+        assert!(canceller.0.lock().unwrap().cancelled);
+        let second = canceller.begin();
+        assert_ne!(first, second);
+        assert!(!canceller.0.lock().unwrap().cancelled);
+        canceller.cancel(first);
+        assert!(
+            !canceller.0.lock().unwrap().cancelled,
+            "a cancellation named the attempt that is already over"
+        );
+        canceller.cancel(second);
+        assert!(canceller.0.lock().unwrap().cancelled);
     }
 
     /// Reading the lock state must not panic or hang, whatever the session is.

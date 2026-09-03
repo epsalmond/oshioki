@@ -40,9 +40,15 @@ pub trait Signer {
     /// does not ignores it.
     fn sign_der(&self, message: &[u8], reason: &str) -> Result<Vec<u8>>;
 
-    /// Dismisses a prompt this backend has on screen. A backend that shows
-    /// nothing has nothing to dismiss.
-    fn cancel_prompt(&self) {}
+    /// Starts a prompt attempt and returns its number. A backend that shows
+    /// nothing has nothing to number.
+    fn begin_prompt(&self) -> u64 {
+        0
+    }
+
+    /// Dismisses that attempt's prompt, and only that attempt's. A number
+    /// from an attempt that is already over does nothing.
+    fn cancel_prompt(&self, _attempt: u64) {}
 }
 
 /// A P-256 key held in process memory.
@@ -76,8 +82,11 @@ impl Signer for EnclaveBackend {
         // the prompt tells a dismissed sheet from an unusable key.
         self.0.sign_der(message, reason).map_err(anyhow::Error::new)
     }
-    fn cancel_prompt(&self) {
-        self.0.canceller().cancel();
+    fn begin_prompt(&self) -> u64 {
+        self.0.canceller().begin()
+    }
+    fn cancel_prompt(&self, attempt: u64) {
+        self.0.canceller().cancel(attempt);
     }
 }
 
@@ -224,9 +233,14 @@ impl Identity {
         self.signing.kind()
     }
 
-    /// Dismisses whatever prompt the signing backend has on screen.
-    pub fn cancel_prompt(&self) {
-        self.signer.cancel_prompt();
+    /// Starts a prompt attempt on the signing backend and returns its number.
+    pub fn begin_prompt(&self) -> u64 {
+        self.signer.begin_prompt()
+    }
+
+    /// Dismisses that attempt's prompt. See [`Signer::cancel_prompt`].
+    pub fn cancel_prompt(&self, attempt: u64) {
+        self.signer.cancel_prompt(attempt);
     }
 
     pub fn public_key_sec1(&self) -> Vec<u8> {

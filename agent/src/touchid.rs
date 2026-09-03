@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use tokio::sync::Mutex;
+use tracing::info;
 
 use crate::remaining_until;
 
@@ -36,8 +37,17 @@ pub trait ScreenLock: Send + Sync + 'static {
 }
 
 /// Dismisses the Touch ID sheet currently on screen, if any.
+///
+/// Cancellations are numbered because a deadline timer cannot always be
+/// stopped: aborting a task that has already reached its last few instructions
+/// does nothing. A timer for a request that was just answered can still fire,
+/// and an unnumbered cancellation would land on the next request instead,
+/// tearing down a sheet nobody had seen and publishing a denial for it.
 pub trait PromptCancel: Send + Sync + 'static {
-    fn cancel(&self);
+    /// Starts an attempt and returns its number.
+    fn begin(&self) -> u64;
+    /// Dismisses that attempt's sheet, and only that attempt's.
+    fn cancel(&self, attempt: u64);
 }
 
 /// Why an attempt produced no signature.
@@ -88,32 +98,55 @@ impl TouchIdPrompt {
     /// thread. Waiting for an earlier sheet, and waiting for the screen to
     /// unlock, both happen before `sign` is called at all: a request whose
     /// deadline passes while it waits never raises a sheet.
-    pub async fn ask<T, F>(&self, expires_at: i64, sign: F) -> Result<Outcome<T>>
+    pub async fn ask<T, F>(&self, request_id: &str, expires_at: i64, sign: F) -> Result<Outcome<T>>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T, AttemptError> + Send + 'static,
     {
         let _sheet = self.sheet.lock().await;
+        let mut waited_for_the_screen = false;
         let remaining = loop {
             let Some(remaining) = remaining_until(expires_at) else {
+                if waited_for_the_screen {
+                    info!(
+                        request_id,
+                        "the screen stayed locked until the request expired"
+                    );
+                }
                 return Ok(Outcome::Expired);
             };
             if !self.screen.is_locked() {
                 break remaining;
             }
+            if !waited_for_the_screen {
+                waited_for_the_screen = true;
+                // Without this a machine with no window session, an ssh
+                // session for instance, expires every request in silence.
+                info!(
+                    request_id,
+                    "the screen is locked, so the Touch ID sheet waits for it to unlock"
+                );
+            }
             tokio::time::sleep(self.poll.min(remaining)).await;
         };
+        if waited_for_the_screen {
+            info!(
+                request_id,
+                "the screen unlocked, raising the Touch ID sheet"
+            );
+        }
 
         // The sheet blocks a thread that cannot see the clock, so the deadline
         // arrives from here: invalidating the context tears the sheet down.
         let expired = Arc::new(AtomicBool::new(false));
+        let attempt = self.canceller.begin();
         let deadline = tokio::spawn({
             let expired = Arc::clone(&expired);
             let canceller = Arc::clone(&self.canceller);
             async move {
                 tokio::time::sleep(remaining).await;
                 expired.store(true, Ordering::SeqCst);
-                canceller.cancel();
+                canceller.cancel(attempt);
             }
         });
         let signed = tokio::task::spawn_blocking(sign).await;
@@ -163,13 +196,39 @@ mod tests {
         }
     }
 
+    /// Models the real canceller: an attempt number, and a flag the sheet
+    /// checks when it comes up.
     #[derive(Default)]
     struct Canceller {
+        state: std::sync::Mutex<(u64, bool)>,
         cancels: AtomicUsize,
     }
 
+    impl Canceller {
+        /// What the sheet sees when it is raised, as `arm` does on a Mac.
+        fn cancelled(&self) -> bool {
+            self.state.lock().unwrap().1
+        }
+
+        fn attempt(&self) -> u64 {
+            self.state.lock().unwrap().0
+        }
+    }
+
     impl PromptCancel for Arc<Canceller> {
-        fn cancel(&self) {
+        fn begin(&self) -> u64 {
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            state.1 = false;
+            state.0
+        }
+
+        fn cancel(&self, attempt: u64) {
+            let mut state = self.state.lock().unwrap();
+            if state.0 != attempt {
+                return;
+            }
+            state.1 = true;
             self.cancels.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -192,7 +251,7 @@ mod tests {
     async fn a_completed_signature_is_an_approval() {
         let (screen, canceller) = (Arc::new(Screen::default()), Arc::new(Canceller::default()));
         let outcome = prompt(&screen, &canceller)
-            .ask(now() + 30, || Ok(vec![1_u8, 2, 3]))
+            .ask("req-1", now() + 30, || Ok(vec![1_u8, 2, 3]))
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Approved(vec![1, 2, 3]));
@@ -204,7 +263,7 @@ mod tests {
     async fn a_dismissed_sheet_denies() {
         let (screen, canceller) = (Arc::new(Screen::default()), Arc::new(Canceller::default()));
         let outcome: Outcome<Vec<u8>> = prompt(&screen, &canceller)
-            .ask(now() + 30, || Err(AttemptError::Canceled))
+            .ask("req-1", now() + 30, || Err(AttemptError::Canceled))
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Denied);
@@ -216,7 +275,7 @@ mod tests {
     async fn a_failed_signature_is_not_a_verdict() {
         let (screen, canceller) = (Arc::new(Screen::default()), Arc::new(Canceller::default()));
         let error = prompt(&screen, &canceller)
-            .ask(now() + 30, || {
+            .ask("req-1", now() + 30, || {
                 Err::<Vec<u8>, _>(AttemptError::Failed(anyhow::anyhow!("biometry changed")))
             })
             .await
@@ -230,7 +289,7 @@ mod tests {
     async fn an_expired_request_raises_no_sheet() {
         let (screen, canceller) = (Arc::new(Screen::default()), Arc::new(Canceller::default()));
         let outcome: Outcome<Vec<u8>> = prompt(&screen, &canceller)
-            .ask(now() - 1, || panic!("the sheet must not appear"))
+            .ask("req-1", now() - 1, || panic!("the sheet must not appear"))
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Expired);
@@ -249,7 +308,7 @@ mod tests {
             }
         });
         let outcome = prompt(&screen, &canceller)
-            .ask(now() + 30, || Ok(vec![7_u8]))
+            .ask("req-1", now() + 30, || Ok(vec![7_u8]))
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Approved(vec![7]));
@@ -263,7 +322,7 @@ mod tests {
     async fn a_screen_locked_past_the_deadline_yields_no_verdict() {
         let (screen, canceller) = (Screen::locked(), Arc::new(Canceller::default()));
         let outcome: Outcome<Vec<u8>> = prompt(&screen, &canceller)
-            .ask(now() + 1, || panic!("the sheet must not appear"))
+            .ask("req-1", now() + 1, || panic!("the sheet must not appear"))
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Expired);
@@ -277,7 +336,7 @@ mod tests {
         let (torn_down, sheet_gone) = std::sync::mpsc::channel();
         let watcher = Arc::clone(&canceller);
         let outcome: Outcome<Vec<u8>> = prompt(&screen, &canceller)
-            .ask(now() + 1, move || {
+            .ask("req-1", now() + 1, move || {
                 while watcher.cancels.load(Ordering::SeqCst) == 0 {
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -289,6 +348,41 @@ mod tests {
         sheet_gone.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(outcome, Outcome::Expired);
         assert_eq!(canceller.cancels.load(Ordering::SeqCst), 1);
+    }
+
+    /// A deadline timer for a request that was just answered can still fire:
+    /// aborting a task in its last instructions does nothing. That cancel must
+    /// not reach the next request, whose sheet nobody has seen yet.
+    #[tokio::test]
+    async fn a_late_cancel_from_a_finished_attempt_leaves_the_next_one_alone() {
+        let (screen, canceller) = (Arc::new(Screen::default()), Arc::new(Canceller::default()));
+        let prompt = prompt(&screen, &canceller);
+        let outcome = prompt
+            .ask("req-1", now() + 30, || Ok(vec![1_u8]))
+            .await
+            .unwrap();
+        assert_eq!(outcome, Outcome::Approved(vec![1]));
+
+        // The first request's timer, firing while the next request is already
+        // under way. The sheet then checks the flag, as the enclave does when
+        // it arms a fresh context.
+        let stale = canceller.attempt();
+        let watcher = Arc::clone(&canceller);
+        let outcome = prompt
+            .ask("req-2", now() + 30, move || {
+                watcher.cancel(stale);
+                if watcher.cancelled() {
+                    return Err(AttemptError::Canceled);
+                }
+                Ok(vec![2_u8])
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Approved(vec![2]),
+            "a stale cancellation denied a request nobody was shown"
+        );
     }
 
     /// Two requests at once share one fingerprint reader. The second sheet only
@@ -304,7 +398,7 @@ mod tests {
             let (prompt, live, peak) = (Arc::clone(&prompt), Arc::clone(&live), Arc::clone(&peak));
             sheets.push(tokio::spawn(async move {
                 prompt
-                    .ask(now() + 30, move || {
+                    .ask("req-1", now() + 30, move || {
                         let concurrent = live.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(concurrent, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(20));
