@@ -439,7 +439,10 @@ async fn decide(
     let decision = if approve {
         identity.approve(opened, &approval_reason(request))?
     } else {
-        identity.deny(&request.request_id)
+        // An explicit refusal signs like an approval: the hook verifies the
+        // denial against the pinned device, so no NATS credential suffices
+        // to deny for it. Silence (timeout, dismissal) signs nothing.
+        identity.deny(opened, &approval_reason(request))?
     };
     Ok(Some(decision))
 }
@@ -919,7 +922,10 @@ mod mac {
             .await
         {
             Ok(Outcome::Approved(decision)) => Ok(Some(decision)),
-            Ok(Outcome::Denied) => Ok(Some(identity.deny(&request.request_id))),
+            // Dismissal carries no signature, and an unsigned denial is
+            // indistinguishable from a forgery: the hook fails closed at
+            // the deadline instead.
+            Ok(Outcome::Denied) => Ok(None),
             Ok(Outcome::Expired) => {
                 info!(
                     request_id = %escape_for_terminal(&request.request_id),
@@ -1429,6 +1435,10 @@ mod tests {
         match socket_verdict(identity.clone(), false, &envelope).await {
             oshioki_protocol::DecisionV1::Deny(denial) => {
                 assert_eq!(denial.request_id, request.request_id);
+                // Auto-deny signs like an explicit refusal: the hook
+                // verifies this against the pinned record.
+                oshioki_protocol::verify_deny_v1(&denial, &identity.device_record("laptop"))
+                    .unwrap();
             }
             other => panic!("expected a denial, got {other:?}"),
         }

@@ -8,18 +8,20 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit},
 };
+use p256::ecdsa::{Signature, signature::Verifier as _};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::Error;
+use crate::{Error, native_v1::sec1_p256_verifying_key, webauthn_v1::cose_p256_verifying_key};
 
 pub const VERSION_V1: u8 = 1;
 pub const MAX_DEVICES: usize = 8;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 3 * 1024 * 1024;
 const CHALLENGE_DOMAIN: &[u8] = b"oshioki/approve/v1\0";
+const DENY_DOMAIN: &[u8] = b"oshioki/deny/v1\0";
 const FINGERPRINT_DOMAIN: &[u8] = b"oshioki/fingerprint/v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,6 +578,13 @@ pub struct DenyV1 {
     pub version: u8,
     pub request_id: String,
     pub device_fingerprint: String,
+    /// Base64url DER ECDSA P-256 over [`deny_challenge`], present on native
+    /// (NATS) verdicts where the device key signs. Absent on browser
+    /// verdicts: the authenticator key never leaves its hardware, so those
+    /// authenticate at the API with the device token and the hook confirms
+    /// them against the server's record instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl ApproveV1 {
@@ -606,8 +615,60 @@ impl DenyV1 {
         {
             return Err(Error::BadVerdict("invalid denial shape".into()));
         }
+        if let Some(signature) = &self.signature {
+            if signature.is_empty() {
+                return Err(Error::BadVerdict("empty denial signature".into()));
+            }
+            decode_base64url(signature)?;
+        }
         Ok(())
     }
+}
+
+/// The 32 bytes a device signs to deny: domain-separated over the request id
+/// and its own fingerprint, so a denial authenticates exactly one request
+/// from exactly one device. Replays across requests or devices challenge
+/// differently and fail verification. Separate domain from approvals, so a
+/// denial signature is never a valid approval signature and vice versa.
+pub fn deny_challenge(request_id: &str, device_fingerprint: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(DENY_DOMAIN);
+    hash.update(request_id.as_bytes());
+    hash.update([0]);
+    hash.update(device_fingerprint.as_bytes());
+    hash.finalize().into()
+}
+
+/// Verifies a device-signed denial against its pinned record. The credential
+/// key parses according to the device kind; both `WebAuthn` and Secure Enclave
+/// devices speak DER ECDSA P-256.
+pub fn verify_deny_v1(denial: &DenyV1, device: &DevicePublicRecordV1) -> Result<(), Error> {
+    device.validate()?;
+    denial.validate_shape()?;
+    if denial.request_id.is_empty() || denial.device_fingerprint != device.fingerprint {
+        return Err(Error::BadVerdict(
+            "denial does not match pinned device".into(),
+        ));
+    }
+    let signature = denial
+        .signature
+        .as_deref()
+        .ok_or_else(|| Error::BadVerdict("denial is unsigned".into()))?;
+    let key = match device.kind {
+        DeviceKindV1::Webauthn => {
+            cose_p256_verifying_key(&decode_base64url(&device.credential_public_key)?)?
+        }
+        DeviceKindV1::SecureEnclave => {
+            sec1_p256_verifying_key(&decode_base64url(&device.credential_public_key)?)?
+        }
+    };
+    let signature =
+        Signature::from_der(&decode_base64url(signature)?).map_err(|_| Error::InvalidSignature)?;
+    key.verify(
+        &deny_challenge(&denial.request_id, &denial.device_fingerprint),
+        &signature,
+    )
+    .map_err(|_| Error::InvalidSignature)
 }
 
 pub fn encode_base64url(bytes: &[u8]) -> String {
@@ -1025,5 +1086,122 @@ mod tests {
         let mut tampered = sealed.clone();
         tampered.ciphertext = encode_base64url(&[0; 32]);
         assert!(unseal_v1(&tampered, &recipient_secret).is_err());
+    }
+
+    /// One pinned device with a real key, in either credential encoding, for
+    /// denial round trips.
+    fn deny_fixture(kind: DeviceKindV1) -> (DevicePublicRecordV1, p256::ecdsa::SigningKey) {
+        use p256::ecdsa::SigningKey;
+        let signing = SigningKey::from_bytes((&[11; 32]).into()).unwrap();
+        let point = signing.verifying_key().to_encoded_point(false);
+        let public = point.as_bytes().to_vec();
+        let (credential_id, credential_public_key) = match kind {
+            DeviceKindV1::SecureEnclave => (
+                encode_base64url(&crate::native_v1::native_credential_id(&public)),
+                encode_base64url(&public),
+            ),
+            DeviceKindV1::Webauthn => {
+                let cose =
+                    crate::webauthn_v1::tests::cose_key(point.x().unwrap(), point.y().unwrap());
+                (encode_base64url(&[9; 16]), encode_base64url(&cose))
+            }
+        };
+        let credential_public_key_bytes = decode_base64url(&credential_public_key).unwrap();
+        let device = DevicePublicRecordV1 {
+            version: VERSION_V1,
+            kind,
+            fingerprint: device_fingerprint(
+                &decode_base64url(&credential_id).unwrap(),
+                &credential_public_key_bytes,
+                &[7; 32],
+            ),
+            credential_id,
+            credential_public_key,
+            box_public_key: encode_base64url(&[7; 32]),
+            label: "laptop".into(),
+            api_token_hash: encode_base64url(&[8; 32]),
+            sign_count: 0,
+            active: true,
+        };
+        device.validate().unwrap();
+        (device, signing)
+    }
+
+    fn signed_denial(
+        signing: &p256::ecdsa::SigningKey,
+        request_id: &str,
+        device: &DevicePublicRecordV1,
+    ) -> DenyV1 {
+        use p256::ecdsa::signature::Signer as _;
+        let challenge = deny_challenge(request_id, &device.fingerprint);
+        let signature: p256::ecdsa::Signature = signing.sign(&challenge);
+        DenyV1 {
+            version: VERSION_V1,
+            request_id: request_id.into(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: Some(encode_base64url(signature.to_der().as_bytes())),
+        }
+    }
+
+    /// A device-signed denial verifies against its pinned record in both
+    /// credential encodings, and the challenge is input-sensitive.
+    #[test]
+    fn signed_denials_verify_per_device_kind() {
+        for kind in [DeviceKindV1::Webauthn, DeviceKindV1::SecureEnclave] {
+            let (device, signing) = deny_fixture(kind);
+            let denial = signed_denial(&signing, "req-1", &device);
+            denial.validate_shape().unwrap();
+            verify_deny_v1(&denial, &device).unwrap();
+        }
+        assert_ne!(deny_challenge("req-1", "fp"), deny_challenge("req-2", "fp"));
+        assert_ne!(
+            deny_challenge("req-1", "fp-a"),
+            deny_challenge("req-1", "fp-b")
+        );
+    }
+
+    /// Forged, cross-device, cross-request, tampered, and unsigned denials
+    /// all fail: the hook can pin exactly one meaning to one signature.
+    #[test]
+    fn denial_forgeries_do_not_verify() {
+        use p256::ecdsa::signature::Signer as _;
+        let (device, signing) = deny_fixture(DeviceKindV1::SecureEnclave);
+        let denial = signed_denial(&signing, "req-1", &device);
+        let other_signing = p256::ecdsa::SigningKey::from_bytes((&[12; 32]).into()).unwrap();
+        let other_signature: p256::ecdsa::Signature =
+            other_signing.sign(&deny_challenge("req-1", &device.fingerprint));
+        let mut forged = denial.clone();
+        forged.signature = Some(encode_base64url(other_signature.to_der().as_bytes()));
+        assert!(verify_deny_v1(&forged, &device).is_err());
+        let mut crossed = denial.clone();
+        crossed.device_fingerprint = encode_base64url(&[8; 16]);
+        assert!(verify_deny_v1(&crossed, &device).is_err());
+        let mut replayed = denial.clone();
+        replayed.request_id = "req-2".into();
+        assert!(verify_deny_v1(&replayed, &device).is_err());
+        let mut tampered = denial.clone();
+        tampered.request_id = "req-1-tampered".into();
+        assert!(verify_deny_v1(&tampered, &device).is_err());
+        let mut unsigned = denial.clone();
+        unsigned.signature = None;
+        assert!(verify_deny_v1(&unsigned, &device).is_err());
+        let mut empty = denial.clone();
+        empty.signature = Some(String::new());
+        assert!(empty.validate_shape().is_err());
+    }
+
+    /// A denial written without a signature — the browser shape — still
+    /// parses, with the signature absent rather than empty.
+    #[test]
+    fn unsigned_denials_parse_for_the_browser_path() {
+        let denial: DenyV1 = serde_json::from_str(
+            r#"{"version":1,"request_id":"req-1","device_fingerprint":"AAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .unwrap();
+        assert_eq!(denial.signature, None);
+        denial.validate_shape().unwrap();
+        let round_tripped: DenyV1 =
+            serde_json::from_str(&serde_json::to_string(&denial).unwrap()).unwrap();
+        assert_eq!(round_tripped.signature, None);
     }
 }

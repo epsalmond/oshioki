@@ -412,6 +412,22 @@ impl Store {
         Ok(InsertResult::Inserted)
     }
 
+    /// The retained copy of a queued API verdict, for hooks confirming a
+    /// relayed denial they cannot verify by signature. The outbox row is the
+    /// server's record of what its authenticated API accepted; mark-sent
+    /// rows are kept, so the record survives delivery.
+    pub fn recorded_verdict(&self, request_id: &str) -> Result<Option<Vec<u8>>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT payload FROM outbox WHERE kind='decision' AND dedupe_key=?1 ORDER BY id DESC LIMIT 1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn pending_outbox(&self, limit: usize) -> Result<Vec<OutboxItem>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
@@ -662,6 +678,7 @@ mod tests {
             version: VERSION_V1,
             request_id: "request-1".into(),
             device_fingerprint: device.fingerprint.clone(),
+            signature: None,
         });
         assert_eq!(
             store
@@ -677,6 +694,38 @@ mod tests {
         );
     }
 
+    /// The retained verdict copy answers hooks confirming relayed denials,
+    /// including after delivery: only the request's own record matches.
+    #[test]
+    fn recorded_verdict_returns_the_queued_decision() {
+        let store = Store::memory().unwrap();
+        let device = device(b"recorded-token");
+        store.put_device(&device).unwrap();
+        let envelope = envelope(&device.fingerprint);
+        let raw = serde_json::to_vec(&envelope).unwrap();
+        store.ingest_request(&raw, &envelope, 20).unwrap();
+        let decision = DecisionV1::Deny(DenyV1 {
+            version: VERSION_V1,
+            request_id: "request-1".into(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: None,
+        });
+        store
+            .queue_decision("request-1", &device.fingerprint, &decision, 20)
+            .unwrap();
+        assert_eq!(
+            store.recorded_verdict("request-1").unwrap(),
+            Some(serde_json::to_vec(&decision).unwrap())
+        );
+        assert_eq!(store.recorded_verdict("request-9").unwrap(), None);
+        let pending = store.pending_outbox(10).unwrap();
+        store.mark_outbox_sent(pending[0].id).unwrap();
+        assert_eq!(
+            store.recorded_verdict("request-1").unwrap(),
+            Some(serde_json::to_vec(&decision).unwrap())
+        );
+    }
+
     #[test]
     fn restart_replays_unsent_outbox_until_marked() {
         let path = temporary_database();
@@ -685,6 +734,7 @@ mod tests {
             version: VERSION_V1,
             request_id: "request-1".into(),
             device_fingerprint: device.fingerprint.clone(),
+            signature: None,
         });
 
         {

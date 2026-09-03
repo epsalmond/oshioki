@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/requests/:id", get(get_request))
         .route("/api/v1/requests/:id/approve", post(approve_request))
         .route("/api/v1/requests/:id/deny", post(deny_request))
+        .route("/api/v1/requests/:id/verdict", get(recorded_verdict))
         .route(
             "/api/v1/enrollments/:id/submission",
             post(submit_enrollment),
@@ -497,6 +498,23 @@ async fn submit_enrollment(
         Err(error) if error.to_string().contains("expired") => Err(ApiError(StatusCode::GONE)),
         Err(error) if error.to_string().contains("unknown") => Err(ApiError(StatusCode::NOT_FOUND)),
         Err(_) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR)),
+    }
+}
+/// The server's recorded verdict for a request, if its authenticated API
+/// accepted one. Public like the NATS verdict stream itself: hooks fetch it
+/// to confirm relayed browser denials they cannot verify by signature.
+/// Verdicts are outcomes, not secrets — the payload was already published.
+async fn recorded_verdict(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    match state
+        .store
+        .recorded_verdict(&id)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+    {
+        Some(payload) => Ok(asset("application/json", &payload, false)),
+        None => Err(ApiError(StatusCode::NOT_FOUND)),
     }
 }
 async fn enrollment_status(

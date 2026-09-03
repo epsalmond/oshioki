@@ -22,7 +22,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use oshioki_protocol::{
     ApproveNativeV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1,
     NativeEnrollmentSubmissionV1, RequestEnvelopeV1, RequestV1, VERSION_V1, approve_challenge,
-    decode_base64url, device_fingerprint, encode_base64url, native_credential_id,
+    decode_base64url, deny_challenge, device_fingerprint, encode_base64url, native_credential_id,
     native_enrollment_proof, native_v1::native_transcript_hmac, unseal_v1,
 };
 
@@ -346,12 +346,19 @@ impl Identity {
         }))
     }
 
-    pub fn deny(&self, request_id: &str) -> DecisionV1 {
-        DecisionV1::Deny(DenyV1 {
+    /// Refuses a request with a device-signed denial: only this device's key
+    /// can produce the signature, so no NATS credential suffices to deny
+    /// for it. `reason` is shown by backends that ask the operator (like an
+    /// approval reason) and ignored by backends that do not.
+    pub fn deny(&self, opened: &OpenedRequest, reason: &str) -> Result<DecisionV1> {
+        let challenge = deny_challenge(&opened.request.request_id, &self.fingerprint());
+        let signature = self.signer.sign_der(&challenge, reason)?;
+        Ok(DecisionV1::Deny(DenyV1 {
             version: VERSION_V1,
-            request_id: request_id.to_owned(),
+            request_id: opened.request.request_id.clone(),
             device_fingerprint: self.fingerprint(),
-        })
+            signature: Some(encode_base64url(&signature)),
+        }))
     }
 }
 
@@ -461,7 +468,8 @@ fn exact_32(value: &str) -> Result<[u8; 32]> {
 mod tests {
     use super::*;
     use oshioki_protocol::{
-        DeviceRegistryV1, seal_v1, verify_native_approval_v1, verify_native_enrollment_v1,
+        DeviceRegistryV1, seal_v1, verify_deny_v1, verify_native_approval_v1,
+        verify_native_enrollment_v1,
     };
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -545,11 +553,27 @@ mod tests {
         };
         verify_native_approval_v1(&approval, &raw, &device).unwrap();
         assert!(verify_native_approval_v1(&approval, b"{}", &device).is_err());
-        let DecisionV1::Deny(denial) = identity.deny("req-1") else {
+        let DecisionV1::Deny(denial) = identity.deny(&opened, "refuse true").unwrap() else {
             panic!("expected denial");
         };
         denial.validate_shape().unwrap();
         assert_eq!(denial.device_fingerprint, device.fingerprint);
+        // The denial authenticates against the pinned record: the hook
+        // accepts exactly this, and nothing forged, replayed, or borrowed
+        // from another device.
+        verify_deny_v1(&denial, &device).unwrap();
+        let mut forged = denial.clone();
+        forged.signature = Some(encode_base64url(&[9; 64]));
+        assert!(verify_deny_v1(&forged, &device).is_err());
+        let mut crossed = denial.clone();
+        crossed.device_fingerprint = encode_base64url(&[7; 16]);
+        assert!(verify_deny_v1(&crossed, &device).is_err());
+        let mut replayed = denial.clone();
+        replayed.request_id = "req-2".into();
+        assert!(verify_deny_v1(&replayed, &device).is_err());
+        let mut unsigned = denial.clone();
+        unsigned.signature = None;
+        assert!(verify_deny_v1(&unsigned, &device).is_err());
     }
 
     #[test]

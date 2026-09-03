@@ -22,10 +22,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use oshioki_protocol::{
-    ActivationV1, DecisionV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
+    ActivationV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
     EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1, RequestEnvelopeV1,
     RequestV1, VERSION_V1, escape_for_terminal, is_approval_env, verify_approval_v1,
-    verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
+    verify_deny_v1, verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
 };
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
@@ -171,6 +171,7 @@ async fn execute_request_at(
         &mut registry,
         directory,
     )
+    .await
 }
 
 /// What one attempt at the local agent socket concluded.
@@ -254,7 +255,7 @@ async fn read_frame(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<Opti
 }
 
 /// Applies one decision to a request. Invalid decisions fail closed.
-fn apply_decision(
+async fn apply_decision(
     decision: DecisionV1,
     request: &RequestV1,
     raw_request: &[u8],
@@ -274,11 +275,24 @@ fn apply_decision(
             if denial.version != VERSION_V1 || denial.request_id != request.request_id {
                 bail!("malformed deny decision");
             }
-            if !active
+            let device = active
                 .iter()
-                .any(|device| device.fingerprint == denial.device_fingerprint)
-            {
-                bail!("deny from unpinned device");
+                .find(|device| device.fingerprint == denial.device_fingerprint)
+                .context("deny from unpinned device")?;
+            if denial.signature.is_some() {
+                // Native verdicts authenticate here: only the pinned device
+                // key can produce this signature, so no NATS credential
+                // suffices to deny for another device.
+                verify_deny_v1(&denial, device).context("deny verification failed")?;
+            } else {
+                // Browser verdicts carry no device signature (the key never
+                // leaves its authenticator); they arrive relayed by the
+                // server after bearer-token authentication, so the server's
+                // record confirms them. A direct forgery has no record.
+                let config = load_hook_config_from(directory)?;
+                if !server_confirms_denial(&config.server_base_url, &denial).await {
+                    bail!("denial is not server-confirmed");
+                }
             }
             bail!("request explicitly denied");
         }
@@ -535,6 +549,35 @@ async fn activate_device(
 }
 
 /// Whether the server serves exactly the record that was just enrolled.
+/// Whether the server's record authenticates an unsigned denial: the recorded
+/// verdict must be a denial for the same request from the same fingerprint.
+/// Only the authenticated API writes that record, so a directly forged NATS
+/// denial — which has none — fails here. Pure, so tests can drive it without
+/// a server.
+fn denial_confirmed_by(recorded: &DecisionV1, denial: &DenyV1) -> bool {
+    matches!(recorded, DecisionV1::Deny(recorded)
+        if recorded.request_id == denial.request_id
+            && recorded.device_fingerprint == denial.device_fingerprint)
+}
+
+/// Fetches the server's recorded verdict for a request and checks it against
+/// an unsigned denial. Unreachable server, missing record, and mismatch all
+/// mean the same thing: no confirmation, fail closed.
+async fn server_confirms_denial(server_base_url: &str, denial: &DenyV1) -> bool {
+    let url = format!(
+        "{server_base_url}/api/v1/requests/{}/verdict",
+        denial.request_id
+    );
+    let recorded: DecisionV1 = match http_get(&url).await {
+        Ok(body) => match serde_json::from_slice(&body) {
+            Ok(recorded) => recorded,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    denial_confirmed_by(&recorded, denial)
+}
+
 async fn server_device_matches(url: &str, device: &DevicePublicRecordV1) -> Result<bool> {
     let body = http_get(url).await?;
     let served: DevicePublicRecordV1 =
@@ -1167,8 +1210,8 @@ mod tests {
 
     /// Nothing decides a request that is already dead, whatever the verdict
     /// says and whichever device kind signed it.
-    #[test]
-    fn an_expired_request_rejects_every_verdict() {
+    #[tokio::test]
+    async fn an_expired_request_rejects_every_verdict() {
         let mut request = build_synthetic_request();
         request.expires_at = now() - 1;
         let fingerprint = URL_SAFE_NO_PAD.encode([1; 16]);
@@ -1181,6 +1224,7 @@ mod tests {
                 version: VERSION_V1,
                 request_id: request.request_id.clone(),
                 device_fingerprint: fingerprint.clone(),
+                signature: None,
             }),
             DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
                 version: VERSION_V1,
@@ -1207,6 +1251,7 @@ mod tests {
                 &mut registry,
                 Path::new("/nonexistent"),
             )
+            .await
             .unwrap_err();
             assert!(
                 error.to_string().contains("expired before its verdict"),
@@ -1218,6 +1263,160 @@ mod tests {
     #[test]
     fn check_uses_the_root_owned_config_directory() {
         assert_eq!(check_config_dir(), Path::new("/etc/oshioki"));
+    }
+
+    /// One pinned Secure Enclave device with a real key, for denial tests.
+    fn deny_test_device() -> (DevicePublicRecordV1, p256::ecdsa::SigningKey) {
+        let signing = p256::ecdsa::SigningKey::from_bytes((&[21; 32]).into()).unwrap();
+        let public = signing
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let credential_id = oshioki_protocol::native_credential_id(&public);
+        let fingerprint = oshioki_protocol::device_fingerprint(&credential_id, &public, &[22; 32]);
+        let device = DevicePublicRecordV1 {
+            version: VERSION_V1,
+            kind: DeviceKindV1::SecureEnclave,
+            fingerprint,
+            credential_id: URL_SAFE_NO_PAD.encode(&credential_id),
+            credential_public_key: URL_SAFE_NO_PAD.encode(&public),
+            box_public_key: URL_SAFE_NO_PAD.encode([22; 32]),
+            label: "test".into(),
+            api_token_hash: URL_SAFE_NO_PAD.encode([23; 32]),
+            sign_count: 0,
+            active: true,
+        };
+        device.validate().unwrap();
+        (device, signing)
+    }
+
+    fn deny_for(
+        signing: &p256::ecdsa::SigningKey,
+        request_id: &str,
+        device: &DevicePublicRecordV1,
+    ) -> DenyV1 {
+        use p256::ecdsa::signature::Signer as _;
+        let challenge = oshioki_protocol::deny_challenge(request_id, &device.fingerprint);
+        let signature: p256::ecdsa::Signature = signing.sign(&challenge);
+        DenyV1 {
+            version: VERSION_V1,
+            request_id: request_id.into(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: Some(URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes())),
+        }
+    }
+
+    /// A device-signed denial applies; a forgery, a cross-device denial, and
+    /// an unsigned denial (with no server to confirm it) do not — each with
+    /// its own error, so operators can tell attack from outage.
+    #[tokio::test]
+    async fn denial_signatures_decide_at_apply_time() {
+        async fn apply(
+            decision: DecisionV1,
+            request: &RequestV1,
+            active: &[DevicePublicRecordV1],
+            registry: &mut DeviceRegistryV1,
+        ) -> Result<()> {
+            apply_decision(
+                decision,
+                request,
+                &[],
+                active,
+                registry,
+                Path::new("/nonexistent"),
+            )
+            .await
+        }
+        let (device, signing) = deny_test_device();
+        let mut request = build_synthetic_request();
+        request.request_id = "req-1".into();
+        let mut registry = DeviceRegistryV1 {
+            version: 1,
+            devices: Vec::new(),
+        };
+        let active = [device.clone()];
+        let error = apply(
+            DecisionV1::Deny(deny_for(&signing, "req-1", &device)),
+            &request,
+            &active,
+            &mut registry,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("explicitly denied"), "{error:#}");
+        let other = p256::ecdsa::SigningKey::from_bytes((&[24; 32]).into()).unwrap();
+        let error = apply(
+            DecisionV1::Deny(deny_for(&other, "req-1", &device)),
+            &request,
+            &active,
+            &mut registry,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("deny verification failed"),
+            "{error:#}"
+        );
+        let mut crossed = deny_for(&signing, "req-1", &device);
+        crossed.device_fingerprint = URL_SAFE_NO_PAD.encode([25; 16]);
+        let error = apply(DecisionV1::Deny(crossed), &request, &active, &mut registry)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("deny from unpinned device"),
+            "{error:#}"
+        );
+        let unsigned = DenyV1 {
+            version: VERSION_V1,
+            request_id: "req-1".into(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: None,
+        };
+        let error = apply(DecisionV1::Deny(unsigned), &request, &active, &mut registry)
+            .await
+            .unwrap_err();
+        assert!(
+            !error.to_string().contains("explicitly denied"),
+            "{error:#}"
+        );
+    }
+
+    /// The server's record confirms exactly the denial it recorded: same
+    /// request, same fingerprint, denial kind. Anything else stands alone.
+    #[test]
+    fn server_records_confirm_only_matching_denials() {
+        let denial = DenyV1 {
+            version: VERSION_V1,
+            request_id: "req-1".into(),
+            device_fingerprint: URL_SAFE_NO_PAD.encode([26; 16]),
+            signature: None,
+        };
+        assert!(denial_confirmed_by(
+            &DecisionV1::Deny(denial.clone()),
+            &denial
+        ));
+        let mut other_request = denial.clone();
+        other_request.request_id = "req-2".into();
+        assert!(!denial_confirmed_by(
+            &DecisionV1::Deny(other_request),
+            &denial
+        ));
+        let mut other_device = denial.clone();
+        other_device.device_fingerprint = URL_SAFE_NO_PAD.encode([27; 16]);
+        assert!(!denial_confirmed_by(
+            &DecisionV1::Deny(other_device),
+            &denial
+        ));
+        assert!(!denial_confirmed_by(
+            &DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
+                version: VERSION_V1,
+                request_id: "req-1".into(),
+                device_fingerprint: denial.device_fingerprint.clone(),
+                signature: URL_SAFE_NO_PAD.encode([28; 64]),
+            }),
+            &denial
+        ));
     }
 
     #[test]
@@ -1294,6 +1493,7 @@ mod tests {
                 version: VERSION_V1,
                 request_id: "req-1".into(),
                 device_fingerprint: "fp".into(),
+                signature: None,
             });
             let frame =
                 oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&decision).unwrap())
