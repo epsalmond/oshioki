@@ -5,6 +5,11 @@ COPY . ./
 RUN cargo build --locked --release --workspace \
  && cd target/release \
  && sha256sum oshioki oshioki-agent oshioki-server liboshioki_plugin.so > SHA256SUMS
+# The E2E drives the agent with `run --auto`, which only exists behind the
+# `unattended` feature. Build that agent apart so the release binary and its
+# checksum above stay feature-free.
+RUN cargo build --locked --release --package oshioki-agent --features unattended \
+      --target-dir target/unattended
 
 FROM debian:bookworm-slim AS server
 RUN apt-get update \
@@ -28,7 +33,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
 COPY --from=builder /build/target/release/oshioki /work/target/release/
-COPY --from=builder /build/target/release/oshioki-agent /work/target/release/
+COPY --from=builder /build/target/unattended/release/oshioki-agent /work/target/unattended/
 COPY --from=builder /build/target/release/liboshioki_plugin.so /work/target/release/
 COPY --from=builder /build/target/release/SHA256SUMS /work/target/release/
 COPY scripts/ /work/scripts/

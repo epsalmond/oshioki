@@ -75,7 +75,9 @@ AGENT_STATE="$STATE_ROOT/agent"
 AGENT_LOG=/tmp/oshioki-agent.log
 ENROLL_LOG=/tmp/oshioki-enroll.log
 HOOK_BIN=/work/target/release/oshioki
-AGENT_BIN=/work/target/release/oshioki-agent
+# Built with `--features unattended` for `run --auto`; kept apart from
+# target/release so that directory still matches its SHA256SUMS.
+AGENT_BIN=/work/target/unattended/oshioki-agent
 rm -rf "$AGENT_STATE"
 install -d -m 0700 "$AGENT_STATE"
 export OSHIOKI_CONFIG_DIR="$HOOK_CONFIG_DIR"

@@ -12,6 +12,11 @@ description = "Native approval agent: holds the device keys, watches for sudo re
 name = "oshioki-agent"
 path = "src/main.rs"
 
+[features]
+# `run --auto approve|deny` decides every request without a prompt. Only the
+# E2E build turns this on; a release agent has no such flag to reach for.
+unattended = []
+
 [dependencies]
 oshioki-protocol = { path = "../protocol" }
 tokio = { workspace = true }
