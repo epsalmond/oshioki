@@ -65,10 +65,15 @@ fn generate() -> Vectors {
     let device = verify_native_enrollment_v1(&submission, &secret).unwrap();
     let raw = request().raw_json().unwrap();
     let DecisionV1::ApproveNative(approval) = identity
-        .approve(&oshioki_agent::OpenedRequest {
-            request: request(),
-            raw: raw.clone(),
-        })
+        .approve(
+            &oshioki_agent::OpenedRequest {
+                request: request(),
+                raw: raw.clone(),
+            },
+            // The reason reaches a backend that asks the operator, and never
+            // the signature: the vectors below must not move when it changes.
+            "run /usr/bin/true as root (uid 0) on host.example",
+        )
         .unwrap()
     else {
         panic!("expected native approval");

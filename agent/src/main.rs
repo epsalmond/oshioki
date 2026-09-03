@@ -19,7 +19,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
-use oshioki_agent::{Identity, OpenedRequest, parse_enrollment_url};
+use oshioki_agent::{Identity, OpenedRequest, SignerKind, parse_enrollment_url, remaining_until};
 use oshioki_protocol::{ActivationV1, DecisionV1, RequestEnvelopeV1, escape_for_terminal};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
@@ -46,6 +46,15 @@ enum Verb {
         /// Label shown on the host's device list.
         #[arg(long)]
         label: String,
+        /// Where the signing key lives. Defaults to the Secure Enclave on
+        /// macOS and to a software key everywhere else. Ignored when this
+        /// device already has an identity, unless it disagrees with it.
+        #[arg(long, value_enum)]
+        signer: Option<SignerArg>,
+        /// Replace an existing identity. The device gets a new fingerprint,
+        /// so the host's old record for it should be revoked.
+        #[arg(long)]
+        force: bool,
     },
     /// Watch for requests and decide them.
     Run {
@@ -65,6 +74,36 @@ enum Auto {
     Deny,
 }
 
+/// The `--signer` choices. Not every one works on every machine: only a Mac
+/// has a Secure Enclave.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SignerArg {
+    Software,
+    Enclave,
+}
+
+/// A Mac signs with the enclave unless told otherwise, so pairing on a Mac
+/// gets Touch ID with no flag to remember.
+const DEFAULT_SIGNER: SignerKind = if cfg!(target_os = "macos") {
+    SignerKind::Enclave
+} else {
+    SignerKind::Software
+};
+
+fn signer_kind(flag: Option<SignerArg>) -> SignerKind {
+    match flag {
+        Some(SignerArg::Software) => SignerKind::Software,
+        Some(SignerArg::Enclave) => SignerKind::Enclave,
+        None => DEFAULT_SIGNER,
+    }
+}
+
+/// Whether `--signer` was given, so a mismatch with an existing identity can
+/// be an error rather than a flag that did nothing.
+fn requested_signer_kind(flag: Option<SignerArg>) -> Option<SignerKind> {
+    flag.map(|flag| signer_kind(Some(flag)))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -77,13 +116,29 @@ async fn main() -> Result<()> {
         Verb::Pair {
             enrollment_url,
             label,
-        } => cmd_pair(&identity_path, &enrollment_url, &label).await,
+            signer,
+            force,
+        } => {
+            cmd_pair(
+                &identity_path,
+                &enrollment_url,
+                &label,
+                Pairing {
+                    requested: requested_signer_kind(signer),
+                    default: signer_kind(signer),
+                    force,
+                },
+            )
+            .await
+        }
         #[cfg(feature = "unattended")]
         Verb::Run { auto } => cmd_run(&identity_path, auto).await,
         #[cfg(not(feature = "unattended"))]
         Verb::Run {} => cmd_run(&identity_path).await,
         Verb::Show => {
-            println!("{}", Identity::load(&identity_path)?.fingerprint());
+            let identity = Identity::load(&identity_path)?;
+            println!("{}", identity.fingerprint());
+            println!("signer: {}", identity.signer_kind());
             Ok(())
         }
     }
@@ -102,19 +157,63 @@ fn state_dir(flag: Option<PathBuf>) -> Result<PathBuf> {
 
 /// Loads the identity, creating one on first use. One identity serves every
 /// host this device pairs with.
-fn load_or_create(path: &std::path::Path) -> Result<Identity> {
-    if path.exists() {
-        Identity::load(path)
-    } else {
-        let identity = Identity::generate_to(path)?;
-        info!(path=%path.display(), fingerprint=%identity.fingerprint(), "created device identity");
-        Ok(identity)
-    }
+/// What `pair` was told about the signing key.
+struct Pairing {
+    /// The `--signer` value, if one was given.
+    requested: Option<SignerKind>,
+    /// What to create when there is no identity yet.
+    default: SignerKind,
+    /// Replace an existing identity rather than reuse it.
+    force: bool,
 }
 
-async fn cmd_pair(identity_path: &std::path::Path, url: &str, label: &str) -> Result<()> {
+fn load_or_create(path: &std::path::Path, pairing: &Pairing) -> Result<Identity> {
+    if path.exists() && !pairing.force {
+        // One identity serves every host this device pairs with, so an
+        // existing one is reused rather than replaced. A --signer that
+        // disagrees with it cannot be honoured and must not look like it was.
+        let identity = Identity::load(path)?;
+        let existing = identity.signer_kind();
+        if let Some(requested) = pairing.requested {
+            if requested != existing {
+                bail!(
+                    "this device already has an identity with a {existing} signing key, and \
+                     --signer {requested} cannot change it; drop the flag to pair this host \
+                     with the existing key, or pass --force to replace the identity, which \
+                     gives the device a new fingerprint and needs the host's old record \
+                     revoked"
+                );
+            }
+        }
+        info!(
+            fingerprint = %identity.fingerprint(),
+            signer = %existing,
+            "pairing with this device's existing identity"
+        );
+        return Ok(identity);
+    }
+    if path.exists() {
+        warn!(path=%path.display(), "replacing this device's identity");
+        std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    let identity = Identity::generate_to(path, pairing.requested.unwrap_or(pairing.default))?;
+    info!(
+        path = %path.display(),
+        fingerprint = %identity.fingerprint(),
+        signer = %identity.signer_kind(),
+        "created device identity"
+    );
+    Ok(identity)
+}
+
+async fn cmd_pair(
+    identity_path: &std::path::Path,
+    url: &str,
+    label: &str,
+    pairing: Pairing,
+) -> Result<()> {
     let (enrollment_id, secret) = parse_enrollment_url(url)?;
-    let identity = load_or_create(identity_path)?;
+    let identity = load_or_create(identity_path, &pairing)?;
     let submission = identity.enrollment_submission(&enrollment_id, &secret, label)?;
     let nats = connect_nats().await?;
     let mut activations = nats
@@ -171,21 +270,24 @@ async fn cmd_run(
     });
     #[cfg(not(feature = "unattended"))]
     let auto: Option<bool> = None;
-    let (decider, stdin_closed) = if let Some(answer) = auto {
-        (Decider::Auto(answer), None)
+    // A terminal prompt with no stdin behind it answers nothing, and the hook
+    // waits out its full deadline on every request. Say so and stop instead.
+    // Nothing else here reads stdin, so nothing else waits on it.
+    let mut stdin_closed: Pin<Box<dyn Future<Output = ()> + Send>> =
+        Box::pin(std::future::pending());
+    let decider = if let Some(decider) = auto
+        .map(Decider::Auto)
+        .or_else(|| native_decider(&identity))
+    {
+        decider
     } else {
         let (prompter, closed) = Prompter::from_stdin();
-        (Decider::Prompt(prompter), Some(closed))
+        stdin_closed = Box::pin(async move {
+            let _ = closed.await;
+        });
+        Decider::Prompt(prompter)
     };
     let decider = Arc::new(decider);
-    // A prompt with no stdin behind it answers nothing, and the hook waits
-    // out its full deadline on every request. Say so and stop instead.
-    let mut stdin_closed: Pin<Box<dyn Future<Output = ()> + Send>> = match stdin_closed {
-        Some(closed) => Box::pin(async move {
-            let _ = closed.await;
-        }),
-        None => Box::pin(std::future::pending()),
-    };
     loop {
         let message = tokio::select! {
             () = &mut stdin_closed => bail!(
@@ -229,7 +331,7 @@ async fn cmd_run(
 }
 
 async fn decide(
-    identity: &Identity,
+    identity: &Arc<Identity>,
     nats: &async_nats::Client,
     decider: &Decider,
     opened: &OpenedRequest,
@@ -239,6 +341,15 @@ async fn decide(
         bail!("request already expired");
     }
     let approve = match decider {
+        #[cfg(target_os = "macos")]
+        Decider::TouchId(prompt) => {
+            // The signature is the approval here, so this path builds the
+            // whole decision rather than answering yes or no.
+            let Some(decision) = mac::decide(prompt, identity, opened).await? else {
+                return Ok(());
+            };
+            return publish(nats, request, decision).await;
+        }
         Decider::Auto(answer) => *answer,
         Decider::Prompt(prompter) => {
             let summary = format!(
@@ -267,10 +378,40 @@ async fn decide(
         }
     };
     let decision = if approve {
-        identity.approve(opened)?
+        identity.approve(opened, &approval_reason(request))?
     } else {
         identity.deny(&request.request_id)
     };
+    publish(nats, request, decision).await
+}
+
+/// The prompt a Mac holding an enclave key uses: the Touch ID sheet itself.
+#[cfg(target_os = "macos")]
+fn native_decider(identity: &Arc<Identity>) -> Option<Decider> {
+    if identity.signer_kind() != SignerKind::Enclave {
+        return None;
+    }
+    info!("approvals are the Touch ID sheet; nothing is read from stdin");
+    Some(Decider::TouchId(
+        oshioki_agent::touchid::TouchIdPrompt::new(
+            Box::new(mac::Screen),
+            Arc::new(mac::Canceller(Arc::clone(identity))),
+        ),
+    ))
+}
+
+/// Only a Mac has a native prompt, and only for an enclave key.
+#[cfg(not(target_os = "macos"))]
+fn native_decider(_identity: &Arc<Identity>) -> Option<Decider> {
+    None
+}
+
+/// Publishes one decision and says so in the log.
+async fn publish(
+    nats: &async_nats::Client,
+    request: &oshioki_protocol::RequestV1,
+    decision: DecisionV1,
+) -> Result<()> {
     nats.publish(
         format!("oshioki.verdict.{}", request.request_id),
         serde_json::to_vec(&decision)?.into(),
@@ -336,11 +477,53 @@ fn runas_label(runas_uid: u32) -> String {
     }
 }
 
-/// Where a verdict comes from: the terminal, or a fixed answer when the
-/// `unattended` feature's `--auto` flag was given.
+/// Where a verdict comes from: the Touch ID sheet on a Mac holding an enclave
+/// key, the terminal otherwise, or a fixed answer when the `unattended`
+/// feature's `--auto` flag was given.
 enum Decider {
     Auto(bool),
     Prompt(Prompter),
+    #[cfg(target_os = "macos")]
+    TouchId(oshioki_agent::touchid::TouchIdPrompt),
+}
+
+/// What the operator is being asked to allow, in the second person.
+///
+/// The Touch ID sheet reads "Oshioki is trying to `<this>`. Touch ID to allow
+/// this", and it is one line on somebody's screen. It carries the arguments,
+/// rendered exactly as the terminal prompt renders them: `rm` and `rm -rf /`
+/// are different requests and must not read the same. The working directory
+/// and the caller process chain go to the log instead, where there is room.
+fn approval_reason(request: &oshioki_protocol::RequestV1) -> String {
+    // Truncate before escaping. escape_for_terminal turns one byte into a
+    // multi-character sequence, and a cut through the middle of one would put
+    // half an escape on the sheet.
+    let command = truncate(
+        &format!("{} {}", request.command, quote_argv(&request.argv)),
+        MAX_COMMAND_CHARS,
+    );
+    format!(
+        "run {} as {} on {}",
+        escape_for_terminal(command.trim_end()),
+        runas_label(request.runas_uid),
+        escape_for_terminal(&truncate(&request.host, MAX_HOST_CHARS)),
+    )
+}
+
+/// How much of the command line the sheet gets. Past this it is not a sentence
+/// anybody reads before touching the sensor.
+const MAX_COMMAND_CHARS: usize = 100;
+
+/// How much of the host name the sheet gets. Long enough for any real name.
+const MAX_HOST_CHARS: usize = 64;
+
+/// Shortens to `limit` characters, marking that it was shortened.
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(limit.saturating_sub(3)).collect();
+    format!("{kept}...")
 }
 
 /// The terminal prompt, serialized across concurrent requests.
@@ -423,26 +606,135 @@ fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
-/// How long is left before `expires_at`, to sub-second precision, or `None`
-/// once that instant has passed.
-///
-/// Whole-second arithmetic rounds the wait up: a request expiring in 200ms
-/// reads as one second left, and the prompt would keep accepting an answer
-/// long after the hook stopped listening for one.
-fn remaining_until(expires_at: i64) -> Option<Duration> {
-    let deadline = time::OffsetDateTime::from_unix_timestamp(expires_at).ok()?;
-    let remaining = deadline - time::OffsetDateTime::now_utc();
-    if remaining.is_positive() {
-        Duration::try_from(remaining).ok()
-    } else {
-        None
+/// The Touch ID sheet, and the two macOS facts the prompt needs: whether the
+/// screen is locked, and how to tear a sheet down at a deadline.
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::sync::Arc;
+
+    use anyhow::Result;
+    use oshioki_agent::{
+        Identity, OpenedRequest,
+        touchid::{AttemptError, Outcome, PromptCancel, ScreenLock, TouchIdPrompt},
+    };
+    use oshioki_enclave::SignError;
+    use oshioki_protocol::{DecisionV1, escape_for_terminal};
+    use tracing::{error, info};
+
+    use super::approval_reason;
+
+    /// The login session's lock state, read fresh each time it is asked for.
+    pub struct Screen;
+
+    impl ScreenLock for Screen {
+        fn is_locked(&self) -> bool {
+            oshioki_enclave::screen_is_locked()
+        }
+    }
+
+    /// Dismisses the sheet the agent's own signing key is showing.
+    pub struct Canceller(pub Arc<Identity>);
+
+    impl PromptCancel for Canceller {
+        fn begin(&self) -> u64 {
+            self.0.begin_prompt()
+        }
+        fn cancel(&self, attempt: u64) {
+            self.0.cancel_prompt(attempt);
+        }
+    }
+
+    /// Asks for one request with a Touch ID sheet.
+    ///
+    /// Returns the decision to publish, or `None` when there is nothing to
+    /// publish: the deadline passed with no answer, or the enclave refused and
+    /// the operator has been told to re-pair.
+    pub async fn decide(
+        prompt: &TouchIdPrompt,
+        identity: &Arc<Identity>,
+        opened: &OpenedRequest,
+    ) -> Result<Option<DecisionV1>> {
+        let request = &opened.request;
+        let reason = approval_reason(request);
+        // The sheet has room for one line, so the rest of the request is
+        // logged rather than shown.
+        info!(
+            request_id = %escape_for_terminal(&request.request_id),
+            user = %escape_for_terminal(&request.user),
+            cwd = %escape_for_terminal(&request.cwd),
+            callers = %escape_for_terminal(&request.pid_chain.join(" <- ")),
+            reason = %escape_for_terminal(&reason),
+            "asking for Touch ID"
+        );
+        let sign = {
+            let (identity, opened, reason) = (Arc::clone(identity), opened.clone(), reason.clone());
+            move || identity.approve(&opened, &reason).map_err(classify)
+        };
+        match prompt
+            .ask(&request.request_id, request.expires_at, sign)
+            .await
+        {
+            Ok(Outcome::Approved(decision)) => Ok(Some(decision)),
+            Ok(Outcome::Denied) => Ok(Some(identity.deny(&request.request_id))),
+            Ok(Outcome::Expired) => {
+                info!(
+                    request_id = %escape_for_terminal(&request.request_id),
+                    host = %escape_for_terminal(&request.host),
+                    "request expired unanswered"
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                // Not a verdict: the key is unusable, not refused. Biometry
+                // re-enrollment invalidates it permanently, and a new key means
+                // a new fingerprint for the host to pin.
+                error!(
+                    request_id = %escape_for_terminal(&request.request_id),
+                    error = %escape_for_terminal(&format!("{error:#}")),
+                    "the Secure Enclave would not sign; re-pair with `oshioki-agent pair`"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// A dismissed sheet is an answer; anything else is a broken key.
+    fn classify(error: anyhow::Error) -> AttemptError {
+        if matches!(error.downcast_ref::<SignError>(), Some(SignError::Canceled)) {
+            AttemptError::Canceled
+        } else {
+            AttemptError::Failed(error)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Prompter, now, quote_argv, runas_label};
+    use super::{
+        Pairing, Prompter, approval_reason, load_or_create, now, quote_argv, runas_label, truncate,
+    };
+    use oshioki_agent::SignerKind;
+    use oshioki_protocol::{RequestV1, VERSION_V1, encode_base64url};
     use tokio::sync::mpsc;
+
+    fn request_for_reason() -> RequestV1 {
+        RequestV1 {
+            version: VERSION_V1,
+            request_id: "req-1".into(),
+            nonce: encode_base64url(&[1; 16]),
+            host: "host.example".into(),
+            user: "eric".into(),
+            uid: 1000,
+            runas_uid: 0,
+            cwd: "/home/eric".into(),
+            tty: None,
+            command: "/usr/bin/apt".into(),
+            argv: vec!["apt".into(), "update".into()],
+            pid_chain: vec![],
+            issued_at: 1_000,
+            expires_at: 1_090,
+        }
+    }
 
     /// One argument holding a space and two arguments are different requests,
     /// so they must not render as the same line.
@@ -480,6 +772,117 @@ mod tests {
     fn target_account_is_always_named() {
         assert_eq!(runas_label(0), "root (uid 0)");
         assert_eq!(runas_label(1000), "uid 1000");
+    }
+
+    /// The Touch ID sheet gets one sentence: what would run, as whom, where.
+    /// The arguments are in it, because `rm` and `rm -rf /` are different
+    /// requests and one fingerprint answers only one of them.
+    #[test]
+    fn the_sheet_reason_names_the_command_the_account_and_the_host() {
+        let mut request = request_for_reason();
+        assert_eq!(
+            approval_reason(&request),
+            "run /usr/bin/apt apt update as root (uid 0) on host.example"
+        );
+        request.runas_uid = 1000;
+        assert!(approval_reason(&request).contains("as uid 1000"));
+
+        let mut dangerous = request_for_reason();
+        dangerous.command = "/bin/rm".into();
+        dangerous.argv = vec!["rm".into()];
+        let mut worse = dangerous.clone();
+        worse.argv = vec!["rm".into(), "-rf".into(), "/".into()];
+        assert_ne!(approval_reason(&dangerous), approval_reason(&worse));
+        assert!(approval_reason(&worse).contains("rm -rf /"));
+
+        // A command with no arguments must not trail a space onto the sheet.
+        let mut bare = request_for_reason();
+        bare.argv = vec![];
+        assert_eq!(
+            approval_reason(&bare),
+            "run /usr/bin/apt as root (uid 0) on host.example"
+        );
+    }
+
+    /// A command line long enough to fill the screen is cut, and says so.
+    #[test]
+    fn a_long_reason_is_cut_rather_than_wrapped() {
+        assert_eq!(truncate("abcdef", 6), "abcdef");
+        assert_eq!(truncate("abcdefg", 6), "abc...");
+        let mut request = request_for_reason();
+        request.command = "/usr/bin/".to_owned() + &"x".repeat(400);
+        let reason = approval_reason(&request);
+        assert!(reason.contains("..."));
+        assert!(reason.chars().count() < 200, "{reason}");
+    }
+
+    /// Cutting the rendered command before escaping keeps whole escape
+    /// sequences on the sheet. Cutting after would leave half of one.
+    #[test]
+    fn truncation_never_splits_an_escape_sequence() {
+        let mut request = request_for_reason();
+        request.command = "/usr/bin/x".to_owned();
+        request.argv = vec!["x".to_owned(), "\u{1b}[31m".repeat(60)];
+        let reason = approval_reason(&request);
+        assert!(
+            !reason.contains('\u{1b}'),
+            "an escape byte reached the sheet"
+        );
+        // Every rendered escape is whole: `\u{` then four hex digits and `}`.
+        let mut rest = reason.as_str();
+        let mut rendered = 0;
+        while let Some(at) = rest.find("\\u{") {
+            let tail = &rest[at + 3..];
+            let (digits, closer) = tail.split_at(tail.len().min(4));
+            assert!(
+                digits.chars().count() == 4 && digits.chars().all(|c| c.is_ascii_hexdigit()),
+                "a cut landed inside an escape: {reason}"
+            );
+            assert!(
+                closer.starts_with('}'),
+                "a cut landed inside an escape: {reason}"
+            );
+            rendered += 1;
+            rest = &tail[4..];
+        }
+        assert!(rendered > 0, "{reason}");
+    }
+
+    /// One identity serves every host, so a second `pair` reuses it. A
+    /// `--signer` that disagrees with it cannot be honoured, and a flag that
+    /// quietly does nothing is worse than a refusal.
+    #[test]
+    fn pairing_reuses_an_identity_and_refuses_to_pretend_otherwise() {
+        let dir = std::env::temp_dir().join(format!("oshioki-pair-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let pairing = |requested, force| Pairing {
+            requested,
+            default: SignerKind::Software,
+            force,
+        };
+
+        let created = load_or_create(&path, &pairing(None, false)).unwrap();
+        let reused = load_or_create(&path, &pairing(None, false)).unwrap();
+        assert_eq!(created.fingerprint(), reused.fingerprint());
+        let asked_for_the_same = load_or_create(&path, &pairing(Some(SignerKind::Software), false));
+        assert_eq!(
+            asked_for_the_same.unwrap().fingerprint(),
+            created.fingerprint()
+        );
+
+        let Err(error) = load_or_create(&path, &pairing(Some(SignerKind::Enclave), false)) else {
+            panic!("a mismatched --signer was accepted");
+        };
+        let error = error.to_string();
+        assert!(error.contains("software"), "{error}");
+        assert!(error.contains("--force"), "{error}");
+
+        // --force replaces the identity, so the device is a new one and the
+        // host's old record for it is stale.
+        let replaced = load_or_create(&path, &pairing(None, true)).unwrap();
+        assert_ne!(replaced.fingerprint(), created.fingerprint());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An answer typed before the prompt appeared belongs to whatever the

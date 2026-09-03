@@ -91,6 +91,77 @@ device's `kind` (`webauthn` or `secure-enclave`) next to its fingerprint.
 `test` publishes a synthetic request and waits for approve or deny. `watch`
 opens each request URL on Darwin without a shell.
 
+## Mac approver
+
+Acceptance is two commands. On the host:
+
+```bash
+scripts/dev-acceptance mac
+```
+
+That starts the acceptance stack with NATS bound to this node's tailnet IPv4
+address, runs `oshioki enroll`, and prints one line to paste on the Mac. The
+line carries the NATS URL, the credentials, and the enrollment URL. On the Mac
+it pulls the checkout, builds the agent, wraps it in `Oshioki.app`, pairs it
+with one Touch ID sheet, and then runs the bundled agent in the foreground. The
+bundle is what makes the request sheets say Oshioki with the logo. Use
+`--label NAME` to name the device. The default is `mbp`.
+
+The host stays blocked until the Mac pairs. It then prints the activation
+result and the next step. Run one of these per request:
+
+```bash
+scripts/dev-acceptance test
+```
+
+Each `test` publishes one synthetic request. The Mac's sheet answers it.
+Approve with Touch ID. Cancel the sheet to exercise deny. Ignore the sheet to
+exercise the timeout. Stop the stack with `scripts/dev-acceptance down`.
+
+`pair` creates the Secure Enclave key and shows one Touch ID sheet for the
+enrollment proof.
+
+### Running the agent as a LaunchAgent
+
+The foreground run above is enough for acceptance. For a Mac that should
+approve after a reboot, install the LaunchAgent instead. It runs the same
+bundled binary:
+
+```bash
+NATS_URL=nats://nats.example.com:4222 NATS_USER=oshioki NATS_PASS=<secret> \
+  scripts/mac/install-agent
+```
+
+`install-agent` writes the LaunchAgent plist 0600, because it holds the NATS
+password, and loads it into the GUI domain. Add `--dry-run` to see the plist
+without writing it; the password is masked. `--uninstall` boots the agent out
+and removes the plist.
+
+Check what is loaded and what it has been doing:
+
+```bash
+launchctl print gui/$(id -u)/dev.oshioki.agent | head -20
+target/release/oshioki-agent show
+tail -f ~/Library/Logs/oshioki-agent.log
+```
+
+`show` prints the fingerprint and the signing backend. Re-run
+`scripts/mac/install-agent` after rebuilding the binary; it boots out the old
+agent first.
+
+### Re-pairing
+
+Adding or removing a fingerprint in Touch ID invalidates the enclave key for
+good. The log says `the Secure Enclave would not sign` and asks for a
+re-pair. Recover with a new enrollment, which mints a new key and a new
+fingerprint for the host to pin:
+
+```bash
+rm ~/.config/oshioki/agent.json      # on the Mac
+scripts/dev-acceptance mac           # on the host, then paste on the Mac
+oshioki revoke <old-fingerprint>     # on the host
+```
+
 Disable the managed block before stopping a supervised stack:
 
 ```bash
