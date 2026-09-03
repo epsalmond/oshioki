@@ -11,6 +11,11 @@
 # no process substitution.
 set -euo pipefail
 
+# Owner-only by default: install.env, agent.env, and the plist all hold the
+# NATS password, and creating them at the ambient umask would leave each
+# briefly world-readable before its explicit chmod runs.
+umask 077
+
 YES=0
 RECONFIGURE=0
 while [ "$#" -gt 0 ]; do
@@ -227,7 +232,7 @@ case "$(uname -s)" in
       {
         printf '%s\n' '[Unit]' 'Description=oshioki sudo approval agent' '' '[Service]'
         printf 'ExecStart="%s" run\n' "$(systemd_escape "$AGENT_BIN")"
-        printf 'EnvironmentFile="%s"\n' "$(systemd_escape "$agent_env")"
+        printf 'EnvironmentFile=%s\n' "$(systemd_escape "$agent_env")"
         printf '%s\n' 'Restart=always' '' '[Install]' 'WantedBy=default.target'
       } > "$unit"
       chmod 0600 "$unit"
