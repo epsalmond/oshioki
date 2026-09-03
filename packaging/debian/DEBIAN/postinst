@@ -29,9 +29,13 @@ case "$1" in
       echo "oshioki: or create it now and run: /usr/share/oshioki/install-oshioki-hook --prelaunch --config-file /etc/oshioki/install.env" >&2
     fi
 
+    # Record enablement through the helper, not systemctl: it remembers what
+    # was enabled in /var/lib/systemd/deb-systemd-helper-enabled/ so postrm
+    # can remove the symlinks after dpkg has deleted the unit file.
+    deb-systemd-helper unmask oshioki-server.service >/dev/null || true
+    deb-systemd-helper --system enable oshioki-server.service >/dev/null
     if [ -d /run/systemd/system ]; then
       systemctl daemon-reload
-      systemctl enable oshioki-server.service
       if [ -n "${2:-}" ]; then
         systemctl try-restart oshioki-server.service || {
           echo "oshioki: upgraded but failed to restart oshioki-server; the old binary is still running" >&2
