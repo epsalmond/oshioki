@@ -142,7 +142,13 @@ fi
 forget_pid "$enroll_pid"
 cat "$ENROLL_LOG"
 
-fingerprint="$("$AGENT_BIN" show --state "$AGENT_STATE")"
+# `show` prints the fingerprint first and the signing backend below it.
+fingerprint="$("$AGENT_BIN" show --state "$AGENT_STATE" | head -n1)"
+if ! "$AGENT_BIN" show --state "$AGENT_STATE" | grep -Fqx 'signer: software'; then
+  echo "the Linux agent should have paired with a software key" >&2
+  "$AGENT_BIN" show --state "$AGENT_STATE" >&2
+  exit 1
+fi
 
 start_agent approve
 if ! "$HOOK_BIN" test; then
