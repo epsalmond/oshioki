@@ -16,6 +16,8 @@ use std::{
     process::Command,
     time::Duration,
 };
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::UnixStream;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -27,6 +29,10 @@ use oshioki_protocol::{
 };
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
+/// How long the hook waits to connect to the local agent socket. A missing
+/// socket fails fast into the NATS fallback; the approval deadline still
+/// governs the wait for a verdict.
+const AGENT_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long enroll waits for the server to confirm it stored the device.
@@ -124,24 +130,39 @@ async fn execute_request_at(
     if payload.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
         bail!("request envelope exceeds 3 MiB");
     }
-    let nats = connect_nats_from(directory).await?;
-    if announce_url {
-        let config = load_hook_config_from(directory)?;
-        println!(
-            "Approval URL (expires in {} seconds):\n  {}",
-            timeout.as_secs(),
-            approval_url(&config.server_base_url, &request.request_id)
-        );
-        io::stdout().flush()?;
-    }
-    let decision = request_decision(
-        &nats,
-        &format!("oshioki.request.{}", request.host),
-        &format!("oshioki.verdict.{}", request.request_id),
-        payload,
-        timeout,
-    )
-    .await?;
+    // One deadline covers both transports: whatever the socket attempt
+    // consumes comes out of the NATS fallback's budget, so a dead agent can
+    // never stretch one sudo invocation past the approval timeout.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let decision = match try_agent_socket(directory, &payload, deadline).await? {
+        SocketOutcome::Decision(decision) => decision,
+        SocketOutcome::Fallback => {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                bail!("sudo decision deadline exceeded before the NATS fallback ran");
+            }
+            let nats = connect_nats_from(directory).await?;
+            if announce_url {
+                let config = load_hook_config_from(directory)?;
+                println!(
+                    "Approval URL (expires in {} seconds):\n  {}",
+                    remaining.as_secs(),
+                    approval_url(&config.server_base_url, &request.request_id)
+                );
+                io::stdout().flush()?;
+            }
+            request_decision(
+                &nats,
+                &format!("oshioki.request.{}", request.host),
+                &format!("oshioki.verdict.{}", request.request_id),
+                payload,
+                remaining,
+            )
+            .await?
+        }
+    };
     apply_decision(
         decision,
         &request,
@@ -150,6 +171,86 @@ async fn execute_request_at(
         &mut registry,
         directory,
     )
+}
+
+/// What one attempt at the local agent socket concluded.
+enum SocketOutcome {
+    /// An agent took the request; the verdict is final.
+    Decision(DecisionV1),
+    /// No agent is listening, or the one listening cannot answer; the
+    /// caller falls back to NATS while the deadline allows.
+    Fallback,
+}
+
+/// Ask the local agent over its Unix socket, if one is configured.
+///
+/// Only a missing or unreachable socket, a connection that dies before
+/// delivering a verdict, or an agent that hangs up without answering falls
+/// back: in all three cases no agent took responsibility for the request. A
+/// verdict, a malformed reply, or the deadline expiring while an agent holds
+/// the request is final, and fails closed on error.
+async fn try_agent_socket(
+    directory: &Path,
+    payload: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<SocketOutcome> {
+    let Some(path) = agent_socket_from(directory)? else {
+        return Ok(SocketOutcome::Fallback);
+    };
+    let Ok(Ok(stream)) =
+        tokio::time::timeout(AGENT_SOCKET_CONNECT_TIMEOUT, UnixStream::connect(&path)).await
+    else {
+        return Ok(SocketOutcome::Fallback);
+    };
+    let (mut reader, mut writer) = stream.into_split();
+    let frame = oshioki_protocol::socket_v1::encode_frame(payload)?;
+    if writer.write_all(&frame).await.is_err() {
+        return Ok(SocketOutcome::Fallback);
+    }
+    drop(writer);
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        bail!("sudo decision deadline exceeded waiting for the local agent");
+    }
+    let bytes = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
+        Ok(Ok(Some(bytes))) => bytes,
+        Ok(_) => return Ok(SocketOutcome::Fallback),
+        Err(_) => bail!("sudo decision deadline exceeded waiting for the local agent"),
+    };
+    let decision: DecisionV1 = serde_json::from_slice(&bytes).context("decode socket decision")?;
+    Ok(SocketOutcome::Decision(decision))
+}
+
+/// The socket path from `OSHIOKI_AGENT_SOCKET` in `config.env`, if set.
+/// Sudo scrubs the hook's environment, so the socket must come from the
+/// root-owned config file rather than a process variable.
+fn agent_socket_from(directory: &Path) -> Result<Option<PathBuf>> {
+    let env = read_env_file(&directory.join("config.env"))?;
+    Ok(env
+        .get("OSHIOKI_AGENT_SOCKET")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from))
+}
+
+/// Read one length-delimited frame. A peer that hangs up before delivering
+/// one has not answered, so the caller treats that as no answer.
+async fn read_frame(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<Option<Vec<u8>>> {
+    let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+    match reader.read_exact(&mut prefix).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let len = oshioki_protocol::socket_v1::decode_frame_len(prefix)?;
+    let mut payload = vec![0u8; len];
+    match reader.read_exact(&mut payload).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(payload))
 }
 
 /// Applies one decision to a request. Invalid decisions fail closed.
@@ -937,6 +1038,7 @@ mod tests {
     use super::*;
     use p256::ecdsa::SigningKey;
     use std::collections::BTreeMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[test]
     fn fingerprint_arguments_may_start_with_a_hyphen() {
         for verb in ["revoke", "pin"] {
@@ -1081,5 +1183,120 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             ["https://sudo.example/r/id?value=a b;false"]
         );
+    }
+
+    fn socket_test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("oshioki-hook-socket-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn socket_test_config(dir: &Path, socket: Option<&Path>) {
+        let mut config = String::from("NATS_URL=nats://127.0.0.1:4222\n");
+        if let Some(socket) = socket {
+            config.push_str("OSHIOKI_AGENT_SOCKET=");
+            config.push_str(&socket.display().to_string());
+            config.push('\n');
+        }
+        std::fs::write(dir.join("config.env"), config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unconfigured_socket_falls_back_to_nats() {
+        let dir = socket_test_dir("unconfigured");
+        socket_test_config(&dir, None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(matches!(
+            try_agent_socket(&dir, b"{}", deadline).await.unwrap(),
+            SocketOutcome::Fallback
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn missing_socket_path_falls_back_to_nats() {
+        let dir = socket_test_dir("missing");
+        socket_test_config(&dir, Some(Path::new("/nonexistent-oshioki-agent.sock")));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(matches!(
+            try_agent_socket(&dir, b"{}", deadline).await.unwrap(),
+            SocketOutcome::Fallback
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn socket_round_trip_returns_the_stub_verdict() {
+        let dir = socket_test_dir("round-trip");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            AsyncReadExt::read_exact(&mut stream, &mut prefix)
+                .await
+                .unwrap();
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut request = vec![0u8; len];
+            AsyncReadExt::read_exact(&mut stream, &mut request)
+                .await
+                .unwrap();
+            assert!(!request.is_empty());
+            let decision = DecisionV1::Deny(oshioki_protocol::DenyV1 {
+                version: VERSION_V1,
+                request_id: "req-1".into(),
+                device_fingerprint: "fp".into(),
+            });
+            let frame =
+                oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&decision).unwrap())
+                    .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        match try_agent_socket(&dir, b"ping", deadline).await.unwrap() {
+            SocketOutcome::Decision(DecisionV1::Deny(denial)) => {
+                assert_eq!(denial.request_id, "req-1");
+            }
+            SocketOutcome::Decision(_) => panic!("stub sent a deny"),
+            SocketOutcome::Fallback => panic!("stub verdict was ignored"),
+        }
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn malformed_socket_reply_fails_closed_without_fallback() {
+        let dir = socket_test_dir("malformed");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let frame = oshioki_protocol::socket_v1::encode_frame(b"not json").unwrap();
+            AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(try_agent_socket(&dir, b"ping", deadline).await.is_err());
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn silent_agent_fails_closed_without_fallback() {
+        let dir = socket_test_dir("silent");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        assert!(try_agent_socket(&dir, b"ping", deadline).await.is_err());
+        serve.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

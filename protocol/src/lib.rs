@@ -10,6 +10,7 @@
 pub mod enrollment_v1;
 pub mod error;
 pub mod native_v1;
+pub mod socket_v1;
 pub mod terminal;
 pub mod v1;
 pub mod webauthn_v1;

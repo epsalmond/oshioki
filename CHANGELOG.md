@@ -33,6 +33,12 @@ protocol and local E2E stabilize.
   Tailscale), and production requirements for running it for real.
 - Release packaging: amd64 `.deb` with systemd unit and postinst hooks, plus
   a Homebrew tap with bottles, published by CI from a version tag.
+- Local agent socket: the hook can reach `oshioki-agent` over a Unix domain
+  socket (`OSHIOKI_AGENT_SOCKET` in `config.env`) instead of NATS, so sudo
+  approvals work with no network in the path. Socket-first with NATS fallback
+  inside one shared approval deadline, and the agent starts without NATS to
+  answer socket requests only. Verdicts stay signature-verified on both
+  transports; only Secure Enclave approvals travel the socket.
 
 ### Changed
 

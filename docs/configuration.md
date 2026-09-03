@@ -22,13 +22,15 @@ values are for production to choose; see [requirements.md](requirements.md).
 |---|---|
 | `OSHIOKI_CONFIG_DIR` | Local hook state; defaults to `/etc/oshioki`. |
 | `OSHIOKI_OPENER` | Test-only override: one executable path followed by one URL argument. Used by `watch` (defaults to `/usr/bin/open` on Darwin). |
+| `OSHIOKI_AGENT_SOCKET` (in `config.env`) | Optional path to the agent's Unix socket. When set, the hook tries the socket first (short connect timeout) and falls back to NATS within the same approval deadline. Unset in dev, where the Compose NATS carries everything. |
 
 ## Native agent (`oshioki-agent` binary)
 
 | Variable | Notes |
 |---|---|
-| `OSHIOKI_AGENT_STATE` | Directory holding the 0600 `agent.json` identity; defaults to `~/.config/oshioki`. |
-| `NATS_URL` | Same value as the hook. |
+| `OSHIOKI_AGENT_STATE` | Directory holding the 0600 `agent.json` identity; defaults to `~/.config/oshioki`. The agent also listens at `agent.sock` in this directory unless overridden below. |
+| `OSHIOKI_AGENT_SOCKET` | Explicit socket path. A live socket there refuses a second agent; a stale file from a dead agent is reclaimed; a non-socket file is never deleted. |
+| `NATS_URL` | Same value as the hook. Optional at runtime: without NATS the agent answers socket requests only until restart. |
 | `NATS_USER` / `NATS_PASS` | Same value as the hook; setting only one of the pair is an error. |
 
 ## Dev tooling (`scripts/dev`)

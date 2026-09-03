@@ -135,6 +135,15 @@ QUOTED_CONFIG="$TEST_ROOT/quoted-config"; mkdir -p "$QUOTED_CONFIG"; cp "$CONFIG
 if run_installer "$QUOTED_CONFIG" --prelaunch --config-file "$QUOTED_CONFIG/install.env" >"$QUOTED_CONFIG/log" 2>&1; then fail "accepted quoted config value"; fi
 grep -Fq 'config value must be unquoted and untrimmed' "$QUOTED_CONFIG/log" || fail "missing quoted config error"
 
+if grep -Fq 'OSHIOKI_AGENT_SOCKET' "$CONFIG_ROOT/state/config.env"; then fail "config.env gained an unconfigured socket"; fi
+SOCKET_CONFIG="$TEST_ROOT/socket-config"; mkdir -p "$SOCKET_CONFIG"; cp "$CONFIG_ROOT/install.env" "$SOCKET_CONFIG/install.env"
+printf 'OSHIOKI_AGENT_SOCKET=/run/oshioki/agent.sock\n' >> "$SOCKET_CONFIG/install.env"
+run_installer "$SOCKET_CONFIG" --prelaunch --config-file "$SOCKET_CONFIG/install.env"
+grep -Fq 'OSHIOKI_AGENT_SOCKET=/run/oshioki/agent.sock' "$SOCKET_CONFIG/state/config.env" || fail "agent socket missing from config.env"
+SOCKET_ENV="$TEST_ROOT/socket-env"
+OSHIOKI_AGENT_SOCKET=/env/agent.sock run_installer "$SOCKET_ENV" --prelaunch
+grep -Fq 'OSHIOKI_AGENT_SOCKET=/env/agent.sock' "$SOCKET_ENV/state/config.env" || fail "agent socket env missing from config.env"
+
 PRELAUNCH="$TEST_ROOT/prelaunch"; mkdir -p "$PRELAUNCH/sudoers.d" "$PRELAUNCH/state"
 printf 'outside-before\n' > "$PRELAUNCH/sudo.conf"
 printf '{"version":1,"devices":[{"sentinel":true}]}\n' > "$PRELAUNCH/state/devices.json"
@@ -162,6 +171,11 @@ dry_secret='recognizable-dry-run-secret'
 dry_output="$(NATS_PASS="$dry_secret" run_installer "$PRELAUNCH" --prelaunch --dry-run 2>&1)"
 grep -Fq '<redacted>' <<<"$dry_output" || fail "dry run omitted redaction"
 if grep -Fq "$dry_secret" <<<"$dry_output"; then fail "dry run disclosed NATS password"; fi
+case "$(uname -s)" in
+  Darwin) grep -Fq -- '-g "$ROOT_GROUP"' <<<"$dry_output" && fail "dry run left group variable unexpanded"
+    grep -Fq -- '-g wheel' <<<"$dry_output" || fail "darwin install did not use wheel group" ;;
+  Linux) grep -Fq -- '-g root' <<<"$dry_output" || fail "linux install did not use root group" ;;
+esac
 
 outside_hash="$(printf 'outside-before\n' | sha256_stream)"
 run_installer "$PRELAUNCH" --disable-prelaunch
@@ -190,6 +204,24 @@ if run_installer "$TEST_ROOT/bad-checksum" --prelaunch >"$TEST_ROOT/bad-checksum
 mv "$TEST_ROOT/service/target/release/SHA256SUMS.good" "$TEST_ROOT/service/target/release/SHA256SUMS"
 
 if FAKE_FILE_MISMATCH=1 run_installer "$TEST_ROOT/bad-arch" --prelaunch >"$TEST_ROOT/bad-arch.log" 2>&1; then fail "accepted architecture mismatch"; fi
+
+LINKED_ROOT="$TEST_ROOT/linked-real"; mkdir -p "$LINKED_ROOT/state"
+ln -s "$LINKED_ROOT" "$TEST_ROOT/linked-root"
+run_installer "$TEST_ROOT/linked-root" --prelaunch --dry-run >"$TEST_ROOT/linked-root.log" 2>&1 || fail "rejected resolvable symlinked state parent"
+grep -Fq 'DRY:' "$TEST_ROOT/linked-root.log" || fail "symlinked dry run printed no plan"
+
+LOOP="$TEST_ROOT/loop"; mkdir -p "$LOOP"; ln -s "$LOOP/loop-b" "$LOOP/loop-a"; ln -s "$LOOP/loop-a" "$LOOP/loop-b"
+LOOP_STATE="$TEST_ROOT/loop-state"; mkdir -p "$LOOP_STATE"; ln -s "$LOOP/loop-a" "$LOOP_STATE/state"
+if run_installer "$LOOP_STATE" --prelaunch >"$LOOP_STATE/log" 2>&1; then fail "accepted symlink loop state dir"; fi
+grep -Fq 'refusing unresolved symlink' "$LOOP_STATE/log" || fail "missing symlink loop error"
+
+LINKED_ARTIFACTS="$TEST_ROOT/linked-artifacts"; mkdir -p "$LINKED_ARTIFACTS"
+ln -s "$TEST_ROOT/service/target/release/oshioki" "$LINKED_ARTIFACTS/oshioki"
+ln -s "$TEST_ROOT/service/target/release/$BUILD_PLUGIN" "$LINKED_ARTIFACTS/$BUILD_PLUGIN"
+HOOK_BIN="$LINKED_ARTIFACTS/oshioki" PLUGIN_BIN="$LINKED_ARTIFACTS/$BUILD_PLUGIN" \
+  run_installer "$TEST_ROOT/linked-artifact-install" --prelaunch || fail "rejected symlinked build artifacts"
+[ -f "$TEST_ROOT/linked-artifact-install/sbin/oshioki" ] || fail "symlinked artifact install wrote no hook binary"
+[ ! -L "$TEST_ROOT/linked-artifact-install/sbin/oshioki" ] || fail "installed hook binary is a symlink"
 
 STANDALONE="$TEST_ROOT/standalone"; run_installer "$STANDALONE" --standalone-e2e
 [ ! -e "$STANDALONE/sudoers.d" ] || fail "standalone created sudoers state"
