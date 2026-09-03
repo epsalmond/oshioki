@@ -473,6 +473,11 @@ run_hook() {
 # The Mac needs one line: where NATS is, which enrollment URL to consume, and
 # what to build. `enroll` blocks until the Mac answers, so the line is printed
 # from inside the stream rather than after it.
+#
+# `run` executes the binary inside Oshioki.app rather than the bare one,
+# because the Touch ID sheet takes its name and icon from the calling process's
+# bundle. `pair` shows a sheet too, but only once, and the acceptance item is
+# about the request sheets.
 print_mac_command() {
   local url="$1" label="$2" password
   case "$url" in
@@ -481,7 +486,7 @@ print_mac_command() {
   password="$(sed -n 's/^NATS_PASS=//p' "$state_root/hook/config.env")"
   [ -n "$password" ] || die "no NATS password in $state_root/hook/config.env"
   printf '\n--- paste this on the Mac ---\n'
-  printf "NATS_URL=nats://%s:%s NATS_USER=oshioki NATS_PASS=%s sh -c 'cd ~/git/oshioki && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p oshioki-agent && target/release/oshioki-agent pair \"%s\" --label %s && exec target/release/oshioki-agent run'\n" \
+  printf "NATS_URL=nats://%s:%s NATS_USER=oshioki NATS_PASS=%s sh -c 'cd ~/git/oshioki && git pull --ff-only && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p oshioki-agent && scripts/mac/bundle-agent && target/release/oshioki-agent pair \"%s\" --label %s && exec target/mac/Oshioki.app/Contents/MacOS/oshioki-agent run'\n" \
     "$nats_host" "$nats_port" "$password" "$url" "$label"
   printf -- '--- end ---\n\nwaiting for the Mac to pair\n\n'
 }
