@@ -107,7 +107,13 @@ oshioki-agent run
 submits the enrollment and waits for the host to activate it. On a Mac the
 signing key is created in the Secure Enclave; everywhere else it is a P-256
 key in that file. `pair --signer software` forces the software key on a Mac
-too, which is what the tests use. `show` prints the fingerprint and which of
+too, which is what the tests use.
+
+One identity serves every host this device pairs with, so pairing again
+reuses it. A `--signer` that disagrees with the identity already there is an
+error rather than a flag that did nothing. `pair --force` replaces the
+identity: the device gets a new fingerprint, every host it had paired with
+needs a new enrollment, and their old records should be revoked. `show` prints the fingerprint and which of
 the two backends this device has.
 
 `run` watches for sudo requests and prompts. A release build has no way

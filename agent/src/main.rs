@@ -47,9 +47,14 @@ enum Verb {
         #[arg(long)]
         label: String,
         /// Where the signing key lives. Defaults to the Secure Enclave on
-        /// macOS and to a software key everywhere else.
+        /// macOS and to a software key everywhere else. Ignored when this
+        /// device already has an identity, unless it disagrees with it.
         #[arg(long, value_enum)]
         signer: Option<SignerArg>,
+        /// Replace an existing identity. The device gets a new fingerprint,
+        /// so the host's old record for it should be revoked.
+        #[arg(long)]
+        force: bool,
     },
     /// Watch for requests and decide them.
     Run {
@@ -93,6 +98,12 @@ fn signer_kind(flag: Option<SignerArg>) -> SignerKind {
     }
 }
 
+/// Whether `--signer` was given, so a mismatch with an existing identity can
+/// be an error rather than a flag that did nothing.
+fn requested_signer_kind(flag: Option<SignerArg>) -> Option<SignerKind> {
+    flag.map(|flag| signer_kind(Some(flag)))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -106,7 +117,20 @@ async fn main() -> Result<()> {
             enrollment_url,
             label,
             signer,
-        } => cmd_pair(&identity_path, &enrollment_url, &label, signer_kind(signer)).await,
+            force,
+        } => {
+            cmd_pair(
+                &identity_path,
+                &enrollment_url,
+                &label,
+                Pairing {
+                    requested: requested_signer_kind(signer),
+                    default: signer_kind(signer),
+                    force,
+                },
+            )
+            .await
+        }
         #[cfg(feature = "unattended")]
         Verb::Run { auto } => cmd_run(&identity_path, auto).await,
         #[cfg(not(feature = "unattended"))]
@@ -133,18 +157,46 @@ fn state_dir(flag: Option<PathBuf>) -> Result<PathBuf> {
 
 /// Loads the identity, creating one on first use. One identity serves every
 /// host this device pairs with.
-fn load_or_create(path: &std::path::Path, kind: SignerKind) -> Result<Identity> {
-    if path.exists() {
+/// What `pair` was told about the signing key.
+struct Pairing {
+    /// The `--signer` value, if one was given.
+    requested: Option<SignerKind>,
+    /// What to create when there is no identity yet.
+    default: SignerKind,
+    /// Replace an existing identity rather than reuse it.
+    force: bool,
+}
+
+fn load_or_create(path: &std::path::Path, pairing: &Pairing) -> Result<Identity> {
+    if path.exists() && !pairing.force {
+        // One identity serves every host this device pairs with, so an
+        // existing one is reused rather than replaced. A --signer that
+        // disagrees with it cannot be honoured and must not look like it was.
         let identity = Identity::load(path)?;
-        if identity.signer_kind() != kind {
-            warn!(
-                signer = %identity.signer_kind(),
-                "this device already has an identity; keeping its signing key"
-            );
+        let existing = identity.signer_kind();
+        if let Some(requested) = pairing.requested {
+            if requested != existing {
+                bail!(
+                    "this device already has an identity with a {existing} signing key, and \
+                     --signer {requested} cannot change it; drop the flag to pair this host \
+                     with the existing key, or pass --force to replace the identity, which \
+                     gives the device a new fingerprint and needs the host's old record \
+                     revoked"
+                );
+            }
         }
+        info!(
+            fingerprint = %identity.fingerprint(),
+            signer = %existing,
+            "pairing with this device's existing identity"
+        );
         return Ok(identity);
     }
-    let identity = Identity::generate_to(path, kind)?;
+    if path.exists() {
+        warn!(path=%path.display(), "replacing this device's identity");
+        std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    let identity = Identity::generate_to(path, pairing.requested.unwrap_or(pairing.default))?;
     info!(
         path = %path.display(),
         fingerprint = %identity.fingerprint(),
@@ -158,10 +210,10 @@ async fn cmd_pair(
     identity_path: &std::path::Path,
     url: &str,
     label: &str,
-    kind: SignerKind,
+    pairing: Pairing,
 ) -> Result<()> {
     let (enrollment_id, secret) = parse_enrollment_url(url)?;
-    let identity = load_or_create(identity_path, kind)?;
+    let identity = load_or_create(identity_path, &pairing)?;
     let submission = identity.enrollment_submission(&enrollment_id, &secret, label)?;
     let nats = connect_nats().await?;
     let mut activations = nats
@@ -647,7 +699,10 @@ mod mac {
 
 #[cfg(test)]
 mod tests {
-    use super::{Prompter, approval_reason, now, quote_argv, runas_label, truncate};
+    use super::{
+        Pairing, Prompter, approval_reason, load_or_create, now, quote_argv, runas_label, truncate,
+    };
+    use oshioki_agent::SignerKind;
     use oshioki_protocol::{RequestV1, VERSION_V1, encode_base64url};
     use tokio::sync::mpsc;
 
@@ -730,6 +785,43 @@ mod tests {
         let reason = approval_reason(&request);
         assert_eq!(reason.chars().count(), 120);
         assert!(reason.ends_with("..."));
+    }
+
+    /// One identity serves every host, so a second `pair` reuses it. A
+    /// `--signer` that disagrees with it cannot be honoured, and a flag that
+    /// quietly does nothing is worse than a refusal.
+    #[test]
+    fn pairing_reuses_an_identity_and_refuses_to_pretend_otherwise() {
+        let dir = std::env::temp_dir().join(format!("oshioki-pair-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let pairing = |requested, force| Pairing {
+            requested,
+            default: SignerKind::Software,
+            force,
+        };
+
+        let created = load_or_create(&path, &pairing(None, false)).unwrap();
+        let reused = load_or_create(&path, &pairing(None, false)).unwrap();
+        assert_eq!(created.fingerprint(), reused.fingerprint());
+        let asked_for_the_same = load_or_create(&path, &pairing(Some(SignerKind::Software), false));
+        assert_eq!(
+            asked_for_the_same.unwrap().fingerprint(),
+            created.fingerprint()
+        );
+
+        let Err(error) = load_or_create(&path, &pairing(Some(SignerKind::Enclave), false)) else {
+            panic!("a mismatched --signer was accepted");
+        };
+        let error = error.to_string();
+        assert!(error.contains("software"), "{error}");
+        assert!(error.contains("--force"), "{error}");
+
+        // --force replaces the identity, so the device is a new one and the
+        // host's old record for it is stale.
+        let replaced = load_or_create(&path, &pairing(None, true)).unwrap();
+        assert_ne!(replaced.fingerprint(), created.fingerprint());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An answer typed before the prompt appeared belongs to whatever the
