@@ -256,7 +256,8 @@ read_session() {
   server_pid="$(session_value server_pid)"
   server_start="$(session_value server_start)"
   nats_port="$(session_value nats_port)"
-  nats_host="$(session_value nats_host)"
+  # Sessions written before the field existed were always loopback-bound.
+  nats_host="$("$JQ_BIN" -r '.nats_host // "127.0.0.1"' "$SESSION_FILE")"
   server_port="$(session_value server_port)"
   https_port="$(session_value https_port)"
   case "$nats_pid:$nats_start:$server_pid:$server_start" in
