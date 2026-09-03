@@ -111,7 +111,7 @@ chmod 0755 "$TEST_ROOT/fake-bin"/*
 
 export APPLIED_CONFIG="$TEST_ROOT/applied-config.env"
 export CALL_LOG="$TEST_ROOT/calls.log"
-export HOLDER_PIDS="$TEST_ROOT/holder.pid"
+export HOLDER_PIDS="$TEST_ROOT/holder-pids"
 export AGENT_STATE="$TEST_ROOT/home/.config/oshioki"
 export SOCKET_TO_MAKE="$AGENT_STATE/agent.sock"
 : > "$CALL_LOG"
@@ -122,7 +122,7 @@ run_setup() {
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
     APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
     CALL_LOG="$TEST_ROOT/calls.log" \
-    HOLDER_PIDS="$TEST_ROOT/holder.pid" \
+    HOLDER_PIDS="$TEST_ROOT/holder-pids" \
     SUDO="$TEST_ROOT/fake-bin/sudo" \
     LAUNCHCTL="$TEST_ROOT/fake-bin/launchctl" \
     SYSTEMCTL="$TEST_ROOT/fake-bin/systemctl" \
