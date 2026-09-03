@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Installs oshioki-agent as a per-user LaunchAgent.
+#
+# The agent runs as the logged-in user, never as root: it holds that user's
+# Secure Enclave key, shows that user's Touch ID sheet, and executes nothing.
+# So this needs no sudo and touches nothing outside the user's home.
+#
+# Re-running is safe. An already loaded agent is booted out before the new one
+# is bootstrapped.
+set -euo pipefail
+
+LABEL="dev.oshioki.agent"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$HOME/Library/Logs/oshioki-agent.log"
+
+usage() {
+  cat <<'USAGE'
+usage: scripts/mac/install-agent [options]
+       scripts/mac/install-agent --uninstall
+
+  --binary PATH     agent binary to run. Default: the one inside
+                    target/mac/Oshioki.app, built by scripts/mac/bundle-agent
+                    if it is not there yet. The bundle is what gives the Touch
+                    ID sheet the Oshioki name and logo.
+  --state DIR       identity directory (default: ~/.config/oshioki)
+  --nats-url URL    default: $NATS_URL
+  --nats-user USER  default: $NATS_USER
+  --nats-pass PASS  default: $NATS_PASS. Prefer the environment: an argument is
+                    visible to every process on the machine while it runs.
+  --log-level LEVEL RUST_LOG value (default: info)
+  --dry-run         print the plist that would be written, with the password
+                    masked, and change nothing
+  --uninstall       boot out the agent and remove the plist
+
+The device must be paired first:
+
+  oshioki-agent pair '<enrollment-url>' --label <label>
+USAGE
+}
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+BINARY=""
+STATE="$HOME/.config/oshioki"
+NATS_URL="${NATS_URL:-}"
+NATS_USER="${NATS_USER:-}"
+NATS_PASS="${NATS_PASS:-}"
+LOG_LEVEL="info"
+DRY_RUN=false
+UNINSTALL=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
+    --state) STATE="${2:?--state needs a path}"; shift 2 ;;
+    --nats-url) NATS_URL="${2:?--nats-url needs a URL}"; shift 2 ;;
+    --nats-user) NATS_USER="${2:?--nats-user needs a name}"; shift 2 ;;
+    --nats-pass) NATS_PASS="${2:?--nats-pass needs a password}"; shift 2 ;;
+    --log-level) LOG_LEVEL="${2:?--log-level needs a value}"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --uninstall) UNINSTALL=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[ "$(uname -s)" = "Darwin" ] || { echo "install-agent only runs on macOS" >&2; exit 1; }
+
+domain="gui/$(id -u)"
+
+boot_out() {
+  launchctl bootout "$domain/$LABEL" 2>/dev/null || true
+}
+
+if [ "$UNINSTALL" = true ]; then
+  boot_out
+  rm -f "$PLIST"
+  echo "removed $LABEL"
+  exit 0
+fi
+
+[ -n "$NATS_URL" ] || {
+  echo "set NATS_URL, or pass --nats-url; the agent has nothing to subscribe to without it" >&2
+  exit 2
+}
+# Half a credential is a misconfiguration, not a request for an anonymous
+# connection. The agent itself refuses it too; catching it here is faster than
+# reading the log.
+if { [ -n "$NATS_USER" ] && [ -z "$NATS_PASS" ]; } \
+  || { [ -z "$NATS_USER" ] && [ -n "$NATS_PASS" ]; }; then
+  echo "set both NATS_USER and NATS_PASS, or neither" >&2
+  exit 2
+fi
+
+if [ -z "$BINARY" ]; then
+  BINARY="$ROOT/target/mac/Oshioki.app/Contents/MacOS/oshioki-agent"
+  [ -x "$BINARY" ] || BINARY="$("$ROOT/scripts/mac/bundle-agent")"
+fi
+[ -x "$BINARY" ] || { echo "no agent binary at $BINARY" >&2; exit 1; }
+
+if [ ! -f "$STATE/agent.json" ]; then
+  echo "no identity in $STATE; pair this Mac first with \`oshioki-agent pair\`" >&2
+  exit 1
+fi
+
+# A plist is XML, and a password is arbitrary bytes.
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
+render_plist() {
+  local password="$1" environment
+  environment=$(
+    printf '    <key>NATS_URL</key><string>%s</string>\n' "$(xml_escape "$NATS_URL")"
+    printf '    <key>RUST_LOG</key><string>%s</string>\n' "$(xml_escape "$LOG_LEVEL")"
+    if [ -n "$NATS_USER" ]; then
+      printf '    <key>NATS_USER</key><string>%s</string>\n' "$(xml_escape "$NATS_USER")"
+      printf '    <key>NATS_PASS</key><string>%s</string>\n' "$(xml_escape "$password")"
+    fi
+  )
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$BINARY</string>
+    <string>run</string>
+    <string>--state</string>
+    <string>$STATE</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+$environment  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict>
+</plist>
+PLIST
+}
+
+if [ "$DRY_RUN" = true ]; then
+  render_plist "****"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
+# The plist holds the NATS password, so it is not world-readable.
+umask 077
+render_plist "$NATS_PASS" > "$PLIST.partial"
+plutil -lint "$PLIST.partial" >/dev/null
+boot_out
+mv "$PLIST.partial" "$PLIST"
+launchctl bootstrap "$domain" "$PLIST"
+launchctl kickstart "$domain/$LABEL" >/dev/null
+
+echo "loaded $LABEL"
+echo "  binary: $BINARY"
+echo "  state:  $STATE"
+echo "  log:    $LOG"
