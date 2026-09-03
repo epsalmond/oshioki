@@ -19,8 +19,9 @@ use axum::{
 use db::{InsertResult, RequestLifecycle, Store};
 use futures::StreamExt as _;
 use oshioki_protocol::{
-    ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
-    RequestEnvelopeV1, SealedDeviceBodyV1,
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1,
+    EnrollmentSubmissionV1, RequestEnvelopeV1, SealedDeviceBodyV1, allow_plaintext_nats,
+    check_nats_url,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -634,9 +635,15 @@ fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
         .ok_or(ApiError(StatusCode::UNAUTHORIZED))
 }
 async fn connect_nats() -> Result<async_nats::Client> {
+    let url = required_env("NATS_URL")?;
+    check_nats_url(
+        &url,
+        allow_plaintext_nats(std::env::var(ALLOW_PLAINTEXT_NATS_ENV).ok().as_deref()),
+    )
+    .context("invalid NATS_URL")?;
     async_nats::ConnectOptions::new()
         .user_and_password(required_env("NATS_USER")?, required_env("NATS_PASS")?)
-        .connect(required_env("NATS_URL")?)
+        .connect(url)
         .await
         .context("connect to NATS")
 }

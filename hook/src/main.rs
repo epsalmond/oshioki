@@ -22,10 +22,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use oshioki_protocol::{
-    ActivationV1, DecisionV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
-    EnrollmentIntentV1, EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1, RequestV1,
-    VERSION_V1, escape_for_terminal, verify_approval_v1, verify_enrollment_v1,
-    verify_native_approval_v1, verify_native_enrollment_v1,
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, DeviceKindV1, DevicePublicRecordV1,
+    DeviceRegistryV1, EnrollmentIntentV1, EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1,
+    RequestV1, VERSION_V1, allow_plaintext_nats, check_nats_url, escape_for_terminal,
+    verify_approval_v1, verify_enrollment_v1, verify_native_approval_v1,
+    verify_native_enrollment_v1,
 };
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
@@ -912,12 +913,20 @@ async fn connect_nats() -> Result<async_nats::Client> {
 }
 async fn connect_nats_from(directory: &Path) -> Result<async_nats::Client> {
     let env = read_env_file(&directory.join("config.env"))?;
+    // The flag comes from config.env rather than the process environment:
+    // sudo scrubs the environment, so this file is the hook's only channel.
+    let url = env.get("NATS_URL").context("NATS_URL not set")?.clone();
+    check_nats_url(
+        &url,
+        allow_plaintext_nats(env.get(ALLOW_PLAINTEXT_NATS_ENV).map(String::as_str)),
+    )
+    .context("invalid NATS_URL")?;
     async_nats::ConnectOptions::new()
         .user_and_password(
             env.get("NATS_USER").context("NATS_USER not set")?.clone(),
             env.get("NATS_PASS").context("NATS_PASS not set")?.clone(),
         )
-        .connect(env.get("NATS_URL").context("NATS_URL not set")?)
+        .connect(url)
         .await
         .context("connect to NATS")
 }
@@ -1173,6 +1182,28 @@ mod tests {
     #[test]
     fn check_uses_the_root_owned_config_directory() {
         assert_eq!(check_config_dir(), Path::new("/etc/oshioki"));
+    }
+
+    /// The TLS gate runs before any network: plaintext past loopback (or a
+    /// foreign scheme) fails with the policy error rather than a connection
+    /// timeout, so these cases never open a socket.
+    #[tokio::test]
+    async fn plaintext_nats_fails_before_connecting() {
+        for (url, fragment) in [
+            ("nats://203.0.1.1:4222", "refusing plaintext"),
+            ("http://127.0.0.1:4222", "unsupported NATS URL scheme"),
+        ] {
+            let dir = std::env::temp_dir().join(format!("oshioki-hook-nats-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.env"),
+                format!("NATS_URL={url}\nNATS_USER=u\nNATS_PASS=p\n"),
+            )
+            .unwrap();
+            let error = connect_nats_from(&dir).await.unwrap_err();
+            assert!(format!("{error:#}").contains(fragment), "{error:#}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]

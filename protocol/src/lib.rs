@@ -10,6 +10,7 @@
 pub mod enrollment_v1;
 pub mod error;
 pub mod native_v1;
+pub mod nats_policy;
 pub mod socket_v1;
 pub mod terminal;
 pub mod v1;
@@ -21,6 +22,7 @@ pub use native_v1::{
     native_credential_id, native_enrollment_proof, sec1_p256_verifying_key,
     verify_native_approval_v1, verify_native_enrollment_v1,
 };
+pub use nats_policy::{ALLOW_PLAINTEXT_NATS_ENV, allow_plaintext_nats, check_nats_url};
 pub use terminal::escape_for_terminal;
 pub use v1::{
     ActivationV1, ApproveNativeV1, ApproveV1, DecisionV1, DenyV1, DeviceKindV1,

@@ -22,7 +22,10 @@ use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, SignerKind, parse_enrollment_url, remaining_until};
-use oshioki_protocol::{ActivationV1, DecisionV1, RequestEnvelopeV1, escape_for_terminal};
+use oshioki_protocol::{
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, RequestEnvelopeV1, allow_plaintext_nats,
+    check_nats_url, escape_for_terminal,
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
@@ -817,6 +820,11 @@ async fn connect_nats() -> Result<async_nats::Client> {
         (Err(_), Err(_)) => {}
         _ => bail!("set both NATS_USER and NATS_PASS, or neither"),
     }
+    check_nats_url(
+        &url,
+        allow_plaintext_nats(std::env::var(ALLOW_PLAINTEXT_NATS_ENV).ok().as_deref()),
+    )
+    .context("invalid NATS_URL")?;
     options.connect(&url).await.context("connect to NATS")
 }
 
