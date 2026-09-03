@@ -8,7 +8,7 @@
 
 use std::{
     future::Future,
-    io::{self, BufRead, Write as _},
+    io::{self, BufRead, IsTerminal as _, Write as _},
     os::unix::fs::{FileTypeExt as _, PermissionsExt as _},
     path::PathBuf,
     pin::Pin,
@@ -424,7 +424,10 @@ async fn decide(
             // No answer means no signed verdict: the hook fails closed when
             // the deadline passes, and a Deny nobody typed would be a lie
             // about a request nobody read.
-            let Some(answer) = prompter.ask(&summary, request.expires_at).await? else {
+            let Some(answer) = prompter
+                .ask(&request.request_id, &summary, request.expires_at)
+                .await?
+            else {
                 info!(
                     request_id = %escape_for_terminal(&request.request_id),
                     host = %escape_for_terminal(&request.host),
@@ -788,13 +791,16 @@ impl Prompter {
     /// dead by then and the caller must not sign anything for it. Lines typed
     /// before the prompt appeared are discarded, so a stale answer never
     /// decides a later request.
-    async fn ask(&self, summary: &str, expires_at: i64) -> Result<Option<bool>> {
+    async fn ask(&self, request_id: &str, summary: &str, expires_at: i64) -> Result<Option<bool>> {
         let mut lines = self.lines.lock().await;
         let Some(remaining) = remaining_until(expires_at) else {
             return Ok(None);
         };
         while lines.try_recv().is_ok() {}
-        print!("{summary}Approve? [y/N] ");
+        print!(
+            "{}",
+            prompt_output(request_id, summary, io::stdout().is_terminal())
+        );
         io::stdout().flush()?;
         match tokio::time::timeout(remaining, lines.recv()).await {
             Ok(Some(answer)) => Ok(Some(answer.trim().eq_ignore_ascii_case("y"))),
@@ -804,6 +810,24 @@ impl Prompter {
                 Ok(None)
             }
         }
+    }
+}
+
+/// What one terminal prompt may print. Stdout backs the persistent agent log
+/// when launchd runs the agent, so the request summary — user, command,
+/// arguments, directory, callers — is only rendered to a live terminal.
+/// Anywhere else the opaque request id is all that is printed: an operator
+/// answering there is approving blind, and the log must not carry the
+/// request to make it readable.
+fn prompt_output(request_id: &str, summary: &str, stdout_is_terminal: bool) -> String {
+    if stdout_is_terminal {
+        format!("{summary}Approve? [y/N] ")
+    } else {
+        format!(
+            "request {} needs an answer, but stdout is not a terminal: \
+             no request details are shown here\nApprove? [y/N] ",
+            escape_for_terminal(request_id)
+        )
     }
 }
 
@@ -874,14 +898,12 @@ mod mac {
     ) -> Result<Option<DecisionV1>> {
         let request = &opened.request;
         let reason = approval_reason(request);
-        // The sheet has room for one line, so the rest of the request is
-        // logged rather than shown.
+        // The sheet has room for one line, so the reason is shown there and
+        // only there: stdout and stderr both back the persistent agent log
+        // under launchd, and the command line can carry credentials. The log
+        // gets the opaque request id, nothing that identifies the request.
         info!(
             request_id = %escape_for_terminal(&request.request_id),
-            user = %escape_for_terminal(&request.user),
-            cwd = %escape_for_terminal(&request.cwd),
-            callers = %escape_for_terminal(&request.pid_chain.join(" <- ")),
-            reason = %escape_for_terminal(&reason),
             "asking for Touch ID"
         );
         let sign = {
@@ -929,11 +951,12 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::{
-        Pairing, Prompter, approval_reason, bind_socket, load_or_create, now, quote_argv,
-        runas_label, socket_path, truncate,
+        Decider, Pairing, Prompter, approval_reason, bind_socket, decide, load_or_create, now,
+        prompt_output, quote_argv, runas_label, socket_path, truncate,
     };
     use oshioki_agent::SignerKind;
-    use oshioki_protocol::{RequestV1, VERSION_V1, encode_base64url};
+    use oshioki_protocol::{RequestEnvelopeV1, RequestV1, VERSION_V1, encode_base64url};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::mpsc;
 
     fn request_for_reason() -> RequestV1 {
@@ -1117,7 +1140,10 @@ mod tests {
             sender
         });
         assert_eq!(
-            prompter.ask("summary\n", now() + 30).await.unwrap(),
+            prompter
+                .ask("req-test", "summary\n", now() + 30)
+                .await
+                .unwrap(),
             Some(false)
         );
         drop(typed.await.unwrap());
@@ -1130,7 +1156,13 @@ mod tests {
         let (sender, receiver) = mpsc::channel(8);
         let prompter = Prompter::new(receiver);
         sender.send("y".into()).await.unwrap();
-        assert_eq!(prompter.ask("summary\n", now() - 1).await.unwrap(), None);
+        assert_eq!(
+            prompter
+                .ask("req-test", "summary\n", now() - 1)
+                .await
+                .unwrap(),
+            None
+        );
         // The queued line is still there: no answer was consumed.
         assert_eq!(
             prompter.lines.lock().await.try_recv().unwrap(),
@@ -1143,7 +1175,12 @@ mod tests {
     async fn reports_a_reader_that_cannot_answer() {
         let (prompter, closed) = Prompter::from_reader(std::io::empty());
         closed.await.unwrap();
-        assert!(prompter.ask("summary\n", now() + 30).await.is_err());
+        assert!(
+            prompter
+                .ask("req-test", "summary\n", now() + 30)
+                .await
+                .is_err()
+        );
     }
 
     /// The prompt stops at the expiry instant itself. Whole-second
@@ -1154,7 +1191,13 @@ mod tests {
         let (sender, receiver) = mpsc::channel(8);
         let prompter = Prompter::new(receiver);
         let expires_at = now() + 1;
-        assert_eq!(prompter.ask("summary\n", expires_at).await.unwrap(), None);
+        assert_eq!(
+            prompter
+                .ask("req-test", "summary\n", expires_at)
+                .await
+                .unwrap(),
+            None
+        );
         let overshoot = time::OffsetDateTime::now_utc()
             - time::OffsetDateTime::from_unix_timestamp(expires_at).unwrap();
         assert!(
@@ -1169,7 +1212,13 @@ mod tests {
     async fn unanswered_prompt_yields_no_verdict() {
         let (sender, receiver) = mpsc::channel(8);
         let prompter = Prompter::new(receiver);
-        assert_eq!(prompter.ask("summary\n", now() + 1).await.unwrap(), None);
+        assert_eq!(
+            prompter
+                .ask("req-test", "summary\n", now() + 1)
+                .await
+                .unwrap(),
+            None
+        );
         drop(sender);
     }
 
@@ -1339,6 +1388,226 @@ mod tests {
             }
             other => panic!("expected a denial, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The prompt renders the request to a live terminal only. Stdout backs
+    /// the persistent agent log under launchd, so anywhere else the summary
+    /// stays out and the opaque request id is all that is printed.
+    #[test]
+    fn prompt_hides_the_request_without_a_terminal() {
+        let summary = "sudo on host: user runs /bin/secret --token abc\n  cwd: /tmp\n";
+        let shown = prompt_output("req-1", summary, true);
+        assert!(shown.contains(summary), "{shown}");
+        let hidden = prompt_output("req-1", summary, false);
+        assert!(hidden.contains("req-1"), "{hidden}");
+        assert!(!hidden.contains("/bin/secret"), "{hidden}");
+        assert!(!hidden.contains("--token abc"), "{hidden}");
+    }
+
+    /// Marker that request-shaped tracing tests hunt for. Plain ASCII so the
+    /// terminal escaping passes it through visibly: if it reached the log,
+    /// this test would see it.
+    const LOG_PROBE: &str = "OQ-LOGPROBE-7f3a9c";
+
+    /// A request carrying the marker in every field the log must never see:
+    /// command, arguments, working directory, user, and process chain.
+    fn request_for_log_probe() -> RequestV1 {
+        RequestV1 {
+            version: VERSION_V1,
+            request_id: "req-logprobe-1".into(),
+            nonce: encode_base64url(&[7; 16]),
+            host: "host.example".into(),
+            user: format!("user-{LOG_PROBE}"),
+            uid: 1000,
+            runas_uid: 0,
+            cwd: format!("/tmp/{LOG_PROBE}"),
+            tty: None,
+            command: format!("/tmp/{LOG_PROBE}/do"),
+            argv: vec!["do".into(), format!("--token={LOG_PROBE}")],
+            pid_chain: vec![format!("{LOG_PROBE}:4242")],
+            issued_at: now(),
+            expires_at: now() + 60,
+        }
+    }
+
+    /// Seal one envelope the way the hook seals one per active device.
+    /// Unlike `sealed_envelope_for` this is not gated on `unattended`: seal
+    /// and open work with a software key in every build.
+    fn sealed_envelope_bytes(identity: &oshioki_agent::Identity, request: &RequestV1) -> Vec<u8> {
+        let raw = request.raw_json().unwrap();
+        let sealed = oshioki_protocol::seal_v1(&raw, &identity.device_record("test")).unwrap();
+        let envelope = RequestEnvelopeV1 {
+            version: VERSION_V1,
+            request_id: request.request_id.clone(),
+            host: request.host.clone(),
+            user: request.user.clone(),
+            issued_at: request.issued_at,
+            expires_at: request.expires_at,
+            sealed: vec![sealed],
+        };
+        envelope.validate().unwrap();
+        serde_json::to_vec(&envelope).unwrap()
+    }
+
+    /// Tracing events captured into memory, so the test can prove request
+    /// plaintext never reaches the log while the agent decides.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    struct CapturedGuard<'a>(std::sync::MutexGuard<'a, Vec<u8>>);
+
+    impl std::io::Write for CapturedGuard<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedGuard<'a>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedGuard(self.0.lock().unwrap())
+        }
+    }
+
+    /// A terminal prompter with a canned answer, so `decide` runs without a
+    /// keyboard. The answer arrives after the prompt appears: lines already
+    /// queued are stale input and `ask` discards them.
+    fn canned_prompter(answer: &str) -> (Prompter, tokio::task::JoinHandle<mpsc::Sender<String>>) {
+        let (sender, receiver) = mpsc::channel(8);
+        let answer = answer.to_owned();
+        let delivery = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sender.send(answer).await.unwrap();
+            sender
+        });
+        (Prompter::new(receiver), delivery)
+    }
+
+    #[cfg(target_os = "macos")]
+    struct UnlockedScreen;
+
+    #[cfg(target_os = "macos")]
+    impl oshioki_agent::touchid::ScreenLock for UnlockedScreen {
+        fn is_locked(&self) -> bool {
+            false
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct NoopCanceller;
+
+    #[cfg(target_os = "macos")]
+    impl oshioki_agent::touchid::PromptCancel for NoopCanceller {
+        fn begin(&self) -> u64 {
+            0
+        }
+
+        fn cancel(&self, _attempt: u64) {}
+    }
+
+    /// Decrypted request details must never enter the tracing log: no
+    /// command, arguments, working directory, user, or process chain. The
+    /// positive controls keep this honest — the probe proves the request
+    /// really carried the marker, and the request ids in the log prove the
+    /// capture really saw the decision paths.
+    #[tokio::test]
+    async fn request_plaintext_never_reaches_the_log() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _ = tracing::dispatcher::set_global_default(tracing::Dispatch::new(subscriber));
+
+        let dir = socket_test_dir("logprobe");
+        let identity = std::sync::Arc::new(
+            oshioki_agent::Identity::generate_to(
+                &dir.join("agent.json"),
+                oshioki_agent::SignerKind::Software,
+            )
+            .unwrap(),
+        );
+
+        // The probe request really carries the marker everywhere the log
+        // must not see it.
+        let request = request_for_log_probe();
+        let reason = approval_reason(&request);
+        assert!(reason.contains(LOG_PROBE), "{reason}");
+
+        // Terminal prompt path: answer yes to the canned prompt.
+        let envelope: RequestEnvelopeV1 =
+            serde_json::from_slice(&sealed_envelope_bytes(&identity, &request)).unwrap();
+        let opened = identity.open_request(&envelope).unwrap().unwrap();
+        let (prompter, _sender) = canned_prompter("y");
+        let decision = decide(&identity, &Decider::Prompt(prompter), &opened)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                decision,
+                Some(oshioki_protocol::DecisionV1::ApproveNative(_))
+            ),
+            "the canned yes should approve"
+        );
+
+        // Local socket path: the same request through `handle_socket`.
+        let (mut hook_side, agent_side) = tokio::net::UnixStream::pair().unwrap();
+        let frame =
+            oshioki_protocol::socket_v1::encode_frame(&sealed_envelope_bytes(&identity, &request))
+                .unwrap();
+        hook_side.write_all(&frame).await.unwrap();
+        let (prompter, _sender) = canned_prompter("y");
+        let decider = Decider::Prompt(prompter);
+        super::handle_socket(agent_side, &identity, &decider)
+            .await
+            .unwrap();
+        let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        hook_side.read_exact(&mut prefix).await.unwrap();
+        let len = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+        assert!(len > 0, "the socket path should answer");
+
+        #[cfg(target_os = "macos")]
+        {
+            let prompt = oshioki_agent::touchid::TouchIdPrompt::new(
+                Box::new(UnlockedScreen),
+                std::sync::Arc::new(NoopCanceller),
+            );
+            let decision = super::mac::decide(&prompt, &identity, &opened)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    decision,
+                    Some(oshioki_protocol::DecisionV1::ApproveNative(_))
+                ),
+                "the software key should sign behind the mocked sheet"
+            );
+        }
+
+        let text = logs.text();
+        assert!(
+            text.contains("req-logprobe-1"),
+            "the capture missed the decision paths:\n{text}"
+        );
+        assert!(
+            !text.contains(LOG_PROBE),
+            "request plaintext reached the log:\n{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
