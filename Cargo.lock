@@ -1311,6 +1311,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "nix",
+ "oshioki-protocol",
  "serde_json",
  "tracing",
 ]

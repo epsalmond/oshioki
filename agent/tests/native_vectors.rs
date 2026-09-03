@@ -48,6 +48,7 @@ fn request() -> RequestV1 {
         command: "/usr/bin/true".into(),
         argv: vec!["true".into()],
         pid_chain: vec!["1 systemd".into()],
+        env: vec![],
         issued_at: 1_700_000_000,
         expires_at: 1_700_000_090,
     }
