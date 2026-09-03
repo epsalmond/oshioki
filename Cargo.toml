@@ -18,7 +18,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85.0"
 repository = "https://github.com/epsalmond/oshioki"
-license = "proprietary"
+license = "MIT OR Apache-2.0"
 publish = false
 
 # Deny warnings workspace-wide; keep the supply chain tight. The plugin crate
