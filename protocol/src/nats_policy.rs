@@ -76,9 +76,28 @@ pub fn check_nats_url(url: &str, allow_plaintext: bool) -> Result<(), Error> {
     )))
 }
 
+/// Whether the URL selects TLS. Callers pass this to
+/// `ConnectOptions::require_tls` so servers the cluster discovers later
+/// cannot downgrade a `tls://` deployment: discovered addresses arrive as
+/// bare `host:port`, which parse as plaintext, and the options flag is the
+/// only thing forcing TLS on them.
+pub fn nats_url_is_tls(url: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("tls"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tls_probe_follows_the_scheme() {
+        assert!(nats_url_is_tls("tls://nats.example.com:4222"));
+        assert!(nats_url_is_tls("TLS://nats.example.com:4222"));
+        assert!(!nats_url_is_tls("nats://nats.example.com:4222"));
+        assert!(!nats_url_is_tls("nats://127.0.0.1:4222"));
+        assert!(!nats_url_is_tls("nats.example.com:4222"));
+    }
 
     #[test]
     fn tls_passes_anywhere() {

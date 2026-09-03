@@ -25,7 +25,7 @@ use oshioki_protocol::{
     ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, DeviceKindV1, DevicePublicRecordV1,
     DeviceRegistryV1, EnrollmentIntentV1, EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1,
     RequestV1, VERSION_V1, allow_plaintext_nats, check_nats_url, escape_for_terminal,
-    verify_approval_v1, verify_enrollment_v1, verify_native_approval_v1,
+    nats_url_is_tls, verify_approval_v1, verify_enrollment_v1, verify_native_approval_v1,
     verify_native_enrollment_v1,
 };
 
@@ -921,14 +921,17 @@ async fn connect_nats_from(directory: &Path) -> Result<async_nats::Client> {
         allow_plaintext_nats(env.get(ALLOW_PLAINTEXT_NATS_ENV).map(String::as_str)),
     )
     .context("invalid NATS_URL")?;
-    async_nats::ConnectOptions::new()
-        .user_and_password(
-            env.get("NATS_USER").context("NATS_USER not set")?.clone(),
-            env.get("NATS_PASS").context("NATS_PASS not set")?.clone(),
-        )
-        .connect(url)
-        .await
-        .context("connect to NATS")
+    // A tls:// URL must stay TLS past the first server: the cluster
+    // advertises more addresses on reconnect as bare host:port, which parse
+    // as plaintext, so the options flag carries the requirement with them.
+    let mut options = async_nats::ConnectOptions::new().user_and_password(
+        env.get("NATS_USER").context("NATS_USER not set")?.clone(),
+        env.get("NATS_PASS").context("NATS_PASS not set")?.clone(),
+    );
+    if nats_url_is_tls(&url) {
+        options = options.require_tls(true);
+    }
+    options.connect(url).await.context("connect to NATS")
 }
 fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
     let content = fs::read_to_string(path)?;
