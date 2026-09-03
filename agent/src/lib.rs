@@ -64,15 +64,20 @@ impl Signer for SoftwareSigner {
 
 /// A P-256 key in this Mac's Secure Enclave, used only after Touch ID.
 #[cfg(target_os = "macos")]
-impl Signer for oshioki_enclave::EnclaveSigner {
+struct EnclaveBackend(oshioki_enclave::EnclaveSigner);
+
+#[cfg(target_os = "macos")]
+impl Signer for EnclaveBackend {
     fn public_key_sec1(&self) -> Vec<u8> {
-        Self::public_key_sec1(self).to_vec()
+        self.0.public_key_sec1().to_vec()
     }
     fn sign_der(&self, message: &[u8], reason: &str) -> Result<Vec<u8>> {
-        Self::sign_der(self, message, reason).map_err(anyhow::Error::new)
+        // The variant survives into the caller's anyhow chain, which is how
+        // the prompt tells a dismissed sheet from an unusable key.
+        self.0.sign_der(message, reason).map_err(anyhow::Error::new)
     }
     fn cancel_prompt(&self) {
-        self.canceller().cancel();
+        self.0.canceller().cancel();
     }
 }
 
@@ -394,7 +399,7 @@ fn new_enclave_signer() -> Result<(Box<dyn Signer + Send + Sync>, SigningFileV1)
     let file = SigningFileV1::Enclave {
         blob: encode_base64url(signer.blob()),
     };
-    Ok((Box::new(signer), file))
+    Ok((Box::new(EnclaveBackend(signer)), file))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -404,10 +409,10 @@ fn new_enclave_signer() -> Result<(Box<dyn Signer + Send + Sync>, SigningFileV1)
 
 #[cfg(target_os = "macos")]
 fn enclave_signer(blob: Vec<u8>) -> Result<Box<dyn Signer + Send + Sync>> {
-    Ok(Box::new(
+    Ok(Box::new(EnclaveBackend(
         oshioki_enclave::EnclaveSigner::from_blob(blob)
             .context("reattach this Mac's Secure Enclave key")?,
-    ))
+    )))
 }
 
 #[cfg(not(target_os = "macos"))]
