@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# End-to-end plumbing test for oshioki-laptop-setup with faked privilege and
+# service boundaries. The real script runs; sudo, the installer, the hook,
+# the agent, and launchctl/systemctl are fakes.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Under /tmp: macOS limits unix socket paths to 104 bytes and sandbox
+# TMPDIRs exceed that.
+TEST_ROOT="$(mktemp -d /tmp/oshioki-laptop-setup-test.XXXXXX)"
+trap 'rm -rf "$TEST_ROOT"; kill "$HOLDER_PID" 2>/dev/null || true' EXIT
+HOLDER_PID=""
+fail() { echo "test-oshioki-laptop-setup: $*" >&2; exit 1; }
+
+mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/stage/libexec" "$TEST_ROOT/home" "$TEST_ROOT/etc"
+cp "$SCRIPT_DIR/oshioki-laptop-setup" "$TEST_ROOT/stage/"
+chmod 0755 "$TEST_ROOT/stage/oshioki-laptop-setup" "$TEST_ROOT/fake-bin"/* 2>/dev/null || true
+
+# Fake privilege boundary: leading VAR= assignments become environment, -v/-V
+# succeed, everything else executes for real (mkdir, tee, cat, chmod).
+cat > "$TEST_ROOT/fake-bin/sudo" <<'SH'
+#!/usr/bin/env bash
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    *=*) export "$1"; shift ;;
+    -v|-V) exit 0 ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+SH
+# Fake installer: dry-run prints a plan, install records the config it saw,
+# status succeeds.
+cat > "$TEST_ROOT/fake-bin/install-oshioki-hook" <<'SH'
+#!/usr/bin/env bash
+mode="$1"
+config=""
+dry=0
+for arg in "$@"; do
+  [ "$arg" = --dry-run ] && dry=1
+done
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --config-file) config="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$mode --dry-run=$dry" in
+  "--prelaunch --dry-run=1") echo "DRY: plan for $config" ;;
+  "--prelaunch --dry-run=0") cp "$config" "$APPLIED_CONFIG"; echo "installed $HOOK_BIN" ;;
+  "--prelaunch-status --dry-run=0") exit 0 ;;
+  *) echo "fake installer saw unexpected call: $mode dry=$dry" >&2; exit 1 ;;
+esac
+SH
+# Fake hook: status reports an active device when told to, enroll prints a
+# URL and exits (the real one waits for pairing).
+cat > "$TEST_ROOT/fake-bin/oshioki" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  status)
+    if [ "${DEVICES_ACTIVE:-0}" = 1 ]; then echo "  fp  label  kind=SecureEnclave  active=true"; else echo "Enrolled devices (0):"; fi
+    ;;
+  enroll)
+    echo "Enrollment URL (expires in five minutes):"
+    echo "  https://enroll.test/e/id?value=secret"
+    echo "Native agent:"
+    echo "  oshioki-agent pair 'https://enroll.test/e/id?value=secret'"
+    ;;
+  *) echo "fake hook saw unexpected verb: $*" >&2; exit 1 ;;
+esac
+SH
+# Fake agent: show reflects identity presence, pair records its environment
+# and creates the identity.
+cat > "$TEST_ROOT/fake-bin/oshioki-agent" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  show) [ -f "$AGENT_STATE/agent.json" ] ;;
+  pair)
+    [ -n "$NATS_PASS" ] || { echo "pair got no NATS_PASS" >&2; exit 1; }
+    echo "$2" > "$AGENT_STATE/paired-url"
+    : > "$AGENT_STATE/agent.json"
+    ;;
+  *) echo "fake agent saw unexpected verb: $*" >&2; exit 1 ;;
+esac
+SH
+# Fake service managers record their calls; bootstrap also holds the agent
+# socket open the way a booted agent would.
+cat > "$TEST_ROOT/fake-bin/launchctl" <<'SH'
+#!/usr/bin/env bash
+echo "$*" >> "$CALL_LOG"
+if [ "${1:-}" = bootstrap ] && [ -n "${SOCKET_TO_MAKE:-}" ]; then
+  python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(120)' "$SOCKET_TO_MAKE" &
+  echo "$!" > "$HOLDER_PID_FILE"
+fi
+SH
+cat > "$TEST_ROOT/fake-bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+echo "$*" >> "$CALL_LOG"
+SH
+chmod 0755 "$TEST_ROOT/fake-bin"/*
+
+export APPLIED_CONFIG="$TEST_ROOT/applied-config.env"
+export CALL_LOG="$TEST_ROOT/calls.log"
+export HOLDER_PID_FILE="$TEST_ROOT/holder.pid"
+export AGENT_STATE="$TEST_ROOT/home/.config/oshioki"
+export SOCKET_TO_MAKE="$AGENT_STATE/agent.sock"
+: > "$CALL_LOG"
+
+run_setup() {
+  env -i PATH="/usr/bin:/bin" HOME="$TEST_ROOT/home" \
+    AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
+    SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
+    APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
+    CALL_LOG="$TEST_ROOT/calls.log" \
+    HOLDER_PID_FILE="$TEST_ROOT/holder.pid" \
+    SUDO="$TEST_ROOT/fake-bin/sudo" \
+    LAUNCHCTL="$TEST_ROOT/fake-bin/launchctl" \
+    SYSTEMCTL="$TEST_ROOT/fake-bin/systemctl" \
+    INSTALLER="$TEST_ROOT/fake-bin/install-oshioki-hook" \
+    AGENT_BIN="$TEST_ROOT/fake-bin/oshioki-agent" \
+    INSTALLED_HOOK="$TEST_ROOT/fake-bin/oshioki" \
+    OSHIOKI_INSTALL_ENV="$TEST_ROOT/etc/install.env" \
+    OSHIOKI_ORIGIN="${OSHIOKI_ORIGIN:-https://laptop.test}" OSHIOKI_RP_ID="laptop.test" \
+    NATS_URL="nats://127.0.0.1:4222" NATS_USER="oshioki" NATS_PASS="test-secret" \
+    DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
+    "$TEST_ROOT/stage/oshioki-laptop-setup" "$@" </dev/null
+}
+
+# Scenario A: fresh machine, identity missing, no devices. Full flow.
+DEVICES_ACTIVE=0 run_setup --yes >"$TEST_ROOT/fresh.log" 2>&1 || fail "fresh setup failed"
+grep -Fq 'OSHIOKI_ORIGIN=https://laptop.test' "$TEST_ROOT/etc/install.env" || fail "origin missing from install.env"
+grep -Fq 'OSHIOKI_AGENT_SOCKET='"$AGENT_STATE/agent.sock" "$TEST_ROOT/etc/install.env" || fail "socket missing from install.env"
+# Probe once: GNU stat -f prints a filesystem dump to stdout even when it
+# fails, which would poison an || fallback, so pick the working form first.
+if stat -c '%a' /dev/null >/dev/null 2>&1; then
+  file_mode() { stat -c '%a' "$1"; }
+else
+  file_mode() { stat -f '%Lp' "$1"; }
+fi
+[ "$(file_mode "$TEST_ROOT/etc/install.env")" = 600 ] || fail "install.env is not 0600"
+grep -Fq 'OSHIOKI_AGENT_SOCKET=' "$APPLIED_CONFIG" || fail "installer never saw the socket key"
+[ -f "$AGENT_STATE/agent.json" ] || fail "pair never created the identity"
+grep -Fq 'https://enroll.test/e/id' "$AGENT_STATE/paired-url" || fail "pair got the wrong URL"
+if [ "$(uname -s)" = Darwin ]; then
+  plist="$TEST_ROOT/home/Library/LaunchAgents/com.oshioki.agent.plist"
+  [ -f "$plist" ] || fail "LaunchAgent plist missing"
+  grep -Fq '<string>test-secret</string>' "$plist" || fail "plist missing NATS password"
+  grep -Fq 'bootstrap' "$CALL_LOG" || fail "launchctl bootstrap never ran"
+else
+  [ -f "$TEST_ROOT/home/.config/systemd/user/com.oshioki.agent.service" ] || fail "systemd unit missing"
+  grep -Fq 'enable --now' "$CALL_LOG" || fail "systemctl enable never ran"
+fi
+grep -Fq 'agent socket is live' "$TEST_ROOT/fresh.log" || fail "verify never completed"
+HOLDER_PID="$(cat "$HOLDER_PID_FILE" 2>/dev/null || true)"
+
+# Scenario B: re-run is idempotent. Identity exists, devices active, enroll
+# must not run again.
+export DEVICES_ACTIVE=1
+: > "$AGENT_STATE/agent.json"
+: > "$CALL_LOG"
+run_setup --yes >"$TEST_ROOT/rerun.log" 2>&1 || fail "re-run failed"
+grep -Fq 'agent identity present' "$TEST_ROOT/rerun.log" || fail "re-run missed the identity"
+grep -Fq 'host has active devices' "$TEST_ROOT/rerun.log" || fail "re-run missed active devices"
+if grep -Fq 'enrolling a new device' "$TEST_ROOT/rerun.log"; then fail "re-run enrolled again"; fi
+if [ "$(uname -s)" = Darwin ]; then
+  grep -Fq 'bootout' "$CALL_LOG" || fail "re-run never cycled the agent"
+  grep -Fq 'bootstrap' "$CALL_LOG" || fail "re-run never restarted the agent"
+fi
+
+# Scenario C: --reconfigure rewrites install.env from current values.
+OSHIOKI_ORIGIN="https://reconfigured.test" run_setup --yes --reconfigure >"$TEST_ROOT/reconf.log" 2>&1 || fail "reconfigure failed"
+grep -Fq 'OSHIOKI_ORIGIN=https://reconfigured.test' "$TEST_ROOT/etc/install.env" || fail "reconfigure kept stale origin"
+
+echo "test-oshioki-laptop-setup: PASS"
