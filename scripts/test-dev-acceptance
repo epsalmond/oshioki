@@ -9,6 +9,7 @@ FAKE_BIN="$TEST_ROOT/bin"
 TAILSCALE_LOG="$TEST_ROOT/tailscale.log"
 PRIVILEGE_LOG="$TEST_ROOT/privilege.log"
 PROCESS_LOG="$TEST_ROOT/process.log"
+NATS_ARGS_LOG="$TEST_ROOT/nats-args.log"
 SERVE_STATE="$TEST_ROOT/serve-state.json"
 EXPECTED_SERVE_STATE="$TEST_ROOT/expected-serve-state.json"
 NATS_PID=""
@@ -45,6 +46,7 @@ EOF
 cat >"$FAKE_BIN/nats-server" <<'EOF'
 #!/usr/bin/env bash
 printf 'nats %s\n' "$$" >>"$FAKE_PROCESS_LOG"
+printf '%s\n' "$*" >>"$FAKE_NATS_ARGS_LOG"
 exec sleep 300
 EOF
 cat >"$FAKE_BIN/oshioki-server" <<'EOF'
@@ -55,7 +57,10 @@ EOF
 cat >"$FAKE_BIN/oshioki" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-  enroll) echo "Enrollment URL: https://nas.example.test/enroll/test#secret" ;;
+  enroll)
+    url="https://nas.example.test:18444/enroll/test-enrollment#test-secret"
+    printf 'Enrollment URL (expires in five minutes):\n  %s\nNative agent:\n  oshioki-agent pair '"'"'%s'"'"'\n' "$url" "$url"
+    ;;
   test) echo "synthetic request complete" ;;
   *) exit 2 ;;
 esac
@@ -69,6 +74,9 @@ cat >"$FAKE_BIN/tailscale" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1 $2" in
+  "ip -4")
+    printf '%s\n' "${FAKE_TAILNET_IPV4:-100.64.0.1}"
+    ;;
   "status --json")
     printf '%s\n' '{"Self":{"DNSName":"nas.example.test.","Online":true}}'
     ;;
@@ -108,6 +116,7 @@ export PATH="$FAKE_BIN:$PATH"
 export FAKE_TAILSCALE_LOG="$TAILSCALE_LOG"
 export FAKE_PRIVILEGE_LOG="$PRIVILEGE_LOG"
 export FAKE_PROCESS_LOG="$PROCESS_LOG"
+export FAKE_NATS_ARGS_LOG="$NATS_ARGS_LOG"
 export FAKE_SERVE_STATE="$SERVE_STATE"
 export OSHIOKI_ACCEPTANCE_SESSION_FILE="$SESSION_FILE"
 export OSHIOKI_ACCEPTANCE_TAILSCALE_BIN="$FAKE_BIN/tailscale"
@@ -126,6 +135,10 @@ export OSHIOKI_ACCEPTANCE_HOOK_BIN="$FAKE_BIN/oshioki"
 [ -f "$TEST_ROOT/state/hook/devices.json" ] || fail "device registry was not created"
 jq -e '.origin == "https://nas.example.test:18444" and .rp_id == "nas.example.test"' \
   "$TEST_ROOT/state/hook/hook.json" >/dev/null || fail "hook origin or RP ID is wrong"
+jq -e '.nats_host == "127.0.0.1"' "$SESSION_FILE" >/dev/null || fail "up did not record the loopback NATS host"
+grep -Fq -- '-a 127.0.0.1 -p 14222' "$NATS_ARGS_LOG" || fail "NATS is not bound to loopback"
+grep -Fxq 'NATS_URL=nats://127.0.0.1:14222' "$TEST_ROOT/state/hook/config.env" ||
+  fail "hook environment does not point at loopback NATS"
 NATS_PID="$(jq -r .nats_pid "$SESSION_FILE")"
 SERVER_PID="$(jq -r .server_pid "$SESSION_FILE")"
 kill -0 "$NATS_PID"
@@ -140,7 +153,8 @@ case "$(tr '\0' ' ' <"/proc/$NATS_PID/cmdline")" in
   *"$NATS_PASSWORD_VALUE"*) fail "NATS password appears in process arguments" ;;
 esac
 "$SCRIPT" status | grep -Fq 'https://nas.example.test:18444'
-"$SCRIPT" enroll | grep -Fq 'Enrollment URL:'
+"$SCRIPT" status | grep -Fq 'NATS: nats://127.0.0.1:14222' || fail "status omits the NATS endpoint"
+"$SCRIPT" enroll | grep -Fq 'Enrollment URL (expires in five minutes):'
 "$SCRIPT" test | grep -Fq 'synthetic request complete'
 cp "$SERVE_STATE" "$EXPECTED_SERVE_STATE"
 jq '.TCP["9443"] = {"HTTPS":true}' "$SERVE_STATE" >"$SERVE_STATE.tmp"
@@ -197,7 +211,49 @@ while read -r _ failed_pid; do
   [ -z "$failed_state" ] || [ "$failed_state" = Z ] || fail "failed startup left process $failed_pid running"
 done <"$PROCESS_LOG"
 
-printf '%s\n' '{"version":1,"state_root":"/","managed_state":true,"nats_pid":1,"nats_start":"1","server_pid":1,"server_start":"1","nats_port":1,"server_port":1,"https_port":443,"origin":"https://nas.example.test","rp_id":"nas.example.test","serve_snapshot":"/serve.json"}' >"$SESSION_FILE"
+: >"$TAILSCALE_LOG"
+: >"$PRIVILEGE_LOG"
+: >"$PROCESS_LOG"
+: >"$NATS_ARGS_LOG"
+printf '%s\n' '{}' >"$SERVE_STATE"
+mkdir -p "$TEST_ROOT/tmp"
+export TMPDIR="$TEST_ROOT/tmp"
+"$SCRIPT" mac --label testmac >"$TEST_ROOT/mac.log" 2>&1 || {
+  cat "$TEST_ROOT/mac.log" >&2
+  fail "mac verb failed"
+}
+MAC_STATE="$(jq -r .state_root "$SESSION_FILE")"
+NATS_PID="$(jq -r .nats_pid "$SESSION_FILE")"
+SERVER_PID="$(jq -r .server_pid "$SESSION_FILE")"
+jq -e '.nats_host == "100.64.0.1"' "$SESSION_FILE" >/dev/null || fail "mac did not record the tailnet NATS host"
+grep -Fxq 'NATS_URL=nats://100.64.0.1:14222' "$MAC_STATE/hook/config.env" ||
+  fail "hook environment does not point at the tailnet NATS host"
+grep -Fq -- '-a 100.64.0.1 -p 14222' "$NATS_ARGS_LOG" || fail "NATS is not bound to the tailnet address"
+MAC_PASSWORD="$(sed -n 's/^NATS_PASS=//p' "$MAC_STATE/hook/config.env")"
+MAC_EXPECTED="NATS_URL=nats://100.64.0.1:14222 NATS_USER=oshioki NATS_PASS=$MAC_PASSWORD sh -c 'cd ~/git/oshioki && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p oshioki-agent && target/release/oshioki-agent pair \"https://nas.example.test:18444/enroll/test-enrollment#test-secret\" --label testmac && exec target/release/oshioki-agent run'"
+grep -Fxq "$MAC_EXPECTED" "$TEST_ROOT/mac.log" || {
+  cat "$TEST_ROOT/mac.log" >&2
+  fail "mac verb did not print the expected Mac command"
+}
+grep -Fq 'Enrollment URL (expires in five minutes):' "$TEST_ROOT/mac.log" ||
+  fail "mac verb did not forward enroll output"
+if grep -Fq 'Native agent:' "$TEST_ROOT/mac.log"; then
+  fail "mac verb left the hook's competing pair hint in the output"
+fi
+if grep -Fq "oshioki-agent pair 'https" "$TEST_ROOT/mac.log"; then
+  fail "mac verb left the hook's competing pair command in the output"
+fi
+grep -Fxq 'next: scripts/dev-acceptance test' "$TEST_ROOT/mac.log" ||
+  fail "mac verb did not print the next step"
+"$SCRIPT" status | grep -Fq 'NATS: nats://100.64.0.1:14222' || fail "status omits the tailnet NATS endpoint"
+"$SCRIPT" down
+[ ! -e "$SESSION_FILE" ] || fail "session file remains after down"
+[ ! -e "$MAC_STATE" ] || fail "managed state directory remains after down"
+NATS_PID=""
+SERVER_PID=""
+unset TMPDIR
+
+printf '%s\n' '{"version":1,"state_root":"/","managed_state":true,"nats_pid":1,"nats_start":"1","server_pid":1,"server_start":"1","nats_port":1,"nats_host":"127.0.0.1","server_port":1,"https_port":443,"origin":"https://nas.example.test","rp_id":"nas.example.test","serve_snapshot":"/serve.json"}' >"$SESSION_FILE"
 chmod 0600 "$SESSION_FILE"
 if "$SCRIPT" down >"$TEST_ROOT/unsafe.log" 2>&1; then
   fail "unsafe managed state path was accepted"

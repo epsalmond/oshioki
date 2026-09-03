@@ -71,6 +71,11 @@ command does not install or enable the sudo plugin. Use `--state-dir PATH` with
 `sudo`; Tailscale discovery, the server, NATS, and the hook remain under the
 invoking user.
 
+`scripts/dev-acceptance mac` is the same session for a Mac approver. It binds
+NATS to the host's tailnet IPv4 address instead of loopback, so the Mac can
+reach it, then runs `enroll` and prints one line to paste on the Mac. See the
+RUNBOOK.
+
 ## Repository layout
 
 - `protocol/` defines v1 messages, validation, sealing, WebAuthn checks, and
