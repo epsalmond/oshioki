@@ -1256,6 +1256,7 @@ dependencies = [
  "oshioki-protocol",
  "p256",
  "rand 0.8.8",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "sha2",

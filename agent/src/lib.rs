@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod secret_store;
 pub mod touchid;
 
 use std::{fmt, fs, io::Write as _, os::unix::fs::OpenOptionsExt as _, path::Path, time::Duration};
@@ -113,7 +114,7 @@ impl fmt::Display for SignerKind {
 ///
 /// The software key is the secret scalar. The enclave key is the
 /// enclave-encrypted blob, which is useless anywhere but the Mac that made it.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum SigningFileV1 {
     Software { key: String },
@@ -130,22 +131,33 @@ impl SigningFileV1 {
 }
 
 /// On-disk form of the identity. Mode 0600.
+///
+/// The box secret takes one of two forms. Legacy files carry it inline in
+/// `box_secret`; current macOS files keep it in the login keychain and carry
+/// only its account name in `box_secret_ref`. A file with both, or with
+/// neither, is corrupt.
 #[derive(Serialize, Deserialize)]
 struct IdentityFileV1 {
     version: u8,
     signing: SigningFileV1,
-    box_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    box_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    box_secret_ref: Option<String>,
     api_token_hash: String,
 }
 
 /// The agent's device identity: signer, box key, and API token hash.
 ///
-/// The box key is always a software key in the same file: the enclave holds
-/// P-256 and nothing else, so X25519 has nowhere else to live.
+/// The box key is always a software key: the enclave holds P-256 and nothing
+/// else, so X25519 has nowhere else to live. On macOS the secret itself sits
+/// in the login keychain and the file keeps only its account name; anywhere
+/// else the file carries it inline.
 pub struct Identity {
     signer: Box<dyn Signer + Send + Sync>,
     signing: SigningFileV1,
     box_secret: StaticSecret,
+    box_secret_ref: Option<String>,
     api_token_hash: [u8; 32],
 }
 
@@ -164,11 +176,22 @@ impl Identity {
                 key: encode_base64url(&signing),
             },
             box_secret: StaticSecret::from(box_secret),
+            box_secret_ref: None,
             api_token_hash,
         })
     }
 
     pub fn load(path: &Path) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        return Self::load_with(path, &secret_store::KeychainStore::oshioki());
+        #[cfg(not(target_os = "macos"))]
+        return Self::load_embedded(path);
+    }
+
+    /// Loads the identity through an explicit secret store. Production on
+    /// macOS passes the login keychain; tests pass a memory store so no test
+    /// run touches a real keychain.
+    pub fn load_with(path: &Path, store: &dyn secret_store::SecretStore) -> Result<Self> {
         let file: IdentityFileV1 = serde_json::from_slice(
             &fs::read(path).with_context(|| format!("read {}", path.display()))?,
         )
@@ -176,37 +199,139 @@ impl Identity {
         if file.version != VERSION_V1 {
             bail!("unsupported identity file version");
         }
+        let IdentityFileV1 {
+            signing,
+            box_secret,
+            box_secret_ref,
+            api_token_hash,
+            ..
+        } = file;
+        let (secret, secret_ref) = match (box_secret, box_secret_ref) {
+            (Some(_), Some(_)) => bail!(
+                "identity file {} carries both an embedded secret and a keychain reference",
+                path.display()
+            ),
+            (Some(secret), None) => {
+                // Legacy file: the secret moves into the store before the
+                // file is rewritten without it, so a crash in between leaves
+                // the old file intact and the migration simply retries.
+                let bytes = exact_32(&secret)?;
+                let reference = new_secret_ref();
+                store
+                    .put(&reference, &bytes)
+                    .context("move the box secret into the secret store")?;
+                let stripped = IdentityFileV1 {
+                    version: VERSION_V1,
+                    signing: signing.clone(),
+                    box_secret: None,
+                    box_secret_ref: Some(reference.clone()),
+                    api_token_hash: api_token_hash.clone(),
+                };
+                write_identity_file(path, &stripped, false)?;
+                (bytes, Some(reference))
+            }
+            (None, Some(reference)) => {
+                let bytes = store
+                    .get(&reference)
+                    .with_context(|| format!("read the box secret for {}", path.display()))?
+                    .with_context(|| {
+                        format!(
+                            "the secret store holds nothing for {}; re-pair with --force",
+                            path.display()
+                        )
+                    })?;
+                (bytes, Some(reference))
+            }
+            (None, None) => bail!(
+                "identity file {} has no box secret and no keychain reference",
+                path.display()
+            ),
+        };
+        Ok(Self {
+            signer: signer_from_file(&signing)?,
+            signing,
+            box_secret: StaticSecret::from(secret),
+            box_secret_ref: secret_ref,
+            api_token_hash: exact_32(&api_token_hash)?,
+        })
+    }
+
+    /// Loads a file that carries its box secret inline. The only form outside
+    /// macOS; on macOS it exists for files the keychain cannot serve.
+    #[cfg(not(target_os = "macos"))]
+    fn load_embedded(path: &Path) -> Result<Self> {
+        let file: IdentityFileV1 = serde_json::from_slice(
+            &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .context("decode identity file")?;
+        if file.version != VERSION_V1 {
+            bail!("unsupported identity file version");
+        }
+        if file.box_secret_ref.is_some() {
+            bail!(
+                "identity file {} points at a keychain this platform has no store for",
+                path.display()
+            );
+        }
+        let Some(secret) = file.box_secret else {
+            bail!("identity file {} has no box secret", path.display());
+        };
         Ok(Self {
             signer: signer_from_file(&file.signing)?,
             signing: file.signing,
-            box_secret: StaticSecret::from(exact_32(&file.box_secret)?),
+            box_secret: StaticSecret::from(exact_32(&secret)?),
+            box_secret_ref: None,
             api_token_hash: exact_32(&file.api_token_hash)?,
         })
     }
 
     /// Writes the identity with mode 0600. Fails if the file exists.
     pub fn save_new(&self, path: &Path) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        return self.save_new_with(path, &secret_store::KeychainStore::oshioki());
+        #[cfg(not(target_os = "macos"))]
+        return self.save_embedded(path);
+    }
+
+    /// Persists through an explicit secret store. See [`Self::load_with`].
+    pub fn save_new_with(&self, path: &Path, store: &dyn secret_store::SecretStore) -> Result<()> {
+        let reference = new_secret_ref();
+        store
+            .put(&reference, self.box_secret.as_bytes())
+            .context("store the box secret")?;
         let file = IdentityFileV1 {
             version: VERSION_V1,
             signing: match &self.signing {
                 SigningFileV1::Software { key } => SigningFileV1::Software { key: key.clone() },
                 SigningFileV1::Enclave { blob } => SigningFileV1::Enclave { blob: blob.clone() },
             },
-            box_secret: encode_base64url(self.box_secret.as_bytes()),
+            box_secret: None,
+            box_secret_ref: Some(reference),
             api_token_hash: encode_base64url(&self.api_token_hash),
         };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut handle = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("create {}", path.display()))?;
-        handle.write_all(&serde_json::to_vec_pretty(&file)?)?;
-        handle.write_all(b"\n")?;
-        Ok(())
+        write_identity_file(path, &file, true)
+    }
+
+    /// Persists with the box secret inline. The only form outside macOS.
+    #[cfg(not(target_os = "macos"))]
+    fn save_embedded(&self, path: &Path) -> Result<()> {
+        let file = IdentityFileV1 {
+            version: VERSION_V1,
+            signing: match &self.signing {
+                SigningFileV1::Software { key } => SigningFileV1::Software { key: key.clone() },
+                SigningFileV1::Enclave { blob } => SigningFileV1::Enclave { blob: blob.clone() },
+            },
+            box_secret: Some(encode_base64url(self.box_secret.as_bytes())),
+            box_secret_ref: None,
+            api_token_hash: encode_base64url(&self.api_token_hash),
+        };
+        write_identity_file(path, &file, true)
+    }
+
+    /// The keychain account holding this identity's box secret, if the file
+    /// keeps only a reference. Lets `--force` re-pair clean up the old entry.
+    pub fn secret_ref(&self) -> Option<&str> {
+        self.box_secret_ref.as_deref()
     }
 
     /// Generates a key of the requested kind and persists it in one step.
@@ -214,6 +339,18 @@ impl Identity {
     /// Creating an enclave key shows no Touch ID sheet: the access control is
     /// checked when the key signs, not when it is made.
     pub fn generate_to(path: &Path, kind: SignerKind) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        return Self::generate_to_with(path, kind, &secret_store::KeychainStore::oshioki());
+        #[cfg(not(target_os = "macos"))]
+        return Self::generate_embedded(path, kind);
+    }
+
+    /// Generates through an explicit secret store. See [`Self::load_with`].
+    pub fn generate_to_with(
+        path: &Path,
+        kind: SignerKind,
+        store: &dyn secret_store::SecretStore,
+    ) -> Result<Self> {
         let mut rng = rand::thread_rng();
         let mut token = [0_u8; 32];
         rng.fill_bytes(&mut token);
@@ -222,9 +359,28 @@ impl Identity {
             signer,
             signing,
             box_secret: StaticSecret::random_from_rng(rng),
+            box_secret_ref: None,
             api_token_hash: Sha256::digest(token).into(),
         };
-        identity.save_new(path)?;
+        identity.save_new_with(path, store)?;
+        Ok(identity)
+    }
+
+    /// Generates with the box secret inline. The only form outside macOS.
+    #[cfg(not(target_os = "macos"))]
+    fn generate_embedded(path: &Path, kind: SignerKind) -> Result<Self> {
+        let mut rng = rand::thread_rng();
+        let mut token = [0_u8; 32];
+        rng.fill_bytes(&mut token);
+        let (signer, signing) = new_signer(kind, &mut rng)?;
+        let identity = Self {
+            signer,
+            signing,
+            box_secret: StaticSecret::random_from_rng(rng),
+            box_secret_ref: None,
+            api_token_hash: Sha256::digest(token).into(),
+        };
+        identity.save_embedded(path)?;
         Ok(identity)
     }
 
@@ -464,9 +620,55 @@ fn exact_32(value: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("expected 32 bytes"))
 }
 
+/// A fresh keychain account name for a box secret. Random, so two identities
+/// in different state directories never share an entry.
+fn new_secret_ref() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    encode_base64url(&bytes)
+}
+
+/// Writes the identity file with mode 0600. `create_new` refuses to replace
+/// an existing file; without it the file is replaced atomically, so a crash
+/// leaves either the old file or the new one, never a half-written file.
+fn write_identity_file(path: &Path, file: &IdentityFileV1, create_new: bool) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut body = serde_json::to_vec_pretty(&file)?;
+    body.push(b'\n');
+    if create_new {
+        let mut handle = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("create {}", path.display()))?;
+        handle.write_all(&body)?;
+        return Ok(());
+    }
+    let staging = path.with_extension("tmp");
+    {
+        let mut handle = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staging)
+            .with_context(|| format!("stage {}", staging.display()))?;
+        handle.write_all(&body)?;
+        handle
+            .sync_all()
+            .with_context(|| format!("flush {}", staging.display()))?;
+    }
+    fs::rename(&staging, path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret_store::SecretStore as _;
     use oshioki_protocol::{
         DeviceRegistryV1, seal_v1, verify_deny_v1, verify_native_approval_v1,
         verify_native_enrollment_v1,
@@ -607,11 +809,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oshioki-agent-{}", std::process::id()));
         let path = dir.join("agent.json");
         let _ = fs::remove_dir_all(&dir);
-        let generated = Identity::generate_to(&path, SignerKind::Software).unwrap();
-        let loaded = Identity::load(&path).unwrap();
+        let store = secret_store::MemoryStore::new();
+        let generated = Identity::generate_to_with(&path, SignerKind::Software, &store).unwrap();
+        let loaded = Identity::load_with(&path, &store).unwrap();
         assert_eq!(generated.fingerprint(), loaded.fingerprint());
         assert_eq!(loaded.signer_kind(), SignerKind::Software);
-        assert!(Identity::generate_to(&path, SignerKind::Software).is_err());
+        assert!(Identity::generate_to_with(&path, SignerKind::Software, &store).is_err());
+        // The file keeps a reference, never the secret itself.
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(stored.get("box_secret").is_none());
+        assert!(stored["box_secret_ref"].is_string());
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -626,7 +833,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oshioki-tagged-{}", std::process::id()));
         let path = dir.join("agent.json");
         let _ = fs::remove_dir_all(&dir);
-        Identity::generate_to(&path, SignerKind::Software).unwrap();
+        let store = secret_store::MemoryStore::new();
+        Identity::generate_to_with(&path, SignerKind::Software, &store).unwrap();
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(stored["signing"]["kind"], "software");
         assert!(stored["signing"]["key"].is_string());
@@ -639,13 +847,110 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "version": VERSION_V1,
                 "signing": {"kind": "enclave", "blob": encode_base64url(&[9_u8; 32])},
-                "box_secret": stored["box_secret"],
+                "box_secret_ref": stored["box_secret_ref"],
                 "api_token_hash": stored["api_token_hash"],
             }))
             .unwrap(),
         )
         .unwrap();
-        assert!(Identity::load(&path).is_err());
+        assert!(Identity::load_with(&path, &store).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A legacy file carrying its box secret inline migrates on load: the
+    /// secret moves into the store, the file is rewritten without it, and the
+    /// device keeps its fingerprint.
+    #[test]
+    fn a_legacy_file_migrates_its_secret_into_the_store() {
+        let dir = std::env::temp_dir().join(format!("oshioki-migrate-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let secret = encode_base64url(&[0x55; 32]);
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": VERSION_V1,
+                "signing": {"kind": "software", "key": encode_base64url(&[0x54; 32])},
+                "box_secret": secret,
+                "api_token_hash": encode_base64url(&[0x56; 32]),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = secret_store::MemoryStore::new();
+        let before = Identity::load_with(&path, &store).unwrap();
+        let stripped: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(stripped.get("box_secret").is_none());
+        let reference = stripped["box_secret_ref"].as_str().unwrap();
+        assert_eq!(store.get(reference).unwrap(), Some([0x55; 32]));
+        // The second load serves the secret from the store, same device.
+        let after = Identity::load_with(&path, &store).unwrap();
+        assert_eq!(before.fingerprint(), after.fingerprint());
+        assert_eq!(after.secret_ref(), Some(reference));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file with both forms, or with neither, is corrupt rather than a
+    /// guess about which secret to use.
+    #[test]
+    fn an_ambiguous_or_empty_secret_form_is_refused() {
+        let dir = std::env::temp_dir().join(format!("oshioki-ambiguous-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = secret_store::MemoryStore::new();
+        for (name, file) in [
+            (
+                "both",
+                serde_json::json!({
+                    "version": VERSION_V1,
+                    "signing": {"kind": "software", "key": encode_base64url(&[0x54; 32])},
+                    "box_secret": encode_base64url(&[0x55; 32]),
+                    "box_secret_ref": "ref",
+                    "api_token_hash": encode_base64url(&[0x56; 32]),
+                }),
+            ),
+            (
+                "neither",
+                serde_json::json!({
+                    "version": VERSION_V1,
+                    "signing": {"kind": "software", "key": encode_base64url(&[0x54; 32])},
+                    "api_token_hash": encode_base64url(&[0x56; 32]),
+                }),
+            ),
+        ] {
+            fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+            assert!(Identity::load_with(&path, &store).is_err(), "{name}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A reference whose entry is gone names re-pairing, so the operator
+    /// knows the fix instead of seeing a keychain error.
+    #[test]
+    fn a_missing_store_entry_names_repairing() {
+        let dir = std::env::temp_dir().join(format!("oshioki-gone-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": VERSION_V1,
+                "signing": {"kind": "software", "key": encode_base64url(&[0x54; 32])},
+                "box_secret_ref": "no-such-entry",
+                "api_token_hash": encode_base64url(&[0x56; 32]),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = secret_store::MemoryStore::new();
+        let Err(error) = Identity::load_with(&path, &store) else {
+            panic!("a missing store entry loaded");
+        };
+        assert!(error.to_string().contains("--force"), "{error:#}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

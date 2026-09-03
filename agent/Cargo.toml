@@ -38,6 +38,10 @@ time = { workspace = true }
 # the Compose E2E and the container image, never see it.
 [target.'cfg(target_os = "macos")'.dependencies]
 oshioki-enclave = { path = "../enclave" }
+# Login-keychain storage for the box secret (#23). macOS identities keep the
+# secret in the login keychain and the file keeps only a reference; anywhere
+# else the file keeps carrying the secret itself.
+security-framework = "3"
 
 [lints]
 workspace = true
