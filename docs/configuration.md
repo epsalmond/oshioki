@@ -1,0 +1,43 @@
+# Configuration
+
+Values shown are the local development defaults from `compose.yaml`. Production
+values are for production to choose; see [requirements.md](requirements.md).
+
+## Server
+
+| Variable | Dev default | Notes |
+|---|---|---|
+| `OSHIOKI_ORIGIN` | `https://sudo.test` | WebAuthn origin the hook enrolls and verifies against. |
+| `OSHIOKI_RP_ID` | `sudo.test` | WebAuthn relying-party ID. |
+| `OSHIOKI_LISTEN` | `0.0.0.0:8443` | Bind address; the binary defaults to `127.0.0.1:8443`. |
+| `OSHIOKI_STATE_PATH` | `/state/state.sqlite3` | Writable SQLite path; one active server per database file. |
+| `OSHIOKI_DARWIN_DIST` | unset | Optional directory of Darwin packages served as immutable artifacts. |
+| `OSHIOKI_NTFY_URL` | unset | Optional ntfy broker URL. Messages carry host, user, request ID, and `/r/<id>` URL only — never request plaintext. |
+| `NATS_URL` | `nats://nats:4222` | JetStream server. |
+| `NATS_USER` / `NATS_PASS` | `oshioki` / `test-only` | Set both together or neither. |
+
+## Hook (`oshioki` binary)
+
+| Variable | Notes |
+|---|---|
+| `OSHIOKI_CONFIG_DIR` | Local hook state; defaults to `/etc/oshioki`. |
+| `OSHIOKI_OPENER` | Test-only override: one executable path followed by one URL argument. Used by `watch` (defaults to `/usr/bin/open` on Darwin). |
+
+## Native agent (`oshioki-agent` binary)
+
+| Variable | Notes |
+|---|---|
+| `OSHIOKI_AGENT_STATE` | Directory holding the 0600 `agent.json` identity; defaults to `~/.config/oshioki`. |
+| `NATS_URL` | Same value as the hook. |
+| `NATS_USER` / `NATS_PASS` | Same value as the hook; setting only one of the pair is an error. |
+
+## Dev tooling (`scripts/dev`)
+
+| Variable | Notes |
+|---|---|
+| `OSHIOKI_UID` / `OSHIOKI_HOST_UID` | Container/host UID mapping. `scripts/dev` derives these (host UID, or `0` under rootless Docker); set them manually only when invoking Compose directly. |
+| `OSHIOKI_STATE_ROOT` / `OSHIOKI_HTTP_PORT` | State directory and host port for the Compose project; managed by `scripts/dev`. |
+
+Test-only variables (`OSHIOKI_TEST_CONFIG_DIR`, `OSHIOKI_SERVER_HTTP`,
+`OSHIOKI_E2E_*`) are set by the Compose E2E project; operators never need to
+set them.

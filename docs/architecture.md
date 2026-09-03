@@ -1,7 +1,10 @@
-# Oshioki server architecture
+# Oshioki architecture
 
 The server stores routing data and opaque ciphertext. It cannot produce an
 approval accepted by the hook.
+
+For what production must provide, see [requirements.md](requirements.md).
+For configuration reference, see [configuration.md](configuration.md).
 
 ## Request path
 
@@ -93,7 +96,8 @@ device once the server is healthy.
 SQLite uses WAL, foreign keys, a five-second busy timeout, and embedded schema
 version 1. Tables cover devices, enrollments, requests, sealed bodies,
 tombstones, and outbox work. Cleanup expires pending enrollment state and
-removes old resolved work.
+removes old resolved work. The expected runtime is one active server with one
+persistent database file.
 
 `GET /healthz` checks the schema, durable request consumer progress, and
 outbox progress. Every browser response uses `Cache-Control: no-store`,
@@ -112,5 +116,5 @@ The browser bundle vendors libsodium.js 0.7.15. Its WebAssembly payload is
 embedded in the reviewed browser file. `server/web/vendor/SHA256SUMS` records
 the source files included in the browser application.
 
-Package publication remains deferred. A future server container may be a
-deployment choice. It will not transport Darwin packages.
+Package publication remains deferred. There is no server container yet.
+When there is one, it will not include Darwin packages.

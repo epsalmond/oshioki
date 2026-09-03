@@ -3,19 +3,11 @@
 The current workflow is local and prelaunch. It does not activate a production
 service or a permanent sudo plugin.
 
-## Build and test
+Build, test, and retained dev servers are the contributor loop; see
+[CONTRIBUTING.md](CONTRIBUTING.md). The notes below are operator tasks.
 
-```bash
-scripts/dev build
-scripts/dev test --quick
-scripts/dev test --browser
-scripts/dev test
-```
-
-The full test creates fresh NATS and SQLite state. It runs browser enrollment
-and approval with two isolated Chromium profiles. It then installs the hook and
-plugin inside the E2E container and invokes real sudo. Failed runs retain their
-state path and scrubbed Compose logs.
+"Supervised" below means a person is watching: you answer the approval
+prompts (Touch ID, terminal) while the loop runs.
 
 The installer requires `target/release/SHA256SUMS`. Create it after a release
 build:
@@ -24,18 +16,6 @@ build:
 cd target/release
 sha256sum oshioki liboshioki_plugin.so > SHA256SUMS
 ```
-
-## Retained development state
-
-```bash
-scripts/dev up --state-dir ./tmp/dev-state
-scripts/dev status
-scripts/dev down
-```
-
-The development server uses the local test origin only when the caller supplies
-matching configuration. Production origin, RP ID, NATS credentials, storage,
-and routing are consumer-owned settings.
 
 ## Prelaunch installer
 
@@ -162,7 +142,8 @@ scripts/dev-acceptance mac           # on the host, then paste on the Mac
 oshioki revoke <old-fingerprint>     # on the host
 ```
 
-Disable the managed block before stopping a supervised stack:
+Remove the `# BEGIN oshioki` … `# END oshioki` section the installer added
+to `sudo.conf` before stopping a supervised stack:
 
 ```bash
 sudo scripts/install-oshioki-hook --disable-prelaunch
