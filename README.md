@@ -152,9 +152,11 @@ is one active server with one persistent database file.
 On a Mac the Touch ID sheet is the approval. The signing key lives in the
 Secure Enclave behind `biometryCurrentSet`, so the signature cannot exist
 without the fingerprint, and there is no second confirmation to give. The
-sheet reads "Oshioki is trying to run `<command>` as `<account>` on `<host>`.
-Touch ID to allow this." The working directory and the caller process chain
-go to the log, where there is room for them.
+sheet reads "Oshioki is trying to run `<command and arguments>` as
+`<account>` on `<host>`. Touch ID to allow this." The arguments are there
+because `rm` and `rm -rf /` are different requests, rendered the same way the
+terminal prompt renders them. The working directory and the caller process
+chain go to the log, where there is room for them.
 
 ```bash
 scripts/mac/bundle-agent

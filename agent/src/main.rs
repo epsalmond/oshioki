@@ -490,21 +490,32 @@ enum Decider {
 /// What the operator is being asked to allow, in the second person.
 ///
 /// The Touch ID sheet reads "Oshioki is trying to `<this>`. Touch ID to allow
-/// this", and it is one line on somebody's screen. The working directory and
-/// the caller process chain go to the log instead, where there is room.
+/// this", and it is one line on somebody's screen. It carries the arguments,
+/// rendered exactly as the terminal prompt renders them: `rm` and `rm -rf /`
+/// are different requests and must not read the same. The working directory
+/// and the caller process chain go to the log instead, where there is room.
 fn approval_reason(request: &oshioki_protocol::RequestV1) -> String {
-    let reason = format!(
-        "run {} as {} on {}",
-        escape_for_terminal(&request.command),
-        runas_label(request.runas_uid),
-        escape_for_terminal(&request.host),
+    // Truncate before escaping. escape_for_terminal turns one byte into a
+    // multi-character sequence, and a cut through the middle of one would put
+    // half an escape on the sheet.
+    let command = truncate(
+        &format!("{} {}", request.command, quote_argv(&request.argv)),
+        MAX_COMMAND_CHARS,
     );
-    truncate(&reason, MAX_REASON_CHARS)
+    format!(
+        "run {} as {} on {}",
+        escape_for_terminal(command.trim_end()),
+        runas_label(request.runas_uid),
+        escape_for_terminal(&truncate(&request.host, MAX_HOST_CHARS)),
+    )
 }
 
-/// How much of the reason the sheet gets. Past this it is not a sentence
+/// How much of the command line the sheet gets. Past this it is not a sentence
 /// anybody reads before touching the sensor.
-const MAX_REASON_CHARS: usize = 120;
+const MAX_COMMAND_CHARS: usize = 100;
+
+/// How much of the host name the sheet gets. Long enough for any real name.
+const MAX_HOST_CHARS: usize = 64;
 
 /// Shortens to `limit` characters, marking that it was shortened.
 fn truncate(text: &str, limit: usize) -> String {
@@ -764,15 +775,33 @@ mod tests {
     }
 
     /// The Touch ID sheet gets one sentence: what would run, as whom, where.
+    /// The arguments are in it, because `rm` and `rm -rf /` are different
+    /// requests and one fingerprint answers only one of them.
     #[test]
     fn the_sheet_reason_names_the_command_the_account_and_the_host() {
         let mut request = request_for_reason();
         assert_eq!(
             approval_reason(&request),
-            "run /usr/bin/apt as root (uid 0) on host.example"
+            "run /usr/bin/apt apt update as root (uid 0) on host.example"
         );
         request.runas_uid = 1000;
         assert!(approval_reason(&request).contains("as uid 1000"));
+
+        let mut dangerous = request_for_reason();
+        dangerous.command = "/bin/rm".into();
+        dangerous.argv = vec!["rm".into()];
+        let mut worse = dangerous.clone();
+        worse.argv = vec!["rm".into(), "-rf".into(), "/".into()];
+        assert_ne!(approval_reason(&dangerous), approval_reason(&worse));
+        assert!(approval_reason(&worse).contains("rm -rf /"));
+
+        // A command with no arguments must not trail a space onto the sheet.
+        let mut bare = request_for_reason();
+        bare.argv = vec![];
+        assert_eq!(
+            approval_reason(&bare),
+            "run /usr/bin/apt as root (uid 0) on host.example"
+        );
     }
 
     /// A command line long enough to fill the screen is cut, and says so.
@@ -783,8 +812,40 @@ mod tests {
         let mut request = request_for_reason();
         request.command = "/usr/bin/".to_owned() + &"x".repeat(400);
         let reason = approval_reason(&request);
-        assert_eq!(reason.chars().count(), 120);
-        assert!(reason.ends_with("..."));
+        assert!(reason.contains("..."));
+        assert!(reason.chars().count() < 200, "{reason}");
+    }
+
+    /// Cutting the rendered command before escaping keeps whole escape
+    /// sequences on the sheet. Cutting after would leave half of one.
+    #[test]
+    fn truncation_never_splits_an_escape_sequence() {
+        let mut request = request_for_reason();
+        request.command = "/usr/bin/x".to_owned();
+        request.argv = vec!["x".to_owned(), "\u{1b}[31m".repeat(60)];
+        let reason = approval_reason(&request);
+        assert!(
+            !reason.contains('\u{1b}'),
+            "an escape byte reached the sheet"
+        );
+        // Every rendered escape is whole: `\u{` then four hex digits and `}`.
+        let mut rest = reason.as_str();
+        let mut rendered = 0;
+        while let Some(at) = rest.find("\\u{") {
+            let tail = &rest[at + 3..];
+            let (digits, closer) = tail.split_at(tail.len().min(4));
+            assert!(
+                digits.chars().count() == 4 && digits.chars().all(|c| c.is_ascii_hexdigit()),
+                "a cut landed inside an escape: {reason}"
+            );
+            assert!(
+                closer.starts_with('}'),
+                "a cut landed inside an escape: {reason}"
+            );
+            rendered += 1;
+            rest = &tail[4..];
+        }
+        assert!(rendered > 0, "{reason}");
     }
 
     /// One identity serves every host, so a second `pair` reuses it. A
