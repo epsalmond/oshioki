@@ -1,5 +1,6 @@
 //! `oshioki-agent`: pairs a native device with a host and answers sudo
-//! requests over NATS.
+//! requests over NATS and a local Unix socket. NATS is optional at runtime:
+//! without it the agent answers socket requests only.
 //!
 //! This binary is the Linux and test build of the macOS agent (#9). It uses
 //! a software P-256 key and a terminal prompt. macOS adds the Secure Enclave
@@ -8,6 +9,7 @@
 use std::{
     future::Future,
     io::{self, BufRead, Write as _},
+    os::unix::fs::{FileTypeExt as _, PermissionsExt as _},
     path::PathBuf,
     pin::Pin,
     sync::Arc,
@@ -21,6 +23,7 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, SignerKind, parse_enrollment_url, remaining_until};
 use oshioki_protocol::{ActivationV1, DecisionV1, RequestEnvelopeV1, escape_for_terminal};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 
@@ -256,13 +259,19 @@ async fn cmd_run(
     #[cfg(feature = "unattended")] auto: Option<Auto>,
 ) -> Result<()> {
     let identity = Arc::new(Identity::load(identity_path)?);
-    let nats = connect_nats().await?;
-    let mut requests = nats
-        .subscribe("oshioki.request.>")
-        .await
-        .context("subscribe requests")?;
-    nats.flush().await?;
-    info!(fingerprint=%identity.fingerprint(), "watching for requests");
+    // Bind before subscribing so a second instance fails fast instead of
+    // double-prompting behind the first one.
+    let socket_path = socket_path(identity_path, std::env::var_os("OSHIOKI_AGENT_SOCKET"))?;
+    let socket = bind_socket(&socket_path)?;
+    info!(
+        path = %socket_path.display(),
+        fingerprint = %identity.fingerprint(),
+        "agent socket listening"
+    );
+    // NATS is the network transport; the socket above is the local one. When
+    // the network is down the agent still answers socket requests, and
+    // rejoining NATS needs a restart.
+    let mut requests = subscribe_requests(&identity).await?;
     #[cfg(feature = "unattended")]
     let auto = auto.map(|auto| match auto {
         Auto::Approve => true,
@@ -288,13 +297,23 @@ async fn cmd_run(
         Decider::Prompt(prompter)
     };
     let decider = Arc::new(decider);
+    tokio::spawn(serve_socket(
+        socket,
+        Arc::clone(&identity),
+        Arc::clone(&decider),
+    ));
     loop {
         let message = tokio::select! {
             () = &mut stdin_closed => bail!(
                 "stdin is closed, so no approval prompt can be answered and every request \
                  would wait out its deadline; run the agent on a terminal"
             ),
-            message = requests.next() => message.context("request stream closed")?,
+            message = async {
+                match requests.as_mut() {
+                    Some((_, subscription)) => subscription.next().await,
+                    None => std::future::pending().await,
+                }
+            } => message.context("request stream closed")?,
         };
         let envelope: RequestEnvelopeV1 = match serde_json::from_slice(&message.payload) {
             Ok(envelope) => envelope,
@@ -316,10 +335,22 @@ async fn cmd_run(
             }
         };
         let identity = Arc::clone(&identity);
-        let nats = nats.clone();
+        let nats = requests.as_ref().map(|(nats, _)| nats.clone());
         let decider = Arc::clone(&decider);
         tokio::spawn(async move {
-            if let Err(error) = decide(&identity, &nats, &decider, &opened).await {
+            let verdict = decide(&identity, &decider, &opened).await;
+            let result = match verdict {
+                Ok(Some(decision)) => {
+                    if let Some(nats) = nats {
+                        publish(&nats, &opened.request, decision).await
+                    } else {
+                        Ok(())
+                    }
+                }
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
                 warn!(
                     request_id = %escape_for_terminal(&opened.request.request_id),
                     error = %escape_for_terminal(&error.to_string()),
@@ -330,12 +361,39 @@ async fn cmd_run(
     }
 }
 
+/// Connect NATS and subscribe to requests, or return `None` when the network
+/// is down so the agent answers socket requests only.
+async fn subscribe_requests(
+    identity: &Identity,
+) -> Result<Option<(async_nats::Client, async_nats::Subscriber)>> {
+    let nats = match connect_nats().await {
+        Ok(nats) => nats,
+        Err(error) => {
+            warn!(
+                error = %escape_for_terminal(&format!("{error:#}")),
+                "NATS is unreachable; answering socket requests only until restart"
+            );
+            return Ok(None);
+        }
+    };
+    let requests = nats
+        .subscribe("oshioki.request.>")
+        .await
+        .context("subscribe requests")?;
+    nats.flush().await?;
+    info!(fingerprint=%identity.fingerprint(), "watching for requests");
+    Ok(Some((nats, requests)))
+}
+
+/// Answer one opened request. `Ok(None)` means no verdict was produced —
+/// the request expired, nobody answered the prompt, or the Touch ID sheet
+/// was dismissed — and the caller must not publish anything. Delivery (NATS
+/// or socket) is the caller's job, so every transport shares this decider.
 async fn decide(
     identity: &Arc<Identity>,
-    nats: &async_nats::Client,
     decider: &Decider,
     opened: &OpenedRequest,
-) -> Result<()> {
+) -> Result<Option<DecisionV1>> {
     let request = &opened.request;
     if request.expires_at <= now() {
         bail!("request already expired");
@@ -346,9 +404,9 @@ async fn decide(
             // The signature is the approval here, so this path builds the
             // whole decision rather than answering yes or no.
             let Some(decision) = mac::decide(prompt, identity, opened).await? else {
-                return Ok(());
+                return Ok(None);
             };
-            return publish(nats, request, decision).await;
+            return Ok(Some(decision));
         }
         Decider::Auto(answer) => *answer,
         Decider::Prompt(prompter) => {
@@ -372,7 +430,7 @@ async fn decide(
                     host = %escape_for_terminal(&request.host),
                     "request expired unanswered"
                 );
-                return Ok(());
+                return Ok(None);
             };
             answer
         }
@@ -382,7 +440,7 @@ async fn decide(
     } else {
         identity.deny(&request.request_id)
     };
-    publish(nats, request, decision).await
+    Ok(Some(decision))
 }
 
 /// The prompt a Mac holding an enclave key uses: the Touch ID sheet itself.
@@ -431,6 +489,166 @@ async fn publish(
         "decision published"
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Local socket — the hook's network-free fast path
+// ---------------------------------------------------------------------------
+
+/// File name of the agent socket inside the agent state directory, unless
+/// `OSHIOKI_AGENT_SOCKET` overrides it.
+const AGENT_SOCKET_NAME: &str = "agent.sock";
+
+/// Resolve the socket path: explicit override first, then the state dir next
+/// to the identity. The override is a parameter (rather than read here) so
+/// tests do not mutate the process environment.
+fn socket_path(
+    identity_path: &std::path::Path,
+    override_path: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if let Some(path) = override_path {
+        if path.is_empty() {
+            bail!("OSHIOKI_AGENT_SOCKET is set but empty");
+        }
+        return Ok(PathBuf::from(path));
+    }
+    identity_path
+        .parent()
+        .context("identity path has no parent directory")
+        .map(|parent| parent.join(AGENT_SOCKET_NAME))
+}
+
+/// Bind the agent socket, clearing a stale file left by a dead agent. A
+/// live agent on the path is a second instance, which must not silently
+/// double-prompt behind the first one, so that case is an error. Anything
+/// that is not a socket file is never deleted.
+fn bind_socket(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
+    if let Ok(listener) = tokio::net::UnixListener::bind(path) {
+        restrict_socket(path)?;
+        return Ok(listener);
+    }
+    if !std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .file_type()
+        .is_socket()
+    {
+        bail!("socket path {} exists and is not a socket", path.display());
+    }
+    // The path is a socket file. If someone answers there, they own it.
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        bail!("another agent is already listening on {}", path.display());
+    }
+    std::fs::remove_file(path)
+        .with_context(|| format!("remove stale socket {}", path.display()))?;
+    let listener =
+        tokio::net::UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
+    restrict_socket(path)?;
+    Ok(listener)
+}
+
+/// Owner-only permissions on the socket file. The state directory already
+/// gates access, but a socket that outlives a permissive umask should not
+/// stay world-accessible.
+fn restrict_socket(path: &std::path::Path) -> Result<()> {
+    let mut permissions = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+        .with_context(|| format!("chmod {}", path.display()))?;
+    Ok(())
+}
+
+/// Accept hook connections forever. One failing accept must not kill the
+/// listener, so errors are logged with a breather instead of propagated.
+async fn serve_socket(
+    listener: tokio::net::UnixListener,
+    identity: Arc<Identity>,
+    decider: Arc<Decider>,
+) {
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                warn!(
+                    error = %escape_for_terminal(&error.to_string()),
+                    "agent socket accept failed"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let identity = Arc::clone(&identity);
+        let decider = Arc::clone(&decider);
+        tokio::spawn(async move {
+            if let Err(error) = handle_socket(stream, &identity, &decider).await {
+                warn!(
+                    error = %escape_for_terminal(&error.to_string()),
+                    "socket request failed"
+                );
+            }
+        });
+    }
+}
+
+/// Answer one hook connection: one framed envelope in, one framed verdict
+/// out. Hanging up without a verdict means this agent is not answering, and
+/// the hook falls back to NATS, where another agent may.
+async fn handle_socket(
+    stream: tokio::net::UnixStream,
+    identity: &Arc<Identity>,
+    decider: &Decider,
+) -> Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let Some(bytes) = read_frame(&mut reader).await? else {
+        return Ok(());
+    };
+    let envelope: RequestEnvelopeV1 =
+        serde_json::from_slice(&bytes).context("decode socket envelope")?;
+    let opened = match identity.open_request(&envelope) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            warn!(
+                request_id = %escape_for_terminal(&envelope.request_id),
+                error = %escape_for_terminal(&error.to_string()),
+                "ignoring socket request"
+            );
+            return Ok(());
+        }
+    };
+    let Some(decision) = decide(identity, decider, &opened).await? else {
+        return Ok(());
+    };
+    let frame = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&decision)?)?;
+    writer
+        .write_all(&frame)
+        .await
+        .context("write socket verdict")?;
+    info!(
+        request_id = %escape_for_terminal(&opened.request.request_id),
+        "socket decision answered"
+    );
+    Ok(())
+}
+
+/// Read one length-delimited frame. A peer that hangs up before delivering
+/// one has not answered.
+async fn read_frame(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<Option<Vec<u8>>> {
+    let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+    match reader.read_exact(&mut prefix).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let len = oshioki_protocol::socket_v1::decode_frame_len(prefix)?;
+    let mut payload = vec![0u8; len];
+    match reader.read_exact(&mut payload).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(Some(payload))
 }
 
 /// Renders argv so the boundaries between arguments are visible.
@@ -711,7 +929,8 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::{
-        Pairing, Prompter, approval_reason, load_or_create, now, quote_argv, runas_label, truncate,
+        Pairing, Prompter, approval_reason, bind_socket, load_or_create, now, quote_argv,
+        runas_label, socket_path, truncate,
     };
     use oshioki_agent::SignerKind;
     use oshioki_protocol::{RequestV1, VERSION_V1, encode_base64url};
@@ -952,5 +1171,174 @@ mod tests {
         let prompter = Prompter::new(receiver);
         assert_eq!(prompter.ask("summary\n", now() + 1).await.unwrap(), None);
         drop(sender);
+    }
+
+    fn socket_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oshioki-agent-socket-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn socket_defaults_to_the_state_dir() {
+        let dir = socket_test_dir("default");
+        let path = socket_path(&dir.join("agent.json"), None).unwrap();
+        assert_eq!(path, dir.join("agent.sock"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socket_override_wins_over_the_state_dir() {
+        let dir = socket_test_dir("override");
+        let path = socket_path(
+            &dir.join("agent.json"),
+            Some(std::ffi::OsString::from("/tmp/custom-agent.sock")),
+        )
+        .unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/tmp/custom-agent.sock"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_socket_override_is_an_error() {
+        let dir = socket_test_dir("empty");
+        assert!(socket_path(&dir.join("agent.json"), Some(std::ffi::OsString::new())).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stale_socket_file_is_reclaimed() {
+        let dir = socket_test_dir("stale");
+        let path = dir.join("agent.sock");
+        {
+            let _dead = tokio::net::UnixListener::bind(&path).unwrap();
+        }
+        let listener = bind_socket(&path).unwrap();
+        drop(listener);
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn live_socket_refuses_a_second_agent() {
+        let dir = socket_test_dir("live");
+        let path = dir.join("agent.sock");
+        let _first = bind_socket(&path).unwrap();
+        let second = bind_socket(&path);
+        assert!(second.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn regular_file_is_never_deleted_as_a_socket() {
+        let dir = socket_test_dir("regular");
+        let path = dir.join("agent.sock");
+        std::fs::write(&path, "not a socket").unwrap();
+        assert!(bind_socket(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sealed request for this test's own identity, the way the hook seals
+    /// one envelope per active device.
+    #[cfg(feature = "unattended")]
+    fn sealed_envelope_for(
+        identity: &oshioki_agent::Identity,
+        request: &oshioki_protocol::RequestV1,
+    ) -> Vec<u8> {
+        use oshioki_protocol::RequestEnvelopeV1;
+        let raw = request.raw_json().unwrap();
+        let sealed = oshioki_protocol::seal_v1(&raw, &identity.device_record("test")).unwrap();
+        let envelope = RequestEnvelopeV1 {
+            version: oshioki_protocol::VERSION_V1,
+            request_id: request.request_id.clone(),
+            host: request.host.clone(),
+            user: request.user.clone(),
+            issued_at: request.issued_at,
+            expires_at: request.expires_at,
+            sealed: vec![sealed],
+        };
+        envelope.validate().unwrap();
+        serde_json::to_vec(&envelope).unwrap()
+    }
+
+    /// Drive `handle_socket` with one connected pair: frame in, verdict out.
+    /// `Auto` needs the `unattended` feature, so this whole happy-path test
+    /// only exists in the E2E build, like `run --auto` itself.
+    #[cfg(feature = "unattended")]
+    async fn socket_verdict(
+        identity: std::sync::Arc<oshioki_agent::Identity>,
+        approve: bool,
+        envelope: &[u8],
+    ) -> oshioki_protocol::DecisionV1 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut hook_side, agent_side) = tokio::net::UnixStream::pair().unwrap();
+        let serve = tokio::spawn(async move {
+            let decider = super::Decider::Auto(approve);
+            super::handle_socket(agent_side, &identity, &decider).await
+        });
+        let frame = oshioki_protocol::socket_v1::encode_frame(envelope).unwrap();
+        hook_side.write_all(&frame).await.unwrap();
+        let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        hook_side.read_exact(&mut prefix).await.unwrap();
+        let len = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+        let mut verdict = vec![0u8; len];
+        hook_side.read_exact(&mut verdict).await.unwrap();
+        serve.await.unwrap().unwrap();
+        serde_json::from_slice(&verdict).unwrap()
+    }
+
+    /// The full local loop with an auto-approving agent: the sealed envelope
+    /// comes back as a signed native approval for the same request.
+    #[cfg(feature = "unattended")]
+    #[tokio::test]
+    async fn socket_auto_approve_returns_a_signed_verdict() {
+        let dir = socket_test_dir("happy");
+        let identity = oshioki_agent::Identity::generate_to(
+            &dir.join("agent.json"),
+            oshioki_agent::SignerKind::Software,
+        )
+        .unwrap();
+        let mut request = request_for_reason();
+        request.issued_at = now();
+        request.expires_at = now() + 60;
+        let envelope = sealed_envelope_for(&identity, &request);
+        let identity = std::sync::Arc::new(identity);
+        match socket_verdict(identity.clone(), true, &envelope).await {
+            oshioki_protocol::DecisionV1::ApproveNative(approval) => {
+                assert_eq!(approval.request_id, request.request_id);
+                assert_eq!(approval.device_fingerprint, identity.fingerprint());
+            }
+            other => panic!("expected a native approval, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Auto-deny travels the same path back as an explicit denial.
+    #[cfg(feature = "unattended")]
+    #[tokio::test]
+    async fn socket_auto_deny_returns_a_denial() {
+        let dir = socket_test_dir("deny");
+        let identity = oshioki_agent::Identity::generate_to(
+            &dir.join("agent.json"),
+            oshioki_agent::SignerKind::Software,
+        )
+        .unwrap();
+        let mut request = request_for_reason();
+        request.issued_at = now();
+        request.expires_at = now() + 60;
+        let envelope = sealed_envelope_for(&identity, &request);
+        let identity = std::sync::Arc::new(identity);
+        match socket_verdict(identity.clone(), false, &envelope).await {
+            oshioki_protocol::DecisionV1::Deny(denial) => {
+                assert_eq!(denial.request_id, request.request_id);
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

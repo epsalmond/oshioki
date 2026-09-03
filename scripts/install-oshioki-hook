@@ -34,6 +34,7 @@ RP_ID="${OSHIOKI_RP_ID:-}"
 NATS_URL="${NATS_URL:-}"
 NATS_USER="${NATS_USER:-oshioki}"
 NATS_PASS="${NATS_PASS:-}"
+AGENT_SOCKET="${OSHIOKI_AGENT_SOCKET:-}"
 BEGIN_MARK='# BEGIN oshioki'
 END_MARK='# END oshioki'
 LOCK_DIR="${OSHIOKI_INSTALL_LOCK:-${STATE_DIR}.install.lock}"
@@ -43,6 +44,8 @@ case "$(uname -s)" in
   Darwin) PLUGIN_DIR="${SUDO_PLUGIN_DIR:-/usr/local/libexec/sudo}"; PLUGIN_NAME=oshioki.dylib; BUILD_PLUGIN=liboshioki_plugin.dylib ;;
   *) echo "install-oshioki-hook: unsupported operating system" >&2; exit 1 ;;
 esac
+ROOT_GROUP=root
+[ "$(uname -s)" = Darwin ] && ROOT_GROUP=wheel
 HOOK_BIN="${HOOK_BIN:-$SERVICE_DIR/target/release/oshioki}"
 PLUGIN_BIN="${PLUGIN_BIN:-$SERVICE_DIR/target/release/$BUILD_PLUGIN}"
 PLUGIN_DEST="$PLUGIN_DIR/$PLUGIN_NAME"
@@ -50,7 +53,23 @@ PLUGIN_DEST="$PLUGIN_DIR/$PLUGIN_NAME"
 die() { echo "install-oshioki-hook: $*" >&2; exit 1; }
 run() { if [ "$DRY_RUN" -eq 1 ]; then printf 'DRY:'; printf ' %q' "$@"; printf '\n'; else "$@"; fi; }
 regular_or_absent() { [ ! -L "$1" ] || die "refusing unsafe target: $1"; [ ! -e "$1" ] || [ -f "$1" ] || die "refusing unsafe target: $1"; }
-safe_directory() { [ ! -L "$1" ] || die "refusing symlink directory: $1"; [ ! -e "$1" ] || [ -d "$1" ] || die "refusing non-directory: $1"; }
+canonicalize() {
+  local p="$1" link hops=0
+  while [ "$hops" -lt 40 ] && link="$(readlink "$p" 2>/dev/null)" && [ -n "$link" ]; do
+    case "$link" in
+      /*) p="$link" ;;
+      *) p="$(dirname "$p")/$link" ;;
+    esac
+    hops=$((hops + 1))
+  done
+  if [ -L "$p" ]; then die "refusing unresolved symlink: $1"; fi
+  printf '%s\n' "$p"
+}
+safe_directory() {
+  local canon
+  canon="$(canonicalize "$1")"
+  [ ! -e "$canon" ] || [ -d "$canon" ] || die "refusing non-directory: $1"
+}
 hash_file() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 
 load_config_file() {
@@ -81,10 +100,17 @@ load_config_file() {
       NATS_URL) NATS_URL="$value" ;;
       NATS_USER) NATS_USER="$value" ;;
       NATS_PASS) NATS_PASS="$value" ;;
+      OSHIOKI_AGENT_SOCKET) AGENT_SOCKET="$value" ;;
       *) die "unknown config key in $path: $key" ;;
     esac
   done < "$path"
 }
+
+# Resolve caller-supplied paths (e.g. Homebrew prefix symlinks) to the real
+# files before the safety checks below. Checksum lookup uses the resolved
+# basename, so links must keep the artifact filename.
+HOOK_BIN="$(canonicalize "$HOOK_BIN")"
+PLUGIN_BIN="$(canonicalize "$PLUGIN_BIN")"
 
 [ -z "$CONFIG_FILE" ] || load_config_file "$CONFIG_FILE"
 
@@ -143,7 +169,7 @@ rewrite_block() {
     [ ! -s "$tmp" ] || [ "$(tail -c 1 "$tmp" | wc -l)" -ne 0 ] || printf '\n' >> "$tmp"
     printf '%s\nPlugin approval_exec %s\n%s\n' "$BEGIN_MARK" "$PLUGIN_DEST" "$END_MARK" >> "$tmp"
   fi
-  chmod 0644 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$destination"
+  chmod 0644 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$destination"
 }
 
 [ ! -f "$SUDO_CONF" ] || validate_block "$SUDO_CONF"
@@ -181,6 +207,7 @@ case "$architecture" in
 esac
 
 CHECKSUMS="${OSHIOKI_CHECKSUMS:-$SERVICE_DIR/target/release/SHA256SUMS}"
+CHECKSUMS="$(canonicalize "$CHECKSUMS")"
 if [ ! -f "$CHECKSUMS" ] || [ -L "$CHECKSUMS" ]; then
   die "missing artifact checksum manifest: $CHECKSUMS"
 fi
@@ -192,21 +219,22 @@ done
 
 
 run install -d -m 0755 "$SBIN_DIR" "$PLUGIN_DIR"
-run install -m 0755 -o root -g root "$HOOK_BIN" "$SBIN_DIR/oshioki"
-run install -m 0755 -o root -g root "$PLUGIN_BIN" "$PLUGIN_DEST"
-run install -d -m 0750 -o root -g root "$STATE_DIR"
+run install -m 0755 -o root -g "$ROOT_GROUP" "$HOOK_BIN" "$SBIN_DIR/oshioki"
+run install -m 0755 -o root -g "$ROOT_GROUP" "$PLUGIN_BIN" "$PLUGIN_DEST"
+run install -d -m 0750 -o root -g "$ROOT_GROUP" "$STATE_DIR"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf 'DRY: write %s/config.env with NATS_PASS=<redacted>\n' "$STATE_DIR"
+  [ -z "$AGENT_SOCKET" ] || printf 'DRY: write OSHIOKI_AGENT_SOCKET=%s to config.env\n' "$AGENT_SOCKET"
   printf 'DRY: write %s/hook.json for origin %s and RP ID %s\n' "$STATE_DIR" "$ORIGIN" "$RP_ID"
 else
-  tmp="$(mktemp "$STATE_DIR/config.env.XXXXXX")"; printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\n' "$NATS_URL" "$NATS_USER" "$NATS_PASS" > "$tmp"; chmod 0600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$STATE_DIR/config.env"
-  tmp="$(mktemp "$STATE_DIR/hook.json.XXXXXX")"; printf '{"version":1,"origin":"%s","rp_id":"%s","server_base_url":"%s"}\n' "$ORIGIN" "$RP_ID" "$ORIGIN" > "$tmp"; chmod 0600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$STATE_DIR/hook.json"
-  if [ ! -e "$STATE_DIR/devices.json" ]; then printf '{"version":1,"devices":[]}\n' > "$STATE_DIR/devices.json"; chmod 0600 "$STATE_DIR/devices.json"; chown root:root "$STATE_DIR/devices.json"; fi
+  tmp="$(mktemp "$STATE_DIR/config.env.XXXXXX")"; printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\n' "$NATS_URL" "$NATS_USER" "$NATS_PASS" > "$tmp"; [ -z "$AGENT_SOCKET" ] || printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET" >> "$tmp"; chmod 0600 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$STATE_DIR/config.env"
+  tmp="$(mktemp "$STATE_DIR/hook.json.XXXXXX")"; printf '{"version":1,"origin":"%s","rp_id":"%s","server_base_url":"%s"}\n' "$ORIGIN" "$RP_ID" "$ORIGIN" > "$tmp"; chmod 0600 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$STATE_DIR/hook.json"
+  if [ ! -e "$STATE_DIR/devices.json" ]; then printf '{"version":1,"devices":[]}\n' > "$STATE_DIR/devices.json"; chmod 0600 "$STATE_DIR/devices.json"; chown "root:$ROOT_GROUP" "$STATE_DIR/devices.json"; fi
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then echo "DRY: enable exact managed block in $SUDO_CONF"; validate_sudo; exit 0; fi
-[ -f "$SUDO_CONF" ] || install -m 0644 -o root -g root /dev/null "$SUDO_CONF"
+[ -f "$SUDO_CONF" ] || install -m 0644 -o root -g "$ROOT_GROUP" /dev/null "$SUDO_CONF"
 backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
 rewrite_block enable "$SUDO_CONF" "$SUDO_CONF"
 if ! validate_sudo; then rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"; cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"; die "sudo -V failed; restored prior configuration"; fi
