@@ -1025,7 +1025,9 @@ mod tests {
         truncate,
     };
     use oshioki_agent::SignerKind;
-    use oshioki_protocol::{EnvEntryV1, RequestEnvelopeV1, RequestV1, VERSION_V1, encode_base64url};
+    use oshioki_protocol::{
+        EnvEntryV1, RequestEnvelopeV1, RequestV1, VERSION_V1, encode_base64url,
+    };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::mpsc;
 
@@ -1583,6 +1585,7 @@ mod tests {
             command: format!("/tmp/{LOG_PROBE}/do"),
             argv: vec!["do".into(), format!("--token={LOG_PROBE}")],
             pid_chain: vec![format!("{LOG_PROBE}:4242")],
+            env: vec![],
             issued_at: now(),
             expires_at: now() + 60,
         }
