@@ -20,6 +20,11 @@ The browser token identifies one device. The request API returns only that
 device's sealed body. Plaintext commands never enter SQLite, logs,
 notifications, or metrics.
 
+The request also carries the curated execution environment — loader,
+resolution, shell, interpreter, pager, and trust variables. Approvals sign
+those bytes alongside the command, so a different environment is a different
+approval; the environment travels only inside the sealed bodies.
+
 ## Device kinds
 
 A device record carries a `kind`: `webauthn` or `secure-enclave`.

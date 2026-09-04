@@ -23,10 +23,10 @@ use uuid::Uuid;
 
 use oshioki_protocol::{
     ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, DeviceKindV1, DevicePublicRecordV1,
-    DeviceRegistryV1, EnrollmentIntentV1, EnrollmentSubmissionV1, HookConfigV1, RequestEnvelopeV1,
-    RequestV1, VERSION_V1, allow_plaintext_nats, check_nats_url, escape_for_terminal,
-    nats_url_is_tls, verify_approval_v1, verify_enrollment_v1, verify_native_approval_v1,
-    verify_native_enrollment_v1,
+    DeviceRegistryV1, EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1,
+    RequestEnvelopeV1, RequestV1, VERSION_V1, allow_plaintext_nats, check_nats_url,
+    escape_for_terminal, is_approval_env, nats_url_is_tls, verify_approval_v1, verify_enrollment_v1,
+    verify_native_approval_v1, verify_native_enrollment_v1,
 };
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
@@ -695,6 +695,23 @@ fn build_request(values: &HashMap<String, String>) -> Result<RequestV1> {
         .into_iter()
         .filter_map(|index| values.get(&format!("argv.{index}")).cloned())
         .collect();
+    // The plugin already filters to policy variables; re-filter here so a
+    // hand-built payload cannot smuggle extra environment into the signed
+    // request. Sorted for a stable payload.
+    let mut env: Vec<EnvEntryV1> = values
+        .iter()
+        .filter_map(|(key, value)| {
+            let name = key.strip_prefix("env.")?;
+            if !is_approval_env(name) {
+                return None;
+            }
+            Some(EnvEntryV1 {
+                name: name.to_owned(),
+                value: value.clone(),
+            })
+        })
+        .collect();
+    env.sort_by(|a, b| a.name.cmp(&b.name));
     let request = RequestV1 {
         version: VERSION_V1,
         request_id: Uuid::new_v4().to_string(),
@@ -723,6 +740,7 @@ fn build_request(values: &HashMap<String, String>) -> Result<RequestV1> {
         command,
         argv,
         pid_chain: pid_chain(),
+        env,
         issued_at,
         expires_at: issued_at + 90,
     };
@@ -750,6 +768,7 @@ fn build_synthetic_request() -> RequestV1 {
         command: "/usr/bin/true".into(),
         argv: vec!["/usr/bin/true".into()],
         pid_chain: pid_chain(),
+        env: vec![],
         issued_at,
         expires_at: issued_at + 90,
     }
@@ -1073,6 +1092,32 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["oshioki", "enroll", "--resume", "-abc"]).unwrap();
         assert!(matches!(cli.verb, Verb::Enroll { resume: Some(ref r) } if r == "-abc"));
+    }
+    /// Only policy variables reach the signed request, sorted by name, even
+    /// when the payload carries the whole environment: the hook re-filters
+    /// what the plugin sends.
+    #[test]
+    fn build_request_binds_only_policy_environment() {
+        let values = HashMap::from([
+            ("info.command".into(), "/usr/bin/python3".into()),
+            ("argv.1".into(), "/usr/bin/python3".into()),
+            ("env.PATH".into(), "/tmp/bin:/usr/bin".into()),
+            ("env.LD_PRELOAD".into(), "/tmp/evil.so".into()),
+            ("env.HOME".into(), "/root".into()),
+            ("env.AWS_SECRET_ACCESS_KEY".into(), "hunter2".into()),
+        ]);
+        let request = build_request(&values).unwrap();
+        let names: Vec<_> = request
+            .env
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["LD_PRELOAD", "PATH"]);
+        assert_eq!(request.env[0].value, "/tmp/evil.so");
+        assert_eq!(request.env[1].value, "/tmp/bin:/usr/bin");
+        // The environment is part of the signed bytes, not decoration.
+        let raw = String::from_utf8(request.raw_json().unwrap()).unwrap();
+        assert!(raw.contains("LD_PRELOAD"));
     }
     #[test]
     fn request_bytes_are_retained_in_every_sealed_body() {

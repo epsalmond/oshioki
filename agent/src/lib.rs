@@ -483,6 +483,7 @@ mod tests {
             command: "/bin/true".into(),
             argv: vec!["true".into()],
             pid_chain: vec![],
+            env: vec![],
             issued_at: 1_000,
             expires_at: 1_090,
         }
