@@ -51,6 +51,7 @@ STATE="$HOME/.config/oshioki"
 NATS_URL="${NATS_URL:-}"
 NATS_USER="${NATS_USER:-}"
 NATS_PASS="${NATS_PASS:-}"
+ALLOW_PLAINTEXT="${OSHIOKI_ALLOW_PLAINTEXT_NATS:-}"
 LOG_LEVEL="info"
 DRY_RUN=false
 UNINSTALL=false
@@ -122,6 +123,9 @@ render_plist() {
     if [ -n "$NATS_USER" ]; then
       printf '    <key>NATS_USER</key><string>%s</string>\n' "$(xml_escape "$NATS_USER")"
       printf '    <key>NATS_PASS</key><string>%s</string>\n' "$(xml_escape "$password")"
+    fi
+    if [ -n "$ALLOW_PLAINTEXT" ]; then
+      printf '    <key>OSHIOKI_ALLOW_PLAINTEXT_NATS</key><string>%s</string>\n' "$(xml_escape "$ALLOW_PLAINTEXT")"
     fi
   )
   cat <<PLIST

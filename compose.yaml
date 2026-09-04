@@ -43,6 +43,9 @@ services:
       NATS_URL: nats://nats:4222
       NATS_USER: oshioki
       NATS_PASS: test-only
+      # Dev-only: `nats` is a Compose hostname, not loopback, so the TLS
+      # gate needs this opt-out here. Production uses tls://.
+      OSHIOKI_ALLOW_PLAINTEXT_NATS: "1"
       OSHIOKI_STATE_PATH: /state/state.sqlite3
       OSHIOKI_LISTEN: 0.0.0.0:8443
       OSHIOKI_ORIGIN: https://sudo.test
@@ -69,6 +72,8 @@ services:
       NATS_URL: nats://nats:4222
       NATS_USER: oshioki
       NATS_PASS: test-only
+      # Dev-only, same reason as the server above.
+      OSHIOKI_ALLOW_PLAINTEXT_NATS: "1"
       OSHIOKI_TEST_CONFIG_DIR: /state/hook
       OSHIOKI_ORIGIN: https://sudo.test
       OSHIOKI_RP_ID: sudo.test

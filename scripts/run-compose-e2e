@@ -48,8 +48,8 @@ chmod 0700 "$HOOK_CONFIG_DIR"
 printf '{"version":1,"origin":"%s","rp_id":"%s","server_base_url":"%s"}\n' \
   "$OSHIOKI_ORIGIN" "$OSHIOKI_RP_ID" "$OSHIOKI_ORIGIN" \
   >"$HOOK_CONFIG_DIR/hook.json"
-printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\n' \
-  "$NATS_URL" "$NATS_USER" "$NATS_PASS" \
+printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\nOSHIOKI_ALLOW_PLAINTEXT_NATS=%s\n' \
+  "$NATS_URL" "$NATS_USER" "$NATS_PASS" "${OSHIOKI_ALLOW_PLAINTEXT_NATS:-1}" \
   >"$HOOK_CONFIG_DIR/config.env"
 printf '{"version":1,"devices":[]}\n' >"$HOOK_CONFIG_DIR/devices.json"
 chmod 0600 "$HOOK_CONFIG_DIR"/*.json "$HOOK_CONFIG_DIR/config.env"

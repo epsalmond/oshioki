@@ -34,6 +34,7 @@ RP_ID="${OSHIOKI_RP_ID:-}"
 NATS_URL="${NATS_URL:-}"
 NATS_USER="${NATS_USER:-oshioki}"
 NATS_PASS="${NATS_PASS:-}"
+ALLOW_PLAINTEXT="${OSHIOKI_ALLOW_PLAINTEXT_NATS:-}"
 AGENT_SOCKET="${OSHIOKI_AGENT_SOCKET:-}"
 BEGIN_MARK='# BEGIN oshioki'
 END_MARK='# END oshioki'
@@ -72,6 +73,30 @@ safe_directory() {
 }
 hash_file() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 
+# True when the hook would refuse NATS_URL as plaintext past loopback. The
+# hook itself is authoritative; this only warns at install time so a bad URL
+# is caught here instead of at the first sudo afterwards.
+needs_tls_warning() {
+  case "$NATS_URL" in
+    [Tt][Ll][Ss]://*) return 1 ;;
+    [Nn][Aa][Tt][Ss]://*) ;;
+    *) return 1 ;;
+  esac
+  [ -z "$ALLOW_PLAINTEXT" ] || return 1
+  local rest host
+  rest="${NATS_URL#*://}"
+  rest="${rest%%/*}"; rest="${rest%%\?*}"; rest="${rest%%#*}"
+  host="${rest##*@}"
+  case "$host" in
+    \[*\]*) host="$(printf '%s' "$host" | sed 's/^\[//; s/\].*//')" ;;
+    *) host="${host%%:*}" ;;
+  esac
+  case "$host" in
+    ""|[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|127.*|::1) return 1 ;;
+  esac
+  return 0
+}
+
 load_config_file() {
   local path="$1" owner mode line key value
   if [ ! -f "$path" ] || [ -L "$path" ]; then
@@ -100,6 +125,7 @@ load_config_file() {
       NATS_URL) NATS_URL="$value" ;;
       NATS_USER) NATS_USER="$value" ;;
       NATS_PASS) NATS_PASS="$value" ;;
+      OSHIOKI_ALLOW_PLAINTEXT_NATS) ALLOW_PLAINTEXT="$value" ;;
       OSHIOKI_AGENT_SOCKET) AGENT_SOCKET="$value" ;;
       *) die "unknown config key in $path: $key" ;;
     esac
@@ -193,6 +219,9 @@ fi
 [ -n "$RP_ID" ] || die "OSHIOKI_RP_ID is required"
 [ -n "$NATS_URL" ] || die "NATS_URL is required"
 [ -n "$NATS_PASS" ] || die "NATS_PASS is required"
+if needs_tls_warning; then
+  echo "install-oshioki-hook: warning: NATS_URL is plaintext to a non-loopback host, and the hook will refuse it: use tls://, or set OSHIOKI_ALLOW_PLAINTEXT_NATS=1 (testing only; see README.md)" >&2
+fi
 
 for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do
   if [ ! -f "$artifact" ] || [ -L "$artifact" ]; then
@@ -225,10 +254,11 @@ run install -d -m 0750 -o root -g "$ROOT_GROUP" "$STATE_DIR"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf 'DRY: write %s/config.env with NATS_PASS=<redacted>\n' "$STATE_DIR"
+  [ -z "$ALLOW_PLAINTEXT" ] || printf 'DRY: write OSHIOKI_ALLOW_PLAINTEXT_NATS=%s to config.env\n' "$ALLOW_PLAINTEXT"
   [ -z "$AGENT_SOCKET" ] || printf 'DRY: write OSHIOKI_AGENT_SOCKET=%s to config.env\n' "$AGENT_SOCKET"
   printf 'DRY: write %s/hook.json for origin %s and RP ID %s\n' "$STATE_DIR" "$ORIGIN" "$RP_ID"
 else
-  tmp="$(mktemp "$STATE_DIR/config.env.XXXXXX")"; printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\n' "$NATS_URL" "$NATS_USER" "$NATS_PASS" > "$tmp"; [ -z "$AGENT_SOCKET" ] || printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET" >> "$tmp"; chmod 0600 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$STATE_DIR/config.env"
+  tmp="$(mktemp "$STATE_DIR/config.env.XXXXXX")"; printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\n' "$NATS_URL" "$NATS_USER" "$NATS_PASS" > "$tmp"; [ -z "$ALLOW_PLAINTEXT" ] || printf 'OSHIOKI_ALLOW_PLAINTEXT_NATS=%s\n' "$ALLOW_PLAINTEXT" >> "$tmp"; [ -z "$AGENT_SOCKET" ] || printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET" >> "$tmp"; chmod 0600 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$STATE_DIR/config.env"
   tmp="$(mktemp "$STATE_DIR/hook.json.XXXXXX")"; printf '{"version":1,"origin":"%s","rp_id":"%s","server_base_url":"%s"}\n' "$ORIGIN" "$RP_ID" "$ORIGIN" > "$tmp"; chmod 0600 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$STATE_DIR/hook.json"
   if [ ! -e "$STATE_DIR/devices.json" ]; then printf '{"version":1,"devices":[]}\n' > "$STATE_DIR/devices.json"; chmod 0600 "$STATE_DIR/devices.json"; chown "root:$ROOT_GROUP" "$STATE_DIR/devices.json"; fi
 fi

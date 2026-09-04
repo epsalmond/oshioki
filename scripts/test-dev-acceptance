@@ -230,7 +230,7 @@ grep -Fxq 'NATS_URL=nats://100.64.0.1:14222' "$MAC_STATE/hook/config.env" ||
   fail "hook environment does not point at the tailnet NATS host"
 grep -Fq -- '-a 100.64.0.1 -p 14222' "$NATS_ARGS_LOG" || fail "NATS is not bound to the tailnet address"
 MAC_PASSWORD="$(sed -n 's/^NATS_PASS=//p' "$MAC_STATE/hook/config.env")"
-MAC_EXPECTED="NATS_URL=nats://100.64.0.1:14222 NATS_USER=oshioki NATS_PASS=$MAC_PASSWORD sh -c 'cd ~/git/oshioki && git pull --ff-only && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p oshioki-agent && scripts/mac/bundle-agent && target/mac/Oshioki.app/Contents/MacOS/oshioki-agent pair \"https://nas.example.test:18444/enroll/test-enrollment#test-secret\" --label testmac && exec target/mac/Oshioki.app/Contents/MacOS/oshioki-agent run'"
+MAC_EXPECTED="OSHIOKI_ALLOW_PLAINTEXT_NATS=1 NATS_URL=nats://100.64.0.1:14222 NATS_USER=oshioki NATS_PASS=$MAC_PASSWORD sh -c 'cd ~/git/oshioki && git pull --ff-only && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p oshioki-agent && scripts/mac/bundle-agent && target/mac/Oshioki.app/Contents/MacOS/oshioki-agent pair \"https://nas.example.test:18444/enroll/test-enrollment#test-secret\" --label testmac && exec target/mac/Oshioki.app/Contents/MacOS/oshioki-agent run'"
 grep -Fxq "$MAC_EXPECTED" "$TEST_ROOT/mac.log" || {
   cat "$TEST_ROOT/mac.log" >&2
   fail "mac verb did not print the expected Mac command"

@@ -11,6 +11,8 @@ pub enum Error {
     BadVerdict(String),
     #[error("decode failed: {0}")]
     Decode(String),
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
 
     // WebAuthn verification failures
     #[error("challenge mismatch")]

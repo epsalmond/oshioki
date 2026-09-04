@@ -19,8 +19,9 @@ use axum::{
 use db::{InsertResult, RequestLifecycle, Store};
 use futures::StreamExt as _;
 use oshioki_protocol::{
-    ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
-    RequestEnvelopeV1, SealedDeviceBodyV1,
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1,
+    EnrollmentSubmissionV1, RequestEnvelopeV1, SealedDeviceBodyV1, allow_plaintext_nats,
+    check_nats_url, nats_url_is_tls,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -691,11 +692,21 @@ fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
         .ok_or(ApiError(StatusCode::UNAUTHORIZED))
 }
 async fn connect_nats() -> Result<async_nats::Client> {
-    async_nats::ConnectOptions::new()
-        .user_and_password(required_env("NATS_USER")?, required_env("NATS_PASS")?)
-        .connect(required_env("NATS_URL")?)
-        .await
-        .context("connect to NATS")
+    let url = required_env("NATS_URL")?;
+    check_nats_url(
+        &url,
+        allow_plaintext_nats(std::env::var(ALLOW_PLAINTEXT_NATS_ENV).ok().as_deref()),
+    )
+    .context("invalid NATS_URL")?;
+    // A tls:// URL must stay TLS past the first server: the cluster
+    // advertises more addresses on reconnect as bare host:port, which parse
+    // as plaintext, so the options flag carries the requirement with them.
+    let mut options = async_nats::ConnectOptions::new()
+        .user_and_password(required_env("NATS_USER")?, required_env("NATS_PASS")?);
+    if nats_url_is_tls(&url) {
+        options = options.require_tls(true);
+    }
+    options.connect(url).await.context("connect to NATS")
 }
 fn required_env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} not set"))
