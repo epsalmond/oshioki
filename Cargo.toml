@@ -61,7 +61,7 @@ unnecessary_wraps = "deny"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-async-nats = { version = "0.38" }
+async-nats = { version = "0.50" }
 
 # Crypto / auth
 p256 = { version = "0.13", features = ["ecdsa"] }
