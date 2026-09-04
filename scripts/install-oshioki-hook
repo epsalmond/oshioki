@@ -127,6 +127,7 @@ load_config_file() {
       NATS_PASS) NATS_PASS="$value" ;;
       OSHIOKI_ALLOW_PLAINTEXT_NATS) ALLOW_PLAINTEXT="$value" ;;
       OSHIOKI_AGENT_SOCKET) AGENT_SOCKET="$value" ;;
+      OSHIOKI_LOCAL) : ;; # local-setup marker; inert, kept so the mode is visible in the file
       *) die "unknown config key in $path: $key" ;;
     esac
   done < "$path"
