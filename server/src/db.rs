@@ -28,7 +28,6 @@ pub struct SealedRequest {
 #[derive(Debug)]
 pub struct OutboxItem {
     pub id: i64,
-    pub kind: String,
     pub subject: String,
     pub payload: Vec<u8>,
 }
@@ -412,17 +411,27 @@ impl Store {
         Ok(InsertResult::Inserted)
     }
 
-    pub fn pending_outbox(&self, limit: usize) -> Result<Vec<OutboxItem>> {
+    /// Verdicts and enrollment relays publish to NATS. Notifications are
+    /// deliberately not here: one failed ntfy delivery must never hold up
+    /// the approval path, so each lane drains its own rows.
+    pub fn pending_verdicts(&self, limit: usize) -> Result<Vec<OutboxItem>> {
+        self.pending_outbox_where("kind != 'ntfy'", limit)
+    }
+
+    pub fn pending_notifications(&self, limit: usize) -> Result<Vec<OutboxItem>> {
+        self.pending_outbox_where("kind = 'ntfy'", limit)
+    }
+
+    fn pending_outbox_where(&self, condition: &str, limit: usize) -> Result<Vec<OutboxItem>> {
         let connection = self.lock()?;
-        let mut statement = connection.prepare(
-            "SELECT id, kind, subject, payload FROM outbox WHERE sent_at IS NULL ORDER BY id LIMIT ?1",
-        )?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT id, subject, payload FROM outbox WHERE sent_at IS NULL AND {condition} ORDER BY id LIMIT ?1",
+        ))?;
         let rows = statement.query_map([i64::try_from(limit)?], |row| {
             Ok(OutboxItem {
                 id: row.get(0)?,
-                kind: row.get(1)?,
-                subject: row.get(2)?,
-                payload: row.get(3)?,
+                subject: row.get(1)?,
+                payload: row.get(2)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -677,6 +686,39 @@ mod tests {
         );
     }
 
+    /// Verdicts and notifications drain through separate lanes: a stuck
+    /// notification row is invisible to the verdict reader and vice versa,
+    /// so a dead ntfy endpoint cannot head-of-line-block an approval.
+    #[test]
+    fn verdict_and_notification_lanes_are_separate() {
+        let store = Store::memory().unwrap();
+        let device = device(b"first");
+        store.put_device(&device).unwrap();
+        let envelope = envelope(&device.fingerprint);
+        let raw = serde_json::to_vec(&envelope).unwrap();
+        store.ingest_request(&raw, &envelope, 20).unwrap();
+        let decision = DecisionV1::Deny(DenyV1 {
+            version: VERSION_V1,
+            request_id: "request-1".into(),
+            device_fingerprint: device.fingerprint.clone(),
+        });
+        store
+            .queue_decision("request-1", &device.fingerprint, &decision, 20)
+            .unwrap();
+        store
+            .queue_notification("request-1", "https://ntfy.example/x", b"{}")
+            .unwrap();
+        let verdicts = store.pending_verdicts(10).unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].subject, "oshioki.verdict.request-1");
+        let notifications = store.pending_notifications(10).unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].subject, "https://ntfy.example/x");
+        store.mark_outbox_sent(verdicts[0].id).unwrap();
+        assert!(store.pending_verdicts(10).unwrap().is_empty());
+        assert_eq!(store.pending_notifications(10).unwrap().len(), 1);
+    }
+
     #[test]
     fn restart_replays_unsent_outbox_until_marked() {
         let path = temporary_database();
@@ -696,7 +738,7 @@ mod tests {
             store
                 .queue_decision("request-1", &device.fingerprint, &decision, 20)
                 .unwrap();
-            assert_eq!(store.pending_outbox(10).unwrap().len(), 1);
+            assert_eq!(store.pending_verdicts(10).unwrap().len(), 1);
         }
 
         {
@@ -712,12 +754,11 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-            let pending = store.pending_outbox(10).unwrap();
+            let pending = store.pending_verdicts(10).unwrap();
             assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].kind, "decision");
             assert_eq!(pending[0].subject, "oshioki.verdict.request-1");
             store.mark_outbox_sent(pending[0].id).unwrap();
-            assert!(store.pending_outbox(10).unwrap().is_empty());
+            assert!(store.pending_verdicts(10).unwrap().is_empty());
 
             let connection = store.lock().unwrap();
             let foreign_keys: i64 = connection

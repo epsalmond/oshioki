@@ -143,8 +143,10 @@ fn spawn_workers(state: &AppState) {
             }
         }
     });
-    let outbox_state = state.clone();
-    tokio::spawn(async move { outbox_worker(outbox_state).await });
+    let verdict_state = state.clone();
+    tokio::spawn(async move { verdict_worker(verdict_state).await });
+    let notification_state = state.clone();
+    tokio::spawn(async move { notification_worker(notification_state).await });
     let cleanup_store = state.store.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -290,40 +292,27 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
     }
 }
 
-async fn outbox_worker(state: AppState) {
-    let http = reqwest::Client::new();
+/// Publishes verdicts (and enrollment relays) to NATS. This lane never
+/// touches a notification row, so a dead ntfy endpoint cannot delay an
+/// approval: while this worker is healthy, `/healthz` is healthy.
+async fn verdict_worker(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     loop {
         interval.tick().await;
-        match state.store.pending_outbox(32) {
+        match state.store.pending_verdicts(32) {
             Ok(items) => {
                 let mut healthy = true;
                 for item in items {
-                    if item.kind == "ntfy" {
-                        let result = http
-                            .post(&item.subject)
-                            .header("content-type", "application/json")
-                            .body(item.payload.clone())
-                            .send()
-                            .await;
-                        if !matches!(result, Ok(response) if response.status().is_success()) {
-                            warn!(outbox_id = item.id, "ntfy delivery failed");
-                            healthy = false;
-                            break;
-                        }
-                    } else {
-                        if let Err(error) =
-                            state.nats.publish(item.subject, item.payload.into()).await
-                        {
-                            warn!(%error, outbox_id=item.id, "outbox publish failed");
-                            healthy = false;
-                            break;
-                        }
-                        if let Err(error) = state.nats.flush().await {
-                            warn!(%error, outbox_id=item.id, "outbox flush failed");
-                            healthy = false;
-                            break;
-                        }
+                    if let Err(error) = state.nats.publish(item.subject, item.payload.into()).await
+                    {
+                        warn!(%error, outbox_id=item.id, "outbox publish failed");
+                        healthy = false;
+                        break;
+                    }
+                    if let Err(error) = state.nats.flush().await {
+                        warn!(%error, outbox_id=item.id, "outbox flush failed");
+                        healthy = false;
+                        break;
                     }
                     if let Err(error) = state.store.mark_outbox_sent(item.id) {
                         warn!(%error, outbox_id=item.id, "outbox mark-sent failed");
@@ -335,7 +324,53 @@ async fn outbox_worker(state: AppState) {
                     state.outbox_last_ok.store(now(), Ordering::Relaxed);
                 }
             }
-            Err(error) => warn!(%error, "outbox read failed"),
+            Err(error) => warn!(%error, "verdict outbox read failed"),
+        }
+    }
+}
+
+/// Delivers notifications on their own cadence with bounded backoff. A
+/// failure here sleeps this worker only: verdicts keep flowing, and the
+/// health check (driven by the verdict lane) stays green.
+async fn notification_worker(state: AppState) {
+    let http = reqwest::Client::new();
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    let mut consecutive_failures: u32 = 0;
+    loop {
+        interval.tick().await;
+        match state.store.pending_notifications(32) {
+            Ok(items) => {
+                let mut batch_clean = true;
+                for item in items {
+                    let result = http
+                        .post(&item.subject)
+                        .header("content-type", "application/json")
+                        .body(item.payload.clone())
+                        .send()
+                        .await;
+                    if !matches!(result, Ok(response) if response.status().is_success()) {
+                        warn!(outbox_id = item.id, "ntfy delivery failed");
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        batch_clean = false;
+                        break;
+                    }
+                    if let Err(error) = state.store.mark_outbox_sent(item.id) {
+                        warn!(%error, outbox_id=item.id, "ntfy mark-sent failed");
+                        batch_clean = false;
+                        break;
+                    }
+                }
+                if batch_clean {
+                    consecutive_failures = 0;
+                } else {
+                    // Independent exponential backoff, capped at five
+                    // minutes: a dead endpoint is retried, never hammered.
+                    let wait = Duration::from_secs(1 << consecutive_failures.min(8))
+                        .min(Duration::from_secs(300));
+                    tokio::time::sleep(wait).await;
+                }
+            }
+            Err(error) => warn!(%error, "ntfy outbox read failed"),
         }
     }
 }
