@@ -3,10 +3,6 @@
 mod db;
 
 use anyhow::{Context as _, Result, bail};
-use async_nats::jetstream::{
-    self, AckKind,
-    consumer::{AckPolicy, PullConsumer, pull},
-};
 use axum::{
     Json, Router,
     body::Body,
@@ -19,10 +15,10 @@ use axum::{
 use db::{InsertResult, RequestLifecycle, Store};
 use futures::StreamExt as _;
 use oshioki_protocol::{
-    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1,
-    EnrollmentSubmissionV1, RequestEnvelopeV1, SealedDeviceBodyV1, allow_plaintext_nats,
-    check_nats_url, nats_url_is_tls,
+    ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
+    RequestEnvelopeV1, SealedDeviceBodyV1,
 };
+use oshioki_transport::{NatsTransport, ServerTransport};
 use serde::Serialize;
 use serde_json::json;
 use std::{
@@ -37,10 +33,7 @@ use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
 
-const REQUEST_STREAM: &str = "OSHIOKI";
-const REQUEST_CONSUMER: &str = "oshioki-server-v1";
 const MAX_HTTP_BODY: usize = 3 * 1024 * 1024;
-
 /// Largest servable Darwin artifact. Release tarballs are tens of megabytes,
 /// so this is headroom, not a fit: anything bigger is not ours to serve,
 /// and refusing it before reading a byte keeps one request from eating the
@@ -54,7 +47,7 @@ const MAX_CONCURRENT_ARTIFACTS: usize = 8;
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
-    nats: async_nats::Client,
+    transport: Arc<dyn ServerTransport>,
     dist_root: Arc<PathBuf>,
     artifact_permits: Arc<Semaphore>,
     consumer_last_ok: Arc<AtomicI64>,
@@ -104,7 +97,7 @@ async fn main() -> Result<()> {
     store.ready()?;
     let state = AppState {
         store,
-        nats: connect_nats().await?,
+        transport: transport_from_env().await?,
         dist_root: Arc::new(PathBuf::from(dist_root)),
         artifact_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_ARTIFACTS)),
         consumer_last_ok: Arc::new(AtomicI64::new(0)),
@@ -176,96 +169,66 @@ fn spawn_workers(state: &AppState) {
 }
 
 async fn request_consumer(state: AppState) -> Result<()> {
-    let stream = jetstream::new(state.nats.clone())
-        .get_stream(REQUEST_STREAM)
-        .await
-        .context("open request stream")?;
-    let consumer: PullConsumer = stream
-        .get_or_create_consumer(
-            REQUEST_CONSUMER,
-            pull::Config {
-                durable_name: Some(REQUEST_CONSUMER.into()),
-                filter_subject: "oshioki.request.>".into(),
-                ack_policy: AckPolicy::Explicit,
-                ..Default::default()
-            },
-        )
-        .await
-        .context("open durable request consumer")?;
+    let mut batches = state.transport.requests().await?;
     state.consumer_last_ok.store(now(), Ordering::Relaxed);
-    let mut messages = consumer.messages().await?;
     loop {
-        let result = match tokio::time::timeout(Duration::from_secs(10), messages.next()).await {
-            Ok(Some(result)) => result,
+        let batch = match tokio::time::timeout(Duration::from_secs(10), batches.next()).await {
+            Ok(Some(batch)) => batch,
             Ok(None) => bail!("request consumer stream closed"),
             Err(_) => {
                 state.consumer_last_ok.store(now(), Ordering::Relaxed);
                 continue;
             }
         };
-        let message = result?;
-        let raw = message.payload.as_ref();
-        if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
-            warn!(bytes = raw.len(), "terminating oversized request envelope");
-            message
-                .ack_with(AckKind::Term)
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            state.consumer_last_ok.store(now(), Ordering::Relaxed);
-            continue;
-        }
-        let envelope = match serde_json::from_slice::<RequestEnvelopeV1>(raw) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(%error, "terminating malformed request envelope");
-                message
-                    .ack_with(AckKind::Term)
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        for message in batch? {
+            let raw = message.payload.as_slice();
+            if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
+                warn!(bytes = raw.len(), "terminating oversized request envelope");
+                (message.term).await?;
                 state.consumer_last_ok.store(now(), Ordering::Relaxed);
                 continue;
             }
-        };
-        match state.store.ingest_request(raw, &envelope, now()) {
-            Ok(result @ (InsertResult::Inserted | InsertResult::Identical)) => {
-                if result == InsertResult::Inserted {
-                    queue_notification(&state, &envelope)?;
+            let envelope = match serde_json::from_slice::<RequestEnvelopeV1>(raw) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(%error, "terminating malformed request envelope");
+                    (message.term).await?;
+                    state.consumer_last_ok.store(now(), Ordering::Relaxed);
+                    continue;
                 }
-                message
-                    .double_ack()
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            };
+            match state.store.ingest_request(raw, &envelope, now()) {
+                Ok(result @ (InsertResult::Inserted | InsertResult::Identical)) => {
+                    if result == InsertResult::Inserted {
+                        queue_notification(&state, &envelope)?;
+                    }
+                    (message.ack).await?;
+                }
+                Ok(InsertResult::Conflict) => {
+                    warn!(request_id=%envelope.request_id, "terminating conflicting request id reuse");
+                    (message.term).await?;
+                }
+                Err(error) => {
+                    warn!(%error, "terminating invalid or expired request");
+                    (message.term).await?;
+                }
             }
-            Ok(InsertResult::Conflict) => {
-                warn!(request_id=%envelope.request_id, "terminating conflicting request id reuse");
-                message
-                    .ack_with(AckKind::Term)
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            }
-            Err(error) => {
-                warn!(%error, "terminating invalid or expired request");
-                message
-                    .ack_with(AckKind::Term)
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            }
+            state.consumer_last_ok.store(now(), Ordering::Relaxed);
         }
-        state.consumer_last_ok.store(now(), Ordering::Relaxed);
     }
 }
 
 async fn enrollment_consumer(state: AppState) -> Result<()> {
-    let mut intents = state.nats.subscribe("oshioki.enrollment.intent").await?;
+    let mut intents = state.transport.subscribe("oshioki.enrollment.intent").await?;
     let mut submissions = state
-        .nats
+        .transport
         .subscribe("oshioki.enrollment.submission.>")
         .await?;
     let mut activations = state
-        .nats
+        .transport
         .subscribe("oshioki.enrollment.activation.>")
         .await?;
-    let mut revocations = state.nats.subscribe("oshioki.device.revoke.>").await?;
+    let mut revocations = state.transport.subscribe("oshioki.device.revoke.>").await?;
     loop {
         tokio::select! {
             Some(message) = intents.next() => match serde_json::from_slice::<EnrollmentIntentV1>(&message.payload) {
@@ -315,19 +278,26 @@ async fn enrollment_consumer(state: AppState) -> Result<()> {
                 Err(error) => warn!(%error, "invalid enrollment activation"),
             },
             Some(message) = revocations.next() => {
-                if let Some(fingerprint) = message.subject.strip_prefix("oshioki.device.revoke.") {
-                    match state.store.set_device_active(fingerprint, false) {
-                        Ok(false) => warn!(%fingerprint, "revocation named unknown device"),
-                        Err(error) => { warn!(%error, %fingerprint, "revocation persistence failed"); continue; }
-                        Ok(true) => {}
-                    }
-                    state.nats.publish(format!("oshioki.device.revoked.{fingerprint}"), Vec::new().into()).await?;
-                    state.nats.flush().await?;
-                }
+                handle_revocation(&state, message.subject).await?;
             },
             else => bail!("enrollment subscription closed"),
         }
     }
+}
+
+/// One revocation delivery: strip the subject prefix, deactivate the device,
+/// then publish the confirmation. Publishing after the store write is the
+/// contract — a confirmation says the revocation persisted.
+async fn handle_revocation(state: &AppState, subject: String) -> Result<()> {
+    if let Some(fingerprint) = subject.strip_prefix("oshioki.device.revoke.") {
+        match state.store.set_device_active(fingerprint, false) {
+            Ok(false) => warn!(%fingerprint, "revocation named unknown device"),
+            Err(error) => { warn!(%error, %fingerprint, "revocation persistence failed"); return Ok(()); }
+            Ok(true) => {}
+        }
+        state.transport.publish(format!("oshioki.device.revoked.{fingerprint}"), Vec::new()).await?;
+    }
+    Ok(())
 }
 
 /// Publishes verdicts (and enrollment relays) to NATS. This lane never
@@ -341,14 +311,12 @@ async fn verdict_worker(state: AppState) {
             Ok(items) => {
                 let mut healthy = true;
                 for item in items {
-                    if let Err(error) = state.nats.publish(item.subject, item.payload.into()).await
+                    // The transport publishes then flushes; a flush failure
+                    // surfaces here as a publish failure, preserving the
+                    // observable contract.
+                    if let Err(error) = state.transport.publish(item.subject, item.payload).await
                     {
                         warn!(%error, outbox_id=item.id, "outbox publish failed");
-                        healthy = false;
-                        break;
-                    }
-                    if let Err(error) = state.nats.flush().await {
-                        warn!(%error, outbox_id=item.id, "outbox flush failed");
                         healthy = false;
                         break;
                     }
@@ -776,22 +744,14 @@ fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
         .map(ToOwned::to_owned)
         .ok_or(ApiError(StatusCode::UNAUTHORIZED))
 }
-async fn connect_nats() -> Result<async_nats::Client> {
-    let url = required_env("NATS_URL")?;
-    check_nats_url(
-        &url,
-        allow_plaintext_nats(std::env::var(ALLOW_PLAINTEXT_NATS_ENV).ok().as_deref()),
-    )
-    .context("invalid NATS_URL")?;
-    // A tls:// URL must stay TLS past the first server: the cluster
-    // advertises more addresses on reconnect as bare host:port, which parse
-    // as plaintext, so the options flag carries the requirement with them.
-    let mut options = async_nats::ConnectOptions::new()
-        .user_and_password(required_env("NATS_USER")?, required_env("NATS_PASS")?);
-    if nats_url_is_tls(&url) {
-        options = options.require_tls(true);
+/// Selects the server transport named by `OSHIOKI_TRANSPORT`. Absent or
+/// empty means `nats`, the only backend; anything else fails closed before
+/// the listener binds — an unknown transport must never silently use NATS.
+async fn transport_from_env() -> Result<Arc<dyn ServerTransport>> {
+    match std::env::var("OSHIOKI_TRANSPORT").as_deref() {
+        Err(_) | Ok("" | "nats") => Ok(Arc::new(NatsTransport::from_env().await?)),
+        Ok(other) => bail!("unsupported transport: {other}"),
     }
-    options.connect(url).await.context("connect to NATS")
 }
 fn required_env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} not set"))
@@ -1006,5 +966,143 @@ mod tests {
         drop(held);
         assert_eq!(status(&dir, "agent.tar.gz", &permits).await, StatusCode::OK);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The verdict worker publishes every outbox row through the transport
+    /// and marks it sent, so the publish ordering survives the seam: a
+    /// duplicate publish in the recording would mean commit-before-ack
+    /// flipped.
+    #[tokio::test]
+    async fn mock_transport_drives_verdict_worker() {
+        let dir = std::env::temp_dir().join(format!("oshioki-server-verdict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("state.sqlite3")).unwrap());
+        store.ready().unwrap();
+        let device = test_device();
+        store.put_device(&device).unwrap();
+        let envelope = RequestEnvelopeV1 {
+            version: 1,
+            request_id: "req-1".into(),
+            host: "nas".into(),
+            user: "eric".into(),
+            issued_at: 10,
+            expires_at: now() + 600,
+            sealed: vec![SealedDeviceBodyV1 {
+                device_fingerprint: device.fingerprint.clone(),
+                ephemeral_pub: oshioki_protocol::v1::encode_base64url(&[4; 32]),
+                nonce: oshioki_protocol::v1::encode_base64url(&[5; 12]),
+                ciphertext: oshioki_protocol::v1::encode_base64url(&[6; 32]),
+            }],
+        };
+        let raw = serde_json::to_vec(&envelope).unwrap();
+        store.ingest_request(&raw, &envelope, now()).unwrap();
+        let decision = DecisionV1::Deny(DenyV1 {
+            version: 1,
+            request_id: "req-1".into(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: None,
+        });
+        store.queue_decision("req-1", &device.fingerprint, &decision, now()).unwrap();
+        let transport = oshioki_transport::MockTransport::new();
+        let state = AppState {
+            store: Arc::clone(&store),
+            transport: Arc::new(transport.clone()),
+            dist_root: Arc::new(PathBuf::from("/nonexistent")),
+            artifact_permits: Arc::new(Semaphore::new(1)),
+            consumer_last_ok: Arc::new(AtomicI64::new(0)),
+            outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            origin: Arc::new("https://sudo.test".into()),
+            ntfy_url: None,
+        };
+        let worker = tokio::spawn(verdict_worker(state));
+        let store_check = Arc::clone(&store);
+        let transport_check = transport.clone();
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            loop {
+                if !transport_check.published().is_empty()
+                    && store_check.pending_verdicts(32).is_ok_and(|items| items.is_empty()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("verdict worker never drained the outbox");
+        worker.abort();
+        let published = transport.published();
+        assert_eq!(published.len(), 1, "duplicate publish means commit-before-ack flipped");
+        assert_eq!(published[0].0, "oshioki.verdict.req-1");
+        assert_eq!(published[0].1, serde_json::to_vec(&decision).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A revocation delivery deactivates the device and confirms on the
+    /// subject verbatim: the store transition comes first, then exactly one
+    /// confirmation on `oshioki.device.revoked.<fingerprint>`.
+    #[tokio::test]
+    async fn mock_transport_drives_revocation() {
+        let dir = std::env::temp_dir().join(format!("oshioki-server-revoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("state.sqlite3")).unwrap();
+        store.ready().unwrap();
+        let device = test_device();
+        store.put_device(&device).unwrap();
+        let transport = oshioki_transport::MockTransport::new();
+        let state = AppState {
+            store: Arc::new(store),
+            transport: Arc::new(transport.clone()),
+            dist_root: Arc::new(PathBuf::from("/nonexistent")),
+            artifact_permits: Arc::new(Semaphore::new(1)),
+            consumer_last_ok: Arc::new(AtomicI64::new(0)),
+            outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            origin: Arc::new("https://sudo.test".into()),
+            ntfy_url: None,
+        };
+        handle_revocation(&state, format!("oshioki.device.revoke.{}", device.fingerprint))
+            .await
+            .unwrap();
+        assert!(state.store.active_device(&device.fingerprint).unwrap().is_none());
+        let last = transport.published().last().map(|(subject, _)| subject.clone());
+        assert_eq!(last, Some(format!("oshioki.device.revoked.{}", device.fingerprint)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_device() -> oshioki_protocol::DevicePublicRecordV1 {
+        let credential_id = vec![1; 16];
+        let signing = p256::ecdsa::SigningKey::from_bytes((&[2; 32]).into()).unwrap();
+        let point = signing.verifying_key().to_encoded_point(false);
+        let mut cose = std::collections::BTreeMap::new();
+        cose.insert(serde_cbor::Value::Integer(1), serde_cbor::Value::Integer(2));
+        cose.insert(serde_cbor::Value::Integer(3), serde_cbor::Value::Integer(-7));
+        cose.insert(serde_cbor::Value::Integer(-1), serde_cbor::Value::Integer(1));
+        cose.insert(
+            serde_cbor::Value::Integer(-2),
+            serde_cbor::Value::Bytes(point.x().unwrap().to_vec()),
+        );
+        cose.insert(
+            serde_cbor::Value::Integer(-3),
+            serde_cbor::Value::Bytes(point.y().unwrap().to_vec()),
+        );
+        let credential_public_key = serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap();
+        let box_public_key = vec![3; 32];
+        let fingerprint = oshioki_protocol::device_fingerprint(
+            &credential_id,
+            &credential_public_key,
+            &box_public_key,
+        );
+        oshioki_protocol::DevicePublicRecordV1 {
+            version: 1,
+            kind: oshioki_protocol::DeviceKindV1::Webauthn,
+            fingerprint,
+            credential_id: oshioki_protocol::v1::encode_base64url(&credential_id),
+            credential_public_key: oshioki_protocol::v1::encode_base64url(&credential_public_key),
+            box_public_key: oshioki_protocol::v1::encode_base64url(&box_public_key),
+            label: "test".into(),
+            api_token_hash: oshioki_protocol::v1::encode_base64url(&[9; 32]),
+            sign_count: 0,
+            active: true,
+        }
     }
 }

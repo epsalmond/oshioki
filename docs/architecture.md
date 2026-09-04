@@ -25,6 +25,8 @@ resolution, shell, interpreter, pager, and trust variables. Approvals sign
 those bytes alongside the command, so a different environment is a different
 approval; the environment travels only inside the sealed bodies.
 
+The hook and the server route through `oshioki-transport`. The hook holds a `HookTransport`; the server holds a `ServerTransport`. `OSHIOKI_TRANSPORT=nats` is the default and the only transport this issue lands. The wire format (SMTP-style subjects and v1 JSON payloads) is identical to what shipped before the seam. The agent keeps talking to NATS directly until a device-side transport ships (#6/#7).
+
 ## Device kinds
 
 A device record carries a `kind`: `webauthn` or `secure-enclave`.

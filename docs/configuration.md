@@ -13,6 +13,7 @@ values are for production to choose; see [requirements.md](requirements.md).
 | `OSHIOKI_STATE_PATH` | `/state/state.sqlite3` | Writable SQLite path; one active server per database file. |
 | `OSHIOKI_DARWIN_DIST` | unset | Optional directory of Darwin packages served as immutable artifacts. |
 | `OSHIOKI_NTFY_URL` | unset | Optional ntfy broker URL. Messages carry host, user, request ID, and `/r/<id>` URL only — never request plaintext. |
+| `OSHIOKI_TRANSPORT` | `nats` | Transport backend; the only value today. |
 | `NATS_URL` | `nats://nats:4222` | JetStream server. Production uses `tls://` to any non-loopback host: plaintext `nats://` is refused past `localhost`, `127.0.0.0/8`, and `::1` unless the opt-out below is set. TLS validates against the system roots with hostname verification, so the server needs a publicly trusted certificate (on a tailnet, the node's MagicDNS certificate works). |
 | `NATS_USER` / `NATS_PASS` | `oshioki` / `test-only` | Set both together or neither. Production gives each role its own user — e.g. `oshioki-server` here, `oshioki-hook` on hosts, `oshioki-agent` on devices — so one leaked credential does not open the whole control plane. Per-role publish/subscribe restrictions on the NATS server itself are planned (#20). |
 | `OSHIOKI_ALLOW_PLAINTEXT_NATS` | unset | Testing opt-out for plaintext `nats://` past loopback: `1`, `true`, or `yes`. Honors Compose hostnames and tailnet addresses without certificates. Never set in production. |
@@ -21,7 +22,8 @@ values are for production to choose; see [requirements.md](requirements.md).
 
 | Variable | Notes |
 |---|---|
-| `OSHIOKI_CONFIG_DIR` | Local hook state; defaults to `/etc/oshioki`. The hook reads NATS settings from `config.env` there (sudo scrubs its environment): `NATS_URL` follows the server's TLS rule, `NATS_USER` should be the host role's own user (e.g. `oshioki-hook`), and `OSHIOKI_ALLOW_PLAINTEXT_NATS` is the testing opt-out in file form. |
+| `OSHIOKI_CONFIG_DIR` | Local hook state; defaults to `/etc/oshioki`. `config.env` accepts `OSHIOKI_TRANSPORT=nats` (default; the only value today). The hook reads NATS settings from `config.env` there (sudo scrubs its environment): `NATS_URL` follows the server's TLS rule, `NATS_USER` should be the host role's own user (e.g. `oshioki-hook`), and `OSHIOKI_ALLOW_PLAINTEXT_NATS` is the testing opt-out in file form. |
+| `OSHIOKI_OPENER` | Test-only override: one executable path followed by one URL argument. Used by `watch` (defaults to `/usr/bin/open` on Darwin). |
 | `OSHIOKI_AGENT_SOCKET` (in `config.env`) | Optional path to the agent's Unix socket. When set, the hook tries the socket first (short connect timeout) and falls back to NATS within the same approval deadline. Unset in dev, where the Compose NATS carries everything. |
 | `NATS_URL` (in `config.env`) | Optional: absent means socket-only. The hook then never touches NATS — a silent agent denies at once instead of waiting out the deadline, and an empty transport set (no socket either) fails before any request is built. Installers verify a staged NATS before writing it and write no `NATS_*` keys otherwise, never placeholders. |
 
