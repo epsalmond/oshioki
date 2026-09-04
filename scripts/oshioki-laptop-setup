@@ -10,8 +10,11 @@
 # --local pairs this machine with itself and needs no server: the device
 # record is exported and pinned directly, and the installer leaves the sudo
 # plugin disabled until a device is active rather than locking sudo out.
-# NATS_* values in local mode are placeholders for a server you may add
-# later; nothing local reads them. On macOS --local also wraps the agent in
+# --local is socket-only unless a NATS is staged (NATS_URL, NATS_USER, or
+# NATS_PASS in the environment): a staged NATS is probed before anything is
+# written, and an unstaged one writes no NATS keys anywhere, never
+# placeholders. A stale placeholder install migrates with --reconfigure.
+# On macOS --local also wraps the agent in
 # Oshioki.app (scripts/mac/bundle-agent) so the Touch ID sheet shows the
 # Oshioki name and logo instead of a bare binary; set OSHIOKI_SIGN_IDENTITY
 # to sign the bundle too.
@@ -218,8 +221,15 @@ read_markers() {
 
 check_config() {
   [ -n "$ORIGIN" ] || die "$INSTALL_ENV has no OSHIOKI_ORIGIN"
-  [ -n "$NATS_URL_V" ] || die "$INSTALL_ENV has no NATS_URL"
   [ -n "$AGENT_SOCKET_V" ] || AGENT_SOCKET_V="$DEFAULT_SOCKET"
+  if [ -z "$NATS_URL_V" ]; then
+    # Socket-only: credentials without a server describe a NATS that
+    # cannot exist, so they fail here rather than at the first sudo.
+    if [ -n "$NATS_USER_V" ] || [ -n "$NATS_PASS_V" ]; then
+      die "$INSTALL_ENV has NATS credentials without NATS_URL; remove them or set a URL"
+    fi
+    return 0
+  fi
   # The hook and agent refuse plaintext NATS past loopback at runtime; say so
   # now rather than failing the first sudo afterwards. Production uses tls://.
   case "$NATS_URL_V" in
@@ -247,6 +257,102 @@ run_installer() {
 # outlives its listener across agent restarts, so presence proves nothing.
 socket_live() {
   python3 -c 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(2);s.connect(sys.argv[1])' "$1" 2>/dev/null
+}
+
+# Verify a NATS server answers and the credentials open it: TCP connect,
+# INFO with auth_required honored, CONNECT accepted. Status 0 means the
+# hook and agent will be able to use these values; anything else prints
+# the failing step. $1 url, $2 user, $3 pass.
+nats_probe() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" "$2" "$3" <<'PYEOF'
+import json, socket, ssl, sys
+from urllib.parse import urlsplit
+url, user, password = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    parts = urlsplit(url)
+    host, port = parts.hostname, parts.port or 4222
+except Exception:
+    sys.exit("NATS probe: unparseable URL: %s" % url)
+if not host:
+    sys.exit("NATS probe: no host in URL: %s" % url)
+if parts.scheme.lower() not in ("nats", "tls"):
+    sys.exit("NATS probe: unsupported scheme in URL: %s" % url)
+try:
+    sock = socket.create_connection((host, port), timeout=4)
+except OSError as error:
+    sys.exit("NATS probe: cannot reach %s:%s: %s" % (host, port, error))
+if parts.scheme.lower() == "tls":
+    try:
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+    except ssl.SSLError as error:
+        sys.exit("NATS probe: TLS to %s:%s failed: %s" % (host, port, error))
+lines = b""
+while b"\r\n" not in lines:
+    chunk = sock.recv(4096)
+    if not chunk:
+        sys.exit("NATS probe: server closed the connection before INFO")
+    lines += chunk
+try:
+    info = json.loads(lines.split(b"\r\n", 1)[0].split(None, 1)[1])
+except Exception:
+    sys.exit("NATS probe: unreadable server INFO")
+if info.get("nonce"):
+    sys.exit("NATS probe: server wants NKey auth, which setup does not configure")
+required = info.get("auth_required", False)
+if required and (not user or not password):
+    sys.exit("NATS probe: server requires credentials and none were given")
+if (user or password) and not (user and password):
+    sys.exit("NATS probe: NATS user and password must be set together")
+hello = {"verbose": False, "pedantic": False}
+if user and password:
+    # The protocol field is `pass`, not `password`: a wrong name fails
+    # authentication the same way a wrong secret does, with no hint.
+    hello.update(user=user, **{"pass": password})
+sock.sendall(("CONNECT %s\r\nPING\r\n" % json.dumps(hello)).encode())
+rest = lines.split(b"\r\n", 1)[1]
+while rest.count(b"\r\n") < 1:
+    chunk = sock.recv(4096)
+    if not chunk:
+        sys.exit("NATS probe: server closed the connection during CONNECT")
+    rest += chunk
+reply = rest.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+if reply.startswith("-ERR"):
+    sys.exit("NATS probe: server rejected the connection: %s" % reply)
+if reply != "PONG":
+    sys.exit("NATS probe: unexpected server reply: %s" % reply)
+PYEOF
+    return "$?"
+  fi
+  # No python3: reachability only, which cannot verify credentials. Say so
+  # rather than writing values that fail at the first sudo.
+  nats_probe_reachable "$1" || return 1
+  if [ -n "$2" ] || [ -n "$3" ]; then
+    info "warning: $1 is reachable but credentials were not verified (no python3); a wrong user or password fails at the first sudo"
+  fi
+  return 0
+}
+
+# True when $1 (a NATS URL) accepts TCP. Scheme, userinfo, path, and
+# brackets are stripped; only reachability is tested.
+nats_probe_reachable() {
+  local rest hostport host port
+  rest="${1#*://}"; rest="${rest%%/*}"; rest="${rest%%\?*}"
+  hostport="${rest##*@}"
+  case "$hostport" in
+    \[*\]*) host="$(printf '%s' "$hostport" | sed 's/^\[//; s/\].*//')"
+      port="$(printf '%s' "$hostport" | sed 's/^[^]]*\]//; s/^://')" ;;
+    *) host="${hostport%%:*}"; port="${hostport##*:}" ;;
+  esac
+  [ -n "$host" ] || { echo "NATS probe: no host in URL: $1" >&2; return 1; }
+  # A bare host carries itself as the "port" (no colon to split on), and a
+  # bracketed IPv6 host with no port yields an empty one; both mean 4222.
+  if [ -z "$port" ] || [ "$host" = "$port" ]; then port=4222; fi
+  if [ "$(uname -s)" = Darwin ]; then
+    nc -z -G 2 "$host" "$port" 2>/dev/null
+  else
+    nc -z -w 2 "$host" "$port" 2>/dev/null
+  fi || { echo "NATS probe: cannot reach $host:$port" >&2; return 1; }
 }
 
 # The single privileged step of --local, run once under sudo by the outer
@@ -280,8 +386,24 @@ privileged_phase_local() {
   done < "$VALUES_FILE"
   rm -f "$VALUES_FILE"
   [ -n "${PHASE_ORIGIN:-}" ] || die "values file has no OSHIOKI_ORIGIN"
-  [ -n "${PHASE_NATS_URL:-}" ] || die "values file has no NATS_URL"
+  # No NATS keys in the values means socket-only: the outer flow probes a
+  # staged NATS before writing it here, so whatever arrives verified stays,
+  # and whatever is absent is omitted rather than placeholdered.
   if [ -f "$INSTALL_ENV" ] && [ "$RECONFIGURE" -eq 0 ]; then
+    # Reuse keeps the existing file byte-for-byte, so the reported values
+    # must be what is actually installed. A stale file whose transports no
+    # longer match what this run staged — notably the old unprobed
+    # placeholders — refuses instead of silently reinstating them: the
+    # installer would write them into config.env while the agent side went
+    # socket-only. Values are plain KEY=VALUE lines; sed reads them rather
+    # than sourcing, so hostile content cannot execute.
+    reused_key() { sed -n "s/^$1=//p" "$INSTALL_ENV" | head -1; }
+    if [ "$(reused_key NATS_URL)" != "${PHASE_NATS_URL:-}" ] \
+      || [ "$(reused_key NATS_USER)" != "${PHASE_NATS_USER:-}" ] \
+      || [ "$(reused_key NATS_PASS)" != "${PHASE_NATS_PASS:-}" ] \
+      || [ "$(reused_key OSHIOKI_AGENT_SOCKET)" != "${PHASE_AGENT_SOCKET:-$DEFAULT_SOCKET}" ]; then
+      die "existing $INSTALL_ENV names different transports than this run staged (stale NATS placeholders?); re-run with --reconfigure to rewrite it"
+    fi
     info "reusing existing $INSTALL_ENV (pass --reconfigure to redo it)"
     PHASE_REUSED=1
   else
@@ -290,9 +412,11 @@ privileged_phase_local() {
     {
       printf 'OSHIOKI_ORIGIN=%s\n' "$PHASE_ORIGIN"
       printf 'OSHIOKI_RP_ID=%s\n' "${PHASE_RP_ID:-localhost}"
-      printf 'NATS_URL=%s\n' "$PHASE_NATS_URL"
-      printf 'NATS_USER=%s\n' "${PHASE_NATS_USER:-local}"
-      printf 'NATS_PASS=%s\n' "${PHASE_NATS_PASS:-local}"
+      if [ -n "${PHASE_NATS_URL:-}" ]; then
+        printf 'NATS_URL=%s\n' "$PHASE_NATS_URL"
+        printf 'NATS_USER=%s\n' "${PHASE_NATS_USER:-}"
+        printf 'NATS_PASS=%s\n' "${PHASE_NATS_PASS:-}"
+      fi
       printf 'OSHIOKI_AGENT_SOCKET=%s\n' "${PHASE_AGENT_SOCKET:-$DEFAULT_SOCKET}"
       printf 'OSHIOKI_LOCAL=1\n'
     } > "$INSTALL_ENV"
@@ -320,9 +444,11 @@ privileged_phase_local() {
   printf '%s\n' 'OSHIOKI_SETUP_VALUES_BEGIN'
   printf 'OSHIOKI_ORIGIN=%s\n' "$PHASE_ORIGIN"
   printf 'OSHIOKI_RP_ID=%s\n' "${PHASE_RP_ID:-localhost}"
-  printf 'NATS_URL=%s\n' "$PHASE_NATS_URL"
-  printf 'NATS_USER=%s\n' "${PHASE_NATS_USER:-local}"
-  printf 'NATS_PASS=%s\n' "${PHASE_NATS_PASS:-local}"
+  if [ -n "${PHASE_NATS_URL:-}" ]; then
+    printf 'NATS_URL=%s\n' "$PHASE_NATS_URL"
+    printf 'NATS_USER=%s\n' "${PHASE_NATS_USER:-}"
+    printf 'NATS_PASS=%s\n' "${PHASE_NATS_PASS:-}"
+  fi
   printf 'OSHIOKI_AGENT_SOCKET=%s\n' "${PHASE_AGENT_SOCKET:-$DEFAULT_SOCKET}"
   printf 'OSHIOKI_REUSED=%s\n' "$PHASE_REUSED"
   printf '%s\n' 'OSHIOKI_SETUP_VALUES_END'
@@ -350,16 +476,33 @@ if [ "$LOCAL" -eq 1 ]; then
   fingerprint="$(grep '"fingerprint":' "$record" | sed -e 's/^[^:]*:[[:space:]]*"//' -e 's/".*$//' || true)"
   [ -n "$fingerprint" ] || { rm -f "$record"; die "device record has no fingerprint"; }
   info "pinning device $fingerprint"
-  info "local mode: no server, so no prompts; NATS values are placeholders"
+  # NATS is opt-in: any staged NATS_* value means a server exists to
+  # verify, and it is probed before anything is written. Otherwise the
+  # install is socket-only and no NATS keys are staged anywhere, neither
+  # here nor by the privileged phase: a config must never claim a
+  # transport that was not verified live.
+  if [ -n "${NATS_URL+set}" ] || [ -n "${NATS_USER+set}" ] || [ -n "${NATS_PASS+set}" ]; then
+    NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
+    NATS_USER="${NATS_USER:-}"
+    NATS_PASS="${NATS_PASS:-}"
+    nats_probe "$NATS_URL" "$NATS_USER" "$NATS_PASS" \
+      || die "NATS verification failed; fix the server or unset NATS_URL/NATS_USER/NATS_PASS for a socket-only install"
+    info "NATS verified at $NATS_URL"
+  else
+    NATS_URL=""; NATS_USER=""; NATS_PASS=""
+    info "socket-only install: no NATS values staged, so none will be written"
+  fi
   # Staged for the privileged phase, which writes install.env itself (or
   # reuses it) and reports the effective values back.
   values="$(mktemp "${TMPDIR:-/tmp}/oshioki-values.XXXXXX")"
   {
     printf 'OSHIOKI_ORIGIN=%s\n' "${OSHIOKI_ORIGIN:-https://localhost}"
     printf 'OSHIOKI_RP_ID=%s\n' "${OSHIOKI_RP_ID:-localhost}"
-    printf 'NATS_URL=%s\n' "${NATS_URL:-nats://127.0.0.1:4222}"
-    printf 'NATS_USER=%s\n' "${NATS_USER:-local}"
-    printf 'NATS_PASS=%s\n' "${NATS_PASS:-local}"
+    if [ -n "$NATS_URL" ]; then
+      printf 'NATS_URL=%s\n' "$NATS_URL"
+      printf 'NATS_USER=%s\n' "$NATS_USER"
+      printf 'NATS_PASS=%s\n' "$NATS_PASS"
+    fi
     printf 'OSHIOKI_AGENT_SOCKET=%s\n' "${OSHIOKI_AGENT_SOCKET:-$DEFAULT_SOCKET}"
   } > "$values"
   chmod 0600 "$values"
@@ -394,6 +537,15 @@ NATS_USER_V="$(env_key NATS_USER)"
 NATS_PASS_V="$(env_key NATS_PASS)"
 AGENT_SOCKET_V="$(env_key OSHIOKI_AGENT_SOCKET)"
 check_config
+# Server installs name a NATS, so verify it before any elevation: a dead
+# or miscredentialed server must fail here, not at the first sudo. An
+# empty URL is the socket-only shape check_config accepts; there is
+# nothing to probe then.
+if [ -n "$NATS_URL_V" ]; then
+  nats_probe "$NATS_URL_V" "$NATS_USER_V" "$NATS_PASS_V" \
+    || die "NATS verification failed for $NATS_URL_V"
+  info "NATS verified at $NATS_URL_V"
+fi
 fi
 
 if [ "$LOCAL" -eq 1 ]; then
@@ -486,9 +638,14 @@ case "$(uname -s)" in
       printf '  <key>Label</key><string>%s</string>\n' "$LABEL"
       printf '  <key>ProgramArguments</key><array><string>%s</string><string>run</string></array>\n' "$(xml_escape "$AGENT_BIN")"
       printf '%s\n' '  <key>EnvironmentVariables</key><dict>'
-      printf '    <key>NATS_URL</key><string>%s</string>\n' "$(xml_escape "$NATS_URL_V")"
-      printf '    <key>NATS_USER</key><string>%s</string>\n' "$(xml_escape "$NATS_USER_V")"
-      printf '    <key>NATS_PASS</key><string>%s</string>\n' "$(xml_escape "$NATS_PASS_V")"
+      # Socket-only writes no NATS keys at all: the agent would otherwise
+      # log an authorization failure on every start against a server that
+      # was never there.
+      if [ -n "$NATS_URL_V" ]; then
+        printf '    <key>NATS_URL</key><string>%s</string>\n' "$(xml_escape "$NATS_URL_V")"
+        printf '    <key>NATS_USER</key><string>%s</string>\n' "$(xml_escape "$NATS_USER_V")"
+        printf '    <key>NATS_PASS</key><string>%s</string>\n' "$(xml_escape "$NATS_PASS_V")"
+      fi
       printf '    <key>OSHIOKI_AGENT_SOCKET</key><string>%s</string>\n' "$(xml_escape "$AGENT_SOCKET_V")"
       printf '    <key>OSHIOKI_AGENT_STATE</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE")"
       printf '%s\n' '  </dict>'
@@ -512,9 +669,11 @@ case "$(uname -s)" in
       # dir the booted agent must agree on with the hook.
       agent_env="$AGENT_STATE/agent.env"
       {
-        printf 'NATS_URL=%s\n' "$NATS_URL_V"
-        printf 'NATS_USER=%s\n' "$NATS_USER_V"
-        printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
+        if [ -n "$NATS_URL_V" ]; then
+          printf 'NATS_URL=%s\n' "$NATS_URL_V"
+          printf 'NATS_USER=%s\n' "$NATS_USER_V"
+          printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
+        fi
         printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET_V"
         printf 'OSHIOKI_AGENT_STATE=%s\n' "$AGENT_STATE"
       } > "$agent_env"

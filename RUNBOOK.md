@@ -135,6 +135,32 @@ travel the socket; browser WebAuthn still needs the server. Native pairing
 can be done offline (below), so one agent serves local sudo over the socket
 and remote requests over NATS at the same time.
 
+Omit `NATS_URL` from `config.env` for a socket-only host: the hook then
+never touches NATS, a silent agent denies at once, and a config naming
+neither transport fails before any request is built. Fallback failures name
+the server and the failed step (`NATS fallback to nats://host:port failed:
+connect: ...`) with credentials redacted. `oshioki-laptop-setup --local`
+writes this shape unless a NATS is staged, and probes a staged NATS before
+writing it. A stale install carrying the old `local`/`local` placeholder
+credentials migrates with `oshioki-laptop-setup --local --reconfigure`;
+a plain re-run against a stale `install.env` refuses with the same advice
+instead of reinstalling it.
+
+Revocation still needs a NATS: `oshioki revoke` publishes to the server
+and waits for its confirmation, so on a socket-only host it fails with
+`NATS_URL not set`. The revocation itself is server-side — the local
+registry is only edited after the server confirms — so point the hook at
+any reachable server NATS just for the command (sudo scrubs the
+environment, hence `env`):
+
+```bash
+sudo env NATS_URL=tls://sudo.example.com:4222 NATS_USER=<hook-user> NATS_PASS=<secret> \
+  oshioki revoke <fingerprint>
+```
+
+The fingerprint must still be pinned locally; the command removes it there
+once the server confirms.
+
 Each browser profile enrolls separately:
 
 ```bash
@@ -178,8 +204,7 @@ so nothing pinned needs redoing.
 command a native device runs to consume the same URL. `status` prints each
 device's `kind` (`webauthn` or `secure-enclave`) next to its fingerprint.
 
-`test` publishes a synthetic request and waits for approve or deny. `watch`
-opens each request URL on Darwin without a shell.
+`test` publishes a synthetic request and waits for approve or deny.
 
 ## Mac approver
 
