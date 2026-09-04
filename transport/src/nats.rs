@@ -88,8 +88,12 @@ impl NatsTransport {
         )
         .context("invalid NATS_URL")?;
         // Same both-or-neither credential contract as the hook.
-        let user = std::env::var("NATS_USER").ok().filter(|value| !value.is_empty());
-        let pass = std::env::var("NATS_PASS").ok().filter(|value| !value.is_empty());
+        let user = std::env::var("NATS_USER")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let pass = std::env::var("NATS_PASS")
+            .ok()
+            .filter(|value| !value.is_empty());
         let mut options = match (user, pass) {
             (Some(user), Some(pass)) => {
                 async_nats::ConnectOptions::new().user_and_password(user, pass)

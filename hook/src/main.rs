@@ -252,8 +252,8 @@ async fn nats_fallback(
     }
     let display = nats_display_url(nats_url);
     let transport = transport_from(directory).await;
-    let transport = transport
-        .with_context(|| format!("NATS fallback to {display} failed: connect"))?;
+    let transport =
+        transport.with_context(|| format!("NATS fallback to {display} failed: connect"))?;
     if announce_url {
         let config = load_hook_config_from(directory)?;
         println!(
@@ -1808,13 +1808,17 @@ mod tests {
             "NATS_URL=nats://127.0.0.1:4222\nNATS_USER=u\n",
         )
         .unwrap();
-        let error = connect_nats_from(&dir).await.unwrap_err();
+        let Err(error) = transport_from(&dir).await else {
+            panic!("half-credentials unexpectedly connected")
+        };
         assert!(
             format!("{error:#}").contains("both or neither"),
             "{error:#}"
         );
         std::fs::write(dir.join("config.env"), "NATS_URL=nats://203.0.1.1:4222\n").unwrap();
-        let error = connect_nats_from(&dir).await.unwrap_err();
+        let Err(error) = transport_from(&dir).await else {
+            panic!("plaintext NATS unexpectedly connected")
+        };
         assert!(
             format!("{error:#}").contains("refusing plaintext"),
             "{error:#}"
