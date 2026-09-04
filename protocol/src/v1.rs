@@ -23,6 +23,64 @@ const CHALLENGE_DOMAIN: &[u8] = b"oshioki/approve/v1\0";
 const FINGERPRINT_DOMAIN: &[u8] = b"oshioki/fingerprint/v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvEntryV1 {
+    pub name: String,
+    pub value: String,
+}
+
+/// Environment variables that can change what a command does without
+/// changing its path or arguments: the dynamic loader, command resolution,
+/// shell startup files, interpreter search paths, pagers and editors, and
+/// trust configuration. The plugin sends only these, so secrets that happen
+/// to sit in the environment never enter the request at all — not the sealed
+/// body, not server storage, not logs.
+pub fn is_approval_env(name: &str) -> bool {
+    matches!(
+        name,
+        "BASH_ENV"
+            | "CLASSPATH"
+            | "DYLD_FALLBACK_LIBRARY_PATH"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "EDITOR"
+            | "ENV"
+            | "GCONV_PATH"
+            | "HOSTALIASES"
+            | "JAVA_TOOL_OPTIONS"
+            | "JDK_JAVA_OPTIONS"
+            | "LD_AUDIT"
+            | "LD_CONFIG"
+            | "LD_LIBRARY_PATH"
+            | "LD_PRELOAD"
+            | "LD_PROFILE"
+            | "LOCPATH"
+            | "LUA_CPATH"
+            | "LUA_PATH"
+            | "MANPAGER"
+            | "NLSPATH"
+            | "NODE_OPTIONS"
+            | "NODE_PATH"
+            | "PAGER"
+            | "PATH"
+            | "PERL5LIB"
+            | "PERLLIB"
+            | "PYTHONHOME"
+            | "PYTHONPATH"
+            | "PYTHONSTARTUP"
+            | "RES_OPTIONS"
+            | "RUBYLIB"
+            | "RUBYOPT"
+            | "SHELLOPTS"
+            | "SSL_CERT_DIR"
+            | "SSL_CERT_FILE"
+            | "SYSTEMD_EDITOR"
+            | "SYSTEMD_PAGER"
+            | "VISUAL"
+            | "_JAVA_OPTIONS"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestV1 {
     pub version: u8,
     pub request_id: String,
@@ -36,6 +94,13 @@ pub struct RequestV1 {
     pub command: String,
     pub argv: Vec<String>,
     pub pid_chain: Vec<String>,
+    /// Curated execution environment (see [`is_approval_env`]). Signed as
+    /// part of the raw request bytes, so two different environments never
+    /// share an approval. Empty environments serialize to nothing, so
+    /// requests written before the field existed are byte-identical to new
+    /// ones without it — and old signatures keep verifying.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<EnvEntryV1>,
     pub issued_at: i64,
     pub expires_at: i64,
 }
@@ -60,6 +125,11 @@ impl RequestV1 {
             || self.argv.len() > 4096
             || self.pid_chain.len() > 5
             || self.pid_chain.iter().any(|entry| entry.len() > 512)
+            || self.env.len() > 64
+            || self
+                .env
+                .iter()
+                .any(|entry| entry.name.len() > 256 || entry.value.len() > 32768)
         {
             return Err(Error::InvalidRequest("invalid request field size".into()));
         }
@@ -671,6 +741,125 @@ mod tests {
     #[test]
     fn rejects_padded_base64url() {
         assert!(decode_base64url("AA==").is_err());
+    }
+
+    fn minimal_request() -> RequestV1 {
+        RequestV1 {
+            version: VERSION_V1,
+            request_id: "req-1".into(),
+            nonce: encode_base64url(&[1; 16]),
+            host: "host.example".into(),
+            user: "eric".into(),
+            uid: 1000,
+            runas_uid: 0,
+            cwd: "/home/eric".into(),
+            tty: None,
+            command: "/usr/bin/apt".into(),
+            argv: vec!["apt".into()],
+            pid_chain: vec![],
+            env: vec![],
+            issued_at: 1_000,
+            expires_at: 1_090,
+        }
+    }
+
+    /// The allowlist pins behavior-shaping variables and nothing else:
+    /// loaders, resolution, shells, interpreters, pagers, trust config.
+    /// Anything carrying secrets or mere preferences stays out, so it never
+    /// enters the sealed request.
+    #[test]
+    fn approval_env_list_covers_the_dangerous_and_little_else() {
+        for name in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "PATH",
+            "PYTHONPATH",
+            "BASH_ENV",
+            "PAGER",
+            "SSL_CERT_FILE",
+        ] {
+            assert!(is_approval_env(name), "{name}");
+        }
+        for name in [
+            "HOME",
+            "LANG",
+            "TERM",
+            "USER",
+            "AWS_SECRET_ACCESS_KEY",
+            "path",
+            "Ld_PreLoad",
+            "",
+        ] {
+            assert!(!is_approval_env(name), "{name}");
+        }
+    }
+
+    /// An empty environment serializes to nothing: a new request without
+    /// env is byte-identical to one written before the field existed, and
+    /// an old payload loads with an empty environment. Old hooks and old
+    /// signatures keep working in both directions.
+    #[test]
+    fn pre_env_requests_load_with_empty_env() {
+        let mut request = minimal_request();
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("\"env\""), "{json}");
+        let loaded: RequestV1 = serde_json::from_str(&json).unwrap();
+        assert!(loaded.env.is_empty());
+        loaded.validate().unwrap();
+        request.env = vec![EnvEntryV1 {
+            name: "PATH".into(),
+            value: "/usr/bin".into(),
+        }];
+        let with_env = serde_json::to_string(&request).unwrap();
+        assert!(with_env.contains("\"env\""), "{with_env}");
+        let round_tripped: RequestV1 = serde_json::from_str(&with_env).unwrap();
+        assert_eq!(round_tripped.env, request.env);
+        round_tripped.validate().unwrap();
+    }
+
+    #[test]
+    fn env_entries_have_size_bounds() {
+        let mut request = minimal_request();
+        request.env = vec![
+            EnvEntryV1 {
+                name: "PATH".into(),
+                value: "/usr/bin".into(),
+            };
+            65
+        ];
+        assert!(request.validate().is_err());
+        request.env.truncate(1);
+        request.env[0].name = "x".repeat(257);
+        assert!(request.validate().is_err());
+        request.env[0].name = "PATH".into();
+        request.env[0].value = "x".repeat(32769);
+        assert!(request.validate().is_err());
+    }
+
+    /// The approval signs the raw request bytes, so requests that differ
+    /// only in environment hash — and sign — differently. Two materially
+    /// different environments can never share an approval payload.
+    #[test]
+    fn different_environments_never_share_an_approval() {
+        let bare = minimal_request();
+        let mut one = bare.clone();
+        one.env = vec![EnvEntryV1 {
+            name: "LD_PRELOAD".into(),
+            value: "/tmp/evil.so".into(),
+        }];
+        let mut other = bare.clone();
+        other.env = vec![EnvEntryV1 {
+            name: "LD_PRELOAD".into(),
+            value: "/tmp/other.so".into(),
+        }];
+        let raw_bare = bare.raw_json().unwrap();
+        let raw_one = one.raw_json().unwrap();
+        let raw_other = other.raw_json().unwrap();
+        assert_ne!(raw_bare, raw_one);
+        assert_ne!(raw_one, raw_other);
+        assert_ne!(approve_challenge(&raw_bare), approve_challenge(&raw_one));
+        assert_ne!(approve_challenge(&raw_one), approve_challenge(&raw_other));
     }
 
     /// A record written before the `kind` field existed must still load, as

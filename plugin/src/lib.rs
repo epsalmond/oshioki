@@ -306,8 +306,13 @@ unsafe fn gather_context(
         let key = format!("argv.{}", i + 1); // 1-based for readability
         push_kv(&mut payload, "", &key, value);
     }
+    // Only behavior-shaping variables cross into the approval: the full
+    // environment can carry secrets, and the curated list (shared with the
+    // hook, which re-filters) is what the approver is shown and signs.
     for (k, v) in &envp {
-        push_kv(&mut payload, "env.", k, v);
+        if oshioki_protocol::is_approval_env(k) {
+            push_kv(&mut payload, "env.", k, v);
+        }
     }
 
     Some(SudoContext { payload })
@@ -691,6 +696,30 @@ mod tests {
                 "argv.4=-n\n",
             )
         );
+    }
+
+    /// Only behavior-shaping variables cross into the approval: the loader
+    /// override and the command search path are bound, while preferences
+    /// and secrets stay out of the payload entirely.
+    #[test]
+    fn gather_context_filters_the_environment_to_policy_variables() {
+        let context = gather_test_context(
+            &[b"command=/usr/bin/python3"],
+            &[b"/usr/bin/python3", b"app.py"],
+            &[
+                b"LD_PRELOAD=/tmp/evil.so",
+                b"PATH=/tmp/bin:/usr/bin",
+                b"HOME=/root",
+                b"AWS_SECRET_ACCESS_KEY=hunter2",
+            ],
+        )
+        .unwrap();
+        let payload = String::from_utf8(context.payload).unwrap();
+        assert!(payload.contains("env.LD_PRELOAD=/tmp/evil.so\n"));
+        assert!(payload.contains("env.PATH=/tmp/bin:/usr/bin\n"));
+        assert!(!payload.contains("HOME="));
+        assert!(!payload.contains("AWS_SECRET_ACCESS_KEY="));
+        assert!(!payload.contains("hunter2"));
     }
 
     #[test]

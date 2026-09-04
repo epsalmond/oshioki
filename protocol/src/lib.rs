@@ -29,8 +29,9 @@ pub use terminal::escape_for_terminal;
 pub use v1::{
     ActivationV1, ApproveNativeV1, ApproveV1, DecisionV1, DenyV1, DeviceKindV1,
     DevicePublicRecordV1, DeviceRegistryV1, EnrollmentIntentV1, EnrollmentStatusV1,
-    EnrollmentSubmissionV1, HookConfigV1, NativeEnrollmentSubmissionV1, RequestEnvelopeV1,
-    RequestV1, SealedDeviceBodyV1, VERSION_V1, WebauthnEnrollmentSubmissionV1, approve_challenge,
-    decode_base64url, device_fingerprint, encode_base64url, seal_v1, unseal_v1,
+    EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1, NativeEnrollmentSubmissionV1,
+    RequestEnvelopeV1, RequestV1, SealedDeviceBodyV1, VERSION_V1, WebauthnEnrollmentSubmissionV1,
+    approve_challenge, decode_base64url, device_fingerprint, encode_base64url, is_approval_env,
+    seal_v1, unseal_v1,
 };
 pub use webauthn_v1::{AssertionOutcomeV1, verify_approval_v1};

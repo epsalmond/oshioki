@@ -414,7 +414,7 @@ async fn decide(
         Decider::Auto(answer) => *answer,
         Decider::Prompt(prompter) => {
             let summary = format!(
-                "sudo on {}: {} (uid {}) wants to run as {}: {} {}\n  cwd: {}\n  callers: {}\n",
+                "sudo on {}: {} (uid {}) wants to run as {}: {} {}\n  cwd: {}\n  callers: {}\n{}",
                 escape_for_terminal(&request.host),
                 escape_for_terminal(&request.user),
                 request.uid,
@@ -423,6 +423,7 @@ async fn decide(
                 escape_for_terminal(&quote_argv(&request.argv)),
                 escape_for_terminal(&request.cwd),
                 escape_for_terminal(&request.pid_chain.join(" <- ")),
+                format_env(request),
             );
             // No answer means no signed verdict: the hook fails closed when
             // the deadline passes, and a Deny nobody typed would be a lie
@@ -726,13 +727,67 @@ fn approval_reason(request: &oshioki_protocol::RequestV1) -> String {
         &format!("{} {}", request.command, quote_argv(&request.argv)),
         MAX_COMMAND_CHARS,
     );
+    // The sheet has room for one line, so a request carrying environment
+    // only announces how much: the count tells the approver something is
+    // bound beyond the command, and the signature binds the values.
+    let env = if request.env.is_empty() {
+        String::new()
+    } else {
+        format!(" (+{} env)", request.env.len())
+    };
     format!(
-        "run {} as {} on {}",
+        "run {} as {} on {}{}",
         escape_for_terminal(command.trim_end()),
         runas_label(request.runas_uid),
         escape_for_terminal(&truncate(&request.host, MAX_HOST_CHARS)),
+        env,
     )
 }
+
+/// The bound environment as approver-visible lines, empty when the request
+/// carries none. Terminal prompts show these; the Touch ID sheet only has
+/// room for a count (see [`approval_reason`]).
+///
+/// Both dimensions are bounded: values are attacker-controlled and can be
+/// kilobytes each, and lines print after the command block just before the
+/// prompt, so an unbounded environment would scroll the command off the
+/// approver's screen. Truncation is display-only; the signature still binds
+/// the whole values.
+fn format_env(request: &oshioki_protocol::RequestV1) -> String {
+    use std::fmt::Write as _;
+    let mut shown = String::new();
+    for entry in request.env.iter().take(MAX_ENV_LINES_SHOWN) {
+        // Truncate before escaping, as in approval_reason: escaping turns
+        // one byte into several characters, and a cut through the middle of
+        // one would put half an escape on the screen.
+        let _ = writeln!(
+            shown,
+            "  env {}={}",
+            escape_for_terminal(&truncate(&entry.name, MAX_ENV_NAME_CHARS)),
+            escape_for_terminal(&truncate(&entry.value, MAX_ENV_VALUE_CHARS))
+        );
+    }
+    if request.env.len() > MAX_ENV_LINES_SHOWN {
+        let _ = writeln!(
+            shown,
+            "  ... ({} more)",
+            request.env.len() - MAX_ENV_LINES_SHOWN
+        );
+    }
+    shown
+}
+
+/// How much of one environment name the terminal prompt shows. Allowlisted
+/// names are short; this only caps a hostile one.
+const MAX_ENV_NAME_CHARS: usize = 64;
+
+/// How much of one environment value the terminal prompt shows. Enough to
+/// recognize a PATH, not enough to fill a screen.
+const MAX_ENV_VALUE_CHARS: usize = 128;
+
+/// How many bound variables the terminal prompt lists before summarizing
+/// the rest.
+const MAX_ENV_LINES_SHOWN: usize = 10;
 
 /// How much of the command line the sheet gets. Past this it is not a sentence
 /// anybody reads before touching the sensor.
@@ -965,11 +1020,14 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::{
-        Decider, Pairing, Prompter, approval_reason, bind_socket, decide, load_or_create, now,
-        prompt_output, quote_argv, runas_label, socket_path, truncate,
+        Decider, MAX_ENV_LINES_SHOWN, Pairing, Prompter, approval_reason, bind_socket, decide,
+        format_env, load_or_create, now, prompt_output, quote_argv, runas_label, socket_path,
+        truncate,
     };
     use oshioki_agent::SignerKind;
-    use oshioki_protocol::{RequestEnvelopeV1, RequestV1, VERSION_V1, encode_base64url};
+    use oshioki_protocol::{
+        EnvEntryV1, RequestEnvelopeV1, RequestV1, VERSION_V1, encode_base64url,
+    };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::mpsc;
 
@@ -987,6 +1045,7 @@ mod tests {
             command: "/usr/bin/apt".into(),
             argv: vec!["apt".into(), "update".into()],
             pid_chain: vec![],
+            env: vec![],
             issued_at: 1_000,
             expires_at: 1_090,
         }
@@ -1058,6 +1117,92 @@ mod tests {
             approval_reason(&bare),
             "run /usr/bin/apt as root (uid 0) on host.example"
         );
+    }
+
+    /// The terminal summary shows the bound environment line by line, while
+    /// an empty environment shows nothing; the sheet reason only announces
+    /// the count, because one line cannot hold the values.
+    #[test]
+    fn summary_shows_the_bound_environment() {
+        let mut request = request_for_reason();
+        assert!(!format_env(&request).contains("env "));
+        assert!(!approval_reason(&request).contains("env)"));
+        request.env = vec![
+            EnvEntryV1 {
+                name: "LD_PRELOAD".into(),
+                value: "/tmp/evil.so".into(),
+            },
+            EnvEntryV1 {
+                name: "PATH".into(),
+                value: "/tmp/bin:/usr/bin".into(),
+            },
+        ];
+        let shown = format_env(&request);
+        assert!(shown.contains("  env LD_PRELOAD=/tmp/evil.so\n"), "{shown}");
+        assert!(shown.contains("  env PATH=/tmp/bin:/usr/bin\n"), "{shown}");
+        let reason = approval_reason(&request);
+        assert!(reason.ends_with(" (+2 env)"), "{reason}");
+    }
+
+    /// A hostile environment cannot scroll the command off the screen: long
+    /// values are cut and the list is capped with a count of what is hidden.
+    #[test]
+    fn a_hostile_environment_stays_bounded() {
+        let mut request = request_for_reason();
+        request.env = (0..64)
+            .map(|n| EnvEntryV1 {
+                name: format!("PATH{n}"),
+                value: "x".repeat(1024),
+            })
+            .collect();
+        let shown = format_env(&request);
+        assert_eq!(shown.lines().count(), MAX_ENV_LINES_SHOWN + 1, "{shown}");
+        assert!(shown.ends_with("  ... (54 more)\n"), "{shown}");
+        assert!(shown.contains("..."), "{shown}");
+        assert!(!shown.contains(&"x".repeat(129)), "{shown}");
+        // The count still announces the binding on the one-line sheet.
+        assert!(approval_reason(&request).ends_with(" (+64 env)"));
+    }
+
+    /// Same command, different environments: the signatures differ, because
+    /// the signature covers the raw request bytes and the environment is
+    /// part of them.
+    #[test]
+    fn approvals_differ_by_environment() {
+        let dir = std::env::temp_dir().join(format!("oshioki-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pairing = Pairing {
+            requested: None,
+            default: SignerKind::Software,
+            force: false,
+        };
+        let identity = load_or_create(&dir.join("agent.json"), &pairing).unwrap();
+        let sign = |env: Vec<EnvEntryV1>| {
+            let mut request = request_for_reason();
+            request.env = env;
+            let raw = request.raw_json().unwrap();
+            let opened = oshioki_agent::OpenedRequest { request, raw };
+            match identity
+                .approve(&opened, &approval_reason(&opened.request))
+                .unwrap()
+            {
+                oshioki_protocol::DecisionV1::ApproveNative(approval) => approval.signature,
+                other => panic!("expected an approval, got {other:?}"),
+            }
+        };
+        let bare = sign(vec![]);
+        let one = sign(vec![EnvEntryV1 {
+            name: "PATH".into(),
+            value: "/a".into(),
+        }]);
+        let other = sign(vec![EnvEntryV1 {
+            name: "PATH".into(),
+            value: "/b".into(),
+        }]);
+        assert_ne!(bare, one);
+        assert_ne!(one, other);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A command line long enough to fill the screen is cut, and says so.
@@ -1440,6 +1585,7 @@ mod tests {
             command: format!("/tmp/{LOG_PROBE}/do"),
             argv: vec!["do".into(), format!("--token={LOG_PROBE}")],
             pid_chain: vec![format!("{LOG_PROBE}:4242")],
+            env: vec![],
             issued_at: now(),
             expires_at: now() + 60,
         }
