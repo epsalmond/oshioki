@@ -23,15 +23,20 @@ sha256sum oshioki liboshioki_plugin.so > SHA256SUMS
 brew install epsalmond/oshioki/oshioki && oshioki-laptop-setup
 ```
 
-The setup script walks through five steps and is idempotent, so re-running
-it after a `brew upgrade` applies the new bottle and restarts the agent:
-writes `/etc/oshioki/install.env` (prompting for values on first run,
-`--reconfigure` to redo), dry-runs then applies the prelaunch install,
-enrolls and pairs the agent when there is no identity, installs a
-LaunchAgent (Darwin) or user systemd unit (Linux) for `oshioki-agent run`,
-and finishes with a real `sudo true` as proof. Non-interactive with `--yes`
-plus values in the environment. The manual steps below remain for
-non-brew layouts.
+The setup script is idempotent. Re-running it after a `brew upgrade`
+applies the new bottle and restarts the agent. It writes
+`/etc/oshioki/install.env` (prompting for values on first run,
+`--reconfigure` to redo), dry-runs then applies the prelaunch install
+inside one sudo elevation, enrolls and pairs the agent when there is no
+identity, installs a LaunchAgent (Darwin) or user systemd unit (Linux) for
+`oshioki-agent run`, and finishes with a real `sudo true` as proof. Run it
+as yourself, never under sudo. A root run poisons user-owned files (the app
+bundle loses its readable icon that way). Non-interactive with `--yes`
+plus values in the environment. Setup costs two Touch ID approvals, the
+elevation and the proof (plus the sudo password on a machine that has never
+run setup). Day-to-day sudo costs one approval, no password: the installer
+couples a `sudoers.d` NOPASSWD drop-in to the plugin block. The manual
+steps below remain for non-brew layouts.
 
 ## Prelaunch installer
 
@@ -76,6 +81,13 @@ sudo scripts/install-oshioki-hook --prelaunch-status
 
 The installer rejects unknown config keys, symlinks, non-root ownership, and
 modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
+With an active device it also writes `/etc/sudoers.d/oshioki`
+(`<user> ALL=(ALL) NOPASSWD: ALL`, visudo-checked), so the Touch ID approval
+is the only gate and sudo stops asking for a password. The user comes from
+`OSHIOKI_SUDO_USER` (else `SUDO_USER`); without either, or without a
+`sudoers.d` include in the main sudoers file, the installer warns and keeps
+password authentication. The drop-in goes away with `--disable-prelaunch`
+and when the registry empties, and `--prelaunch-status` checks both files.
 Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 `oshioki.dylib` in the same directory.
 
@@ -132,9 +144,10 @@ oshioki pin <fingerprint>
 oshioki pin-record <path>
 ```
 
-A host the server never sees pairs offline with one command, which builds
-if needed, creates the identity, pins it, and starts the agent — no server,
-no prompts but your sudo password:
+A host the server never sees pairs offline with one command. It builds
+if needed, creates the identity, pins it, and starts the agent. No server.
+One sudo elevation and no typing: the fingerprint confirmation is piped,
+and `--yes` skips the apply prompt.
 
 ```bash
 oshioki-laptop-setup --local

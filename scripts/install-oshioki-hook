@@ -29,6 +29,8 @@ SUDO_CONF="${SUDO_CONF:-/etc/sudo.conf}"
 SBIN_DIR="${SBIN_DIR:-/usr/local/sbin}"
 STATE_DIR="${OSHIOKI_STATE_DIR:-/etc/oshioki}"
 SUDOERS_D="${SUDOERS_D:-/etc/sudoers.d}"
+MAIN_SUDOERS="${MAIN_SUDOERS:-/etc/sudoers}"
+SUDOERS_FILE="$SUDOERS_D/oshioki"
 ORIGIN="${OSHIOKI_ORIGIN:-}"
 RP_ID="${OSHIOKI_RP_ID:-}"
 NATS_URL="${NATS_URL:-}"
@@ -72,6 +74,90 @@ safe_directory() {
   [ ! -e "$canon" ] || [ -d "$canon" ] || die "refusing non-directory: $1"
 }
 hash_file() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+
+# Passwordless sudo lives in a sudoers.d drop-in next to the plugin block so
+# one never outlives the other: the Touch ID approval becomes the only gate
+# and sudo stops asking for a password. Both install only with an active
+# approval device, both are verified by prelaunch-status, and both go away
+# on disable. A broken sudoers file locks every sudo out, so the drop-in is
+# visudo-validated before it lands and sudo ignores a leaked temp file (its
+# name carries a dot).
+sudoers_user() { printf '%s' "${OSHIOKI_SUDO_USER:-${SUDO_USER:-}}"; }
+valid_sudoers_user() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_.-]*) return 1 ;;
+  esac
+  return 0
+}
+sudoers_line() { printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$1"; }
+# The drop-in takes effect only when the main sudoers file includes its
+# directory. Either spelling of the system path counts.
+sudoers_included() {
+  [ -f "$MAIN_SUDOERS" ] && grep -Eq "^[[:space:]]*#[[:space:]]*includedir[[:space:]]+($SUDOERS_D|/private$SUDOERS_D)([[:space:]]|$)" "$MAIN_SUDOERS" 2>/dev/null
+}
+find_visudo() {
+  if command -v visudo >/dev/null 2>&1; then command -v visudo; return 0; fi
+  [ -x /usr/sbin/visudo ] || return 1
+  printf '/usr/sbin/visudo\n'
+}
+write_sudoers_dropin() {
+  local user="$1" tmp checker
+  safe_directory "$SUDOERS_D"
+  regular_or_absent "$SUDOERS_FILE"
+  install -d -m 0755 -o root -g "$ROOT_GROUP" "$SUDOERS_D"
+  tmp="$(mktemp "${SUDOERS_FILE}.XXXXXX")"
+  sudoers_line "$user" > "$tmp"
+  checker="$(find_visudo)" || { rm -f "$tmp"; die "visudo not found; refusing to write $SUDOERS_FILE unchecked"; }
+  if ! "$checker" -c -f "$tmp" >/dev/null 2>&1; then rm -f "$tmp"; die "visudo rejected the sudoers drop-in; $SUDO_CONF unchanged"; fi
+  chmod 0440 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$SUDOERS_FILE"
+}
+# Install the drop-in in prelaunch only (standalone-e2e owns no sudoers
+# state). Warns and keeps password authentication when the caller never
+# named the laptop user or the drop-in would be ignored: both leave today's
+# behavior, never a half-open sudo. Explicit garbage fails closed.
+install_sudoers_dropin() {
+  local user="$1"
+  [ "$MODE" = prelaunch ] || return 0
+  if [ -z "$user" ]; then
+    echo "install-oshioki-hook: warning: no laptop user (set OSHIOKI_SUDO_USER); sudo keeps asking for passwords" >&2
+    return 0
+  fi
+  valid_sudoers_user "$user" || die "invalid sudoers user: $user"
+  if ! sudoers_included; then
+    echo "install-oshioki-hook: warning: $MAIN_SUDOERS includes no sudoers.d directory; sudo keeps asking for passwords" >&2
+    return 0
+  fi
+  write_sudoers_dropin "$user"
+}
+# The dry plan mirrors the real checks without writing anything.
+plan_sudoers_dropin() {
+  local user="$1"
+  [ "$MODE" = prelaunch ] || return 0
+  if [ -z "$user" ]; then echo "DRY: skip $SUDOERS_FILE (no laptop user named)"; return 0; fi
+  valid_sudoers_user "$user" || die "invalid sudoers user: $user"
+  if ! sudoers_included; then echo "DRY: skip $SUDOERS_FILE ($MAIN_SUDOERS includes no sudoers.d directory)"; return 0; fi
+  printf 'DRY: write %s for passwordless sudo by %s\n' "$SUDOERS_FILE" "$user"
+}
+remove_sudoers_dropin() {
+  [ "$MODE" = prelaunch ] || [ "$MODE" = disable-prelaunch ] || return 0
+  [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ] || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then printf 'DRY: remove %s\n' "$SUDOERS_FILE"; return 0; fi
+  rm -f "$SUDOERS_FILE"
+}
+dropin_ok() {
+  local user="$1" owner mode
+  [ -n "$user" ] || return 1
+  [ -f "$SUDOERS_FILE" ] && [ ! -L "$SUDOERS_FILE" ] || return 1
+  if owner="$(stat -c '%u' "$SUDOERS_FILE" 2>/dev/null)"; then
+    mode="$(stat -c '%a' "$SUDOERS_FILE")"
+  else
+    owner="$(stat -f '%u' "$SUDOERS_FILE" 2>/dev/null)" || return 1
+    mode="$(stat -f '%Lp' "$SUDOERS_FILE")"
+  fi
+  [ "$owner" -eq 0 ] || return 1
+  [ "$mode" = 440 ] || return 1
+  grep -Fxq "$(sudoers_line "$user")" "$SUDOERS_FILE" 2>/dev/null
+}
 
 # True when the hook would refuse NATS_URL as plaintext past loopback. The
 # hook itself is authoritative; this only warns at install time so a bad URL
@@ -164,7 +250,15 @@ if [ "$MODE" = prelaunch-status ]; then
   [ -f "$SUDO_CONF" ] || { echo "disabled"; exit 1; }
   validate_block "$SUDO_CONF"
   begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"
-  if [ "$begins" -gt 0 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
+  if [ "$begins" -gt 0 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then
+    # With no named user there is no drop-in to verify, so the plugin block
+    # alone reports enabled; laptop-setup always names one, keeping the
+    # coupling strict in the owned flow.
+    dropin_user="$(sudoers_user)"
+    if [ -z "$dropin_user" ] || dropin_ok "$dropin_user"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
+    echo "enabled without passwordless sudo"
+    exit 1
+  fi
   if [ "$begins" -eq 0 ]; then echo "disabled"; exit 1; fi
   die "malformed managed block in $SUDO_CONF"
 fi
@@ -209,11 +303,20 @@ validate_sudo() {
 
 if [ "$MODE" = disable-prelaunch ]; then
   [ -f "$SUDO_CONF" ] || die "missing $SUDO_CONF"
-  if [ "$DRY_RUN" -eq 1 ]; then echo "DRY: remove exact managed block from $SUDO_CONF"; exit 0; fi
+  if [ "$DRY_RUN" -eq 1 ]; then echo "DRY: remove exact managed block from $SUDO_CONF"; remove_sudoers_dropin; exit 0; fi
   backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
+  dropin_backup=""
+  if [ -f "$SUDOERS_FILE" ]; then dropin_backup="$(mktemp "${SUDOERS_FILE}.backup.XXXXXX")"; cp -p "$SUDOERS_FILE" "$dropin_backup"; fi
   rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
-  if ! validate_sudo; then cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"; die "sudo -V failed after disable; restored prior configuration"; fi
-  rm -f "$backup"; echo "install-oshioki-hook: prelaunch disabled and sudo validated"; exit 0
+  remove_sudoers_dropin
+  if ! validate_sudo; then
+    cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"
+    # rm first: the drop-in is 0440, so overwriting it in place fails.
+    if [ -n "$dropin_backup" ]; then rm -f "$SUDOERS_FILE"; cp -p "$dropin_backup" "$SUDOERS_FILE"; rm -f "$dropin_backup"; fi
+    die "sudo -V failed after disable; restored prior configuration"
+  fi
+  rm -f "$backup"; [ -z "$dropin_backup" ] || rm -f "$dropin_backup"
+  echo "install-oshioki-hook: prelaunch disabled and sudo validated"; exit 0
 fi
 
 [ -n "$ORIGIN" ] || die "OSHIOKI_ORIGIN is required"
@@ -274,16 +377,25 @@ registry_has_active_devices() {
   grep -Eq '"active":[[:space:]]*true' "$STATE_DIR/devices.json" 2>/dev/null
 }
 if [ "$DRY_RUN" -eq 1 ]; then
-  if registry_has_active_devices; then echo "DRY: enable exact managed block in $SUDO_CONF"; else echo "DRY: skip enabling $SUDO_CONF (no active approval devices)"; fi
+  if registry_has_active_devices; then echo "DRY: enable exact managed block in $SUDO_CONF"; plan_sudoers_dropin "$(sudoers_user)"; else echo "DRY: skip enabling $SUDO_CONF (no active approval devices)"; remove_sudoers_dropin; fi
   validate_sudo; exit 0
 fi
 if ! registry_has_active_devices; then
   echo "install-oshioki-hook: warning: no active approval devices; leaving $SUDO_CONF without the managed block (pin a device, then re-run)" >&2
+  remove_sudoers_dropin
 else
 [ -f "$SUDO_CONF" ] || install -m 0644 -o root -g "$ROOT_GROUP" /dev/null "$SUDO_CONF"
 backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
+dropin_backup=""
+if [ -f "$SUDOERS_FILE" ]; then dropin_backup="$(mktemp "${SUDOERS_FILE}.backup.XXXXXX")"; cp -p "$SUDOERS_FILE" "$dropin_backup"; fi
 rewrite_block enable "$SUDO_CONF" "$SUDO_CONF"
-if ! validate_sudo; then rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"; cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"; die "sudo -V failed; restored prior configuration"; fi
-rm -f "$backup"
+install_sudoers_dropin "$(sudoers_user)"
+if ! validate_sudo; then
+  rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"; cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"
+  # rm first: the drop-in is 0440, so overwriting it in place fails.
+  if [ -n "$dropin_backup" ]; then rm -f "$SUDOERS_FILE"; cp -p "$dropin_backup" "$SUDOERS_FILE"; rm -f "$dropin_backup"; else rm -f "$SUDOERS_FILE"; fi
+  die "sudo -V failed; restored prior configuration"
+fi
+rm -f "$backup"; [ -z "$dropin_backup" ] || rm -f "$dropin_backup"
 fi
 echo "install-oshioki-hook: $MODE installed and sudo validated"
