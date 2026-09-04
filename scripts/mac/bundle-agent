@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
-# Wraps oshioki-agent in a minimal unsigned Oshioki.app.
+# Wraps oshioki-agent in an Oshioki.app, unsigned by default.
 #
 # The Touch ID sheet takes its title and icon from the calling process's app
 # bundle. A bare binary gets its file name and the generic executable badge; the
-# bundle makes the sheet read "Oshioki is trying to run ... on ...". No
-# signing is involved: the name and the icon do not need it.
+# bundle makes the sheet read "Oshioki is trying to run ... on ...". The name
+# and the icon do not need signing; the keychain entitlement does, so --sign
+# applies scripts/mac/Oshioki.entitlements when an identity is given.
 #
 # Rebuilds the bundle from scratch on every run.
 set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: scripts/mac/bundle-agent [--binary PATH] [--output DIR]
+usage: scripts/mac/bundle-agent [--binary PATH] [--output DIR] [--sign IDENTITY]
 
   --binary PATH   agent binary to wrap (default: target/release/oshioki-agent,
                   built with `cargo build --release -p oshioki-agent` if absent)
   --output DIR    where Oshioki.app is written (default: target/mac)
+  --sign IDENTITY codesign identity, e.g. "Developer ID Application: ...".
+                  Signs the bundle with the hardened runtime and the keychain
+                  entitlement. Absent, the bundle stays unsigned.
 
 Prints the path of the binary inside the bundle, which is what the LaunchAgent
 should run.
@@ -25,11 +29,13 @@ USAGE
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 BINARY=""
 OUTPUT="$ROOT/target/mac"
+SIGN=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
     --output) OUTPUT="${2:?--output needs a path}"; shift 2 ;;
+    --sign) SIGN="${2:?--sign needs an identity}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -101,4 +107,29 @@ rm -rf "$(dirname "$png")"
 
 # Touch the bundle so Launch Services notices a rebuilt app at the same path.
 touch "$APP"
+
+if [ -n "$SIGN" ]; then
+  # codesign leaves $(AppIdentifierPrefix) in the entitlements file
+  # unexpanded, so the Team ID comes from the signing certificate's
+  # Organizational Unit and the file is expanded before signing.
+  team_id="$(security find-certificate -c "$SIGN" -p \
+    | openssl x509 -noout -subject \
+    | sed -n 's/.*OU *= *\([^,]*\).*/\1/p')"
+  [ -n "$team_id" ] || { echo "cannot find a Team ID in the $SIGN certificate" >&2; exit 1; }
+  entitlements="$(mktemp -t 'oshioki-entitlements.XXXXXX').plist"
+  # AppIdentifierPrefix carries its trailing dot by Apple convention; the
+  # certificate field does not, so the replacement adds it.
+  sed "s/\$(AppIdentifierPrefix)/$team_id./g" \
+    "$ROOT/scripts/mac/Oshioki.entitlements" > "$entitlements"
+  # The binary first, then the bundle, so the bundle seal covers a signed
+  # executable. --options runtime opts into the hardened runtime, which the
+  # notarization lane requires; --timestamp keeps the signature verifiable
+  # once the certificate expires.
+  codesign --force --options runtime --timestamp \
+    --entitlements "$entitlements" \
+    --sign "$SIGN" "$APP/Contents/MacOS/oshioki-agent" "$APP"
+  rm -f "$entitlements"
+  codesign --verify --strict --verbose=1 "$APP"
+fi
+
 echo "$APP/Contents/MacOS/oshioki-agent"

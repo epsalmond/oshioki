@@ -20,7 +20,10 @@ oshioki-agent run
 submits the enrollment and waits for the host to activate it. On a Mac the
 signing key is created in the Secure Enclave; everywhere else it is a P-256
 key in that file. `pair --signer software` forces the software key on a Mac
-too, which is what the tests use.
+too, which is what the tests use. On a Mac the file holds only a keychain
+reference for the X25519 box secret, which lives in the login keychain;
+anywhere else the file carries the secret itself. Pre-move files migrate on
+first load, keeping the fingerprint.
 
 One identity serves every host this device pairs with, so pairing again
 reuses it. A `--signer` that disagrees with the identity already there is an
