@@ -309,6 +309,7 @@ run_sudo() {
     NATS_URL="$NATS_URL_VALUE" \
     NATS_USER="${NATS_USER:-oshioki}" \
     NATS_PASS="${NATS_PASS:-test}" \
+    OSHIOKI_ALLOW_PLAINTEXT_NATS=1 \
     OSHIOKI_ORIGIN="$ORIGIN_VALUE" \
     OSHIOKI_RP_ID="$RP_ID_VALUE" \
       bash -x "$INNER_SCRIPT" >"$SHARE/sudo-run.log" 2>&1
@@ -317,6 +318,7 @@ run_sudo() {
       -e NATS_URL="$NATS_URL_VALUE" \
       -e NATS_USER="${NATS_USER:-oshioki}" \
       -e NATS_PASS="${NATS_PASS:-test}" \
+      -e OSHIOKI_ALLOW_PLAINTEXT_NATS=1 \
       -e OSHIOKI_ORIGIN="$ORIGIN_VALUE" \
       -e OSHIOKI_RP_ID="$RP_ID_VALUE" \
       -v "$SHARE":/share \

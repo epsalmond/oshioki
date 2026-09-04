@@ -435,6 +435,13 @@ start_session() {
     '{version:1,origin:$origin,rp_id:$rp_id,server_base_url:$origin}' >"$state_root/hook/hook.json"
   printf 'NATS_URL=nats://%s:%s\nNATS_USER=oshioki\nNATS_PASS=%s\n' \
     "$nats_host" "$nats_port" "$password" >"$state_root/hook/config.env"
+  # The hook refuses plaintext NATS past loopback; a tailnet session is
+  # exactly that, so it carries the testing opt-out. A loopback session
+  # needs nothing.
+  case "$nats_host" in
+    localhost|127.*|::1) ;;
+    *) printf 'OSHIOKI_ALLOW_PLAINTEXT_NATS=1\n' >>"$state_root/hook/config.env" ;;
+  esac
   if [ ! -e "$state_root/hook/devices.json" ]; then
     printf '%s\n' '{"version":1,"devices":[]}' >"$state_root/hook/devices.json"
   fi
@@ -487,7 +494,7 @@ print_mac_command() {
   password="$(sed -n 's/^NATS_PASS=//p' "$state_root/hook/config.env")"
   [ -n "$password" ] || die "no NATS password in $state_root/hook/config.env"
   printf '\n--- paste this on the Mac ---\n'
-  printf "NATS_URL=nats://%s:%s NATS_USER=oshioki NATS_PASS=%s sh -c 'cd ~/git/oshioki && git pull --ff-only && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p oshioki-agent && scripts/mac/bundle-agent && target/mac/Oshioki.app/Contents/MacOS/oshioki-agent pair \"%s\" --label %s && exec target/mac/Oshioki.app/Contents/MacOS/oshioki-agent run'\n" \
+  printf "OSHIOKI_ALLOW_PLAINTEXT_NATS=1 NATS_URL=nats://%s:%s NATS_USER=oshioki NATS_PASS=%s sh -c 'cd ~/git/oshioki && git pull --ff-only && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p oshioki-agent && scripts/mac/bundle-agent && target/mac/Oshioki.app/Contents/MacOS/oshioki-agent pair \"%s\" --label %s && exec target/mac/Oshioki.app/Contents/MacOS/oshioki-agent run'\n" \
     "$nats_host" "$nats_port" "$password" "$url" "$label"
   printf -- '--- end ---\n\nwaiting for the Mac to pair\n\n'
 }

@@ -22,10 +22,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use oshioki_protocol::{
-    ActivationV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
-    EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1, RequestEnvelopeV1,
-    RequestV1, VERSION_V1, escape_for_terminal, is_approval_env, verify_approval_v1,
-    verify_deny_v1, verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1,
+    DeviceRegistryV1, EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1,
+    RequestEnvelopeV1, RequestV1, VERSION_V1, allow_plaintext_nats, check_nats_url,
+    escape_for_terminal, is_approval_env, nats_url_is_tls, verify_approval_v1, verify_deny_v1,
+    verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
 };
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
@@ -509,11 +510,10 @@ async fn activate_device(
         enrollment_id: enrollment_id.to_owned(),
         device: device.clone(),
     };
-    nats.publish(
-        format!("oshioki.enrollment.activation.{enrollment_id}"),
-        serde_json::to_vec(&activation)?.into(),
-    )
-    .await?;
+    let subject = format!("oshioki.enrollment.activation.{enrollment_id}");
+    let payload = serde_json::to_vec(&activation)?;
+    nats.publish(subject.clone(), payload.clone().into())
+        .await?;
     nats.flush().await?;
     let url = format!(
         "{}/api/v1/devices/{}",
@@ -524,8 +524,20 @@ async fn activate_device(
     loop {
         match server_device_matches(&url, device).await {
             Ok(true) => return Ok(()),
+            // A different record is settled state, not a missing message:
+            // restating the activation cannot change what is stored.
             Ok(false) => last_error = "the server serves a different record".into(),
-            Err(error) => last_error = format!("{error:#}"),
+            Err(error) => {
+                last_error = format!("{error:#}");
+                // The server only activates against the stored submission,
+                // which travels over NATS on its own subject; this restatement
+                // may overtake it, and the first publish may have been lost.
+                // Restating is safe — a stored activation is idempotent — so
+                // a slow submission heals here instead of failing the enroll.
+                nats.publish(subject.clone(), payload.clone().into())
+                    .await?;
+                nats.flush().await?;
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -974,14 +986,25 @@ async fn connect_nats() -> Result<async_nats::Client> {
 }
 async fn connect_nats_from(directory: &Path) -> Result<async_nats::Client> {
     let env = read_env_file(&directory.join("config.env"))?;
-    async_nats::ConnectOptions::new()
-        .user_and_password(
-            env.get("NATS_USER").context("NATS_USER not set")?.clone(),
-            env.get("NATS_PASS").context("NATS_PASS not set")?.clone(),
-        )
-        .connect(env.get("NATS_URL").context("NATS_URL not set")?)
-        .await
-        .context("connect to NATS")
+    // The flag comes from config.env rather than the process environment:
+    // sudo scrubs the environment, so this file is the hook's only channel.
+    let url = env.get("NATS_URL").context("NATS_URL not set")?.clone();
+    check_nats_url(
+        &url,
+        allow_plaintext_nats(env.get(ALLOW_PLAINTEXT_NATS_ENV).map(String::as_str)),
+    )
+    .context("invalid NATS_URL")?;
+    // A tls:// URL must stay TLS past the first server: the cluster
+    // advertises more addresses on reconnect as bare host:port, which parse
+    // as plaintext, so the options flag carries the requirement with them.
+    let mut options = async_nats::ConnectOptions::new().user_and_password(
+        env.get("NATS_USER").context("NATS_USER not set")?.clone(),
+        env.get("NATS_PASS").context("NATS_PASS not set")?.clone(),
+    );
+    if nats_url_is_tls(&url) {
+        options = options.require_tls(true);
+    }
+    options.connect(url).await.context("connect to NATS")
 }
 fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
     let content = fs::read_to_string(path)?;
@@ -1417,6 +1440,28 @@ mod tests {
             }),
             &denial
         ));
+    }
+
+    /// The TLS gate runs before any network: plaintext past loopback (or a
+    /// foreign scheme) fails with the policy error rather than a connection
+    /// timeout, so these cases never open a socket.
+    #[tokio::test]
+    async fn plaintext_nats_fails_before_connecting() {
+        for (url, fragment) in [
+            ("nats://203.0.1.1:4222", "refusing plaintext"),
+            ("http://127.0.0.1:4222", "unsupported NATS URL scheme"),
+        ] {
+            let dir = std::env::temp_dir().join(format!("oshioki-hook-nats-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.env"),
+                format!("NATS_URL={url}\nNATS_USER=u\nNATS_PASS=p\n"),
+            )
+            .unwrap();
+            let error = connect_nats_from(&dir).await.unwrap_err();
+            assert!(format!("{error:#}").contains(fragment), "{error:#}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]
