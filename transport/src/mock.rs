@@ -198,9 +198,6 @@ mod tests {
             .unwrap();
         assert_eq!(transport.revoked(), ["fp-1"]);
         assert_eq!(transport.activations(), [activation]);
-        assert_eq!(
-            transport.published(),
-            [("a.b".to_string(), b"x".to_vec())]
-        );
+        assert_eq!(transport.published(), [("a.b".to_string(), b"x".to_vec())]);
     }
 }

@@ -25,11 +25,6 @@ use crate::{
 
 pub const REQUEST_STREAM: &str = "OSHIOKI";
 pub const REQUEST_CONSUMER: &str = "oshioki-server-v1";
-
-/// How long enrollment waits for a submission, matching the hook's
-/// `ENROLLMENT_TIMEOUT`: the enrollment URL promises five minutes.
-const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
-
 pub struct NatsTransport {
     client: async_nats::Client,
 }
@@ -210,8 +205,7 @@ impl HookTransport for NatsTransport {
             self.client.flush().await?;
             let wait = submission_deadline
                 .checked_duration_since(tokio::time::Instant::now())
-                .unwrap_or(Duration::ZERO)
-                .min(ENROLLMENT_TIMEOUT);
+                .unwrap_or(Duration::ZERO);
             let message = tokio::time::timeout(wait, subscription.next())
                 .await
                 .context("enrollment timeout")?

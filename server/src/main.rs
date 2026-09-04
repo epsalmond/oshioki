@@ -219,7 +219,10 @@ async fn request_consumer(state: AppState) -> Result<()> {
 }
 
 async fn enrollment_consumer(state: AppState) -> Result<()> {
-    let mut intents = state.transport.subscribe("oshioki.enrollment.intent").await?;
+    let mut intents = state
+        .transport
+        .subscribe("oshioki.enrollment.intent")
+        .await?;
     let mut submissions = state
         .transport
         .subscribe("oshioki.enrollment.submission.>")
@@ -292,10 +295,16 @@ async fn handle_revocation(state: &AppState, subject: String) -> Result<()> {
     if let Some(fingerprint) = subject.strip_prefix("oshioki.device.revoke.") {
         match state.store.set_device_active(fingerprint, false) {
             Ok(false) => warn!(%fingerprint, "revocation named unknown device"),
-            Err(error) => { warn!(%error, %fingerprint, "revocation persistence failed"); return Ok(()); }
+            Err(error) => {
+                warn!(%error, %fingerprint, "revocation persistence failed");
+                return Ok(());
+            }
             Ok(true) => {}
         }
-        state.transport.publish(format!("oshioki.device.revoked.{fingerprint}"), Vec::new()).await?;
+        state
+            .transport
+            .publish(format!("oshioki.device.revoked.{fingerprint}"), Vec::new())
+            .await?;
     }
     Ok(())
 }
@@ -314,8 +323,7 @@ async fn verdict_worker(state: AppState) {
                     // The transport publishes then flushes; a flush failure
                     // surfaces here as a publish failure, preserving the
                     // observable contract.
-                    if let Err(error) = state.transport.publish(item.subject, item.payload).await
-                    {
+                    if let Err(error) = state.transport.publish(item.subject, item.payload).await {
                         warn!(%error, outbox_id=item.id, "outbox publish failed");
                         healthy = false;
                         break;
@@ -974,7 +982,8 @@ mod tests {
     /// flipped.
     #[tokio::test]
     async fn mock_transport_drives_verdict_worker() {
-        let dir = std::env::temp_dir().join(format!("oshioki-server-verdict-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("oshioki-server-verdict-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(Store::open(&dir.join("state.sqlite3")).unwrap());
@@ -1003,7 +1012,9 @@ mod tests {
             device_fingerprint: device.fingerprint.clone(),
             signature: None,
         });
-        store.queue_decision("req-1", &device.fingerprint, &decision, now()).unwrap();
+        store
+            .queue_decision("req-1", &device.fingerprint, &decision, now())
+            .unwrap();
         let transport = oshioki_transport::MockTransport::new();
         let state = AppState {
             store: Arc::clone(&store),
@@ -1021,17 +1032,24 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async move {
             loop {
                 if !transport_check.published().is_empty()
-                    && store_check.pending_verdicts(32).is_ok_and(|items| items.is_empty()) {
+                    && store_check
+                        .pending_verdicts(32)
+                        .is_ok_and(|items| items.is_empty())
+                {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("verdict worker never drained the outbox");
         worker.abort();
         let published = transport.published();
-        assert_eq!(published.len(), 1, "duplicate publish means commit-before-ack flipped");
+        assert_eq!(
+            published.len(),
+            1,
+            "duplicate publish means commit-before-ack flipped"
+        );
         assert_eq!(published[0].0, "oshioki.verdict.req-1");
         assert_eq!(published[0].1, serde_json::to_vec(&decision).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1042,7 +1060,8 @@ mod tests {
     /// confirmation on `oshioki.device.revoked.<fingerprint>`.
     #[tokio::test]
     async fn mock_transport_drives_revocation() {
-        let dir = std::env::temp_dir().join(format!("oshioki-server-revoke-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("oshioki-server-revoke-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("state.sqlite3")).unwrap();
@@ -1060,12 +1079,117 @@ mod tests {
             origin: Arc::new("https://sudo.test".into()),
             ntfy_url: None,
         };
-        handle_revocation(&state, format!("oshioki.device.revoke.{}", device.fingerprint))
+        handle_revocation(
+            &state,
+            format!("oshioki.device.revoke.{}", device.fingerprint),
+        )
+        .await
+        .unwrap();
+        assert!(
+            state
+                .store
+                .active_device(&device.fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        let last = transport
+            .published()
+            .last()
+            .map(|(subject, _)| subject.clone());
+        assert_eq!(
+            last,
+            Some(format!("oshioki.device.revoked.{}", device.fingerprint))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The request consumer double-acks identifiable requests and term-
+    /// rejects malformed or conflicting envelopes through the transport
+    /// seam, preserving the store/derive-contract: the request rows land before the ack.
+    #[tokio::test]
+    async fn mock_transport_drives_request_consumer() {
+        async fn wait_for(rx: &std::sync::mpsc::Receiver<()>, what: &str) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if rx.try_recv().is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
             .await
-            .unwrap();
-        assert!(state.store.active_device(&device.fingerprint).unwrap().is_none());
-        let last = transport.published().last().map(|(subject, _)| subject.clone());
-        assert_eq!(last, Some(format!("oshioki.device.revoked.{}", device.fingerprint)));
+            .unwrap_or_else(|_| panic!("{what} never fired"));
+        }
+        let dir =
+            std::env::temp_dir().join(format!("oshioki-server-consume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("state.sqlite3")).unwrap());
+        store.ready().unwrap();
+        let device = test_device();
+        store.put_device(&device).unwrap();
+        let valid_envelope = RequestEnvelopeV1 {
+            version: 1,
+            request_id: "req-consume".into(),
+            host: "nas".into(),
+            user: "eric".into(),
+            issued_at: 10,
+            expires_at: now() + 600,
+            sealed: vec![SealedDeviceBodyV1 {
+                device_fingerprint: device.fingerprint.clone(),
+                ephemeral_pub: oshioki_protocol::v1::encode_base64url(&[4; 32]),
+                nonce: oshioki_protocol::v1::encode_base64url(&[5; 12]),
+                ciphertext: oshioki_protocol::v1::encode_base64url(&[6; 32]),
+            }],
+        };
+        let valid_raw = serde_json::to_vec(&valid_envelope).unwrap();
+        // A conflicting reuse of the same request id with a different payload
+        // must term the redelivery, never double-commit.
+        let mut conflict = valid_envelope.clone();
+        conflict.user = "zed".into();
+        let conflict_raw = serde_json::to_vec(&conflict).unwrap();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+        let (term_tx, term_rx) = std::sync::mpsc::channel::<()>();
+        let transport = oshioki_transport::MockTransport::new();
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            payload: b"not json".to_vec(),
+            on_term: Some(term_tx.clone()),
+            on_ack: None,
+        });
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            payload: valid_raw.clone(),
+            on_term: None,
+            on_ack: Some(ack_tx),
+        });
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            payload: conflict_raw,
+            on_term: Some(term_tx),
+            on_ack: None,
+        });
+        let state = AppState {
+            store: Arc::clone(&store),
+            transport: Arc::new(transport),
+            dist_root: Arc::new(PathBuf::from("/nonexistent")),
+            artifact_permits: Arc::new(Semaphore::new(1)),
+            consumer_last_ok: Arc::new(AtomicI64::new(0)),
+            outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            origin: Arc::new("https://sudo.test".into()),
+            ntfy_url: None,
+        };
+        let worker = tokio::spawn(request_consumer(state));
+        // Malformed → term; valid → ack; conflict → term. Poll without
+        // blocking so the single-threaded runtime keeps driving the worker.
+        wait_for(&term_rx, "malformed envelope term").await;
+        wait_for(&ack_rx, "valid request ack").await;
+        wait_for(&term_rx, "conflicting request term").await;
+        worker.abort();
+        // The valid request committed before the ack: the row is pending.
+        assert!(
+            store
+                .request_lifecycle("req-consume", now())
+                .unwrap()
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1075,8 +1199,14 @@ mod tests {
         let point = signing.verifying_key().to_encoded_point(false);
         let mut cose = std::collections::BTreeMap::new();
         cose.insert(serde_cbor::Value::Integer(1), serde_cbor::Value::Integer(2));
-        cose.insert(serde_cbor::Value::Integer(3), serde_cbor::Value::Integer(-7));
-        cose.insert(serde_cbor::Value::Integer(-1), serde_cbor::Value::Integer(1));
+        cose.insert(
+            serde_cbor::Value::Integer(3),
+            serde_cbor::Value::Integer(-7),
+        );
+        cose.insert(
+            serde_cbor::Value::Integer(-1),
+            serde_cbor::Value::Integer(1),
+        );
         cose.insert(
             serde_cbor::Value::Integer(-2),
             serde_cbor::Value::Bytes(point.x().unwrap().to_vec()),

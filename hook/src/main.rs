@@ -517,8 +517,8 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
         config.server_base_url, state.enrollment_id, state.secret
     );
     let remaining = u64::try_from(state.expires_at - now()).context("enrollment expiry")?;
-    let submission_deadline =
-        tokio::time::Instant::now() + Duration::from_secs(remaining.min(ENROLLMENT_TIMEOUT.as_secs()));
+    let submission_deadline = tokio::time::Instant::now()
+        + Duration::from_secs(remaining.min(ENROLLMENT_TIMEOUT.as_secs()));
     // The URL goes to the operator before the wait begins: the browser or
     // native agent must hold it while `enroll` blocks on the submission.
     println!(
@@ -546,7 +546,8 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     registry.devices.push(device.clone());
     registry.validate()?;
     write_registry(&registry)?;
-    let confirmation = activate_device(transport.as_ref(), &state.enrollment_id, &device, &config).await;
+    let confirmation =
+        activate_device(transport.as_ref(), &state.enrollment_id, &device, &config).await;
     // The enrollment itself is spent either way: the device is pinned here
     // and the server has consumed the intent, so there is nothing for
     // `--resume` to redo. What may still be missing is the server's copy.
@@ -1060,19 +1061,23 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<
     result
 }
 
-/// Selects the hook transport named by `OSHIOKI_TRANSPORT` in `config.env`.
-/// Absent or empty means `nats`, the only backend; anything else fails
-/// closed — an unknown transport must never silently fall back to NATS.
-async fn transport_from(directory: &Path) -> Result<Box<dyn HookTransport>> {
+/// Reads the selected transport name from `config.env`, failing closed on an
+/// unknown value. Absent or empty means `nats`, the only backend. The flag
+/// comes from `config.env` rather than the process environment: sudo scrubs
+/// the environment, so this file is the hook's only channel.
+fn selected_transport(directory: &Path) -> Result<String> {
     let env = read_env_file(&directory.join("config.env"))?;
-    // The flag comes from config.env rather than the process environment:
-    // sudo scrubs the environment, so this file is the hook's only channel.
     match env.get("OSHIOKI_TRANSPORT").map(String::as_str) {
-        None | Some("" | "nats") => {
-            Ok(Box::new(NatsTransport::from_config_dir(directory).await?))
-        }
+        None | Some("" | "nats") => Ok("nats".to_owned()),
         Some(other) => bail!("unsupported transport: {other}"),
     }
+}
+
+/// Selects the hook transport named by `OSHIOKI_TRANSPORT` in `config.env`.
+async fn transport_from(directory: &Path) -> Result<Box<dyn HookTransport>> {
+    let name = selected_transport(directory)?;
+    debug_assert_eq!(name, "nats");
+    Ok(Box::new(NatsTransport::from_config_dir(directory).await?))
 }
 fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
     // The path rides along: this read opens every hook invocation, and a
@@ -1974,8 +1979,7 @@ mod tests {
         let (device, signing) = deny_test_device();
         let request = build_synthetic_request();
         let raw = request.raw_json().unwrap();
-        let challenge =
-            oshioki_protocol::v1::approve_challenge(&raw);
+        let challenge = oshioki_protocol::v1::approve_challenge(&raw);
         let signature: p256::ecdsa::Signature = signing.sign(&challenge);
         let mut registry = DeviceRegistryV1 {
             version: 1,
@@ -1990,7 +1994,12 @@ mod tests {
         let transport = oshioki_transport::MockTransport::new();
         transport.push_verdict(approval);
         let decision = transport
-            .request_decision("nas", &request.request_id, raw.clone(), Duration::from_secs(1))
+            .request_decision(
+                "nas",
+                &request.request_id,
+                raw.clone(),
+                Duration::from_secs(1),
+            )
             .await
             .unwrap();
         apply_decision(

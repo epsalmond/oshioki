@@ -105,7 +105,6 @@ uuid = { version = "1", features = ["v4"] }
 
 # Async utilities
 futures = { version = "0.3" }
-async-stream = { version = "0.3" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Test-only
