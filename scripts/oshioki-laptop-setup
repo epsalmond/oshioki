@@ -134,6 +134,12 @@ AGENT_SOCKET_V="$(env_key OSHIOKI_AGENT_SOCKET)"
 [ -n "$ORIGIN" ] || die "$INSTALL_ENV has no OSHIOKI_ORIGIN"
 [ -n "$NATS_URL_V" ] || die "$INSTALL_ENV has no NATS_URL"
 [ -n "$AGENT_SOCKET_V" ] || AGENT_SOCKET_V="$DEFAULT_SOCKET"
+# The hook and agent refuse plaintext NATS past loopback at runtime; say so
+# now rather than failing the first sudo afterwards. Production uses tls://.
+case "$NATS_URL_V" in
+  [Tt][Ll][Ss]://*|[Nn][Aa][Tt][Ss]://localhost*|[Nn][Aa][Tt][Ss]://127.*|[Nn][Aa][Tt][Ss]://\[::1\]*|[Nn][Aa][Tt][Ss]://:*) ;;
+  [Nn][Aa][Tt][Ss]://*) info "warning: NATS_URL is plaintext to a non-loopback host; add OSHIOKI_ALLOW_PLAINTEXT_NATS=1 to $INSTALL_ENV (testing only) or switch to tls:// (see README.md)" ;;
+esac
 
 info "step 2/5: prelaunch install"
 run_installer --prelaunch --dry-run

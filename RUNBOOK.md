@@ -49,10 +49,16 @@ The file contains only these keys:
 ```text
 OSHIOKI_ORIGIN=https://sudo.example.com
 OSHIOKI_RP_ID=sudo.example.com
-NATS_URL=nats://nats.example.com:4222
-NATS_USER=oshioki
+NATS_URL=tls://nats.example.com:4222
+NATS_USER=oshioki-hook
 NATS_PASS=<secret>
 ```
+
+The hook refuses plaintext `nats://` past loopback: the NATS server needs
+TLS with a certificate chaining to the system roots (hostname-verified), and
+each role — hook, agent, server — gets its own NATS user. Testing without
+server certificates sets `OSHIOKI_ALLOW_PLAINTEXT_NATS=1` instead; never do
+that in production.
 
 For socket mode (below), also add:
 
@@ -167,9 +173,13 @@ approve after a reboot, install the LaunchAgent instead. It runs the same
 bundled binary:
 
 ```bash
-NATS_URL=nats://nats.example.com:4222 NATS_USER=oshioki NATS_PASS=<secret> \
+NATS_URL=tls://nats.example.com:4222 NATS_USER=oshioki-agent NATS_PASS=<secret> \
   scripts/mac/install-agent
 ```
+
+Without server certificates yet, prefix `OSHIOKI_ALLOW_PLAINTEXT_NATS=1`
+(testing only) — `install-agent` carries it into the LaunchAgent plist, and
+the agent refuses the plaintext URL otherwise.
 
 `install-agent` writes the LaunchAgent plist 0600, because it holds the NATS
 password, and loads it into the GUI domain. Add `--dry-run` to see the plist

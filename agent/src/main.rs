@@ -22,7 +22,10 @@ use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, SignerKind, parse_enrollment_url, remaining_until};
-use oshioki_protocol::{ActivationV1, DecisionV1, RequestEnvelopeV1, escape_for_terminal};
+use oshioki_protocol::{
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, RequestEnvelopeV1, allow_plaintext_nats,
+    check_nats_url, escape_for_terminal, nats_url_is_tls,
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
@@ -840,6 +843,17 @@ async fn connect_nats() -> Result<async_nats::Client> {
         (Ok(user), Ok(pass)) => options = options.user_and_password(user, pass),
         (Err(_), Err(_)) => {}
         _ => bail!("set both NATS_USER and NATS_PASS, or neither"),
+    }
+    check_nats_url(
+        &url,
+        allow_plaintext_nats(std::env::var(ALLOW_PLAINTEXT_NATS_ENV).ok().as_deref()),
+    )
+    .context("invalid NATS_URL")?;
+    // A tls:// URL must stay TLS past the first server: the cluster
+    // advertises more addresses on reconnect as bare host:port, which parse
+    // as plaintext, so the options flag carries the requirement with them.
+    if nats_url_is_tls(&url) {
+        options = options.require_tls(true);
     }
     options.connect(&url).await.context("connect to NATS")
 }
