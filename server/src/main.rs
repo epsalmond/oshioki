@@ -33,17 +33,30 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::Semaphore;
+use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
 
 const REQUEST_STREAM: &str = "OSHIOKI";
 const REQUEST_CONSUMER: &str = "oshioki-server-v1";
 const MAX_HTTP_BODY: usize = 3 * 1024 * 1024;
 
+/// Largest servable Darwin artifact. Release tarballs are tens of megabytes,
+/// so this is headroom, not a fit: anything bigger is not ours to serve,
+/// and refusing it before reading a byte keeps one request from eating the
+/// server's memory.
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How many artifact streams run at once; the rest get 503. Streaming bounds
+/// each response to its buffer, and this bounds their count (and open files).
+const MAX_CONCURRENT_ARTIFACTS: usize = 8;
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
     nats: async_nats::Client,
     dist_root: Arc<PathBuf>,
+    artifact_permits: Arc<Semaphore>,
     consumer_last_ok: Arc<AtomicI64>,
     outbox_last_ok: Arc<AtomicI64>,
     origin: Arc<String>,
@@ -93,6 +106,7 @@ async fn main() -> Result<()> {
         store,
         nats: connect_nats().await?,
         dist_root: Arc::new(PathBuf::from(dist_root)),
+        artifact_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_ARTIFACTS)),
         consumer_last_ok: Arc::new(AtomicI64::new(0)),
         outbox_last_ok: Arc::new(AtomicI64::new(now())),
         origin: Arc::new(runtime_config.origin),
@@ -598,6 +612,24 @@ async fn dist_file(
     State(state): State<AppState>,
     Path(path): Path<String>,
 ) -> Result<Response, ApiError> {
+    dist_response(state.dist_root.as_ref(), &path, &state.artifact_permits).await
+}
+
+/// Serves one Darwin artifact as a stream, so response memory stays bounded
+/// no matter how large the file is. Split from the handler so tests can
+/// drive it without a NATS connection.
+async fn dist_response(
+    root: &std::path::Path,
+    path: &str,
+    permits: &Arc<Semaphore>,
+) -> Result<Response, ApiError> {
+    // The permit lives in the stream below, not in this frame: holding it
+    // past the return is what bounds concurrent downloads rather than
+    // concurrent handler entries.
+    let permit = permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE))?;
     if path.is_empty()
         || path
             .split('/')
@@ -605,30 +637,65 @@ async fn dist_file(
     {
         return Err(ApiError(StatusCode::NOT_FOUND));
     }
-    let root = tokio::fs::canonicalize(state.dist_root.as_ref())
+    let root = tokio::fs::canonicalize(root)
         .await
         .map_err(|_| ApiError(StatusCode::NOT_FOUND))?;
-    let file = tokio::fs::canonicalize(root.join(&path))
+    let file_path = tokio::fs::canonicalize(root.join(path))
         .await
         .map_err(|_| ApiError(StatusCode::NOT_FOUND))?;
-    if !file.starts_with(&root) {
+    if !file_path.starts_with(&root) {
         return Err(ApiError(StatusCode::NOT_FOUND));
     }
-    let bytes = tokio::fs::read(file)
+    let file = tokio::fs::File::open(&file_path)
         .await
         .map_err(|_| ApiError(StatusCode::NOT_FOUND))?;
-    Ok(asset(
-        if FsPath::new(&path)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-        {
-            "application/json"
-        } else {
-            "application/octet-stream"
-        },
-        &bytes,
-        true,
-    ))
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND))?;
+    if !metadata.is_file() {
+        return Err(ApiError(StatusCode::NOT_FOUND));
+    }
+    let len = metadata.len();
+    if len > MAX_ARTIFACT_BYTES {
+        return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    // The closure captures the permit without otherwise using it, so the
+    // download holds its concurrency slot until the stream is dropped.
+    let stream = ReaderStream::new(file).map(move |chunk| {
+        let _ = &permit;
+        chunk
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(
+            if FsPath::new(path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            {
+                "application/json"
+            } else {
+                "application/octet-stream"
+            },
+        ),
+    );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    Ok(response)
 }
 
 fn html(body: &'static str) -> Response {
@@ -713,4 +780,213 @@ fn required_env(name: &str) -> Result<String> {
 }
 fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dist_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oshioki-dist-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn permits() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(MAX_CONCURRENT_ARTIFACTS))
+    }
+
+    async fn status(root: &std::path::Path, path: &str, permits: &Arc<Semaphore>) -> StatusCode {
+        match dist_response(root, path, permits).await {
+            Ok(response) => response.status(),
+            Err(error) => error.0,
+        }
+    }
+
+    /// Traversal shapes never reach the filesystem as themselves: empty,
+    /// dot, and dot-dot components are rejected before canonicalization,
+    /// and anything escaping the root is rejected after it.
+    #[tokio::test]
+    async fn traversal_attempts_are_not_found() {
+        let dir = dist_root("traversal");
+        std::fs::write(dir.join("manifest.json"), b"{}").unwrap();
+        let permits = permits();
+        for path in [
+            "",
+            ".",
+            "..",
+            "../manifest.json",
+            "a/../../manifest.json",
+            "a//manifest.json",
+            "a/./manifest.json",
+            "/manifest.json",
+        ] {
+            assert_eq!(
+                status(&dir, path, &permits).await,
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Missing files and directories are 404 without a body read.
+    #[tokio::test]
+    async fn missing_and_directories_are_not_found() {
+        let dir = dist_root("missing");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let permits = permits();
+        assert_eq!(
+            status(&dir, "nope.tar.gz", &permits).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(status(&dir, "sub", &permits).await, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink is resolved before the root check: pointing outside stays
+    /// outside, pointing inside serves the target's bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinks_resolve_before_the_root_check() {
+        let dir = dist_root("symlink");
+        let outside = dist_root("symlink-outside");
+        std::fs::write(outside.join("secret"), b"secret").unwrap();
+        std::fs::write(dir.join("real.tar.gz"), b"real").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dir.join("evil")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real.tar.gz"), dir.join("alias.tar.gz")).unwrap();
+        let permits = permits();
+        assert_eq!(status(&dir, "evil", &permits).await, StatusCode::NOT_FOUND);
+        let response = dist_response(&dir, "alias.tar.gz", &permits).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"real");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The size cap is enforced from metadata before a byte is read (sparse
+    /// files, so the over-limit case costs no I/O), and a file exactly at
+    /// the cap serves with its length announced.
+    #[tokio::test]
+    async fn artifacts_over_the_cap_are_rejected() {
+        let dir = dist_root("oversize");
+        let big = std::fs::File::create(dir.join("big.tar.gz")).unwrap();
+        big.set_len(MAX_ARTIFACT_BYTES + 1).unwrap();
+        let exact = std::fs::File::create(dir.join("exact.tar.gz")).unwrap();
+        exact.set_len(MAX_ARTIFACT_BYTES).unwrap();
+        let permits = permits();
+        assert_eq!(
+            status(&dir, "big.tar.gz", &permits).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let response = dist_response(&dir, "exact.tar.gz", &permits).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            &HeaderValue::from(MAX_ARTIFACT_BYTES)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Small files stream their exact bytes with the content type the
+    /// extension implies and an explicit length.
+    #[tokio::test]
+    async fn small_files_stream_verbatim() {
+        let dir = dist_root("small");
+        std::fs::write(dir.join("manifest.json"), br#"{"v":1}"#).unwrap();
+        std::fs::write(dir.join("agent.tar.gz"), b"\x1f\x8bBinary").unwrap();
+        let permits = permits();
+        let json = dist_response(&dir, "manifest.json", &permits)
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::OK);
+        assert_eq!(
+            json.headers().get(header::CONTENT_TYPE).unwrap(),
+            &HeaderValue::from_static("application/json")
+        );
+        let body = axum::body::to_bytes(json.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), br#"{"v":1}"#);
+        let tar = dist_response(&dir, "agent.tar.gz", &permits).await.unwrap();
+        assert_eq!(
+            tar.headers().get(header::CONTENT_TYPE).unwrap(),
+            &HeaderValue::from_static("application/octet-stream")
+        );
+        assert_eq!(
+            tar.headers().get(header::CONTENT_LENGTH).unwrap(),
+            &HeaderValue::from_static("8")
+        );
+        let body = axum::body::to_bytes(tar.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"\x1f\x8bBinary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Many simultaneous downloads all complete: over-limit requests shed
+    /// with 503 and retry, so this also proves permits are released rather
+    /// than leaked — a leak would stall here past the timeout instead.
+    #[tokio::test]
+    async fn concurrent_downloads_all_complete() {
+        let dir = dist_root("concurrent");
+        std::fs::write(dir.join("agent.tar.gz"), b"payload").unwrap();
+        let dir = Arc::new(dir);
+        let permits = permits();
+        let downloads = (0..4 * MAX_CONCURRENT_ARTIFACTS).map(|_| {
+            let dir = Arc::clone(&dir);
+            let permits = Arc::clone(&permits);
+            tokio::spawn(async move {
+                for _ in 0..1000 {
+                    match dist_response(&dir, "agent.tar.gz", &permits).await {
+                        Ok(response) => {
+                            assert_eq!(response.status(), StatusCode::OK);
+                            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                                .await
+                                .unwrap();
+                            assert_eq!(body.as_ref(), b"payload");
+                            return;
+                        }
+                        Err(error) => {
+                            assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+                panic!("a download never won a permit");
+            })
+        });
+        let outstanding: Vec<_> = downloads.collect();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            for download in outstanding {
+                download.await.unwrap();
+            }
+        })
+        .await
+        .expect("downloads stalled: permits leak");
+        let _ = std::fs::remove_dir_all(dir.as_ref());
+    }
+
+    /// Past the concurrency limit the handler sheds load with 503 instead
+    /// of queueing unbounded work, and recovers when a slot frees.
+    #[tokio::test]
+    async fn downloads_past_the_limit_get_503() {
+        let dir = dist_root("limit");
+        std::fs::write(dir.join("agent.tar.gz"), b"payload").unwrap();
+        let permits = permits();
+        let held: Vec<_> = (0..MAX_CONCURRENT_ARTIFACTS)
+            .map(|_| permits.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(
+            status(&dir, "agent.tar.gz", &permits).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(held);
+        assert_eq!(status(&dir, "agent.tar.gz", &permits).await, StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
