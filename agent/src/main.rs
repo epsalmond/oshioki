@@ -174,35 +174,75 @@ struct Pairing {
 }
 
 fn load_or_create(path: &std::path::Path, pairing: &Pairing) -> Result<Identity> {
+    #[cfg(target_os = "macos")]
+    {
+        let store = oshioki_agent::secret_store::KeychainStore::oshioki();
+        load_or_create_with(path, pairing, &store)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if path.exists() && !pairing.force {
+            return reuse_or_complain(pairing, Identity::load(path)?);
+        }
+        replace_identity(path, pairing, |path, kind| {
+            Identity::generate_to(path, kind)
+        })
+    }
+}
+
+/// The macOS pairing flow, and every platform's tests, through an explicit
+/// secret store. See `oshioki_agent::Identity::load_with`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn load_or_create_with(
+    path: &std::path::Path,
+    pairing: &Pairing,
+    store: &dyn oshioki_agent::secret_store::SecretStore,
+) -> Result<Identity> {
     if path.exists() && !pairing.force {
         // One identity serves every host this device pairs with, so an
         // existing one is reused rather than replaced. A --signer that
         // disagrees with it cannot be honoured and must not look like it was.
-        let identity = Identity::load(path)?;
-        let existing = identity.signer_kind();
-        if let Some(requested) = pairing.requested {
-            if requested != existing {
-                bail!(
-                    "this device already has an identity with a {existing} signing key, and \
-                     --signer {requested} cannot change it; drop the flag to pair this host \
-                     with the existing key, or pass --force to replace the identity, which \
-                     gives the device a new fingerprint and needs the host's old record \
-                     revoked"
-                );
-            }
-        }
-        info!(
-            fingerprint = %identity.fingerprint(),
-            signer = %existing,
-            "pairing with this device's existing identity"
-        );
-        return Ok(identity);
+        let identity = Identity::load_with(path, store)?;
+        return reuse_or_complain(pairing, identity);
     }
+    replace_identity(path, pairing, |path, kind| {
+        Identity::generate_to_with(path, kind, store)
+    })
+}
+
+fn reuse_or_complain(pairing: &Pairing, identity: Identity) -> Result<Identity> {
+    let existing = identity.signer_kind();
+    if let Some(requested) = pairing.requested {
+        if requested != existing {
+            bail!(
+                "this device already has an identity with a {existing} signing key, and \
+                 --signer {requested} cannot change it; drop the flag to pair this host \
+                 with the existing key, or pass --force to replace the identity, which \
+                 gives the device a new fingerprint and needs the host's old record \
+                 revoked"
+            );
+        }
+    }
+    info!(
+        fingerprint = %identity.fingerprint(),
+        signer = %existing,
+        "pairing with this device's existing identity"
+    );
+    Ok(identity)
+}
+
+/// Replaces the identity file, cleaning up the old keychain entry first.
+fn replace_identity(
+    path: &std::path::Path,
+    pairing: &Pairing,
+    generate: impl FnOnce(&std::path::Path, SignerKind) -> Result<Identity>,
+) -> Result<Identity> {
     if path.exists() {
         warn!(path=%path.display(), "replacing this device's identity");
+        remove_old_secret(path);
         std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
     }
-    let identity = Identity::generate_to(path, pairing.requested.unwrap_or(pairing.default))?;
+    let identity = generate(path, pairing.requested.unwrap_or(pairing.default))?;
     info!(
         path = %path.display(),
         fingerprint = %identity.fingerprint(),
@@ -210,6 +250,32 @@ fn load_or_create(path: &std::path::Path, pairing: &Pairing) -> Result<Identity>
         "created device identity"
     );
     Ok(identity)
+}
+
+/// Removes the replaced identity's keychain entry, if the file keeps only a
+/// reference. Best effort: re-pairing must not fail because stale cleanup
+/// did, so failures are logged and ignored.
+fn remove_old_secret(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(body) = std::fs::read(path) else {
+            return;
+        };
+        let Ok(file): Result<serde_json::Value, _> = serde_json::from_slice(&body) else {
+            return;
+        };
+        let Some(reference) = file.get("box_secret_ref").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let store = oshioki_agent::secret_store::KeychainStore::oshioki();
+        if let Err(error) = oshioki_agent::secret_store::SecretStore::remove(&store, reference) {
+            warn!(path = %path.display(), error = %format!("{error:#}"), "kept the replaced identity's keychain entry");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+    }
 }
 
 async fn cmd_pair(
@@ -445,7 +511,10 @@ async fn decide(
     let decision = if approve {
         identity.approve(opened, &approval_reason(request))?
     } else {
-        identity.deny(&request.request_id)
+        // An explicit refusal signs like an approval: the hook verifies the
+        // denial against the pinned device, so no NATS credential suffices
+        // to deny for it. Silence (timeout, dismissal) signs nothing.
+        identity.deny(opened, &approval_reason(request))?
     };
     Ok(Some(decision))
 }
@@ -984,7 +1053,10 @@ mod mac {
             .await
         {
             Ok(Outcome::Approved(decision)) => Ok(Some(decision)),
-            Ok(Outcome::Denied) => Ok(Some(identity.deny(&request.request_id))),
+            // Dismissal carries no signature, and an unsigned denial is
+            // indistinguishable from a forgery: the hook fails closed at
+            // the deadline instead.
+            Ok(Outcome::Denied) => Ok(None),
             Ok(Outcome::Expired) => {
                 info!(
                     request_id = %escape_for_terminal(&request.request_id),
@@ -1021,10 +1093,11 @@ mod mac {
 mod tests {
     use super::{
         Decider, MAX_ENV_LINES_SHOWN, Pairing, Prompter, approval_reason, bind_socket, decide,
-        format_env, load_or_create, now, prompt_output, quote_argv, runas_label, socket_path,
+        format_env, load_or_create_with, now, prompt_output, quote_argv, runas_label, socket_path,
         truncate,
     };
     use oshioki_agent::SignerKind;
+    use oshioki_agent::secret_store::MemoryStore;
     use oshioki_protocol::{
         EnvEntryV1, RequestEnvelopeV1, RequestV1, VERSION_V1, encode_base64url,
     };
@@ -1177,7 +1250,8 @@ mod tests {
             default: SignerKind::Software,
             force: false,
         };
-        let identity = load_or_create(&dir.join("agent.json"), &pairing).unwrap();
+        let store = MemoryStore::new();
+        let identity = load_or_create_with(&dir.join("agent.json"), &pairing, &store).unwrap();
         let sign = |env: Vec<EnvEntryV1>| {
             let mut request = request_for_reason();
             request.env = env;
@@ -1263,16 +1337,19 @@ mod tests {
             force,
         };
 
-        let created = load_or_create(&path, &pairing(None, false)).unwrap();
-        let reused = load_or_create(&path, &pairing(None, false)).unwrap();
+        let store = MemoryStore::new();
+        let create =
+            |requested, force| load_or_create_with(&path, &pairing(requested, force), &store);
+        let created = create(None, false).unwrap();
+        let reused = create(None, false).unwrap();
         assert_eq!(created.fingerprint(), reused.fingerprint());
-        let asked_for_the_same = load_or_create(&path, &pairing(Some(SignerKind::Software), false));
+        let asked_for_the_same = create(Some(SignerKind::Software), false);
         assert_eq!(
             asked_for_the_same.unwrap().fingerprint(),
             created.fingerprint()
         );
 
-        let Err(error) = load_or_create(&path, &pairing(Some(SignerKind::Enclave), false)) else {
+        let Err(error) = create(Some(SignerKind::Enclave), false) else {
             panic!("a mismatched --signer was accepted");
         };
         let error = error.to_string();
@@ -1281,7 +1358,7 @@ mod tests {
 
         // --force replaces the identity, so the device is a new one and the
         // host's old record for it is stale.
-        let replaced = load_or_create(&path, &pairing(None, true)).unwrap();
+        let replaced = create(None, true).unwrap();
         assert_ne!(replaced.fingerprint(), created.fingerprint());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1506,11 +1583,8 @@ mod tests {
     #[tokio::test]
     async fn socket_auto_approve_returns_a_signed_verdict() {
         let dir = socket_test_dir("happy");
-        let identity = oshioki_agent::Identity::generate_to(
-            &dir.join("agent.json"),
-            oshioki_agent::SignerKind::Software,
-        )
-        .unwrap();
+        let identity =
+            oshioki_agent::Identity::from_material([0x41; 32], [0x42; 32], [0x43; 32]).unwrap();
         let mut request = request_for_reason();
         request.issued_at = now();
         request.expires_at = now() + 60;
@@ -1531,11 +1605,8 @@ mod tests {
     #[tokio::test]
     async fn socket_auto_deny_returns_a_denial() {
         let dir = socket_test_dir("deny");
-        let identity = oshioki_agent::Identity::generate_to(
-            &dir.join("agent.json"),
-            oshioki_agent::SignerKind::Software,
-        )
-        .unwrap();
+        let identity =
+            oshioki_agent::Identity::from_material([0x44; 32], [0x45; 32], [0x46; 32]).unwrap();
         let mut request = request_for_reason();
         request.issued_at = now();
         request.expires_at = now() + 60;
@@ -1544,6 +1615,10 @@ mod tests {
         match socket_verdict(identity.clone(), false, &envelope).await {
             oshioki_protocol::DecisionV1::Deny(denial) => {
                 assert_eq!(denial.request_id, request.request_id);
+                // Auto-deny signs like an explicit refusal: the hook
+                // verifies this against the pinned record.
+                oshioki_protocol::verify_deny_v1(&denial, &identity.device_record("laptop"))
+                    .unwrap();
             }
             other => panic!("expected a denial, got {other:?}"),
         }
