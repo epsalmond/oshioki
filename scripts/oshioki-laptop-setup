@@ -345,7 +345,9 @@ nats_probe_reachable() {
     *) host="${hostport%%:*}"; port="${hostport##*:}" ;;
   esac
   [ -n "$host" ] || { echo "NATS probe: no host in URL: $1" >&2; return 1; }
-  [ "$host" != "$port" ] || port=4222
+  # A bare host carries itself as the "port" (no colon to split on), and a
+  # bracketed IPv6 host with no port yields an empty one; both mean 4222.
+  if [ -z "$port" ] || [ "$host" = "$port" ]; then port=4222; fi
   if [ "$(uname -s)" = Darwin ]; then
     nc -z -G 2 "$host" "$port" 2>/dev/null
   else
@@ -388,6 +390,20 @@ privileged_phase_local() {
   # staged NATS before writing it here, so whatever arrives verified stays,
   # and whatever is absent is omitted rather than placeholdered.
   if [ -f "$INSTALL_ENV" ] && [ "$RECONFIGURE" -eq 0 ]; then
+    # Reuse keeps the existing file byte-for-byte, so the reported values
+    # must be what is actually installed. A stale file whose transports no
+    # longer match what this run staged — notably the old unprobed
+    # placeholders — refuses instead of silently reinstating them: the
+    # installer would write them into config.env while the agent side went
+    # socket-only. Values are plain KEY=VALUE lines; sed reads them rather
+    # than sourcing, so hostile content cannot execute.
+    reused_key() { sed -n "s/^$1=//p" "$INSTALL_ENV" | head -1; }
+    if [ "$(reused_key NATS_URL)" != "${PHASE_NATS_URL:-}" ] \
+      || [ "$(reused_key NATS_USER)" != "${PHASE_NATS_USER:-}" ] \
+      || [ "$(reused_key NATS_PASS)" != "${PHASE_NATS_PASS:-}" ] \
+      || [ "$(reused_key OSHIOKI_AGENT_SOCKET)" != "${PHASE_AGENT_SOCKET:-$DEFAULT_SOCKET}" ]; then
+      die "existing $INSTALL_ENV names different transports than this run staged (stale NATS placeholders?); re-run with --reconfigure to rewrite it"
+    fi
     info "reusing existing $INSTALL_ENV (pass --reconfigure to redo it)"
     PHASE_REUSED=1
   else
@@ -521,11 +537,15 @@ NATS_USER_V="$(env_key NATS_USER)"
 NATS_PASS_V="$(env_key NATS_PASS)"
 AGENT_SOCKET_V="$(env_key OSHIOKI_AGENT_SOCKET)"
 check_config
-# Server mode always names a NATS, so verify it before any elevation: a
-# dead or miscredentialed server must fail here, not at the first sudo.
-nats_probe "$NATS_URL_V" "$NATS_USER_V" "$NATS_PASS_V" \
-  || die "NATS verification failed for $NATS_URL_V"
-info "NATS verified at $NATS_URL_V"
+# Server installs name a NATS, so verify it before any elevation: a dead
+# or miscredentialed server must fail here, not at the first sudo. An
+# empty URL is the socket-only shape check_config accepts; there is
+# nothing to probe then.
+if [ -n "$NATS_URL_V" ]; then
+  nats_probe "$NATS_URL_V" "$NATS_USER_V" "$NATS_PASS_V" \
+    || die "NATS verification failed for $NATS_URL_V"
+  info "NATS verified at $NATS_URL_V"
+fi
 fi
 
 if [ "$LOCAL" -eq 1 ]; then

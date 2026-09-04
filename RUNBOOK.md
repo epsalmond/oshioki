@@ -142,7 +142,24 @@ the server and the failed step (`NATS fallback to nats://host:port failed:
 connect: ...`) with credentials redacted. `oshioki-laptop-setup --local`
 writes this shape unless a NATS is staged, and probes a staged NATS before
 writing it. A stale install carrying the old `local`/`local` placeholder
-credentials migrates with `oshioki-laptop-setup --local --reconfigure`.
+credentials migrates with `oshioki-laptop-setup --local --reconfigure`;
+a plain re-run against a stale `install.env` refuses with the same advice
+instead of reinstalling it.
+
+Revocation still needs a NATS: `oshioki revoke` publishes to the server
+and waits for its confirmation, so on a socket-only host it fails with
+`NATS_URL not set`. The revocation itself is server-side — the local
+registry is only edited after the server confirms — so point the hook at
+any reachable server NATS just for the command (sudo scrubs the
+environment, hence `env`):
+
+```bash
+sudo env NATS_URL=tls://sudo.example.com:4222 NATS_USER=<hook-user> NATS_PASS=<secret> \
+  oshioki revoke <fingerprint>
+```
+
+The fingerprint must still be pinned locally; the command removes it there
+once the server confirms.
 
 Each browser profile enrolls separately:
 

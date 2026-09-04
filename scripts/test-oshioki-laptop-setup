@@ -15,7 +15,7 @@ stop_holders() {
   while read -r pid; do kill "$pid" 2>/dev/null || true; done < "$TEST_ROOT/holder-pids"
   sleep 1
 }
-trap 'stop_holders; [ -n "${STUB_PID:-}" ] && kill "$STUB_PID" 2>/dev/null; rm -rf "$TEST_ROOT"' EXIT
+trap 'stop_holders; if [ -n "${STUB_PID:-}" ]; then kill "$STUB_PID" 2>/dev/null || true; fi; rm -rf "$TEST_ROOT"' EXIT
 fail() { echo "test-oshioki-laptop-setup: $*" >&2; exit 1; }
 
 mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/stage/libexec" "$TEST_ROOT/home" "$TEST_ROOT/etc"
@@ -413,6 +413,22 @@ if grep -Eq '^NATS_' "$TEST_ROOT/etc/install.env"; then fail "migration kept pla
 grep -Fq 'OSHIOKI_LOCAL=1' "$TEST_ROOT/etc/install.env" || fail "migration dropped the local flag"
 grep -Fq "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" "$TEST_ROOT/etc/install.env" || fail "migration dropped the socket"
 grep -Fq 'agent socket is live' "$TEST_ROOT/migrate.log" || fail "migration verify never completed"
+
+# Scenario I: a plain re-run against a stale placeholder install.env
+# refuses instead of reinstalling the placeholders. install.env must be
+# byte-identical afterwards: refusal happens before any write.
+printf '%s\n' \
+  'OSHIOKI_ORIGIN=https://laptop.test' \
+  'OSHIOKI_RP_ID=laptop.test' \
+  'NATS_URL=nats://127.0.0.1:4222' \
+  'NATS_USER=local' \
+  'NATS_PASS=local' \
+  "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" \
+  'OSHIOKI_LOCAL=1' > "$TEST_ROOT/etc/install.env"
+cp "$TEST_ROOT/etc/install.env" "$TEST_ROOT/install.env.before"
+if DEVICES_ACTIVE=0 run_setup_local --local --yes >"$TEST_ROOT/stale-reuse.log" 2>&1; then fail "reinstalled stale placeholders"; fi
+grep -Fq -- '--reconfigure' "$TEST_ROOT/stale-reuse.log" || fail "stale refusal never advised --reconfigure"
+cmp -s "$TEST_ROOT/etc/install.env" "$TEST_ROOT/install.env.before" || fail "refusal rewrote install.env"
 
 # Self-policing teardown: the EXIT trap removes the tree, but rm succeeds
 # even with live holders (open files unlink), so leaked processes would go

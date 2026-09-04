@@ -1143,7 +1143,10 @@ async fn connect_nats_from(directory: &Path) -> Result<async_nats::Client> {
     options.connect(url).await.context("connect to NATS")
 }
 fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
-    let content = fs::read_to_string(path)?;
+    // The path rides along: this read opens every hook invocation, and a
+    // half-installed host should learn which file is missing, not just
+    // that something is.
+    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     Ok(content
         .lines()
         .map(str::trim)
@@ -1792,6 +1795,17 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         assert!(try_agent_socket(&dir, b"ping", deadline).await.is_err());
         serve.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing config.env names the file, not just the OS error: this
+    /// read opens every hook invocation on a half-installed host.
+    #[test]
+    fn missing_config_env_names_the_file() {
+        let dir = socket_test_dir("missing-env");
+        let error = transports_from(&dir).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("config.env"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
