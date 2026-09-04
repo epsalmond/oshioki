@@ -1,0 +1,31 @@
+name: audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # New advisories land over time; catch them even without code changes.
+    - cron: "17 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # A prebuilt cargo-audit, deliberately: the previous revision let
+      # rustsec/audit-check build it from source with the repo checked out,
+      # so the workspace pin in rust-toolchain.toml leaked into the tool
+      # build and it died on tinyvec before auditing anything. An override
+      # via RUSTUP_TOOLCHAIN was tried and did not propagate into the
+      # action's install step (same failure, run 33819503340), so there is
+      # no source build left to leak into. No extra scopes either: without
+      # the action nothing creates check runs or files issues; a scheduled
+      # finding shows up as a failed run.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
