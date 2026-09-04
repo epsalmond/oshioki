@@ -135,6 +135,15 @@ travel the socket; browser WebAuthn still needs the server. Native pairing
 can be done offline (below), so one agent serves local sudo over the socket
 and remote requests over NATS at the same time.
 
+Omit `NATS_URL` from `config.env` for a socket-only host: the hook then
+never touches NATS, a silent agent denies at once, and a config naming
+neither transport fails before any request is built. Fallback failures name
+the server and the failed step (`NATS fallback to nats://host:port failed:
+connect: ...`) with credentials redacted. `oshioki-laptop-setup --local`
+writes this shape unless a NATS is staged, and probes a staged NATS before
+writing it. A stale install carrying the old `local`/`local` placeholder
+credentials migrates with `oshioki-laptop-setup --local --reconfigure`.
+
 Each browser profile enrolls separately:
 
 ```bash
@@ -178,8 +187,7 @@ so nothing pinned needs redoing.
 command a native device runs to consume the same URL. `status` prints each
 device's `kind` (`webauthn` or `secure-enclave`) next to its fingerprint.
 
-`test` publishes a synthetic request and waits for approve or deny. `watch`
-opens each request URL on Darwin without a shell.
+`test` publishes a synthetic request and waits for approve or deny.
 
 ## Mac approver
 

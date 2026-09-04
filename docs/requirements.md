@@ -34,8 +34,6 @@ A future Mac installer will install the packaged Darwin client. It will own
 the read-only watcher credential, LaunchAgent, the `sudoers.d` passwordless
 drop-in (coupled to the plugin block, never `pam_tid`: one Touch ID approval
 per sudo, no password), laptop activation, and rollback.
-`watch` accepts no shell command. The optional `OSHIOKI_OPENER` test-only
-override is one executable path followed by one URL argument.
 
 Neither the runtime nor the Mac installer changes the v1 wire format. A protocol change requires a new
 version and a compatibility decision in this repository.
