@@ -476,6 +476,13 @@ async fn cmd_run(
 async fn subscribe_requests(
     identity: &Identity,
 ) -> Result<Option<(async_nats::Client, async_nats::Subscriber)>> {
+    // Unset and unreachable are different states: the first is a
+    // socket-only install answering exactly what it was told to, the second
+    // is a fallback worth warning about.
+    if env_nonempty("NATS_URL").is_none() {
+        info!("NATS_URL is not set; answering socket requests only (socket-only)");
+        return Ok(None);
+    }
     let nats = match connect_nats().await {
         Ok(nats) => nats,
         Err(error) => {
@@ -999,14 +1006,20 @@ fn prompt_output(request_id: &str, summary: &str, stdout_is_terminal: bool) -> S
     }
 }
 
+/// Reads an environment variable with empty counting as unset, so generated
+/// files can carry blank values without changing the transport set.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 async fn connect_nats() -> Result<async_nats::Client> {
-    let url = std::env::var("NATS_URL").context("NATS_URL is not set")?;
+    let url = env_nonempty("NATS_URL").context("NATS_URL is not set")?;
     let mut options = async_nats::ConnectOptions::new();
     // Half a credential is a misconfiguration, not a request for an anonymous
     // connection; the hook and the server both require the pair.
-    match (std::env::var("NATS_USER"), std::env::var("NATS_PASS")) {
-        (Ok(user), Ok(pass)) => options = options.user_and_password(user, pass),
-        (Err(_), Err(_)) => {}
+    match (env_nonempty("NATS_USER"), env_nonempty("NATS_PASS")) {
+        (Some(user), Some(pass)) => options = options.user_and_password(user, pass),
+        (None, None) => {}
         _ => bail!("set both NATS_USER and NATS_PASS, or neither"),
     }
     check_nats_url(

@@ -109,11 +109,31 @@ grep -Fq 'choose exactly one mode' "$TEST_ROOT/no-mode.log" || fail "missing mod
 
 if INSTALL_ORIGIN='' run_installer "$TEST_ROOT/missing-origin" --prelaunch >"$TEST_ROOT/missing-origin.log" 2>&1; then fail "accepted missing origin"; fi
 if INSTALL_RP_ID='' run_installer "$TEST_ROOT/missing-rp-id" --prelaunch >"$TEST_ROOT/missing-rp-id.log" 2>&1; then fail "accepted missing RP ID"; fi
-if INSTALL_NATS_URL='' run_installer "$TEST_ROOT/missing-nats-url" --prelaunch >"$TEST_ROOT/missing-nats-url.log" 2>&1; then fail "accepted missing NATS URL"; fi
-if INSTALL_NATS_PASS='' run_installer "$TEST_ROOT/missing-nats-pass" --prelaunch >"$TEST_ROOT/missing-nats-pass.log" 2>&1; then fail "accepted missing NATS password"; fi
-for missing in missing-origin missing-rp-id missing-nats-url missing-nats-pass; do
+if INSTALL_NATS_URL='' run_installer "$TEST_ROOT/missing-nats-url" --prelaunch >"$TEST_ROOT/missing-nats-url.log" 2>&1; then fail "accepted credentials without a NATS URL"; fi
+grep -Fq 'set all three or none' "$TEST_ROOT/missing-nats-url.log" || fail "missing creds-without-URL error"
+if INSTALL_NATS_URL='' INSTALL_NATS_PASS='' run_installer "$TEST_ROOT/no-transports" --prelaunch >"$TEST_ROOT/no-transports.log" 2>&1; then fail "accepted an empty transport set"; fi
+grep -Fq 'no approval transports' "$TEST_ROOT/no-transports.log" || fail "missing transport error names no transports"
+if INSTALL_NATS_URL='' INSTALL_NATS_PASS='orphan-secret' run_installer "$TEST_ROOT/creds-without-url" --prelaunch >"$TEST_ROOT/creds-without-url.log" 2>&1; then fail "accepted credentials without a NATS URL"; fi
+grep -Fq 'set all three or none' "$TEST_ROOT/creds-without-url.log" || fail "missing creds-without-URL error"
+if NATS_USER='lone-user' INSTALL_NATS_PASS='' run_installer "$TEST_ROOT/user-without-pass" --prelaunch >"$TEST_ROOT/user-without-pass.log" 2>&1; then fail "accepted a NATS user without a password"; fi
+grep -Fq 'both or neither' "$TEST_ROOT/user-without-pass.log" || fail "missing one-sided creds error"
+for missing in missing-origin missing-rp-id missing-nats-url no-transports creds-without-url user-without-pass; do
   [ ! -e "$TEST_ROOT/$missing/sbin/oshioki" ] || fail "$missing wrote an executable"
 done
+# A URL without a password is a no-auth server: it installs, and no
+# credential lines are written (never placeholders).
+INSTALL_NATS_PASS='' run_installer "$TEST_ROOT/no-auth-nats" --prelaunch >"$TEST_ROOT/no-auth-nats.log" 2>&1 || fail "rejected a no-auth NATS URL"
+grep -Fq 'NATS_URL=nats://nats.test:4222' "$TEST_ROOT/no-auth-nats/state/config.env" || fail "no-auth install dropped the URL"
+if grep -Eq '^NATS_(USER|PASS)=' "$TEST_ROOT/no-auth-nats/state/config.env"; then fail "no-auth install wrote credential lines"; fi
+# No URL with a socket is socket-only: no NATS keys at all.
+SOCKET_ONLY="$TEST_ROOT/socket-only"; mkdir -p "$SOCKET_ONLY"
+if INSTALL_NATS_URL='' INSTALL_NATS_PASS='' OSHIOKI_AGENT_SOCKET=/run/oshioki/agent.sock run_installer "$SOCKET_ONLY" --prelaunch >"$SOCKET_ONLY/log" 2>&1; then
+  :
+else
+  fail "rejected a socket-only install"
+fi
+if grep -Eq '^NATS_' "$SOCKET_ONLY/state/config.env"; then fail "socket-only install wrote NATS keys"; fi
+grep -Fq 'OSHIOKI_AGENT_SOCKET=/run/oshioki/agent.sock' "$SOCKET_ONLY/state/config.env" || fail "socket-only install dropped the socket"
 
 CONFIG_ROOT="$TEST_ROOT/config-file"; mkdir -p "$CONFIG_ROOT"
 printf '%s\n' \

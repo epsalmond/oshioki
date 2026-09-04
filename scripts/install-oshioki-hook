@@ -34,7 +34,7 @@ SUDOERS_FILE="$SUDOERS_D/oshioki"
 ORIGIN="${OSHIOKI_ORIGIN:-}"
 RP_ID="${OSHIOKI_RP_ID:-}"
 NATS_URL="${NATS_URL:-}"
-NATS_USER="${NATS_USER:-oshioki}"
+NATS_USER="${NATS_USER:-}"
 NATS_PASS="${NATS_PASS:-}"
 ALLOW_PLAINTEXT="${OSHIOKI_ALLOW_PLAINTEXT_NATS:-}"
 AGENT_SOCKET="${OSHIOKI_AGENT_SOCKET:-}"
@@ -342,8 +342,24 @@ fi
 
 [ -n "$ORIGIN" ] || die "OSHIOKI_ORIGIN is required"
 [ -n "$RP_ID" ] || die "OSHIOKI_RP_ID is required"
-[ -n "$NATS_URL" ] || die "NATS_URL is required"
-[ -n "$NATS_PASS" ] || die "NATS_PASS is required"
+# Transports are explicit: an empty NATS_URL means socket-only (no NATS
+# keys are written at all, never placeholders), and an empty socket with an
+# empty URL means nothing could approve, which fails here rather than at
+# the first sudo. Credentials are both-or-neither on both sides of the
+# URL's presence: creds without a server, or a user without a password,
+# describe a NATS that cannot exist.
+if [ -z "$NATS_URL" ]; then
+  if [ -n "$NATS_USER" ] || [ -n "$NATS_PASS" ]; then
+    die "NATS_USER/NATS_PASS are set but NATS_URL is not; set all three or none"
+  fi
+  [ -n "$AGENT_SOCKET" ] || die "no approval transports: NATS_URL is empty and OSHIOKI_AGENT_SOCKET is not set"
+else
+  if [ -n "$NATS_PASS" ]; then
+    [ -n "$NATS_USER" ] || NATS_USER="oshioki"
+  elif [ -n "$NATS_USER" ]; then
+    die "NATS_USER is set but NATS_PASS is not; set both or neither"
+  fi
+fi
 if needs_tls_warning; then
   echo "install-oshioki-hook: warning: NATS_URL is plaintext to a non-loopback host, and the hook will refuse it: use tls://, or set OSHIOKI_ALLOW_PLAINTEXT_NATS=1 (testing only; see README.md)" >&2
 fi
@@ -378,12 +394,12 @@ run install -m 0755 -o root -g "$ROOT_GROUP" "$PLUGIN_BIN" "$PLUGIN_DEST"
 run install -d -m 0750 -o root -g "$ROOT_GROUP" "$STATE_DIR"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf 'DRY: write %s/config.env with NATS_PASS=<redacted>\n' "$STATE_DIR"
+  if [ -n "$NATS_URL" ]; then printf 'DRY: write %s/config.env with NATS_PASS=<redacted>\n' "$STATE_DIR"; else printf 'DRY: write %s/config.env without NATS (socket-only)\n' "$STATE_DIR"; fi
   [ -z "$ALLOW_PLAINTEXT" ] || printf 'DRY: write OSHIOKI_ALLOW_PLAINTEXT_NATS=%s to config.env\n' "$ALLOW_PLAINTEXT"
   [ -z "$AGENT_SOCKET" ] || printf 'DRY: write OSHIOKI_AGENT_SOCKET=%s to config.env\n' "$AGENT_SOCKET"
   printf 'DRY: write %s/hook.json for origin %s and RP ID %s\n' "$STATE_DIR" "$ORIGIN" "$RP_ID"
 else
-  tmp="$(mktemp "$STATE_DIR/config.env.XXXXXX")"; printf 'NATS_URL=%s\nNATS_USER=%s\nNATS_PASS=%s\n' "$NATS_URL" "$NATS_USER" "$NATS_PASS" > "$tmp"; [ -z "$ALLOW_PLAINTEXT" ] || printf 'OSHIOKI_ALLOW_PLAINTEXT_NATS=%s\n' "$ALLOW_PLAINTEXT" >> "$tmp"; [ -z "$AGENT_SOCKET" ] || printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET" >> "$tmp"; chmod 0600 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$STATE_DIR/config.env"
+  tmp="$(mktemp "$STATE_DIR/config.env.XXXXXX")"; [ -z "$NATS_URL" ] || printf 'NATS_URL=%s\n' "$NATS_URL" > "$tmp"; [ -z "$NATS_URL" ] || [ -z "$NATS_PASS" ] || printf 'NATS_USER=%s\nNATS_PASS=%s\n' "$NATS_USER" "$NATS_PASS" >> "$tmp"; [ -z "$ALLOW_PLAINTEXT" ] || printf 'OSHIOKI_ALLOW_PLAINTEXT_NATS=%s\n' "$ALLOW_PLAINTEXT" >> "$tmp"; [ -z "$AGENT_SOCKET" ] || printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET" >> "$tmp"; chmod 0600 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$STATE_DIR/config.env"
   tmp="$(mktemp "$STATE_DIR/hook.json.XXXXXX")"; printf '{"version":1,"origin":"%s","rp_id":"%s","server_base_url":"%s"}\n' "$ORIGIN" "$RP_ID" "$ORIGIN" > "$tmp"; chmod 0600 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$STATE_DIR/hook.json"
   if [ ! -e "$STATE_DIR/devices.json" ]; then printf '{"version":1,"devices":[]}\n' > "$STATE_DIR/devices.json"; chmod 0600 "$STATE_DIR/devices.json"; chown "root:$ROOT_GROUP" "$STATE_DIR/devices.json"; fi
 fi
