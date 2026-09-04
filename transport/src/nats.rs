@@ -12,7 +12,7 @@ use async_nats::jetstream::{
     self, AckKind,
     consumer::{AckPolicy, pull},
 };
-use futures::{Stream, StreamExt as _};
+use futures::StreamExt as _;
 use oshioki_protocol::{
     ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
     allow_plaintext_nats, check_nats_url, nats_url_is_tls,
@@ -105,19 +105,6 @@ impl NatsTransport {
             .await
             .context("connect to NATS")
             .map(Self::from_client)
-    }
-
-    /// Subscribes to the request subjects verbatim, for `oshioki watch`.
-    /// Watch stays a NATS-only viewer rather than a seam operation: it
-    /// decides nothing.
-    pub async fn watch_requests(
-        &self,
-    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = InboundMessage> + Send>>> {
-        let subscriber = self.client.subscribe("oshioki.request.>").await?;
-        Ok(Box::pin(subscriber.map(|message| InboundMessage {
-            subject: message.subject.to_string(),
-            payload: message.payload.to_vec(),
-        })))
     }
 }
 
@@ -252,6 +239,16 @@ impl HookTransport for NatsTransport {
                 .context("server revocation confirmation timeout")?
                 .context("server revocation confirmation stream closed")?;
             Ok(())
+        })
+    }
+
+    fn watch_requests(&self) -> BoxFuture<'_, InboundStream> {
+        Box::pin(async move {
+            let subscriber = self.client.subscribe("oshioki.request.>").await?;
+            Ok(Box::pin(subscriber.map(|message| InboundMessage {
+                subject: message.subject.to_string(),
+                payload: message.payload.to_vec(),
+            })) as InboundStream)
         })
     }
 }

@@ -51,6 +51,11 @@ pub trait HookTransport: Send + Sync {
     /// Requests revocation of `fingerprint` and waits for the server's
     /// confirmation.
     fn revoke(&self, fingerprint: &str) -> BoxFuture<'_, ()>;
+
+    /// Streams one delivery per approval request, as `oshioki watch` prints
+    /// them, until the stream is dropped. The stream yields raw request
+    /// subjects so a terminal viewer can show hosts.
+    fn watch_requests(&self) -> BoxFuture<'_, InboundStream>;
 }
 
 /// One inbound core pub/sub delivery with its physical subject, so handlers

@@ -124,6 +124,12 @@ impl HookTransport for MockTransport {
         self.lock().revoked.push(fingerprint.to_owned());
         Box::pin(async { Ok(()) })
     }
+
+    fn watch_requests(&self) -> BoxFuture<'_, InboundStream> {
+        // Watch only prints requests; tests drive behavior through the
+        // verdict/submission queues, so an empty stream is honest.
+        Box::pin(async { Ok(Box::pin(futures::stream::empty()) as _) })
+    }
 }
 
 fn stub_ack(sender: Option<Sender<()>>) -> AckFuture {
