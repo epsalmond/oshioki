@@ -71,8 +71,8 @@ oshioki-agent pair '<enrollment-url>' --label <label>
 oshioki-agent run
 ```
 
-From then on, sudo requests will ask for your fingerprint to approve. Details in
-[docs/native-agent.md](docs/native-agent.md) and
+From then on, each sudo request costs one fingerprint tap to approve, no
+password. Details in [docs/native-agent.md](docs/native-agent.md) and
 [docs/mac-approvals.md](docs/mac-approvals.md).
 
 ```bash

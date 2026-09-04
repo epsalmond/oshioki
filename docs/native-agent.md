@@ -32,6 +32,14 @@ identity: the device gets a new fingerprint, every host it had paired with
 needs a new enrollment, and their old records should be revoked. `show` prints the fingerprint and which of
 the two backends this device has.
 
+A host the server never sees pairs offline: `device-record --label <label>`
+prints this device's public record (no NATS, no server), and `sudo oshioki
+pin-record <path>` pins it on the host with the same typed-fingerprint
+confirmation as server pairing. The pinned device approves local sudo over
+the socket exactly like an enrolled one, and the agent still answers NATS
+requests whenever the network is up — one agent does both. Pairing with the
+server later keeps the fingerprint, so nothing pinned needs redoing.
+
 `run` watches for sudo requests and prompts. A release build has no way
 to skip the prompt: `run --auto approve` and `run --auto deny`, which decide
 every request without asking, exist only when the agent is built with
