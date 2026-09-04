@@ -132,11 +132,18 @@ oshioki pin <fingerprint>
 oshioki pin-record <path>
 ```
 
-A host the server never sees pairs offline: the device exports its own
-record and the host pins it with the same fingerprint confirmation as
-`pin`, no NATS or server involved.
+A host the server never sees pairs offline with one command, which builds
+if needed, creates the identity, pins it, and starts the agent — no server,
+no prompts but your sudo password:
 
 ```bash
+oshioki-laptop-setup --local
+```
+
+The steps, spelled out for when something needs a hand:
+
+```bash
+oshioki-agent init
 oshioki-agent device-record --label <label> > /tmp/record.json
 sudo oshioki pin-record /tmp/record.json
 rm /tmp/record.json
@@ -144,7 +151,9 @@ sudo oshioki status
 ```
 
 The record carries only public material (fingerprint, public keys, label),
-so plain `rm` is enough.
+so plain `rm` is enough. The installer leaves the sudo plugin disabled
+until a device is active: enabling it on an empty registry would lock every
+sudo out, including the one that would pin the first device.
 
 The pinned device approves exactly like an enrolled one. Pairing the same
 device with the server later (plain `enroll`/`pair`) keeps the fingerprint,

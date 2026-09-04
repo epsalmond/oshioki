@@ -146,7 +146,7 @@ grep -Fq 'OSHIOKI_AGENT_SOCKET=/env/agent.sock' "$SOCKET_ENV/state/config.env" |
 
 PRELAUNCH="$TEST_ROOT/prelaunch"; mkdir -p "$PRELAUNCH/sudoers.d" "$PRELAUNCH/state"
 printf 'outside-before\n' > "$PRELAUNCH/sudo.conf"
-printf '{"version":1,"devices":[{"sentinel":true}]}\n' > "$PRELAUNCH/state/devices.json"
+printf '{"version":1,"devices":[{"sentinel":true,"active":true}]}\n' > "$PRELAUNCH/state/devices.json"
 devices_hash="$(sha256_file "$PRELAUNCH/state/devices.json")"
 run_installer "$PRELAUNCH" --prelaunch
 [ "$(sha256_file "$PRELAUNCH/state/devices.json")" = "$devices_hash" ] || fail "existing device state changed"
@@ -183,9 +183,23 @@ if grep -Fq '# BEGIN oshioki' "$PRELAUNCH/sudo.conf"; then fail "disable left ma
 [ "$(sha256_file "$PRELAUNCH/sudo.conf")" = "$outside_hash" ] || fail "disable changed bytes outside block"
 if run_installer "$PRELAUNCH" --prelaunch-status >/dev/null 2>&1; then fail "disabled status returned success"; fi
 
-ROLLBACK="$TEST_ROOT/rollback"; mkdir -p "$ROLLBACK"; printf 'original\n' > "$ROLLBACK/sudo.conf"; before="$(sha256_file "$ROLLBACK/sudo.conf")"
+ROLLBACK="$TEST_ROOT/rollback"; mkdir -p "$ROLLBACK/state"; printf 'original\n' > "$ROLLBACK/sudo.conf"; before="$(sha256_file "$ROLLBACK/sudo.conf")"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$ROLLBACK/state/devices.json"
 if FAIL_SUDO=1 run_installer "$ROLLBACK" --prelaunch >"$ROLLBACK/log" 2>&1; then fail "accepted sudo validation failure"; fi
 [ "$(sha256_file "$ROLLBACK/sudo.conf")" = "$before" ] || fail "rollback did not restore sudo.conf"
+
+EMPTY_REGISTRY="$TEST_ROOT/empty-registry"; mkdir -p "$EMPTY_REGISTRY"
+run_installer "$EMPTY_REGISTRY" --prelaunch >"$EMPTY_REGISTRY/log" 2>&1
+grep -Fq 'no active approval devices' "$EMPTY_REGISTRY/log" || fail "empty registry enabled silently"
+[ ! -e "$EMPTY_REGISTRY/sudo.conf" ] || fail "empty registry enabled the plugin"
+[ -x "$EMPTY_REGISTRY/sbin/oshioki" ] || fail "empty registry skipped the binary install"
+run_installer "$EMPTY_REGISTRY" --prelaunch --dry-run >"$EMPTY_REGISTRY/dry.log" 2>&1
+grep -Fq 'skip enabling' "$EMPTY_REGISTRY/dry.log" || fail "dry run did not predict the skip"
+
+ACTIVE_REGISTRY="$TEST_ROOT/active-registry"; mkdir -p "$ACTIVE_REGISTRY/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$ACTIVE_REGISTRY/state/devices.json"
+run_installer "$ACTIVE_REGISTRY" --prelaunch >"$ACTIVE_REGISTRY/log" 2>&1
+grep -Fq '# BEGIN oshioki' "$ACTIVE_REGISTRY/sudo.conf" || fail "active registry did not enable the plugin"
 
 UNSAFE="$TEST_ROOT/unsafe"; mkdir -p "$UNSAFE"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE/sudo.conf"
 if run_installer "$UNSAFE" --prelaunch >"$UNSAFE/log" 2>&1; then fail "accepted symlink sudo.conf"; fi

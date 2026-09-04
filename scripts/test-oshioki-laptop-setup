@@ -53,18 +53,24 @@ while [ "$#" -gt 0 ]; do
 done
 case "$mode --dry-run=$dry" in
   "--prelaunch --dry-run=1") echo "DRY: plan for $config" ;;
-  "--prelaunch --dry-run=0") cp "$config" "$APPLIED_CONFIG"; echo "installed $HOOK_BIN" ;;
-  "--prelaunch-status --dry-run=0") exit 0 ;;
+  "--prelaunch --dry-run=0")
+    cp "$config" "$APPLIED_CONFIG"; echo "installed $HOOK_BIN"
+    # The real installer enables the plugin only with an active device; the
+    # marker stands in for the registry here.
+    if [ -f "$AGENT_STATE/pinned" ] || [ "${DEVICES_ACTIVE:-0}" = 1 ]; then : > "$PLUGIN_ENABLED_FILE"; fi
+    ;;
+  "--prelaunch-status --dry-run=0") [ -f "$PLUGIN_ENABLED_FILE" ] ;;
   *) echo "fake installer saw unexpected call: $mode dry=$dry" >&2; exit 1 ;;
 esac
 SH
 # Fake hook: status reports an active device when told to, enroll prints a
-# URL and exits (the real one waits for pairing).
+# URL and exits (the real one waits for pairing), pin-record marks the
+# device the setup just exported.
 cat > "$TEST_ROOT/fake-bin/oshioki" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
   status)
-    if [ "${DEVICES_ACTIVE:-0}" = 1 ]; then echo "  fp  label  kind=SecureEnclave  active=true"; else echo "Enrolled devices (0):"; fi
+    if [ -f "$AGENT_STATE/pinned" ] || [ "${DEVICES_ACTIVE:-0}" = 1 ]; then echo "  fp  label  kind=SecureEnclave  active=true"; else echo "Enrolled devices (0):"; fi
     ;;
   enroll)
     echo "Enrollment URL (expires in five minutes):"
@@ -72,11 +78,17 @@ case "${1:-}" in
     echo "Native agent:"
     echo "  oshioki-agent pair 'https://enroll.test/e/id?value=secret'"
     ;;
+  pin-record)
+    [ -f "$2" ] || { echo "pin-record got no record file" >&2; exit 1; }
+    : > "$AGENT_STATE/pinned"
+    echo "Device pinned: LOCALFP01"
+    ;;
   *) echo "fake hook saw unexpected verb: $*" >&2; exit 1 ;;
 esac
 SH
 # Fake agent: show reflects identity presence, pair records its environment
-# and creates the identity.
+# and creates the identity, init creates it without a server, device-record
+# exports a fixed record for pin-record to consume.
 cat > "$TEST_ROOT/fake-bin/oshioki-agent" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -85,6 +97,11 @@ case "${1:-}" in
     [ -n "$NATS_PASS" ] || { echo "pair got no NATS_PASS" >&2; exit 1; }
     echo "$2" > "$AGENT_STATE/paired-url"
     : > "$AGENT_STATE/agent.json"
+    : > "$AGENT_STATE/pinned"
+    ;;
+  init) : > "$AGENT_STATE/agent.json" ;;
+  device-record)
+    printf '{\n  "version": 1,\n  "fingerprint": "LOCALFP01",\n  "label": "local"\n}\n'
     ;;
   *) echo "fake agent saw unexpected verb: $*" >&2; exit 1 ;;
 esac
@@ -110,6 +127,7 @@ SH
 chmod 0755 "$TEST_ROOT/fake-bin"/*
 
 export APPLIED_CONFIG="$TEST_ROOT/applied-config.env"
+export PLUGIN_ENABLED_FILE="$TEST_ROOT/plugin-enabled"
 export CALL_LOG="$TEST_ROOT/calls.log"
 export HOLDER_PIDS="$TEST_ROOT/holder-pids"
 export AGENT_STATE="$TEST_ROOT/home/.config/oshioki"
@@ -121,6 +139,7 @@ run_setup() {
     AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
     APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
+    PLUGIN_ENABLED_FILE="$TEST_ROOT/plugin-enabled" \
     CALL_LOG="$TEST_ROOT/calls.log" \
     HOLDER_PIDS="$TEST_ROOT/holder-pids" \
     SUDO="$TEST_ROOT/fake-bin/sudo" \
@@ -202,6 +221,18 @@ else
   grep -Fq 'OSHIOKI_AGENT_STATE=' "$agent_env" || fail "agent.env missing agent state"
   [ "$(file_mode "$agent_env")" = 600 ] || fail "agent.env is not 0600"
 fi
+
+# Scenario E: --local pairs with itself and never touches enrollment. Fresh
+# state, no server values anywhere.
+rm -f "$TEST_ROOT/etc/install.env" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+DEVICES_ACTIVE=0 run_setup --local --yes >"$TEST_ROOT/local.log" 2>&1 || fail "local setup failed"
+grep -Fq 'OSHIOKI_LOCAL=1' "$TEST_ROOT/etc/install.env" || fail "local flag missing from install.env"
+grep -Fq 'device paired locally' "$TEST_ROOT/local.log" || fail "local flow never paired"
+if grep -Fq 'enrolling a new device' "$TEST_ROOT/local.log"; then fail "local flow enrolled"; fi
+[ -f "$AGENT_STATE/agent.json" ] || fail "init never created the identity"
+[ -f "$AGENT_STATE/pinned" ] || fail "pin-record never pinned"
+[ "$(grep -c '^installed ' "$TEST_ROOT/local.log")" = 2 ] || fail "plugin was not enabled after pinning"
+grep -Fq 'agent socket is live' "$TEST_ROOT/local.log" || fail "local verify never completed"
 
 # Self-policing teardown: the EXIT trap removes the tree, but rm succeeds
 # even with live holders (open files unlink), so leaked processes would go

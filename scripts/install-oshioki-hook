@@ -263,10 +263,26 @@ else
   if [ ! -e "$STATE_DIR/devices.json" ]; then printf '{"version":1,"devices":[]}\n' > "$STATE_DIR/devices.json"; chmod 0600 "$STATE_DIR/devices.json"; chown "root:$ROOT_GROUP" "$STATE_DIR/devices.json"; fi
 fi
 
-if [ "$DRY_RUN" -eq 1 ]; then echo "DRY: enable exact managed block in $SUDO_CONF"; validate_sudo; exit 0; fi
+# Enabling the plugin with no approval devices locks every sudo out: the
+# hook fails closed on an empty registry, including the sudo that would pin
+# the first device. The binaries and config still install; pin a device and
+# re-run to enable. The registry is machine-written, so the literal
+# `"active": true` can only come from the active field: string values escape
+# their quotes, and no other key is named active.
+registry_has_active_devices() {
+  grep -Eq '"active":[[:space:]]*true' "$STATE_DIR/devices.json" 2>/dev/null
+}
+if [ "$DRY_RUN" -eq 1 ]; then
+  if registry_has_active_devices; then echo "DRY: enable exact managed block in $SUDO_CONF"; else echo "DRY: skip enabling $SUDO_CONF (no active approval devices)"; fi
+  validate_sudo; exit 0
+fi
+if ! registry_has_active_devices; then
+  echo "install-oshioki-hook: warning: no active approval devices; leaving $SUDO_CONF without the managed block (pin a device, then re-run)" >&2
+else
 [ -f "$SUDO_CONF" ] || install -m 0644 -o root -g "$ROOT_GROUP" /dev/null "$SUDO_CONF"
 backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
 rewrite_block enable "$SUDO_CONF" "$SUDO_CONF"
 if ! validate_sudo; then rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"; cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"; die "sudo -V failed; restored prior configuration"; fi
 rm -f "$backup"
+fi
 echo "install-oshioki-hook: $MODE installed and sudo validated"

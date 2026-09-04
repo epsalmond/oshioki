@@ -71,6 +71,19 @@ enum Verb {
     },
     /// Print this device's fingerprint.
     Show,
+    /// Create this device's identity without enrolling it. For offline
+    /// pairing: `device-record` reads what `init` writes.
+    Init {
+        /// Where the signing key lives. Defaults to the Secure Enclave on
+        /// macOS and to a software key everywhere else. Ignored when this
+        /// device already has an identity, unless it disagrees with it.
+        #[arg(long, value_enum)]
+        signer: Option<SignerArg>,
+        /// Replace an existing identity. The device gets a new fingerprint,
+        /// so every record pinned for the old one should be revoked.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print this device's public record for offline pairing (`oshioki
     /// pin-record`). Read-only: no NATS, no server, no prompt.
     DeviceRecord {
@@ -160,6 +173,19 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&identity.device_record(&label))?
             );
+            Ok(())
+        }
+        Verb::Init { signer, force } => {
+            let identity = load_or_create(
+                &identity_path,
+                &Pairing {
+                    requested: requested_signer_kind(signer),
+                    default: signer_kind(signer),
+                    force,
+                },
+            )?;
+            println!("{}", identity.fingerprint());
+            println!("signer: {}", identity.signer_kind());
             Ok(())
         }
     }
@@ -1238,6 +1264,26 @@ mod tests {
         let cli =
             Cli::try_parse_from(["oshioki-agent", "device-record", "--label", "mbp"]).unwrap();
         assert!(matches!(cli.verb, Verb::DeviceRecord { .. }));
+    }
+
+    #[test]
+    fn init_takes_signer_and_force() {
+        let cli = Cli::try_parse_from(["oshioki-agent", "init", "--signer", "software"]).unwrap();
+        assert!(matches!(
+            cli.verb,
+            Verb::Init {
+                signer: Some(_),
+                force: false
+            }
+        ));
+        let cli = Cli::try_parse_from(["oshioki-agent", "init", "--force"]).unwrap();
+        assert!(matches!(
+            cli.verb,
+            Verb::Init {
+                signer: None,
+                force: true
+            }
+        ));
     }
 
     /// A hostile environment cannot scroll the command off the screen: long
