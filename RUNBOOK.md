@@ -23,15 +23,20 @@ sha256sum oshioki liboshioki_plugin.so > SHA256SUMS
 brew install epsalmond/oshioki/oshioki && oshioki-laptop-setup
 ```
 
-The setup script walks through five steps and is idempotent, so re-running
-it after a `brew upgrade` applies the new bottle and restarts the agent:
-writes `/etc/oshioki/install.env` (prompting for values on first run,
-`--reconfigure` to redo), dry-runs then applies the prelaunch install,
-enrolls and pairs the agent when there is no identity, installs a
-LaunchAgent (Darwin) or user systemd unit (Linux) for `oshioki-agent run`,
-and finishes with a real `sudo true` as proof. Non-interactive with `--yes`
-plus values in the environment. The manual steps below remain for
-non-brew layouts.
+The setup script is idempotent. Re-running it after a `brew upgrade`
+applies the new bottle and restarts the agent. It writes
+`/etc/oshioki/install.env` (prompting for values on first run,
+`--reconfigure` to redo), dry-runs then applies the prelaunch install
+inside one sudo elevation, enrolls and pairs the agent when there is no
+identity, installs a LaunchAgent (Darwin) or user systemd unit (Linux) for
+`oshioki-agent run`, and finishes with a real `sudo true` as proof. Run it
+as yourself, never under sudo. A root run poisons user-owned files (the app
+bundle loses its readable icon that way). Non-interactive with `--yes`
+plus values in the environment. Setup costs two Touch ID approvals, the
+elevation and the proof (plus the sudo password on a machine that has never
+run setup). Day-to-day sudo costs one approval, no password: the installer
+couples a `sudoers.d` NOPASSWD drop-in to the plugin block. The manual
+steps below remain for non-brew layouts.
 
 ## Prelaunch installer
 
@@ -76,6 +81,15 @@ sudo scripts/install-oshioki-hook --prelaunch-status
 
 The installer rejects unknown config keys, symlinks, non-root ownership, and
 modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
+With an active device it also writes `/etc/sudoers.d/oshioki`
+(`<user> ALL=(ALL) NOPASSWD: ALL`, visudo-checked), so the Touch ID approval
+is the only gate and sudo stops asking for a password. The user comes from
+`OSHIOKI_SUDO_USER` (else `SUDO_USER`); without either, or without a
+`sudoers.d` include in the main sudoers file, the installer warns and keeps
+password authentication. The block and the drop-in go away together with
+`--disable-prelaunch`, and a re-run with no active devices removes both as
+well, so an enabled plugin never fails every sudo closed on an empty
+registry. `--prelaunch-status` checks both files.
 Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 `oshioki.dylib` in the same directory.
 
@@ -117,7 +131,9 @@ deadline allows, so a stopped agent degrades to the network path instead of
 hanging sudo. Verdicts are signature-checked on both transports. The agent
 itself starts without NATS and answers socket requests only until it is
 restarted with the network back. Only Secure Enclave (Touch ID) approvals
-travel the socket; browser WebAuthn and enrollment still need the server.
+travel the socket; browser WebAuthn still needs the server. Native pairing
+can be done offline (below), so one agent serves local sudo over the socket
+and remote requests over NATS at the same time.
 
 Each browser profile enrolls separately:
 
@@ -127,7 +143,36 @@ oshioki enroll --resume <enrollment-id>
 oshioki status
 oshioki revoke <fingerprint>
 oshioki pin <fingerprint>
+oshioki pin-record <path>
 ```
+
+A host the server never sees pairs offline with one command. It builds
+if needed, creates the identity, pins it, and starts the agent. No server.
+One sudo elevation and no typing: the fingerprint confirmation is piped,
+and `--yes` skips the apply prompt.
+
+```bash
+oshioki-laptop-setup --local
+```
+
+The steps, spelled out for when something needs a hand:
+
+```bash
+oshioki-agent init
+oshioki-agent device-record --label <label> > /tmp/record.json
+sudo oshioki pin-record /tmp/record.json
+rm /tmp/record.json
+sudo oshioki status
+```
+
+The record carries only public material (fingerprint, public keys, label),
+so plain `rm` is enough. The installer leaves the sudo plugin disabled
+until a device is active: enabling it on an empty registry would lock every
+sudo out, including the one that would pin the first device.
+
+The pinned device approves exactly like an enrolled one. Pairing the same
+device with the server later (plain `enroll`/`pair`) keeps the fingerprint,
+so nothing pinned needs redoing.
 
 `enroll` prints an enrollment URL, and below it the `oshioki-agent pair`
 command a native device runs to consume the same URL. `status` prints each
