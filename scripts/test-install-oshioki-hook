@@ -269,6 +269,7 @@ BADUSER="$TEST_ROOT/bad-sudo-user"; mkdir -p "$BADUSER/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$BADUSER/state/devices.json"
 if OSHIOKI_SUDO_USER='bad user' run_installer "$BADUSER" --prelaunch >"$BADUSER/log" 2>&1; then fail "accepted invalid sudoers user"; fi
 grep -Fq 'invalid sudoers user' "$BADUSER/log" || fail "missing invalid user error"
+if grep -Fq '# BEGIN oshioki' "$BADUSER/sudo.conf"; then fail "invalid user left the plugin enabled"; fi
 
 # An empty registry removes a stale drop-in next to the skipped plugin.
 STALE="$TEST_ROOT/stale-dropin"; mkdir -p "$STALE/state" "$STALE/sudoers.d"
@@ -284,6 +285,7 @@ printf '#includedir %s\n' "$VISUDOFAIL/sudoers.d" > "$VISUDOFAIL/sudoers"
 if OSHIOKI_SUDO_USER=testuser FAIL_VISUDO=1 run_installer "$VISUDOFAIL" --prelaunch >"$VISUDOFAIL/log" 2>&1; then fail "accepted visudo failure"; fi
 grep -Fq 'visudo rejected' "$VISUDOFAIL/log" || fail "missing visudo error"
 [ ! -e "$VISUDOFAIL/sudoers.d/oshioki" ] || fail "visudo failure left a drop-in"
+if grep -Fq '# BEGIN oshioki' "$VISUDOFAIL/sudo.conf"; then fail "visudo failure left the plugin enabled"; fi
 
 # A validation failure after install restores the prior drop-in too.
 RBDROPIN="$TEST_ROOT/rollback-dropin"; mkdir -p "$RBDROPIN/state" "$RBDROPIN/sudoers.d"
@@ -294,6 +296,34 @@ printf 'original\n' > "$RBDROPIN/sudo.conf"
 if OSHIOKI_SUDO_USER=testuser FAIL_SUDO=1 run_installer "$RBDROPIN" --prelaunch >"$RBDROPIN/log" 2>&1; then fail "accepted sudo validation failure with drop-in"; fi
 grep -Fxq 'olduser ALL=(ALL) NOPASSWD: ALL' "$RBDROPIN/sudoers.d/oshioki" || fail "rollback did not restore the drop-in"
 if grep -Fq '# BEGIN oshioki' "$RBDROPIN/sudo.conf"; then fail "rollback did not restore sudo.conf"; fi
+
+# Re-running with an emptied registry removes the block as well as the
+# drop-in: an enabled plugin with no devices fails every sudo closed.
+STALEBLOCK="$TEST_ROOT/stale-block"; mkdir -p "$STALEBLOCK/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$STALEBLOCK/state/devices.json"
+printf '#includedir %s\n' "$STALEBLOCK/sudoers.d" > "$STALEBLOCK/sudoers"
+OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCK" --prelaunch >"$STALEBLOCK/first.log" 2>&1
+grep -Fq '# BEGIN oshioki' "$STALEBLOCK/sudo.conf" || fail "setup did not enable the plugin"
+grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$STALEBLOCK/sudoers.d/oshioki" || fail "setup did not write the drop-in"
+printf '{"version":1,"devices":[]}\n' > "$STALEBLOCK/state/devices.json"
+OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCK" --prelaunch --dry-run >"$STALEBLOCK/dry.log" 2>&1
+grep -Fq "DRY: remove exact managed block from $STALEBLOCK/sudo.conf" "$STALEBLOCK/dry.log" || fail "dry run did not predict the block removal"
+run_installer "$STALEBLOCK" --prelaunch >"$STALEBLOCK/second.log" 2>&1
+grep -Fq 'no active approval devices' "$STALEBLOCK/second.log" || fail "emptied registry re-enabled silently"
+if grep -Fq '# BEGIN oshioki' "$STALEBLOCK/sudo.conf"; then fail "emptied registry left the plugin enabled"; fi
+[ ! -e "$STALEBLOCK/sudoers.d/oshioki" ] || fail "emptied registry left the drop-in"
+if OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCK" --prelaunch-status >/dev/null 2>&1; then fail "status accepted a removed plugin"; fi
+
+# A validation failure while removing the stale block restores the block
+# with the drop-in instead of leaving half a sudoers state.
+STALEBLOCKRB="$TEST_ROOT/stale-block-rollback"; mkdir -p "$STALEBLOCKRB/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$STALEBLOCKRB/state/devices.json"
+printf '#includedir %s\n' "$STALEBLOCKRB/sudoers.d" > "$STALEBLOCKRB/sudoers"
+OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCKRB" --prelaunch >"$STALEBLOCKRB/first.log" 2>&1
+printf '{"version":1,"devices":[]}\n' > "$STALEBLOCKRB/state/devices.json"
+if FAIL_SUDO=1 run_installer "$STALEBLOCKRB" --prelaunch >"$STALEBLOCKRB/log" 2>&1; then fail "accepted sudo validation failure on stale removal"; fi
+grep -Fq '# BEGIN oshioki' "$STALEBLOCKRB/sudo.conf" || fail "rollback did not restore the stale block"
+grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$STALEBLOCKRB/sudoers.d/oshioki" || fail "rollback did not restore the stale drop-in"
 
 UNSAFE="$TEST_ROOT/unsafe"; mkdir -p "$UNSAFE"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE/sudo.conf"
 if run_installer "$UNSAFE" --prelaunch >"$UNSAFE/log" 2>&1; then fail "accepted symlink sudo.conf"; fi

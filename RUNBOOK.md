@@ -86,8 +86,10 @@ With an active device it also writes `/etc/sudoers.d/oshioki`
 is the only gate and sudo stops asking for a password. The user comes from
 `OSHIOKI_SUDO_USER` (else `SUDO_USER`); without either, or without a
 `sudoers.d` include in the main sudoers file, the installer warns and keeps
-password authentication. The drop-in goes away with `--disable-prelaunch`
-and when the registry empties, and `--prelaunch-status` checks both files.
+password authentication. The block and the drop-in go away together with
+`--disable-prelaunch`, and a re-run with no active devices removes both as
+well, so an enabled plugin never fails every sudo closed on an empty
+registry. `--prelaunch-status` checks both files.
 Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 `oshioki.dylib` in the same directory.
 

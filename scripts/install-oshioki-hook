@@ -79,7 +79,8 @@ hash_file() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk
 # one never outlives the other: the Touch ID approval becomes the only gate
 # and sudo stops asking for a password. Both install only with an active
 # approval device, both are verified by prelaunch-status, and both go away
-# on disable. A broken sudoers file locks every sudo out, so the drop-in is
+# on disable and on a re-run that finds no active devices. A broken sudoers
+# file locks every sudo out, so the drop-in is
 # visudo-validated before it lands and sudo ignores a leaked temp file (its
 # name carries a dot).
 sudoers_user() { printf '%s' "${OSHIOKI_SUDO_USER:-${SUDO_USER:-}}"; }
@@ -157,6 +158,28 @@ dropin_ok() {
   [ "$owner" -eq 0 ] || return 1
   [ "$mode" = 440 ] || return 1
   grep -Fxq "$(sudoers_line "$user")" "$SUDOERS_FILE" 2>/dev/null
+}
+backup=""; dropin_backup=""
+# The enable/disable windows rewrite sudo.conf before sudo -V proves the
+# result, and the drop-in install between them can still fail (visudo
+# refusal, invalid user). Every failure path restores both files so the
+# managed block and the drop-in never outlive each other; the EXIT trap is
+# the backstop for die and set -e exits inside the window.
+restore_sudo_backups() {
+  [ -n "$backup" ] && [ -f "$backup" ] || return 0
+  cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"
+  # rm first: the drop-in is 0440, so overwriting it in place fails.
+  if [ -n "$dropin_backup" ] && [ -f "$dropin_backup" ]; then
+    rm -f "$SUDOERS_FILE"; cp -p "$dropin_backup" "$SUDOERS_FILE"; rm -f "$dropin_backup"
+  else
+    rm -f "$SUDOERS_FILE"
+  fi
+  backup=""; dropin_backup=""
+}
+drop_sudo_backups() {
+  [ -z "$backup" ] || rm -f "$backup"
+  [ -z "$dropin_backup" ] || rm -f "$dropin_backup"
+  backup=""; dropin_backup=""
 }
 
 # True when the hook would refuse NATS_URL as plaintext past loopback. The
@@ -270,7 +293,7 @@ regular_or_absent "$STATE_DIR/config.env"; regular_or_absent "$STATE_DIR/hook.js
 
 if [ "$DRY_RUN" -eq 0 ]; then
   mkdir "$LOCK_DIR" 2>/dev/null || die "another installer holds $LOCK_DIR"
-  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
+  trap 'restore_sudo_backups; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
 fi
 
 rewrite_block() {
@@ -310,12 +333,10 @@ if [ "$MODE" = disable-prelaunch ]; then
   rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
   remove_sudoers_dropin
   if ! validate_sudo; then
-    cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"
-    # rm first: the drop-in is 0440, so overwriting it in place fails.
-    if [ -n "$dropin_backup" ]; then rm -f "$SUDOERS_FILE"; cp -p "$dropin_backup" "$SUDOERS_FILE"; rm -f "$dropin_backup"; fi
+    restore_sudo_backups
     die "sudo -V failed after disable; restored prior configuration"
   fi
-  rm -f "$backup"; [ -z "$dropin_backup" ] || rm -f "$dropin_backup"
+  drop_sudo_backups
   echo "install-oshioki-hook: prelaunch disabled and sudo validated"; exit 0
 fi
 
@@ -377,12 +398,27 @@ registry_has_active_devices() {
   grep -Eq '"active":[[:space:]]*true' "$STATE_DIR/devices.json" 2>/dev/null
 }
 if [ "$DRY_RUN" -eq 1 ]; then
-  if registry_has_active_devices; then echo "DRY: enable exact managed block in $SUDO_CONF"; plan_sudoers_dropin "$(sudoers_user)"; else echo "DRY: skip enabling $SUDO_CONF (no active approval devices)"; remove_sudoers_dropin; fi
+  if registry_has_active_devices; then echo "DRY: enable exact managed block in $SUDO_CONF"; plan_sudoers_dropin "$(sudoers_user)"; elif [ -f "$SUDO_CONF" ] && grep -qF "$BEGIN_MARK" "$SUDO_CONF"; then echo "DRY: remove exact managed block from $SUDO_CONF (no active approval devices)"; remove_sudoers_dropin; else echo "DRY: skip enabling $SUDO_CONF (no active approval devices)"; remove_sudoers_dropin; fi
   validate_sudo; exit 0
 fi
 if ! registry_has_active_devices; then
-  echo "install-oshioki-hook: warning: no active approval devices; leaving $SUDO_CONF without the managed block (pin a device, then re-run)" >&2
-  remove_sudoers_dropin
+  echo "install-oshioki-hook: warning: no active approval devices; $SUDO_CONF keeps no managed block (pin a device, then re-run)" >&2
+  # An enabled block with an empty registry fails every sudo closed,
+  # including the sudo that would pin the first device: take it back out.
+  if [ -f "$SUDO_CONF" ] && grep -qF "$BEGIN_MARK" "$SUDO_CONF"; then
+    backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
+    dropin_backup=""
+    if [ -f "$SUDOERS_FILE" ]; then dropin_backup="$(mktemp "${SUDOERS_FILE}.backup.XXXXXX")"; cp -p "$SUDOERS_FILE" "$dropin_backup"; fi
+    rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
+    remove_sudoers_dropin
+    if ! validate_sudo; then
+      restore_sudo_backups
+      die "sudo -V failed; restored prior configuration"
+    fi
+    drop_sudo_backups
+  else
+    remove_sudoers_dropin
+  fi
 else
 [ -f "$SUDO_CONF" ] || install -m 0644 -o root -g "$ROOT_GROUP" /dev/null "$SUDO_CONF"
 backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
@@ -391,11 +427,9 @@ if [ -f "$SUDOERS_FILE" ]; then dropin_backup="$(mktemp "${SUDOERS_FILE}.backup.
 rewrite_block enable "$SUDO_CONF" "$SUDO_CONF"
 install_sudoers_dropin "$(sudoers_user)"
 if ! validate_sudo; then
-  rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"; cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"
-  # rm first: the drop-in is 0440, so overwriting it in place fails.
-  if [ -n "$dropin_backup" ]; then rm -f "$SUDOERS_FILE"; cp -p "$dropin_backup" "$SUDOERS_FILE"; rm -f "$dropin_backup"; else rm -f "$SUDOERS_FILE"; fi
+  restore_sudo_backups
   die "sudo -V failed; restored prior configuration"
 fi
-rm -f "$backup"; [ -z "$dropin_backup" ] || rm -f "$dropin_backup"
+drop_sudo_backups
 fi
 echo "install-oshioki-hook: $MODE installed and sudo validated"

@@ -661,9 +661,11 @@ async fn cmd_pin(expected: &str) -> Result<()> {
 }
 
 /// Pins a device record file exported for offline pairing. The record is
-/// validated and the fingerprint confirmation is required exactly as in
-/// `pin`; the only difference is provenance — a file the operator carried
-/// over instead of the server's HTTPS answer.
+/// validated and pinning still needs the typed fingerprint confirmation,
+/// but unlike `pin` there is no independent expected fingerprint to check
+/// the record against: provenance is the file itself, so the confirmation
+/// only proves the operator meant this record (and in `--local` setup it is
+/// piped from the same export, making the step automatic).
 fn cmd_pin_record(path: &Path) -> Result<()> {
     let raw = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let device: DevicePublicRecordV1 =
@@ -1437,9 +1439,9 @@ mod tests {
         );
     }
 
-    /// Offline pairing pins a carried-over record with the same ceremony as
-    /// pin: the confirmation writes the registry, and the pinned device is
-    /// active immediately.
+    /// Offline pairing pins a carried-over record on the same typed
+    /// confirmation: the confirmation writes the registry, and the pinned
+    /// device is active immediately.
     #[test]
     fn pin_record_writes_the_registry_on_confirmation() {
         let dir = std::env::temp_dir().join(format!("oshioki-pinrecord-{}", std::process::id()));
