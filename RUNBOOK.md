@@ -117,7 +117,9 @@ deadline allows, so a stopped agent degrades to the network path instead of
 hanging sudo. Verdicts are signature-checked on both transports. The agent
 itself starts without NATS and answers socket requests only until it is
 restarted with the network back. Only Secure Enclave (Touch ID) approvals
-travel the socket; browser WebAuthn and enrollment still need the server.
+travel the socket; browser WebAuthn still needs the server. Native pairing
+can be done offline (below), so one agent serves local sudo over the socket
+and remote requests over NATS at the same time.
 
 Each browser profile enrolls separately:
 
@@ -127,7 +129,26 @@ oshioki enroll --resume <enrollment-id>
 oshioki status
 oshioki revoke <fingerprint>
 oshioki pin <fingerprint>
+oshioki pin-record <path>
 ```
+
+A host the server never sees pairs offline: the device exports its own
+record and the host pins it with the same fingerprint confirmation as
+`pin`, no NATS or server involved.
+
+```bash
+oshioki-agent device-record --label <label> > /tmp/record.json
+sudo oshioki pin-record /tmp/record.json
+rm /tmp/record.json
+sudo oshioki status
+```
+
+The record carries only public material (fingerprint, public keys, label),
+so plain `rm` is enough.
+
+The pinned device approves exactly like an enrolled one. Pairing the same
+device with the server later (plain `enroll`/`pair`) keeps the fingerprint,
+so nothing pinned needs redoing.
 
 `enroll` prints an enrollment URL, and below it the `oshioki-agent pair`
 command a native device runs to consume the same URL. `status` prints each

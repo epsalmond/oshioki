@@ -71,6 +71,13 @@ enum Verb {
     },
     /// Print this device's fingerprint.
     Show,
+    /// Print this device's public record for offline pairing (`oshioki
+    /// pin-record`). Read-only: no NATS, no server, no prompt.
+    DeviceRecord {
+        /// Label shown on the host's device list.
+        #[arg(long)]
+        label: String,
+    },
 }
 
 #[cfg(feature = "unattended")]
@@ -145,6 +152,14 @@ async fn main() -> Result<()> {
             let identity = Identity::load(&identity_path)?;
             println!("{}", identity.fingerprint());
             println!("signer: {}", identity.signer_kind());
+            Ok(())
+        }
+        Verb::DeviceRecord { label } => {
+            let identity = Identity::load(&identity_path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&identity.device_record(&label))?
+            );
             Ok(())
         }
     }
@@ -1092,10 +1107,11 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::{
-        Decider, MAX_ENV_LINES_SHOWN, Pairing, Prompter, approval_reason, bind_socket, decide,
-        format_env, load_or_create_with, now, prompt_output, quote_argv, runas_label, socket_path,
-        truncate,
+        Cli, Decider, MAX_ENV_LINES_SHOWN, Pairing, Prompter, Verb, approval_reason, bind_socket,
+        decide, format_env, load_or_create_with, now, prompt_output, quote_argv, runas_label,
+        socket_path, truncate,
     };
+    use clap::Parser as _;
     use oshioki_agent::SignerKind;
     use oshioki_agent::secret_store::MemoryStore;
     use oshioki_protocol::{
@@ -1215,6 +1231,13 @@ mod tests {
         assert!(shown.contains("  env PATH=/tmp/bin:/usr/bin\n"), "{shown}");
         let reason = approval_reason(&request);
         assert!(reason.ends_with(" (+2 env)"), "{reason}");
+    }
+
+    #[test]
+    fn device_record_takes_a_label() {
+        let cli =
+            Cli::try_parse_from(["oshioki-agent", "device-record", "--label", "mbp"]).unwrap();
+        assert!(matches!(cli.verb, Verb::DeviceRecord { .. }));
     }
 
     /// A hostile environment cannot scroll the command off the screen: long

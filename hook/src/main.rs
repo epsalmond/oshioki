@@ -61,6 +61,13 @@ enum Verb {
         #[arg(allow_hyphen_values = true)]
         fingerprint: String,
     },
+    /// Pin a device record from a file, as printed by `oshioki-agent
+    /// device-record`, for hosts the server never sees. The fingerprint
+    /// confirmation is the same ceremony as `pin`; nothing is fetched.
+    PinRecord {
+        #[arg(allow_hyphen_values = true)]
+        path: PathBuf,
+    },
     Status,
     Test,
     Watch,
@@ -88,6 +95,7 @@ async fn main() -> Result<()> {
         Verb::Enroll { resume } => cmd_enroll(resume.as_deref()).await,
         Verb::Revoke { fingerprint } => cmd_revoke(&fingerprint).await,
         Verb::Pin { fingerprint } => cmd_pin(&fingerprint).await,
+        Verb::PinRecord { path } => cmd_pin_record(&path),
         Verb::Status => cmd_status(),
         Verb::Test => cmd_test().await,
         Verb::Watch => cmd_watch().await,
@@ -649,6 +657,30 @@ async fn cmd_pin(expected: &str) -> Result<()> {
     if device.fingerprint != expected {
         bail!("server device fingerprint mismatch");
     }
+    pin_device_record(&config_dir(), &device, &mut io::stdin().lock())
+}
+
+/// Pins a device record file exported for offline pairing. The record is
+/// validated and the fingerprint confirmation is required exactly as in
+/// `pin`; the only difference is provenance — a file the operator carried
+/// over instead of the server's HTTPS answer.
+fn cmd_pin_record(path: &Path) -> Result<()> {
+    let raw = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let device: DevicePublicRecordV1 =
+        serde_json::from_slice(&raw).context("decode device record")?;
+    pin_device_record(&config_dir(), &device, &mut io::stdin().lock())
+}
+
+/// Shows a device record and pins it on typed fingerprint confirmation.
+/// Shared by `pin` (record fetched from the server) and `pin-record`
+/// (record carried over in a file): both write the same registry entry, so
+/// a locally paired device approves exactly like an enrolled one.
+fn pin_device_record(
+    directory: &Path,
+    device: &DevicePublicRecordV1,
+    input: &mut impl io::BufRead,
+) -> Result<()> {
+    device.validate().context("device record")?;
     println!(
         "Fingerprint: {}\nLabel: {}\nCredential: {}",
         device.fingerprint,
@@ -658,18 +690,18 @@ async fn cmd_pin(expected: &str) -> Result<()> {
     print!("Type the full fingerprint to confirm: ");
     io::stdout().flush()?;
     let mut confirmation = String::new();
-    io::stdin().lock().read_line(&mut confirmation)?;
+    input.read_line(&mut confirmation)?;
     if confirmation.trim() != device.fingerprint {
         bail!("fingerprint confirmation mismatch");
     }
-    let mut registry = load_registry()?;
+    let mut registry = load_registry_from(directory)?;
     registry
         .devices
         .retain(|stored| stored.fingerprint != device.fingerprint);
-    registry.devices.push(device);
+    registry.devices.push(device.clone());
     registry.validate()?;
-    write_registry(&registry)?;
-    println!("Device pinned: {expected}");
+    write_registry_to(directory, &registry)?;
+    println!("Device pinned: {}", device.fingerprint);
     Ok(())
 }
 
@@ -1403,6 +1435,62 @@ mod tests {
             !error.to_string().contains("explicitly denied"),
             "{error:#}"
         );
+    }
+
+    /// Offline pairing pins a carried-over record with the same ceremony as
+    /// pin: the confirmation writes the registry, and the pinned device is
+    /// active immediately.
+    #[test]
+    fn pin_record_writes_the_registry_on_confirmation() {
+        let dir = std::env::temp_dir().join(format!("oshioki-pinrecord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (device, _) = deny_test_device();
+        let mut input = std::io::Cursor::new(format!("{}\n", device.fingerprint));
+        pin_device_record(&dir, &device, &mut input).unwrap();
+        let registry = load_registry_from(&dir).unwrap();
+        assert_eq!(registry.devices.len(), 1);
+        assert_eq!(registry.devices[0], device);
+        assert!(registry.devices[0].active);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A wrong confirmation refuses and writes nothing: a record nobody
+    /// confirmed is not a pairing.
+    #[test]
+    fn pin_record_refuses_a_wrong_confirmation() {
+        let dir = std::env::temp_dir().join(format!("oshioki-pinrefuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (device, _) = deny_test_device();
+        let mut input = std::io::Cursor::new("not-the-fingerprint\n");
+        let error = pin_device_record(&dir, &device, &mut input).unwrap_err();
+        assert!(
+            error.to_string().contains("confirmation mismatch"),
+            "{error:#}"
+        );
+        assert!(load_registry_from(&dir).unwrap().devices.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An invalid record never reaches the confirmation: label included.
+    #[test]
+    fn pin_record_refuses_an_invalid_record() {
+        let dir = std::env::temp_dir().join(format!("oshioki-pinbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut device, _) = deny_test_device();
+        device.label.clear();
+        let mut input = std::io::Cursor::new(format!("{}\n", device.fingerprint));
+        assert!(pin_device_record(&dir, &device, &mut input).is_err());
+        assert!(load_registry_from(&dir).unwrap().devices.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pin_record_takes_a_path() {
+        let cli = Cli::try_parse_from(["oshioki", "pin-record", "/tmp/record.json"]).unwrap();
+        assert!(matches!(cli.verb, Verb::PinRecord { .. }));
     }
 
     /// The server's record confirms exactly the denial it recorded: same
