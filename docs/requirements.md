@@ -13,7 +13,8 @@ Production must provide:
 - Publish and subscribe permissions for `oshioki.verdict.*` and
   `oshioki.enrollment.*`.
 - Publish and subscribe permissions for `oshioki.device.>` (revocations and
-  their confirmations).
+  their confirmations). These apply to the `nats` transport; other transports
+  document their own.
 - A writable SQLite path set by `OSHIOKI_STATE_PATH`.
 - `OSHIOKI_ORIGIN=https://sudo.example.com` and
   `OSHIOKI_RP_ID=sudo.example.com`.

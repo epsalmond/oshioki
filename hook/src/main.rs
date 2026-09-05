@@ -22,12 +22,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use oshioki_protocol::{
-    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1,
-    DeviceRegistryV1, EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1,
-    RequestEnvelopeV1, RequestV1, VERSION_V1, allow_plaintext_nats, check_nats_url,
-    escape_for_terminal, is_approval_env, nats_url_is_tls, verify_approval_v1, verify_deny_v1,
-    verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
+    ActivationV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
+    EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1, RequestEnvelopeV1,
+    RequestV1, VERSION_V1, escape_for_terminal, is_approval_env, verify_approval_v1,
+    verify_deny_v1, verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
 };
+use oshioki_transport::{HookTransport, NatsTransport};
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
 /// How long the hook waits to connect to the local agent socket. A missing
@@ -69,6 +69,7 @@ enum Verb {
         path: PathBuf,
     },
     Status,
+    Watch,
     Test,
 }
 
@@ -96,6 +97,7 @@ async fn main() -> Result<()> {
         Verb::Pin { fingerprint } => cmd_pin(&fingerprint).await,
         Verb::PinRecord { path } => cmd_pin_record(&path),
         Verb::Status => cmd_status(),
+        Verb::Watch => cmd_watch().await,
         Verb::Test => cmd_test().await,
     };
     if let Err(error) = result {
@@ -249,9 +251,9 @@ async fn nats_fallback(
         bail!("sudo decision deadline exceeded before the NATS fallback ran");
     }
     let display = nats_display_url(nats_url);
-    let nats = connect_nats_from(directory)
-        .await
-        .with_context(|| format!("NATS fallback to {display} failed: connect"))?;
+    let transport = transport_from(directory).await;
+    let transport =
+        transport.with_context(|| format!("NATS fallback to {display} failed: connect"))?;
     if announce_url {
         let config = load_hook_config_from(directory)?;
         println!(
@@ -261,15 +263,10 @@ async fn nats_fallback(
         );
         io::stdout().flush()?;
     }
-    request_decision(
-        &nats,
-        &format!("oshioki.request.{}", request.host),
-        &format!("oshioki.verdict.{}", request.request_id),
-        payload,
-        remaining,
-    )
-    .await
-    .with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))
+    transport
+        .request_decision(&request.host, &request.request_id, payload, remaining)
+        .await
+        .with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))
 }
 
 /// Renders a NATS URL for error messages: scheme and host without
@@ -490,41 +487,6 @@ fn approval_url(server_base_url: &str, request_id: &str) -> String {
     format!("{server_base_url}/r/{request_id}")
 }
 
-async fn request_decision(
-    nats: &async_nats::Client,
-    request_subject: &str,
-    decision_subject: &str,
-    payload: Vec<u8>,
-    timeout: Duration,
-) -> Result<DecisionV1> {
-    let mut stage = "subscribing to decision";
-    tokio::time::timeout(timeout, async {
-        let mut subscription = nats
-            .subscribe(decision_subject.to_owned())
-            .await
-            .context("subscribe decision")?;
-        stage = "confirming decision subscription readiness";
-        nats.flush().await.context("flush decision subscription")?;
-        stage = "publishing approval request";
-        nats.publish(request_subject.to_owned(), payload.into())
-            .await
-            .context("publish request")?;
-        stage = "waiting for decision";
-        let message = subscription
-            .next()
-            .await
-            .context("decision stream closed")?;
-        serde_json::from_slice(&message.payload).context("decode decision")
-    })
-    .await
-    .with_context(|| {
-        format!(
-            "sudo decision deadline exceeded after {}ms while {stage}",
-            timeout.as_millis()
-        )
-    })?
-}
-
 async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     let config = load_hook_config()?;
     let state = if let Some(id) = resume {
@@ -541,15 +503,8 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     let secret_bytes: [u8; 32] = oshioki_protocol::decode_base64url(&state.secret)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid enrollment secret"))?;
-    let nats = connect_nats().await?;
+    let transport = transport_from(&config_dir()).await?;
     let reply_subject = format!("oshioki.enrollment.submission.{}", state.enrollment_id);
-    let mut subscription = nats
-        .subscribe(reply_subject.clone())
-        .await
-        .context("subscribe enrollment submission")?;
-    nats.flush()
-        .await
-        .context("flush enrollment subscription")?;
     let intent = EnrollmentIntentV1 {
         version: VERSION_V1,
         enrollment_id: state.enrollment_id.clone(),
@@ -557,32 +512,22 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
         expires_at: state.expires_at,
         reply_subject,
     };
-    nats.publish(
-        "oshioki.enrollment.intent",
-        serde_json::to_vec(&intent)?.into(),
-    )
-    .await?;
-    nats.flush().await?;
     let enrollment_url = format!(
         "{}/enroll/{}#{}",
         config.server_base_url, state.enrollment_id, state.secret
     );
+    let remaining = u64::try_from(state.expires_at - now()).context("enrollment expiry")?;
+    let submission_deadline = tokio::time::Instant::now()
+        + Duration::from_secs(remaining.min(ENROLLMENT_TIMEOUT.as_secs()));
+    // Deliver the intent first so the enrollment URL never outruns the row
+    // the server builds from it: publish, confirm, then print, then wait.
+    let reply_stream = transport.publish_enrollment_intent(&intent).await?;
     println!(
         "Enrollment URL (expires in five minutes):\n  {enrollment_url}\nNative agent:\n  oshioki-agent pair '{enrollment_url}'"
     );
-    let remaining = u64::try_from(state.expires_at - now()).context("enrollment expiry")?;
-    let message = tokio::time::timeout(
-        Duration::from_secs(remaining.min(ENROLLMENT_TIMEOUT.as_secs())),
-        subscription.next(),
-    )
-    .await
-    .context("enrollment timeout")?
-    .context("enrollment stream closed")?;
-    let submission: EnrollmentSubmissionV1 =
-        serde_json::from_slice(&message.payload).context("decode enrollment submission")?;
-    if submission.enrollment_id() != state.enrollment_id {
-        bail!("enrollment id mismatch");
-    }
+    let submission = transport
+        .await_submission(&state.enrollment_id, reply_stream, submission_deadline)
+        .await?;
     let device = match &submission {
         EnrollmentSubmissionV1::Webauthn(submission) => {
             verify_enrollment_v1(submission, &secret_bytes, &config).context("verify enrollment")?
@@ -604,7 +549,8 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     registry.devices.push(device.clone());
     registry.validate()?;
     write_registry(&registry)?;
-    let confirmation = activate_device(&nats, &state.enrollment_id, &device, &config).await;
+    let confirmation =
+        activate_device(transport.as_ref(), &state.enrollment_id, &device, &config).await;
     // The enrollment itself is spent either way: the device is pinned here
     // and the server has consumed the intent, so there is nothing for
     // `--resume` to redo. What may still be missing is the server's copy.
@@ -629,7 +575,7 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
 /// silently, and without this check both `enroll` and the agent would report
 /// success.
 async fn activate_device(
-    nats: &async_nats::Client,
+    transport: &dyn HookTransport,
     enrollment_id: &str,
     device: &DevicePublicRecordV1,
     config: &HookConfigV1,
@@ -639,11 +585,7 @@ async fn activate_device(
         enrollment_id: enrollment_id.to_owned(),
         device: device.clone(),
     };
-    let subject = format!("oshioki.enrollment.activation.{enrollment_id}");
-    let payload = serde_json::to_vec(&activation)?;
-    nats.publish(subject.clone(), payload.clone().into())
-        .await?;
-    nats.flush().await?;
+    transport.publish_activation(&activation).await?;
     let url = format!(
         "{}/api/v1/devices/{}",
         config.server_base_url, device.fingerprint
@@ -663,9 +605,7 @@ async fn activate_device(
                 // may overtake it, and the first publish may have been lost.
                 // Restating is safe — a stored activation is idempotent — so
                 // a slow submission heals here instead of failing the enroll.
-                nats.publish(subject.clone(), payload.clone().into())
-                    .await?;
-                nats.flush().await?;
+                transport.publish_activation(&activation).await?;
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -742,20 +682,8 @@ async fn cmd_revoke(fingerprint: &str) -> Result<()> {
     {
         bail!("unknown device fingerprint");
     }
-    let nats = connect_nats().await?;
-    let confirmation_subject = format!("oshioki.device.revoked.{fingerprint}");
-    let mut confirmation = nats.subscribe(confirmation_subject).await?;
-    nats.flush().await?;
-    nats.publish(
-        format!("oshioki.device.revoke.{fingerprint}"),
-        Vec::new().into(),
-    )
-    .await?;
-    nats.flush().await?;
-    tokio::time::timeout(Duration::from_secs(15), confirmation.next())
-        .await
-        .context("server revocation confirmation timeout")?
-        .context("server revocation confirmation stream closed")?;
+    let transport = transport_from(&config_dir()).await?;
+    transport.revoke(fingerprint).await?;
     registry
         .devices
         .retain(|device| device.fingerprint != fingerprint);
@@ -845,6 +773,37 @@ fn cmd_status() -> Result<()> {
 
 async fn cmd_test() -> Result<()> {
     execute_request(build_synthetic_request(), APPROVAL_TIMEOUT).await
+}
+
+async fn cmd_watch() -> Result<()> {
+    let config = load_hook_config()?;
+    let transport = transport_from(&config_dir()).await?;
+    let mut subscription = transport.watch_requests().await?;
+    while let Some(message) = subscription.next().await {
+        let envelope: RequestEnvelopeV1 = match serde_json::from_slice(&message.payload) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "ignoring malformed request");
+                continue;
+            }
+        };
+        envelope.validate()?;
+        let url = approval_url(&config.server_base_url, &envelope.request_id);
+        let opener = std::env::var("OSHIOKI_OPENER").unwrap_or_else(|_| "/usr/bin/open".into());
+        let status = opener_command(&opener, &url)
+            .status()
+            .context("launch approval URL")?;
+        if !status.success() {
+            warn!(%status, "approval URL opener failed");
+        }
+    }
+    bail!("request subscription closed")
+}
+
+fn opener_command(opener: &str, url: &str) -> Command {
+    let mut command = Command::new(opener);
+    command.arg(url);
+    command
 }
 
 fn build_request(values: &HashMap<String, String>) -> Result<RequestV1> {
@@ -1105,42 +1064,23 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<
     result
 }
 
-async fn connect_nats() -> Result<async_nats::Client> {
-    connect_nats_from(&config_dir()).await
-}
-async fn connect_nats_from(directory: &Path) -> Result<async_nats::Client> {
+/// Reads the selected transport name from `config.env`, failing closed on an
+/// unknown value. Absent or empty means `nats`, the only backend. The flag
+/// comes from `config.env` rather than the process environment: sudo scrubs
+/// the environment, so this file is the hook's only channel.
+fn selected_transport(directory: &Path) -> Result<String> {
     let env = read_env_file(&directory.join("config.env"))?;
-    // The flag comes from config.env rather than the process environment:
-    // sudo scrubs the environment, so this file is the hook's only channel.
-    let url = env.get("NATS_URL").context("NATS_URL not set")?.clone();
-    check_nats_url(
-        &url,
-        allow_plaintext_nats(env.get(ALLOW_PLAINTEXT_NATS_ENV).map(String::as_str)),
-    )
-    .context("invalid NATS_URL")?;
-    // Credentials are both-or-neither: a user without a password (or the
-    // reverse) is a misconfiguration, while neither means the server takes
-    // none. Empty values count as unset, like the socket path above.
-    let user = env
-        .get("NATS_USER")
-        .filter(|value| !value.is_empty())
-        .cloned();
-    let pass = env
-        .get("NATS_PASS")
-        .filter(|value| !value.is_empty())
-        .cloned();
-    let mut options = match (user, pass) {
-        (None, None) => async_nats::ConnectOptions::new(),
-        (Some(user), Some(pass)) => async_nats::ConnectOptions::new().user_and_password(user, pass),
-        _ => bail!("config.env sets exactly one of NATS_USER and NATS_PASS; set both or neither"),
-    };
-    // A tls:// URL must stay TLS past the first server: the cluster
-    // advertises more addresses on reconnect as bare host:port, which parse
-    // as plaintext, so the options flag carries the requirement with them.
-    if nats_url_is_tls(&url) {
-        options = options.require_tls(true);
+    match env.get("OSHIOKI_TRANSPORT").map(String::as_str) {
+        None | Some("" | "nats") => Ok("nats".to_owned()),
+        Some(other) => bail!("unsupported transport: {other}"),
     }
-    options.connect(url).await.context("connect to NATS")
+}
+
+/// Selects the hook transport named by `OSHIOKI_TRANSPORT` in `config.env`.
+async fn transport_from(directory: &Path) -> Result<Box<dyn HookTransport>> {
+    let name = selected_transport(directory)?;
+    debug_assert_eq!(name, "nats");
+    Ok(Box::new(NatsTransport::from_config_dir(directory).await?))
 }
 fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
     // The path rides along: this read opens every hook invocation, and a
@@ -1653,7 +1593,9 @@ mod tests {
                 format!("NATS_URL={url}\nNATS_USER=u\nNATS_PASS=p\n"),
             )
             .unwrap();
-            let error = connect_nats_from(&dir).await.unwrap_err();
+            let Err(error) = transport_from(&dir).await else {
+                panic!("plaintext NATS unexpectedly connected");
+            };
             assert!(format!("{error:#}").contains(fragment), "{error:#}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
@@ -1869,13 +1811,17 @@ mod tests {
             "NATS_URL=nats://127.0.0.1:4222\nNATS_USER=u\n",
         )
         .unwrap();
-        let error = connect_nats_from(&dir).await.unwrap_err();
+        let Err(error) = transport_from(&dir).await else {
+            panic!("half-credentials unexpectedly connected")
+        };
         assert!(
             format!("{error:#}").contains("both or neither"),
             "{error:#}"
         );
         std::fs::write(dir.join("config.env"), "NATS_URL=nats://203.0.1.1:4222\n").unwrap();
-        let error = connect_nats_from(&dir).await.unwrap_err();
+        let Err(error) = transport_from(&dir).await else {
+            panic!("plaintext NATS unexpectedly connected")
+        };
         assert!(
             format!("{error:#}").contains("refusing plaintext"),
             "{error:#}"
@@ -1999,5 +1945,79 @@ mod tests {
             config.push('\n');
         }
         std::fs::write(dir.join("config.env"), config).unwrap();
+    }
+    /// A DENY carried by the mock transport fails the request, exactly the
+    /// observable contract the hook must honor: the mock proves the seam
+    /// carries the verdict through without the wire.
+    #[tokio::test]
+    async fn mock_transport_carries_a_deny() {
+        let (device, signing) = deny_test_device();
+        let mut request = build_synthetic_request();
+        request.request_id = "req-1".into();
+        let transport = oshioki_transport::MockTransport::new();
+        transport.push_verdict(DecisionV1::Deny(deny_for(&signing, "req-1", &device)));
+        let decision = transport
+            .request_decision("nas", "req-1", b"{}".to_vec(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut registry = DeviceRegistryV1 {
+            version: 1,
+            devices: Vec::new(),
+        };
+        let error = apply_decision(
+            decision,
+            &request,
+            &[],
+            &[device],
+            &mut registry,
+            Path::new("/nonexistent"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("explicitly denied"), "{error:#}");
+    }
+
+    /// A device-signed native approval carried by the mock transport
+    /// approves against the pinned record: the seam carries the verdict and
+    /// the hook's cryptographic check admits it.
+    #[tokio::test]
+    async fn mock_transport_carries_a_signed_approval() {
+        use p256::ecdsa::signature::Signer as _;
+        let (device, signing) = deny_test_device();
+        let request = build_synthetic_request();
+        let raw = request.raw_json().unwrap();
+        let challenge = oshioki_protocol::v1::approve_challenge(&raw);
+        let signature: p256::ecdsa::Signature = signing.sign(&challenge);
+        let mut registry = DeviceRegistryV1 {
+            version: 1,
+            devices: Vec::new(),
+        };
+        let approval = DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
+            version: VERSION_V1,
+            request_id: request.request_id.clone(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+        });
+        let transport = oshioki_transport::MockTransport::new();
+        transport.push_verdict(approval);
+        let decision = transport
+            .request_decision(
+                "nas",
+                &request.request_id,
+                raw.clone(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        apply_decision(
+            decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            Path::new("/nonexistent"),
+        )
+        .await
+        .expect("signed approval must approve");
     }
 }

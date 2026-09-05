@@ -7,7 +7,9 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::Result;
+#[cfg(target_os = "macos")]
+use anyhow::{Context as _, bail};
 
 /// Storage for fixed-size secrets, keyed by account name.
 ///
