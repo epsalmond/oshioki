@@ -15,7 +15,7 @@ stop_holders() {
   while read -r pid; do kill "$pid" 2>/dev/null || true; done < "$TEST_ROOT/holder-pids"
   sleep 1
 }
-trap 'stop_holders; rm -rf "$TEST_ROOT"' EXIT
+trap 'stop_holders; if [ -n "${STUB_PID:-}" ]; then kill "$STUB_PID" 2>/dev/null || true; fi; rm -rf "$TEST_ROOT"' EXIT
 fail() { echo "test-oshioki-laptop-setup: $*" >&2; exit 1; }
 
 mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/stage/libexec" "$TEST_ROOT/home" "$TEST_ROOT/etc"
@@ -39,6 +39,7 @@ SH
 # status succeeds.
 cat > "$TEST_ROOT/fake-bin/install-oshioki-hook" <<'SH'
 #!/usr/bin/env bash
+[ -n "${SEEN_SUDO_USER:-}" ] && printf '%s' "${OSHIOKI_SUDO_USER:-}" > "$SEEN_SUDO_USER"
 mode="$1"
 config=""
 dry=0
@@ -53,18 +54,24 @@ while [ "$#" -gt 0 ]; do
 done
 case "$mode --dry-run=$dry" in
   "--prelaunch --dry-run=1") echo "DRY: plan for $config" ;;
-  "--prelaunch --dry-run=0") cp "$config" "$APPLIED_CONFIG"; echo "installed $HOOK_BIN" ;;
-  "--prelaunch-status --dry-run=0") exit 0 ;;
+  "--prelaunch --dry-run=0")
+    cp "$config" "$APPLIED_CONFIG"; echo "installed $HOOK_BIN"
+    # The real installer enables the plugin only with an active device; the
+    # marker stands in for the registry here.
+    if [ -f "$AGENT_STATE/pinned" ] || [ "${DEVICES_ACTIVE:-0}" = 1 ]; then : > "$PLUGIN_ENABLED_FILE"; fi
+    ;;
+  "--prelaunch-status --dry-run=0") [ -f "$PLUGIN_ENABLED_FILE" ] ;;
   *) echo "fake installer saw unexpected call: $mode dry=$dry" >&2; exit 1 ;;
 esac
 SH
 # Fake hook: status reports an active device when told to, enroll prints a
-# URL and exits (the real one waits for pairing).
+# URL and exits (the real one waits for pairing), pin-record marks the
+# device the setup just exported.
 cat > "$TEST_ROOT/fake-bin/oshioki" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
   status)
-    if [ "${DEVICES_ACTIVE:-0}" = 1 ]; then echo "  fp  label  kind=SecureEnclave  active=true"; else echo "Enrolled devices (0):"; fi
+    if [ -f "$AGENT_STATE/pinned" ] || [ "${DEVICES_ACTIVE:-0}" = 1 ]; then echo "  fp  label  kind=SecureEnclave  active=true"; else echo "Enrolled devices (0):"; fi
     ;;
   enroll)
     echo "Enrollment URL (expires in five minutes):"
@@ -72,11 +79,22 @@ case "${1:-}" in
     echo "Native agent:"
     echo "  oshioki-agent pair 'https://enroll.test/e/id?value=secret'"
     ;;
+  pin-record)
+    [ -f "$2" ] || { echo "pin-record got no record file" >&2; exit 1; }
+    # The setup answers the confirmation itself; a missing pipe means a
+    # human would have to type the fingerprint.
+    if ! IFS= read -r confirmation || [ -z "$confirmation" ]; then
+      echo "pin-record got no confirmation on stdin" >&2; exit 1
+    fi
+    : > "$AGENT_STATE/pinned"
+    echo "Device pinned: LOCALFP01"
+    ;;
   *) echo "fake hook saw unexpected verb: $*" >&2; exit 1 ;;
 esac
 SH
 # Fake agent: show reflects identity presence, pair records its environment
-# and creates the identity.
+# and creates the identity, init creates it without a server, device-record
+# exports a fixed record for pin-record to consume.
 cat > "$TEST_ROOT/fake-bin/oshioki-agent" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -85,24 +103,40 @@ case "${1:-}" in
     [ -n "$NATS_PASS" ] || { echo "pair got no NATS_PASS" >&2; exit 1; }
     echo "$2" > "$AGENT_STATE/paired-url"
     : > "$AGENT_STATE/agent.json"
+    : > "$AGENT_STATE/pinned"
+    ;;
+  init) : > "$AGENT_STATE/agent.json" ;;
+  device-record)
+    printf '{\n  "version": 1,\n  "fingerprint": "LOCALFP01",\n  "label": "local"\n}\n'
     ;;
   *) echo "fake agent saw unexpected verb: $*" >&2; exit 1 ;;
 esac
 SH
 # Fake service managers record their calls; bootstrap also holds the agent
-# socket open the way a booted agent would.
+# socket open the way a booted agent would. The holder is netcat, not
+# python: an interpreted holder starts unreliably under load here, while nc
+# binds instantly. It replaces any stale socket file first (each scenario
+# gets a fresh listener) and signals readiness by accepting a connection
+# before launchctl returns, so the script's liveness wait sees a started
+# agent, never a starting one. -k keeps it listening across probes.
 cat > "$TEST_ROOT/fake-bin/launchctl" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$CALL_LOG"
 if [ "${1:-}" = bootstrap ] && [ -n "${SOCKET_TO_MAKE:-}" ]; then
-  python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(120)' "$SOCKET_TO_MAKE" &
+  rm -f "$SOCKET_TO_MAKE"
+  nc -k -lU "$SOCKET_TO_MAKE" &
   echo "$!" >> "$HOLDER_PIDS"
+  for _ in $(seq 1 50); do
+    if python3 -c 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(1);s.connect(sys.argv[1])' "$SOCKET_TO_MAKE" 2>/dev/null; then break; fi
+    sleep 0.1
+  done
 fi
 SH
 cat > "$TEST_ROOT/fake-bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$CALL_LOG"
 if [ "${1:-} ${2:-}" = "--user enable" ] && [ -n "${SOCKET_TO_MAKE:-}" ]; then
+  rm -f "$SOCKET_TO_MAKE"
   python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(120)' "$SOCKET_TO_MAKE" &
   echo "$!" >> "$HOLDER_PIDS"
 fi
@@ -110,36 +144,125 @@ SH
 chmod 0755 "$TEST_ROOT/fake-bin"/*
 
 export APPLIED_CONFIG="$TEST_ROOT/applied-config.env"
+export PLUGIN_ENABLED_FILE="$TEST_ROOT/plugin-enabled"
 export CALL_LOG="$TEST_ROOT/calls.log"
 export HOLDER_PIDS="$TEST_ROOT/holder-pids"
 export AGENT_STATE="$TEST_ROOT/home/.config/oshioki"
 export SOCKET_TO_MAKE="$AGENT_STATE/agent.sock"
 : > "$CALL_LOG"
 
+# Minimal NATS server for the installer's probe: INFO with auth_required,
+# then +PONG for a CONNECT carrying the expected user and password, -ERR
+# otherwise. The expected pair lives in STUB_CREDS_FILE (two lines) and is
+# re-read per connection, so scenarios can change it without restarting the
+# stub: a running process never sees later variable assignments. One
+# connection per probe is all the installer ever makes.
+cat > "$TEST_ROOT/fake-bin/nats-stub" <<'SH'
+#!/usr/bin/env python3
+import json, os, socket, sys
+port = int(sys.argv[1])
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen(16)
+while True:
+  conn, _ = listener.accept()
+  try:
+    conn.sendall(b'INFO {"server_id":"stub","version":"0.0.0","proto":1,"host":"127.0.0.1","port":%d,"auth_required":true}\r\n' % port)
+    data = b""
+    while data.count(b"\r\n") < 2:
+      chunk = conn.recv(4096)
+      if not chunk:
+        break
+      data += chunk
+    try:
+      hello = json.loads(data.split(b"\r\n", 1)[0].split(None, 1)[1])
+    except Exception:
+      hello = {}
+    try:
+      with open(os.environ["STUB_CREDS_FILE"]) as handle:
+        want = handle.read().splitlines()
+    except OSError:
+      want = []
+    if len(want) >= 2 and hello.get("user") == want[0] and hello.get("pass") == want[1]:
+      conn.sendall(b"PONG\r\n")
+    else:
+      conn.sendall(b"-ERR 'Authorization Violation'\r\n")
+  except OSError:
+    pass
+  finally:
+    try:
+      conn.close()
+    except OSError:
+      pass
+SH
+chmod 0755 "$TEST_ROOT/fake-bin/nats-stub"
+STUB_PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
+export STUB_PORT
+export STUB_CREDS_FILE="$TEST_ROOT/stub-creds"
+printf '%s\n' 'oshioki' 'test-secret' > "$STUB_CREDS_FILE"
+export SETUP_NATS_URL="nats://127.0.0.1:$STUB_PORT"
+"$TEST_ROOT/fake-bin/nats-stub" "$STUB_PORT" &
+STUB_PID="$!"
+for _ in $(seq 1 50); do
+  if python3 -c 'import socket,os;s=socket.socket();s.settimeout(1);s.connect(("127.0.0.1",int(os.environ["STUB_PORT"])))' 2>/dev/null; then break; fi
+  sleep 0.1
+done
+python3 -c 'import socket,os;s=socket.socket();s.settimeout(1);s.connect(("127.0.0.1",int(os.environ["STUB_PORT"])))' \
+  || fail "NATS stub never listened on $STUB_PORT"
+
 run_setup() {
   env -i PATH="/usr/bin:/bin" HOME="$TEST_ROOT/home" \
     AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
     APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
+    PLUGIN_ENABLED_FILE="$TEST_ROOT/plugin-enabled" \
     CALL_LOG="$TEST_ROOT/calls.log" \
     HOLDER_PIDS="$TEST_ROOT/holder-pids" \
     SUDO="$TEST_ROOT/fake-bin/sudo" \
     LAUNCHCTL="$TEST_ROOT/fake-bin/launchctl" \
     SYSTEMCTL="$TEST_ROOT/fake-bin/systemctl" \
     INSTALLER="$TEST_ROOT/fake-bin/install-oshioki-hook" \
+    SEEN_SUDO_USER="$TEST_ROOT/seen-sudo-user" \
     AGENT_BIN="$TEST_ROOT/fake-bin/oshioki-agent" \
     INSTALLED_HOOK="$TEST_ROOT/fake-bin/oshioki" \
     OSHIOKI_INSTALL_ENV="$TEST_ROOT/etc/install.env" \
     OSHIOKI_ORIGIN="${OSHIOKI_ORIGIN:-https://laptop.test}" OSHIOKI_RP_ID="laptop.test" \
-    NATS_URL="nats://127.0.0.1:4222" NATS_USER="oshioki" NATS_PASS="${NATS_PASS:-test-secret}" \
+    NATS_URL="$SETUP_NATS_URL" NATS_USER="oshioki" NATS_PASS="${NATS_PASS:-test-secret}" \
+    DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
+    "$TEST_ROOT/stage/oshioki-laptop-setup" "$@" </dev/null
+}
+
+# Like run_setup but stages no NATS values at all: the socket-only install
+# under test. Any NATS_* in the child environment would flip the script
+# into NATS mode, so none are passed.
+run_setup_local() {
+  env -i PATH="/usr/bin:/bin" HOME="$TEST_ROOT/home" \
+    AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
+    SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
+    APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
+    PLUGIN_ENABLED_FILE="$TEST_ROOT/plugin-enabled" \
+    CALL_LOG="$TEST_ROOT/calls.log" \
+    HOLDER_PIDS="$TEST_ROOT/holder-pids" \
+    SUDO="$TEST_ROOT/fake-bin/sudo" \
+    LAUNCHCTL="$TEST_ROOT/fake-bin/launchctl" \
+    SYSTEMCTL="$TEST_ROOT/fake-bin/systemctl" \
+    INSTALLER="$TEST_ROOT/fake-bin/install-oshioki-hook" \
+    SEEN_SUDO_USER="$TEST_ROOT/seen-sudo-user" \
+    AGENT_BIN="$TEST_ROOT/fake-bin/oshioki-agent" \
+    INSTALLED_HOOK="$TEST_ROOT/fake-bin/oshioki" \
+    OSHIOKI_INSTALL_ENV="$TEST_ROOT/etc/install.env" \
+    OSHIOKI_ORIGIN="${OSHIOKI_ORIGIN:-https://laptop.test}" OSHIOKI_RP_ID="laptop.test" \
     DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
     "$TEST_ROOT/stage/oshioki-laptop-setup" "$@" </dev/null
 }
 
 # Scenario A: fresh machine, identity missing, no devices. Full flow.
 DEVICES_ACTIVE=0 run_setup --yes >"$TEST_ROOT/fresh.log" 2>&1 || fail "fresh setup failed"
+grep -Fq "NATS verified at $SETUP_NATS_URL" "$TEST_ROOT/fresh.log" || fail "server setup never verified NATS"
 grep -Fq 'OSHIOKI_ORIGIN=https://laptop.test' "$TEST_ROOT/etc/install.env" || fail "origin missing from install.env"
 grep -Fq 'OSHIOKI_AGENT_SOCKET='"$AGENT_STATE/agent.sock" "$TEST_ROOT/etc/install.env" || fail "socket missing from install.env"
+[ -s "$TEST_ROOT/seen-sudo-user" ] || fail "laptop user never reached the installer"
 # Probe once: GNU stat -f prints a filesystem dump to stdout even when it
 # fails, which would poison an || fallback, so pick the working form first.
 if stat -c '%a' /dev/null >/dev/null 2>&1; then
@@ -187,7 +310,10 @@ grep -Fq 'OSHIOKI_ORIGIN=https://reconfigured.test' "$TEST_ROOT/etc/install.env"
 # Scenario D: a password with spaces and % reaches the autostart config
 # literally instead of being split or expanded.
 NASTY='p% a%s s'
+printf '%s\n' 'oshioki' "$NASTY" > "$STUB_CREDS_FILE"
 NATS_PASS="$NASTY" run_setup --yes --reconfigure >"$TEST_ROOT/nasty.log" 2>&1 || fail "nasty password setup failed"
+printf '%s\n' 'oshioki' 'test-secret' > "$STUB_CREDS_FILE"
+grep -Fq "NATS verified at $SETUP_NATS_URL" "$TEST_ROOT/nasty.log" || fail "probe rejected the nasty password"
 if [ "$(uname -s)" = Darwin ]; then
   grep -Fq "<string>$NASTY</string>" "$plist" || fail "plist mangled the password"
 else
@@ -203,6 +329,108 @@ else
   [ "$(file_mode "$agent_env")" = 600 ] || fail "agent.env is not 0600"
 fi
 
+# Scenario E: --local pairs with itself and never touches enrollment. Fresh
+# state, no NATS values staged, so the install is socket-only: no NATS keys
+# anywhere, never placeholders.
+rm -f "$TEST_ROOT/etc/install.env" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+DEVICES_ACTIVE=0 run_setup_local --local --yes >"$TEST_ROOT/local.log" 2>&1 || fail "local setup failed"
+grep -Fq 'OSHIOKI_LOCAL=1' "$TEST_ROOT/etc/install.env" || fail "local flag missing from install.env"
+if grep -Eq '^NATS_' "$TEST_ROOT/etc/install.env"; then fail "socket-only install.env claims a NATS"; fi
+if grep -Eq '^NATS_' "$APPLIED_CONFIG"; then fail "socket-only installer input claims a NATS"; fi
+grep -Fq 'device paired locally' "$TEST_ROOT/local.log" || fail "local flow never paired"
+if grep -Fq 'enrolling a new device' "$TEST_ROOT/local.log"; then fail "local flow enrolled"; fi
+[ -f "$AGENT_STATE/agent.json" ] || fail "init never created the identity"
+[ -f "$AGENT_STATE/pinned" ] || fail "pin-record never pinned"
+[ "$(grep -c '^installed ' "$TEST_ROOT/local.log")" = 2 ] || fail "plugin was not enabled after pinning"
+grep -Fq 'agent socket is live' "$TEST_ROOT/local.log" || fail "local verify never completed"
+if [ "$(uname -s)" = Darwin ]; then
+  plist="$TEST_ROOT/home/Library/LaunchAgents/com.oshioki.agent.plist"
+  if grep -Eq '<key>NATS_(URL|USER|PASS)</key>' "$plist"; then fail "socket-only plist claims a NATS"; fi
+  grep -Fq '<key>OSHIOKI_AGENT_SOCKET</key>' "$plist" || fail "socket-only plist missing agent socket"
+fi
+
+# Scenario F: --local in a repo checkout without AGENT_BIN wraps the agent
+# in Oshioki.app, so the plist (and the Touch ID sheet) uses the bundle.
+mkdir -p "$TEST_ROOT/scripts/mac" "$TEST_ROOT/target/release" "$TEST_ROOT/bundle/Oshioki.app/Contents/MacOS"
+: > "$TEST_ROOT/Cargo.toml"
+: > "$TEST_ROOT/target/release/oshioki"
+: > "$TEST_ROOT/target/release/liboshioki_plugin.dylib"
+chmod 0755 "$TEST_ROOT/target/release/oshioki" "$TEST_ROOT/target/release/liboshioki_plugin.dylib"
+cp "$TEST_ROOT/fake-bin/oshioki-agent" "$TEST_ROOT/target/release/oshioki-agent"
+BUNDLE_BIN="$TEST_ROOT/bundle/Oshioki.app/Contents/MacOS/oshioki-agent"
+cp "$TEST_ROOT/fake-bin/oshioki-agent" "$BUNDLE_BIN"
+cat > "$TEST_ROOT/scripts/mac/bundle-agent" <<SH
+#!/usr/bin/env bash
+: > "$TEST_ROOT/bundle-agent-ran"
+printf '%s\n' "$BUNDLE_BIN"
+SH
+chmod 0755 "$TEST_ROOT/scripts/mac/bundle-agent"
+rm -f "$TEST_ROOT/etc/install.env" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+DEVICES_ACTIVE=0 env -i PATH="/usr/bin:/bin" HOME="$TEST_ROOT/home" \
+  AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
+  SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
+  APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
+  PLUGIN_ENABLED_FILE="$TEST_ROOT/plugin-enabled" \
+  CALL_LOG="$TEST_ROOT/calls.log" \
+  HOLDER_PIDS="$TEST_ROOT/holder-pids" \
+  SUDO="$TEST_ROOT/fake-bin/sudo" \
+  LAUNCHCTL="$TEST_ROOT/fake-bin/launchctl" \
+  SYSTEMCTL="$TEST_ROOT/fake-bin/systemctl" \
+  INSTALLER="$TEST_ROOT/fake-bin/install-oshioki-hook" \
+  INSTALLED_HOOK="$TEST_ROOT/fake-bin/oshioki" \
+  OSHIOKI_INSTALL_ENV="$TEST_ROOT/etc/install.env" \
+  OSHIOKI_ORIGIN="https://laptop.test" OSHIOKI_RP_ID="laptop.test" \
+  NATS_URL="$SETUP_NATS_URL" NATS_USER="oshioki" NATS_PASS="test-secret" \
+  DEVICES_ACTIVE=0 \
+  "$TEST_ROOT/stage/oshioki-laptop-setup" --local --yes </dev/null >"$TEST_ROOT/bundle.log" 2>&1 || fail "local bundle setup failed"
+grep -Fq "NATS verified at $SETUP_NATS_URL" "$TEST_ROOT/bundle.log" || fail "staged NATS was never verified"
+grep -Fq "NATS_URL=$SETUP_NATS_URL" "$TEST_ROOT/etc/install.env" || fail "verified NATS missing from install.env"
+if [ "$(uname -s)" = Darwin ]; then
+  [ -f "$TEST_ROOT/bundle-agent-ran" ] || fail "local flow never built the app bundle"
+  grep -Fq "<string>$BUNDLE_BIN</string>" "$TEST_ROOT/home/Library/LaunchAgents/com.oshioki.agent.plist" \
+    || fail "plist does not run the agent from the bundle"
+fi
+grep -Fq 'agent socket is live' "$TEST_ROOT/bundle.log" || fail "local bundle verify never completed"
+
+# Scenario G: a staged NATS that answers with the wrong credentials refuses
+# the install before anything is written.
+if NATS_PASS="wrong-creds" run_setup --local --yes >"$TEST_ROOT/badprobe.log" 2>&1; then fail "staged a dead NATS"; fi
+grep -Fq 'NATS verification failed' "$TEST_ROOT/badprobe.log" || fail "dead NATS refused silently"
+
+# Scenario H: --reconfigure migrates a stale placeholder install (loopback
+# URL with local/local credentials, written before installs probed) to
+# socket-only. Pinning the same fingerprint again is idempotent.
+printf '%s\n' \
+  'OSHIOKI_ORIGIN=https://laptop.test' \
+  'OSHIOKI_RP_ID=laptop.test' \
+  'NATS_URL=nats://127.0.0.1:4222' \
+  'NATS_USER=local' \
+  'NATS_PASS=local' \
+  "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" \
+  'OSHIOKI_LOCAL=1' > "$TEST_ROOT/etc/install.env"
+rm -f "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+DEVICES_ACTIVE=0 run_setup_local --local --yes --reconfigure >"$TEST_ROOT/migrate.log" 2>&1 || fail "migration reconfigure failed"
+if grep -Eq '^NATS_' "$TEST_ROOT/etc/install.env"; then fail "migration kept placeholder NATS keys"; fi
+grep -Fq 'OSHIOKI_LOCAL=1' "$TEST_ROOT/etc/install.env" || fail "migration dropped the local flag"
+grep -Fq "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" "$TEST_ROOT/etc/install.env" || fail "migration dropped the socket"
+grep -Fq 'agent socket is live' "$TEST_ROOT/migrate.log" || fail "migration verify never completed"
+
+# Scenario I: a plain re-run against a stale placeholder install.env
+# refuses instead of reinstalling the placeholders. install.env must be
+# byte-identical afterwards: refusal happens before any write.
+printf '%s\n' \
+  'OSHIOKI_ORIGIN=https://laptop.test' \
+  'OSHIOKI_RP_ID=laptop.test' \
+  'NATS_URL=nats://127.0.0.1:4222' \
+  'NATS_USER=local' \
+  'NATS_PASS=local' \
+  "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" \
+  'OSHIOKI_LOCAL=1' > "$TEST_ROOT/etc/install.env"
+cp "$TEST_ROOT/etc/install.env" "$TEST_ROOT/install.env.before"
+if DEVICES_ACTIVE=0 run_setup_local --local --yes >"$TEST_ROOT/stale-reuse.log" 2>&1; then fail "reinstalled stale placeholders"; fi
+grep -Fq -- '--reconfigure' "$TEST_ROOT/stale-reuse.log" || fail "stale refusal never advised --reconfigure"
+cmp -s "$TEST_ROOT/etc/install.env" "$TEST_ROOT/install.env.before" || fail "refusal rewrote install.env"
+
 # Self-policing teardown: the EXIT trap removes the tree, but rm succeeds
 # even with live holders (open files unlink), so leaked processes would go
 # unnoticed behind a green run. Prove every holder died instead.
@@ -213,7 +441,7 @@ if [ -f "$TEST_ROOT/holder-pids" ]; then
   while [ "$tries" -lt 50 ] && [ "$live" -eq 1 ]; do
     live=0
     while read -r pid; do
-      if kill -0 "$pid" 2>/dev/null && [ -n "$(ps -p "$pid" -o comm= 2>/dev/null | grep -i ython || true)" ]; then
+      if kill -0 "$pid" 2>/dev/null && [ -n "$(ps -p "$pid" -o comm= 2>/dev/null | grep -iE 'ython|nc' || true)" ]; then
         live=1
       fi
     done < "$TEST_ROOT/holder-pids"

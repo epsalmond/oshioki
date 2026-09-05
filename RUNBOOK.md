@@ -23,15 +23,20 @@ sha256sum oshioki liboshioki_plugin.so > SHA256SUMS
 brew install epsalmond/oshioki/oshioki && oshioki-laptop-setup
 ```
 
-The setup script walks through five steps and is idempotent, so re-running
-it after a `brew upgrade` applies the new bottle and restarts the agent:
-writes `/etc/oshioki/install.env` (prompting for values on first run,
-`--reconfigure` to redo), dry-runs then applies the prelaunch install,
-enrolls and pairs the agent when there is no identity, installs a
-LaunchAgent (Darwin) or user systemd unit (Linux) for `oshioki-agent run`,
-and finishes with a real `sudo true` as proof. Non-interactive with `--yes`
-plus values in the environment. The manual steps below remain for
-non-brew layouts.
+The setup script is idempotent. Re-running it after a `brew upgrade`
+applies the new bottle and restarts the agent. It writes
+`/etc/oshioki/install.env` (prompting for values on first run,
+`--reconfigure` to redo), dry-runs then applies the prelaunch install
+inside one sudo elevation, enrolls and pairs the agent when there is no
+identity, installs a LaunchAgent (Darwin) or user systemd unit (Linux) for
+`oshioki-agent run`, and finishes with a real `sudo true` as proof. Run it
+as yourself, never under sudo. A root run poisons user-owned files (the app
+bundle loses its readable icon that way). Non-interactive with `--yes`
+plus values in the environment. Setup costs two Touch ID approvals, the
+elevation and the proof (plus the sudo password on a machine that has never
+run setup). Day-to-day sudo costs one approval, no password: the installer
+couples a `sudoers.d` NOPASSWD drop-in to the plugin block. The manual
+steps below remain for non-brew layouts.
 
 ## Prelaunch installer
 
@@ -76,6 +81,15 @@ sudo scripts/install-oshioki-hook --prelaunch-status
 
 The installer rejects unknown config keys, symlinks, non-root ownership, and
 modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
+With an active device it also writes `/etc/sudoers.d/oshioki`
+(`<user> ALL=(ALL) NOPASSWD: ALL`, visudo-checked), so the Touch ID approval
+is the only gate and sudo stops asking for a password. The user comes from
+`OSHIOKI_SUDO_USER` (else `SUDO_USER`); without either, or without a
+`sudoers.d` include in the main sudoers file, the installer warns and keeps
+password authentication. The block and the drop-in go away together with
+`--disable-prelaunch`, and a re-run with no active devices removes both as
+well, so an enabled plugin never fails every sudo closed on an empty
+registry. `--prelaunch-status` checks both files.
 Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 `oshioki.dylib` in the same directory.
 
@@ -121,6 +135,32 @@ travel the socket; browser WebAuthn still needs the server. Native pairing
 can be done offline (below), so one agent serves local sudo over the socket
 and remote requests over NATS at the same time.
 
+Omit `NATS_URL` from `config.env` for a socket-only host: the hook then
+never touches NATS, a silent agent denies at once, and a config naming
+neither transport fails before any request is built. Fallback failures name
+the server and the failed step (`NATS fallback to nats://host:port failed:
+connect: ...`) with credentials redacted. `oshioki-laptop-setup --local`
+writes this shape unless a NATS is staged, and probes a staged NATS before
+writing it. A stale install carrying the old `local`/`local` placeholder
+credentials migrates with `oshioki-laptop-setup --local --reconfigure`;
+a plain re-run against a stale `install.env` refuses with the same advice
+instead of reinstalling it.
+
+Revocation still needs a NATS: `oshioki revoke` publishes to the server
+and waits for its confirmation, so on a socket-only host it fails with
+`NATS_URL not set`. The revocation itself is server-side — the local
+registry is only edited after the server confirms — so point the hook at
+any reachable server NATS just for the command (sudo scrubs the
+environment, hence `env`):
+
+```bash
+sudo env NATS_URL=tls://sudo.example.com:4222 NATS_USER=<hook-user> NATS_PASS=<secret> \
+  oshioki revoke <fingerprint>
+```
+
+The fingerprint must still be pinned locally; the command removes it there
+once the server confirms.
+
 Each browser profile enrolls separately:
 
 ```bash
@@ -132,11 +172,21 @@ oshioki pin <fingerprint>
 oshioki pin-record <path>
 ```
 
-A host the server never sees pairs offline: the device exports its own
-record and the host pins it with the same fingerprint confirmation as
-`pin`, no NATS or server involved.
+A host the server never sees pairs offline with one command. It builds
+if needed, creates the identity, pins it, and starts the agent. No server.
+One sudo elevation and no typing: the fingerprint confirmation is piped,
+and `--yes` skips the apply prompt.
 
 ```bash
+oshioki-laptop-setup --local
+```
+
+The steps, spelled out for when something needs a hand: the device exports
+its own record and the host pins it with the same fingerprint confirmation
+as `pin`, no NATS or server involved.
+
+```bash
+oshioki-agent init
 oshioki-agent device-record --label <label> > /tmp/record.json
 sudo oshioki pin-record /tmp/record.json
 rm /tmp/record.json
@@ -144,7 +194,9 @@ sudo oshioki status
 ```
 
 The record carries only public material (fingerprint, public keys, label),
-so plain `rm` is enough.
+so plain `rm` is enough. The installer leaves the sudo plugin disabled
+until a device is active: enabling it on an empty registry would lock every
+sudo out, including the one that would pin the first device.
 
 The pinned device approves exactly like an enrolled one. Pairing the same
 device with the server later (plain `enroll`/`pair`) keeps the fingerprint,
@@ -154,8 +206,7 @@ so nothing pinned needs redoing.
 command a native device runs to consume the same URL. `status` prints each
 device's `kind` (`webauthn` or `secure-enclave`) next to its fingerprint.
 
-`test` publishes a synthetic request and waits for approve or deny. `watch`
-opens each request URL on Darwin without a shell.
+`test` publishes a synthetic request and waits for approve or deny.
 
 ## Mac approver
 

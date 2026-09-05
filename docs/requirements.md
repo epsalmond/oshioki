@@ -13,7 +13,8 @@ Production must provide:
 - Publish and subscribe permissions for `oshioki.verdict.*` and
   `oshioki.enrollment.*`.
 - Publish and subscribe permissions for `oshioki.device.>` (revocations and
-  their confirmations).
+  their confirmations). These apply to the `nats` transport; other transports
+  document their own.
 - A writable SQLite path set by `OSHIOKI_STATE_PATH`.
 - `OSHIOKI_ORIGIN=https://sudo.example.com` and
   `OSHIOKI_RP_ID=sudo.example.com`.
@@ -31,10 +32,9 @@ cover it the same as any other consumer.
 ## The Mac installer (future — nothing ships yet)
 
 A future Mac installer will install the packaged Darwin client. It will own
-the read-only watcher credential, LaunchAgent, `pam_tid`, laptop activation,
-and rollback.
-`watch` accepts no shell command. The optional `OSHIOKI_OPENER` test-only
-override is one executable path followed by one URL argument.
+the read-only watcher credential, LaunchAgent, the `sudoers.d` passwordless
+drop-in (coupled to the plugin block, never `pam_tid`: one Touch ID approval
+per sudo, no password), laptop activation, and rollback.
 
 Neither the runtime nor the Mac installer changes the v1 wire format. A protocol change requires a new
 version and a compatibility decision in this repository.

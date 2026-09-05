@@ -7,6 +7,25 @@
 # from the new bottle and restarts the agent. Everything needing privilege
 # goes through sudo; the NATS password never appears in output or arguments.
 #
+# --local pairs this machine with itself and needs no server: the device
+# record is exported and pinned directly, and the installer leaves the sudo
+# plugin disabled until a device is active rather than locking sudo out.
+# --local is socket-only unless a NATS is staged (NATS_URL, NATS_USER, or
+# NATS_PASS in the environment): a staged NATS is probed before anything is
+# written, and an unstaged one writes no NATS keys anywhere, never
+# placeholders. A stale placeholder install migrates with --reconfigure.
+# On macOS --local also wraps the agent in
+# Oshioki.app (scripts/mac/bundle-agent) so the Touch ID sheet shows the
+# Oshioki name and logo instead of a bare binary; set OSHIOKI_SIGN_IDENTITY
+# to sign the bundle too.
+#
+# One elevation per run: --local does all of its privileged work (config,
+# install, pin, enable) in a single sudo of this script's --privileged-phase
+# subcommand, so setup costs one approval instead of one per step. The phase
+# shows the installer's dry-run plan and asks before acting; only its
+# machine-readable value block goes to stdout, everything human-facing goes
+# to stderr. Server mode keeps its interactive multi-step flow.
+#
 # Portable to the stock macOS bash 3.2: no arrays, no associative arrays,
 # no process substitution.
 set -euo pipefail
@@ -16,16 +35,31 @@ set -euo pipefail
 # briefly world-readable before its explicit chmod runs.
 umask 077
 
+die() { echo "oshioki-laptop-setup: $*" >&2; exit 1; }
+# Everything human-facing goes to stderr: the privileged phase's stdout is a
+# machine-readable value block the outer run parses.
+info() { echo "oshioki-laptop-setup: $*" >&2; }
+
 YES=0
 RECONFIGURE=0
+LOCAL=0
+PRIVILEGED=0
+VALUES_FILE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --yes) YES=1 ;;
     --reconfigure) RECONFIGURE=1 ;;
+    --local) LOCAL=1 ;;
+    --privileged-phase) PRIVILEGED=1 ;;
+    --values-file)
+      [ "$#" -ge 2 ] || die "--values-file requires a path"
+      VALUES_FILE="$2"; shift
+      ;;
     -h|--help)
-      echo "usage: oshioki-laptop-setup [--yes] [--reconfigure]" >&2
+      echo "usage: oshioki-laptop-setup [--yes] [--reconfigure] [--local]" >&2
       echo "  --yes          accept defaults and prompts without asking" >&2
       echo "  --reconfigure  re-enter /etc/oshioki/install.env from scratch" >&2
+      echo "  --local        pair this machine with itself; no server needed" >&2
       exit 0
       ;;
     *) echo "oshioki-laptop-setup: unknown argument: $1" >&2; exit 2 ;;
@@ -33,12 +67,25 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-die() { echo "oshioki-laptop-setup: $*" >&2; exit 1; }
-info() { echo "oshioki-laptop-setup: $*"; }
+# The script elevates once by itself (step 2); running the whole thing as
+# root poisons user-owned files instead (the app bundle lost its readable
+# icon that way). The privileged phase is the only part that runs as root.
+if [ "$PRIVILEGED" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
+  die "run as yourself, not under sudo: the script elevates once by itself"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Absolute path to this script: the privileged phase re-invokes it under
+# sudo, and a bare name would not resolve there.
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+AGENT_BIN_EXPLICIT="${AGENT_BIN:-}"
+LAPTOP_USER="${SUDO_USER:-$(id -un)}"
 INSTALLER="${INSTALLER:-$SCRIPT_DIR/install-oshioki-hook}"
 AGENT_BIN="${AGENT_BIN:-$SCRIPT_DIR/oshioki-agent}"
+# Repo checkout layout keeps the built agent next to the source tree.
+if [ ! -x "$AGENT_BIN" ] && [ -x "$SCRIPT_DIR/../target/release/oshioki-agent" ]; then
+  AGENT_BIN="$SCRIPT_DIR/../target/release/oshioki-agent"
+fi
 # Brew layout keeps binaries next to this script and data one level up in
 # libexec. HOOK_BIN and friends stay empty outside that layout so the
 # installer falls back to its own repo defaults.
@@ -64,7 +111,53 @@ DEFAULT_SOCKET="$AGENT_STATE/agent.sock"
 LABEL="com.oshioki.agent"
 
 [ -x "$INSTALLER" ] || die "installer not found: $INSTALLER (set INSTALLER)"
-[ -x "$AGENT_BIN" ] || die "agent not found: $AGENT_BIN (set AGENT_BIN)"
+# Server mode needs the agent up front for pairing; local mode builds it
+# just below, so its check waits until the build block ran.
+if [ "$LOCAL" -eq 0 ]; then
+  [ -x "$AGENT_BIN" ] || die "agent not found: $AGENT_BIN (set AGENT_BIN)"
+fi
+TOTAL_STEPS=5
+if [ "$LOCAL" -eq 1 ]; then TOTAL_STEPS=4; fi
+# Repo checkout without a prior build: compile what the installer needs and
+# write the checksum manifest the installer verifies, same as the release
+# lane. Brew layouts already ship all three, so this is a no-op there.
+if [ "$LOCAL" -eq 1 ]; then
+  repo_root="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+  if [ -f "$repo_root/Cargo.toml" ]; then
+    release="$repo_root/target/release"
+    if [ ! -x "$release/oshioki" ] || [ ! -x "$release/oshioki-agent" ]; then
+      command -v cargo >/dev/null 2>&1 || die "cargo not found; install Rust or set AGENT_BIN"
+      info "building release artifacts (one time)"
+      ( cd "$repo_root" && cargo build --release -p oshioki-hook -p oshioki-plugin -p oshioki-agent )
+    fi
+    plugin="$release/liboshioki_plugin.dylib"
+    [ "$(uname -s)" = Darwin ] || plugin="$release/liboshioki_plugin.so"
+    if [ -f "$release/oshioki" ] && [ -f "$plugin" ]; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        ( cd "$release" && sha256sum oshioki "$(basename "$plugin")" > SHA256SUMS )
+      else
+        ( cd "$release" && shasum -a 256 oshioki "$(basename "$plugin")" > SHA256SUMS )
+      fi
+    fi
+    [ -x "$AGENT_BIN" ] || AGENT_BIN="$release/oshioki-agent"
+    [ -x "$AGENT_BIN" ] || die "agent not found after build: $AGENT_BIN"
+    # A bare binary makes the Touch ID sheet show a file name and the
+    # generic executable badge. The bundle makes it show the Oshioki
+    # name with the logo; every later step (identity, plist) uses
+    # AGENT_BIN, so switching it here switches all of them. An
+    # explicitly chosen agent binary is left alone.
+    if [ -z "$AGENT_BIN_EXPLICIT" ] && [ "$(uname -s)" = Darwin ] \
+      && [ -x "$repo_root/scripts/mac/bundle-agent" ]; then
+      if [ -n "${OSHIOKI_SIGN_IDENTITY:-}" ]; then
+        bundle_bin="$("$repo_root/scripts/mac/bundle-agent" --sign "$OSHIOKI_SIGN_IDENTITY")"
+      else
+        bundle_bin="$("$repo_root/scripts/mac/bundle-agent")"
+      fi
+      [ -x "$bundle_bin" ] || die "app bundle has no agent binary: $bundle_bin"
+      AGENT_BIN="$bundle_bin"
+    fi
+  fi
+fi
 
 prompt() {
   local label="$1" def="$2" var="$3" secret="$4" value
@@ -100,12 +193,322 @@ env_key() {
   $SUDO cat "$INSTALL_ENV" 2>/dev/null | awk -F= -v key="$1" '$1 == key { print substr($0, length($1) + 2); exit }'
 }
 
-run_installer() {
-  $SUDO HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
-    "$INSTALLER" "$@" --config-file "$INSTALL_ENV"
+# Parse the privileged phase's value block into the config globals.
+read_markers() {
+  local block line key value
+  block="$(printf '%s\n' "$1" | sed -n '/^OSHIOKI_SETUP_VALUES_BEGIN$/,/^OSHIOKI_SETUP_VALUES_END$/p')"
+  [ -n "$block" ] || die "privileged phase reported no configuration"
+  ORIGIN=""; RP_ID=""; NATS_URL_V=""; NATS_USER_V=""; NATS_PASS_V=""; AGENT_SOCKET_V=""
+  while IFS= read -r line; do
+    case "$line" in
+      OSHIOKI_SETUP_VALUES_BEGIN|OSHIOKI_SETUP_VALUES_END) continue ;;
+      *=*) ;;
+      *) continue ;;
+    esac
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      OSHIOKI_ORIGIN) ORIGIN="$value" ;;
+      OSHIOKI_RP_ID) RP_ID="$value" ;;
+      NATS_URL) NATS_URL_V="$value" ;;
+      NATS_USER) NATS_USER_V="$value" ;;
+      NATS_PASS) NATS_PASS_V="$value" ;;
+      OSHIOKI_AGENT_SOCKET) AGENT_SOCKET_V="$value" ;;
+      OSHIOKI_REUSED) ;;
+      *) die "unknown value from privileged phase: $key" ;;
+    esac
+  done <<<"$block"
 }
 
-info "step 1/5: installer configuration in $INSTALL_ENV"
+check_config() {
+  [ -n "$ORIGIN" ] || die "$INSTALL_ENV has no OSHIOKI_ORIGIN"
+  [ -n "$AGENT_SOCKET_V" ] || AGENT_SOCKET_V="$DEFAULT_SOCKET"
+  if [ -z "$NATS_URL_V" ]; then
+    # Socket-only: credentials without a server describe a NATS that
+    # cannot exist, so they fail here rather than at the first sudo.
+    if [ -n "$NATS_USER_V" ] || [ -n "$NATS_PASS_V" ]; then
+      die "$INSTALL_ENV has NATS credentials without NATS_URL; remove them or set a URL"
+    fi
+    return 0
+  fi
+  # The hook and agent refuse plaintext NATS past loopback at runtime; say so
+  # now rather than failing the first sudo afterwards. Production uses tls://.
+  case "$NATS_URL_V" in
+    [Tt][Ll][Ss]://*|[Nn][Aa][Tt][Ss]://localhost*|[Nn][Aa][Tt][Ss]://127.*|[Nn][Aa][Tt][Ss]://\[::1\]*|[Nn][Aa][Tt][Ss]://:*) ;;
+    [Nn][Aa][Tt][Ss]://*) info "warning: NATS_URL is plaintext to a non-loopback host; add OSHIOKI_ALLOW_PLAINTEXT_NATS=1 to $INSTALL_ENV (testing only) or switch to tls:// (see README.md)" ;;
+  esac
+}
+
+run_installer() {
+  # A bare `$SUDO` prefix breaks on the stock macOS bash 3.2 when SUDO is
+  # empty (it tries to run the first VAR= as a command), so the unprivileged
+  # call spells its environment out instead of prefixing nothing.
+  if [ -n "${SUDO:-}" ]; then
+    $SUDO HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
+      OSHIOKI_SUDO_USER="${OSHIOKI_SUDO_USER:-$LAPTOP_USER}" \
+      "$INSTALLER" "$@" --config-file "$INSTALL_ENV"
+  else
+    HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
+      OSHIOKI_SUDO_USER="${OSHIOKI_SUDO_USER:-$LAPTOP_USER}" \
+      "$INSTALLER" "$@" --config-file "$INSTALL_ENV"
+  fi
+}
+
+# True when a unix socket at $1 accepts a connection. The socket file
+# outlives its listener across agent restarts, so presence proves nothing.
+socket_live() {
+  python3 -c 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(2);s.connect(sys.argv[1])' "$1" 2>/dev/null
+}
+
+# Verify a NATS server answers and the credentials open it: TCP connect,
+# INFO with auth_required honored, CONNECT accepted. Status 0 means the
+# hook and agent will be able to use these values; anything else prints
+# the failing step. $1 url, $2 user, $3 pass.
+nats_probe() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" "$2" "$3" <<'PYEOF'
+import json, socket, ssl, sys
+from urllib.parse import urlsplit
+url, user, password = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    parts = urlsplit(url)
+    host, port = parts.hostname, parts.port or 4222
+except Exception:
+    sys.exit("NATS probe: unparseable URL: %s" % url)
+if not host:
+    sys.exit("NATS probe: no host in URL: %s" % url)
+if parts.scheme.lower() not in ("nats", "tls"):
+    sys.exit("NATS probe: unsupported scheme in URL: %s" % url)
+try:
+    sock = socket.create_connection((host, port), timeout=4)
+except OSError as error:
+    sys.exit("NATS probe: cannot reach %s:%s: %s" % (host, port, error))
+if parts.scheme.lower() == "tls":
+    try:
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+    except ssl.SSLError as error:
+        sys.exit("NATS probe: TLS to %s:%s failed: %s" % (host, port, error))
+lines = b""
+while b"\r\n" not in lines:
+    chunk = sock.recv(4096)
+    if not chunk:
+        sys.exit("NATS probe: server closed the connection before INFO")
+    lines += chunk
+try:
+    info = json.loads(lines.split(b"\r\n", 1)[0].split(None, 1)[1])
+except Exception:
+    sys.exit("NATS probe: unreadable server INFO")
+if info.get("nonce"):
+    sys.exit("NATS probe: server wants NKey auth, which setup does not configure")
+required = info.get("auth_required", False)
+if required and (not user or not password):
+    sys.exit("NATS probe: server requires credentials and none were given")
+if (user or password) and not (user and password):
+    sys.exit("NATS probe: NATS user and password must be set together")
+hello = {"verbose": False, "pedantic": False}
+if user and password:
+    # The protocol field is `pass`, not `password`: a wrong name fails
+    # authentication the same way a wrong secret does, with no hint.
+    hello.update(user=user, **{"pass": password})
+sock.sendall(("CONNECT %s\r\nPING\r\n" % json.dumps(hello)).encode())
+rest = lines.split(b"\r\n", 1)[1]
+while rest.count(b"\r\n") < 1:
+    chunk = sock.recv(4096)
+    if not chunk:
+        sys.exit("NATS probe: server closed the connection during CONNECT")
+    rest += chunk
+reply = rest.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+if reply.startswith("-ERR"):
+    sys.exit("NATS probe: server rejected the connection: %s" % reply)
+if reply != "PONG":
+    sys.exit("NATS probe: unexpected server reply: %s" % reply)
+PYEOF
+    return "$?"
+  fi
+  # No python3: reachability only, which cannot verify credentials. Say so
+  # rather than writing values that fail at the first sudo.
+  nats_probe_reachable "$1" || return 1
+  if [ -n "$2" ] || [ -n "$3" ]; then
+    info "warning: $1 is reachable but credentials were not verified (no python3); a wrong user or password fails at the first sudo"
+  fi
+  return 0
+}
+
+# True when $1 (a NATS URL) accepts TCP. Scheme, userinfo, path, and
+# brackets are stripped; only reachability is tested.
+nats_probe_reachable() {
+  local rest hostport host port
+  rest="${1#*://}"; rest="${rest%%/*}"; rest="${rest%%\?*}"
+  hostport="${rest##*@}"
+  case "$hostport" in
+    \[*\]*) host="$(printf '%s' "$hostport" | sed 's/^\[//; s/\].*//')"
+      port="$(printf '%s' "$hostport" | sed 's/^[^]]*\]//; s/^://')" ;;
+    *) host="${hostport%%:*}"; port="${hostport##*:}" ;;
+  esac
+  [ -n "$host" ] || { echo "NATS probe: no host in URL: $1" >&2; return 1; }
+  # A bare host carries itself as the "port" (no colon to split on), and a
+  # bracketed IPv6 host with no port yields an empty one; both mean 4222.
+  if [ -z "$port" ] || [ "$host" = "$port" ]; then port=4222; fi
+  if [ "$(uname -s)" = Darwin ]; then
+    nc -z -G 2 "$host" "$port" 2>/dev/null
+  else
+    nc -z -w 2 "$host" "$port" 2>/dev/null
+  fi || { echo "NATS probe: cannot reach $host:$port" >&2; return 1; }
+}
+
+# The single privileged step of --local, run once under sudo by the outer
+# flow. Writes install.env from the values file (or reuses it), shows the
+# installer's dry-run plan, asks once, then installs, pins, enables, and
+# verifies. Prints only the effective configuration on stdout, between
+# markers, for the outer run to parse; everything else goes to stderr.
+# Already root here, so the installer and hook run directly: no nested sudo,
+# no further approvals.
+privileged_phase_local() {
+  [ "$LOCAL" -eq 1 ] || die "the privileged phase supports --local only"
+  [ "$(id -u)" -eq 0 ] || echo "oshioki-laptop-setup: warning: privileged phase running unprivileged; writes will fail" >&2
+  [ -n "$VALUES_FILE" ] && [ -f "$VALUES_FILE" ] || die "--values-file is required"
+  [ -x "$INSTALLER" ] || die "installer not found: $INSTALLER"
+  [ -n "${OSHIOKI_RECORD:-}" ] && [ -f "$OSHIOKI_RECORD" ] || die "device record is required (set OSHIOKI_RECORD)"
+  local line key value
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    case "$line" in *=*) ;; *) die "invalid values line" ;; esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      OSHIOKI_ORIGIN) PHASE_ORIGIN="$value" ;;
+      OSHIOKI_RP_ID) PHASE_RP_ID="$value" ;;
+      NATS_URL) PHASE_NATS_URL="$value" ;;
+      NATS_USER) PHASE_NATS_USER="$value" ;;
+      NATS_PASS) PHASE_NATS_PASS="$value" ;;
+      OSHIOKI_AGENT_SOCKET) PHASE_AGENT_SOCKET="$value" ;;
+      *) die "unknown values key: $key" ;;
+    esac
+  done < "$VALUES_FILE"
+  rm -f "$VALUES_FILE"
+  [ -n "${PHASE_ORIGIN:-}" ] || die "values file has no OSHIOKI_ORIGIN"
+  # No NATS keys in the values means socket-only: the outer flow probes a
+  # staged NATS before writing it here, so whatever arrives verified stays,
+  # and whatever is absent is omitted rather than placeholdered.
+  if [ -f "$INSTALL_ENV" ] && [ "$RECONFIGURE" -eq 0 ]; then
+    # Reuse keeps the existing file byte-for-byte, so the reported values
+    # must be what is actually installed. A stale file whose transports no
+    # longer match what this run staged — notably the old unprobed
+    # placeholders — refuses instead of silently reinstating them: the
+    # installer would write them into config.env while the agent side went
+    # socket-only. Values are plain KEY=VALUE lines; sed reads them rather
+    # than sourcing, so hostile content cannot execute.
+    reused_key() { sed -n "s/^$1=//p" "$INSTALL_ENV" | head -1; }
+    if [ "$(reused_key NATS_URL)" != "${PHASE_NATS_URL:-}" ] \
+      || [ "$(reused_key NATS_USER)" != "${PHASE_NATS_USER:-}" ] \
+      || [ "$(reused_key NATS_PASS)" != "${PHASE_NATS_PASS:-}" ] \
+      || [ "$(reused_key OSHIOKI_AGENT_SOCKET)" != "${PHASE_AGENT_SOCKET:-$DEFAULT_SOCKET}" ]; then
+      die "existing $INSTALL_ENV names different transports than this run staged (stale NATS placeholders?); re-run with --reconfigure to rewrite it"
+    fi
+    info "reusing existing $INSTALL_ENV (pass --reconfigure to redo it)"
+    PHASE_REUSED=1
+  else
+    info "writing $INSTALL_ENV"
+    mkdir -p "$(dirname "$INSTALL_ENV")"
+    {
+      printf 'OSHIOKI_ORIGIN=%s\n' "$PHASE_ORIGIN"
+      printf 'OSHIOKI_RP_ID=%s\n' "${PHASE_RP_ID:-localhost}"
+      if [ -n "${PHASE_NATS_URL:-}" ]; then
+        printf 'NATS_URL=%s\n' "$PHASE_NATS_URL"
+        printf 'NATS_USER=%s\n' "${PHASE_NATS_USER:-}"
+        printf 'NATS_PASS=%s\n' "${PHASE_NATS_PASS:-}"
+      fi
+      printf 'OSHIOKI_AGENT_SOCKET=%s\n' "${PHASE_AGENT_SOCKET:-$DEFAULT_SOCKET}"
+      printf 'OSHIOKI_LOCAL=1\n'
+    } > "$INSTALL_ENV"
+    chmod 0600 "$INSTALL_ENV"
+    PHASE_REUSED=0
+  fi
+  SUDO="" run_installer --prelaunch --dry-run >&2
+  if [ "$YES" -eq 0 ]; then
+    printf 'Apply the plan above? [y/N]: ' >&2
+    IFS= read -r answer || true
+    [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "aborted; re-run when ready"
+  fi
+  SUDO="" run_installer --prelaunch >&2
+  [ -x "$INSTALLED_HOOK" ] || die "installed hook not found: $INSTALLED_HOOK (set INSTALLED_HOOK)"
+  # The outer run exported the record and answers the confirmation itself,
+  # so pinning never types the fingerprint.
+  printf '%s\n' "${OSHIOKI_FINGERPRINT:-}" | "$INSTALLED_HOOK" pin-record "$OSHIOKI_RECORD" >&2
+  rm -f "$OSHIOKI_RECORD"
+  info "device paired locally"
+  if ! SUDO="" run_installer --prelaunch-status >&2; then
+    info "enabling the sudo plugin now that a device is active"
+    SUDO="" run_installer --prelaunch >&2
+  fi
+  SUDO="" run_installer --prelaunch-status >&2 || die "plugin is not enabled after install"
+  printf '%s\n' 'OSHIOKI_SETUP_VALUES_BEGIN'
+  printf 'OSHIOKI_ORIGIN=%s\n' "$PHASE_ORIGIN"
+  printf 'OSHIOKI_RP_ID=%s\n' "${PHASE_RP_ID:-localhost}"
+  if [ -n "${PHASE_NATS_URL:-}" ]; then
+    printf 'NATS_URL=%s\n' "$PHASE_NATS_URL"
+    printf 'NATS_USER=%s\n' "${PHASE_NATS_USER:-}"
+    printf 'NATS_PASS=%s\n' "${PHASE_NATS_PASS:-}"
+  fi
+  printf 'OSHIOKI_AGENT_SOCKET=%s\n' "${PHASE_AGENT_SOCKET:-$DEFAULT_SOCKET}"
+  printf 'OSHIOKI_REUSED=%s\n' "$PHASE_REUSED"
+  printf '%s\n' 'OSHIOKI_SETUP_VALUES_END'
+}
+
+if [ "$PRIVILEGED" -eq 1 ]; then
+  privileged_phase_local
+  exit "$?"
+fi
+
+if [ "$LOCAL" -eq 1 ]; then
+  info "step 1/$TOTAL_STEPS: agent identity and configuration"
+  [ -x "$AGENT_BIN" ] || die "agent not found: $AGENT_BIN (set AGENT_BIN)"
+  mkdir -p "$AGENT_STATE"
+  if ! "$AGENT_BIN" show >/dev/null 2>&1; then
+    info "no agent identity; creating one (no server involved)"
+    "$AGENT_BIN" init
+  else
+    info "agent identity present"
+  fi
+  # Exported here, pinned by the privileged phase: the record crosses the
+  # boundary as a file, never as arguments.
+  record="$(mktemp "${TMPDIR:-/tmp}/oshioki-record.XXXXXX")"
+  "$AGENT_BIN" device-record --label "$(hostname -s 2>/dev/null || hostname)" > "$record"
+  fingerprint="$(grep '"fingerprint":' "$record" | sed -e 's/^[^:]*:[[:space:]]*"//' -e 's/".*$//' || true)"
+  [ -n "$fingerprint" ] || { rm -f "$record"; die "device record has no fingerprint"; }
+  info "pinning device $fingerprint"
+  # NATS is opt-in: any staged NATS_* value means a server exists to
+  # verify, and it is probed before anything is written. Otherwise the
+  # install is socket-only and no NATS keys are staged anywhere, neither
+  # here nor by the privileged phase: a config must never claim a
+  # transport that was not verified live.
+  if [ -n "${NATS_URL+set}" ] || [ -n "${NATS_USER+set}" ] || [ -n "${NATS_PASS+set}" ]; then
+    NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
+    NATS_USER="${NATS_USER:-}"
+    NATS_PASS="${NATS_PASS:-}"
+    nats_probe "$NATS_URL" "$NATS_USER" "$NATS_PASS" \
+      || die "NATS verification failed; fix the server or unset NATS_URL/NATS_USER/NATS_PASS for a socket-only install"
+    info "NATS verified at $NATS_URL"
+  else
+    NATS_URL=""; NATS_USER=""; NATS_PASS=""
+    info "socket-only install: no NATS values staged, so none will be written"
+  fi
+  # Staged for the privileged phase, which writes install.env itself (or
+  # reuses it) and reports the effective values back.
+  values="$(mktemp "${TMPDIR:-/tmp}/oshioki-values.XXXXXX")"
+  {
+    printf 'OSHIOKI_ORIGIN=%s\n' "${OSHIOKI_ORIGIN:-https://localhost}"
+    printf 'OSHIOKI_RP_ID=%s\n' "${OSHIOKI_RP_ID:-localhost}"
+    if [ -n "$NATS_URL" ]; then
+      printf 'NATS_URL=%s\n' "$NATS_URL"
+      printf 'NATS_USER=%s\n' "$NATS_USER"
+      printf 'NATS_PASS=%s\n' "$NATS_PASS"
+    fi
+    printf 'OSHIOKI_AGENT_SOCKET=%s\n' "${OSHIOKI_AGENT_SOCKET:-$DEFAULT_SOCKET}"
+  } > "$values"
+  chmod 0600 "$values"
+fi
+if [ "$LOCAL" -eq 0 ]; then
+info "step 1/$TOTAL_STEPS: installer configuration in $INSTALL_ENV"
 $SUDO mkdir -p "$(dirname "$INSTALL_ENV")"
 if [ ! -f "$INSTALL_ENV" ] || [ "$RECONFIGURE" -eq 1 ]; then
   prompt "WebAuthn origin" "${OSHIOKI_ORIGIN:-}" ORIGIN 0
@@ -126,22 +529,43 @@ if [ ! -f "$INSTALL_ENV" ] || [ "$RECONFIGURE" -eq 1 ]; then
 else
   info "reusing existing $INSTALL_ENV (pass --reconfigure to redo it)"
 fi
+fi
+if [ "$LOCAL" -eq 0 ]; then
 ORIGIN="$(env_key OSHIOKI_ORIGIN)"
 NATS_URL_V="$(env_key NATS_URL)"
 NATS_USER_V="$(env_key NATS_USER)"
 NATS_PASS_V="$(env_key NATS_PASS)"
 AGENT_SOCKET_V="$(env_key OSHIOKI_AGENT_SOCKET)"
-[ -n "$ORIGIN" ] || die "$INSTALL_ENV has no OSHIOKI_ORIGIN"
-[ -n "$NATS_URL_V" ] || die "$INSTALL_ENV has no NATS_URL"
-[ -n "$AGENT_SOCKET_V" ] || AGENT_SOCKET_V="$DEFAULT_SOCKET"
-# The hook and agent refuse plaintext NATS past loopback at runtime; say so
-# now rather than failing the first sudo afterwards. Production uses tls://.
-case "$NATS_URL_V" in
-  [Tt][Ll][Ss]://*|[Nn][Aa][Tt][Ss]://localhost*|[Nn][Aa][Tt][Ss]://127.*|[Nn][Aa][Tt][Ss]://\[::1\]*|[Nn][Aa][Tt][Ss]://:*) ;;
-  [Nn][Aa][Tt][Ss]://*) info "warning: NATS_URL is plaintext to a non-loopback host; add OSHIOKI_ALLOW_PLAINTEXT_NATS=1 to $INSTALL_ENV (testing only) or switch to tls:// (see README.md)" ;;
-esac
+check_config
+# Server installs name a NATS, so verify it before any elevation: a dead
+# or miscredentialed server must fail here, not at the first sudo. An
+# empty URL is the socket-only shape check_config accepts; there is
+# nothing to probe then.
+if [ -n "$NATS_URL_V" ]; then
+  nats_probe "$NATS_URL_V" "$NATS_USER_V" "$NATS_PASS_V" \
+    || die "NATS verification failed for $NATS_URL_V"
+  info "NATS verified at $NATS_URL_V"
+fi
+fi
 
-info "step 2/5: prelaunch install"
+if [ "$LOCAL" -eq 1 ]; then
+  info "step 2/$TOTAL_STEPS: privileged install (one approval)"
+  # Everything privileged happens in this one sudo: config, install, pin,
+  # enable. Flags forward; the empty expansion vanishes.
+  phase_flags=""
+  if [ "$YES" -eq 1 ]; then phase_flags="--yes"; fi
+  if [ "$RECONFIGURE" -eq 1 ]; then phase_flags="$phase_flags --reconfigure"; fi
+  # shellcheck disable=SC2086: phase_flags intentionally splits.
+  phase_out="$($SUDO HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
+    OSHIOKI_SUDO_USER="$LAPTOP_USER" OSHIOKI_INSTALL_ENV="$INSTALL_ENV" \
+    INSTALLER="$INSTALLER" INSTALLED_HOOK="$INSTALLED_HOOK" OSHIOKI_RECORD="$record" \
+    OSHIOKI_FINGERPRINT="$fingerprint" \
+    "$SCRIPT_PATH" --privileged-phase --local --values-file "$values" $phase_flags)"
+  rm -f "$values" "$record"
+  read_markers "$phase_out"
+  check_config
+else
+info "step 2/$TOTAL_STEPS: prelaunch install"
 run_installer --prelaunch --dry-run
 if [ "$YES" -eq 0 ]; then
   printf 'Apply the plan above? [y/N]: ' >&2
@@ -149,8 +573,10 @@ if [ "$YES" -eq 0 ]; then
   [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "aborted; re-run when ready"
 fi
 run_installer --prelaunch
+fi
 
-info "step 3/5: agent identity"
+if [ "$LOCAL" -eq 0 ]; then
+info "step 3/$TOTAL_STEPS: agent identity"
 [ -x "$INSTALLED_HOOK" ] || die "installed hook not found: $INSTALLED_HOOK (set INSTALLED_HOOK)"
 mkdir -p "$AGENT_STATE"
 cleanup_enroll() {
@@ -185,8 +611,20 @@ if $SUDO "$INSTALLED_HOOK" status 2>/dev/null | grep -q 'active=true'; then
 else
   info "host has no active devices yet; pair a device to approve requests"
 fi
+fi
+# Server mode pairs after installing, so enabling may still be pending; the
+# privileged phase already did this strictly for local mode. This is a
+# no-op when the block is already there.
+if [ "$LOCAL" -eq 0 ]; then
+if ! run_installer --prelaunch-status >/dev/null 2>&1; then
+  info "enabling the sudo plugin now that a device is active"
+  run_installer --prelaunch
+fi
+fi
 
-info "step 4/5: agent autostart"
+if [ "$LOCAL" -eq 1 ]; then AUTOSTART_STEP=3; VERIFY_STEP=4; else AUTOSTART_STEP=4; VERIFY_STEP=5; fi
+
+info "step $AUTOSTART_STEP/$TOTAL_STEPS: agent autostart"
 case "$(uname -s)" in
   Darwin)
     plist_dir="${LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"
@@ -200,9 +638,14 @@ case "$(uname -s)" in
       printf '  <key>Label</key><string>%s</string>\n' "$LABEL"
       printf '  <key>ProgramArguments</key><array><string>%s</string><string>run</string></array>\n' "$(xml_escape "$AGENT_BIN")"
       printf '%s\n' '  <key>EnvironmentVariables</key><dict>'
-      printf '    <key>NATS_URL</key><string>%s</string>\n' "$(xml_escape "$NATS_URL_V")"
-      printf '    <key>NATS_USER</key><string>%s</string>\n' "$(xml_escape "$NATS_USER_V")"
-      printf '    <key>NATS_PASS</key><string>%s</string>\n' "$(xml_escape "$NATS_PASS_V")"
+      # Socket-only writes no NATS keys at all: the agent would otherwise
+      # log an authorization failure on every start against a server that
+      # was never there.
+      if [ -n "$NATS_URL_V" ]; then
+        printf '    <key>NATS_URL</key><string>%s</string>\n' "$(xml_escape "$NATS_URL_V")"
+        printf '    <key>NATS_USER</key><string>%s</string>\n' "$(xml_escape "$NATS_USER_V")"
+        printf '    <key>NATS_PASS</key><string>%s</string>\n' "$(xml_escape "$NATS_PASS_V")"
+      fi
       printf '    <key>OSHIOKI_AGENT_SOCKET</key><string>%s</string>\n' "$(xml_escape "$AGENT_SOCKET_V")"
       printf '    <key>OSHIOKI_AGENT_STATE</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE")"
       printf '%s\n' '  </dict>'
@@ -226,9 +669,11 @@ case "$(uname -s)" in
       # dir the booted agent must agree on with the hook.
       agent_env="$AGENT_STATE/agent.env"
       {
-        printf 'NATS_URL=%s\n' "$NATS_URL_V"
-        printf 'NATS_USER=%s\n' "$NATS_USER_V"
-        printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
+        if [ -n "$NATS_URL_V" ]; then
+          printf 'NATS_URL=%s\n' "$NATS_URL_V"
+          printf 'NATS_USER=%s\n' "$NATS_USER_V"
+          printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
+        fi
         printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET_V"
         printf 'OSHIOKI_AGENT_STATE=%s\n' "$AGENT_STATE"
       } > "$agent_env"
@@ -251,14 +696,27 @@ case "$(uname -s)" in
   *) die "unsupported operating system: $(uname -s)" ;;
 esac
 
-info "step 5/5: verify"
+info "step $VERIFY_STEP/$TOTAL_STEPS: verify"
+# Local mode verified the plugin strictly inside the privileged phase;
+# server mode checks it here, after pairing.
+if [ "$LOCAL" -eq 0 ]; then
 run_installer --prelaunch-status
-for _ in $(seq 1 15); do
-  [ -S "$AGENT_SOCKET_V" ] && break
-  sleep 1
-done
-[ -S "$AGENT_SOCKET_V" ] || die "agent socket never appeared at $AGENT_SOCKET_V; see $AGENT_STATE/agent.log"
-$SUDO -V >/dev/null
+fi
+# The socket file outlives its listener across agent restarts (notably the
+# autostart cycle just above), so wait for a live listener, not a path.
+if command -v python3 >/dev/null 2>&1; then
+  for _ in $(seq 1 30); do
+    socket_live "$AGENT_SOCKET_V" && break
+    sleep 1
+  done
+  socket_live "$AGENT_SOCKET_V" || die "agent socket never answered at $AGENT_SOCKET_V; see $AGENT_STATE/agent.log"
+else
+  for _ in $(seq 1 15); do
+    [ -S "$AGENT_SOCKET_V" ] && break
+    sleep 1
+  done
+  [ -S "$AGENT_SOCKET_V" ] || die "agent socket never appeared at $AGENT_SOCKET_V; see $AGENT_STATE/agent.log"
+fi
 if [ -t 0 ]; then
   info "final proof: one real sudo (a Touch ID prompt is coming)"
   $SUDO true || die "sudo true was denied; see $AGENT_STATE/agent.log"

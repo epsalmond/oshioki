@@ -43,8 +43,7 @@ then wire up the hook with `scripts/install-oshioki-hook` — see the
 
 ## Configure
 
-You need a reachable NATS server with JetStream alongside the Oshioki server
-(for now) — see [docs/configuration.md](docs/configuration.md).
+You need a reachable NATS server with JetStream alongside the Oshioki server. `OSHIOKI_TRANSPORT` selects the transport; the default is `nats`. Others are planned (#6, #7).
 
 NATS connections past your own machine require TLS: use `tls://` URLs, with
 the server presenting a certificate your system trusts (hostname-verified
@@ -71,8 +70,8 @@ oshioki-agent pair '<enrollment-url>' --label <label>
 oshioki-agent run
 ```
 
-From then on, sudo requests will ask for your fingerprint to approve. Details in
-[docs/native-agent.md](docs/native-agent.md) and
+From then on, each sudo request costs one fingerprint tap to approve, no
+password. Details in [docs/native-agent.md](docs/native-agent.md) and
 [docs/mac-approvals.md](docs/mac-approvals.md).
 
 ```bash

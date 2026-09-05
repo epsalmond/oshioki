@@ -71,6 +71,19 @@ enum Verb {
     },
     /// Print this device's fingerprint.
     Show,
+    /// Create this device's identity without enrolling it. For offline
+    /// pairing: `device-record` reads what `init` writes.
+    Init {
+        /// Where the signing key lives. Defaults to the Secure Enclave on
+        /// macOS and to a software key everywhere else. Ignored when this
+        /// device already has an identity, unless it disagrees with it.
+        #[arg(long, value_enum)]
+        signer: Option<SignerArg>,
+        /// Replace an existing identity. The device gets a new fingerprint,
+        /// so every record pinned for the old one should be revoked.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print this device's public record for offline pairing (`oshioki
     /// pin-record`). Read-only: no NATS, no server, no prompt.
     DeviceRecord {
@@ -156,10 +169,22 @@ async fn main() -> Result<()> {
         }
         Verb::DeviceRecord { label } => {
             let identity = Identity::load(&identity_path)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&identity.device_record(&label))?
-            );
+            let record = identity.device_record(&label);
+            record.validate().context("device record")?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            Ok(())
+        }
+        Verb::Init { signer, force } => {
+            let identity = load_or_create(
+                &identity_path,
+                &Pairing {
+                    requested: requested_signer_kind(signer),
+                    default: signer_kind(signer),
+                    force,
+                },
+            )?;
+            println!("{}", identity.fingerprint());
+            println!("signer: {}", identity.signer_kind());
             Ok(())
         }
     }
@@ -450,6 +475,13 @@ async fn cmd_run(
 async fn subscribe_requests(
     identity: &Identity,
 ) -> Result<Option<(async_nats::Client, async_nats::Subscriber)>> {
+    // Unset and unreachable are different states: the first is a
+    // socket-only install answering exactly what it was told to, the second
+    // is a fallback worth warning about.
+    if env_nonempty("NATS_URL").is_none() {
+        info!("NATS_URL is not set; answering socket requests only (socket-only)");
+        return Ok(None);
+    }
     let nats = match connect_nats().await {
         Ok(nats) => nats,
         Err(error) => {
@@ -973,14 +1005,20 @@ fn prompt_output(request_id: &str, summary: &str, stdout_is_terminal: bool) -> S
     }
 }
 
+/// Reads an environment variable with empty counting as unset, so generated
+/// files can carry blank values without changing the transport set.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 async fn connect_nats() -> Result<async_nats::Client> {
-    let url = std::env::var("NATS_URL").context("NATS_URL is not set")?;
+    let url = env_nonempty("NATS_URL").context("NATS_URL is not set")?;
     let mut options = async_nats::ConnectOptions::new();
     // Half a credential is a misconfiguration, not a request for an anonymous
     // connection; the hook and the server both require the pair.
-    match (std::env::var("NATS_USER"), std::env::var("NATS_PASS")) {
-        (Ok(user), Ok(pass)) => options = options.user_and_password(user, pass),
-        (Err(_), Err(_)) => {}
+    match (env_nonempty("NATS_USER"), env_nonempty("NATS_PASS")) {
+        (Some(user), Some(pass)) => options = options.user_and_password(user, pass),
+        (None, None) => {}
         _ => bail!("set both NATS_USER and NATS_PASS, or neither"),
     }
     check_nats_url(
@@ -1238,6 +1276,26 @@ mod tests {
         let cli =
             Cli::try_parse_from(["oshioki-agent", "device-record", "--label", "mbp"]).unwrap();
         assert!(matches!(cli.verb, Verb::DeviceRecord { .. }));
+    }
+
+    #[test]
+    fn init_takes_signer_and_force() {
+        let cli = Cli::try_parse_from(["oshioki-agent", "init", "--signer", "software"]).unwrap();
+        assert!(matches!(
+            cli.verb,
+            Verb::Init {
+                signer: Some(_),
+                force: false
+            }
+        ));
+        let cli = Cli::try_parse_from(["oshioki-agent", "init", "--force"]).unwrap();
+        assert!(matches!(
+            cli.verb,
+            Verb::Init {
+                signer: None,
+                force: true
+            }
+        ));
     }
 
     /// A hostile environment cannot scroll the command off the screen: long
