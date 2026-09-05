@@ -519,12 +519,15 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     let remaining = u64::try_from(state.expires_at - now()).context("enrollment expiry")?;
     let submission_deadline = tokio::time::Instant::now()
         + Duration::from_secs(remaining.min(ENROLLMENT_TIMEOUT.as_secs()));
-    // The URL goes to the operator before the wait begins: the browser or
-    // native agent must hold it while `enroll` blocks on the submission.
+    // Deliver the intent first so the enrollment URL never outruns the row
+    // the server builds from it: publish, confirm, then print, then wait.
+    let reply_stream = transport.publish_enrollment_intent(&intent).await?;
     println!(
         "Enrollment URL (expires in five minutes):\n  {enrollment_url}\nNative agent:\n  oshioki-agent pair '{enrollment_url}'"
     );
-    let submission = transport.enroll(&intent, submission_deadline).await?;
+    let submission = transport
+        .await_submission(&state.enrollment_id, reply_stream, submission_deadline)
+        .await?;
     let device = match &submission {
         EnrollmentSubmissionV1::Webauthn(submission) => {
             verify_enrollment_v1(submission, &secret_bytes, &config).context("verify enrollment")?

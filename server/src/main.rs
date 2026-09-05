@@ -18,7 +18,7 @@ use oshioki_protocol::{
     ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
     RequestEnvelopeV1, SealedDeviceBodyV1,
 };
-use oshioki_transport::{NatsTransport, ServerTransport};
+use oshioki_transport::{Ack, JetStreamMessage, NatsTransport, ServerTransport};
 use serde::Serialize;
 use serde_json::json;
 use std::{
@@ -181,10 +181,13 @@ async fn request_consumer(state: AppState) -> Result<()> {
             }
         };
         for message in batch? {
-            let raw = message.payload.as_slice();
+            // Payload and acknowledgement split apart: the ack closure is
+            // single-use, and every arm below consumes it exactly once.
+            let JetStreamMessage { payload, ack } = message;
+            let raw = payload.as_slice();
             if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
                 warn!(bytes = raw.len(), "terminating oversized request envelope");
-                (message.term).await?;
+                ack(Ack::Term).await?;
                 state.consumer_last_ok.store(now(), Ordering::Relaxed);
                 continue;
             }
@@ -192,7 +195,7 @@ async fn request_consumer(state: AppState) -> Result<()> {
                 Ok(value) => value,
                 Err(error) => {
                     warn!(%error, "terminating malformed request envelope");
-                    (message.term).await?;
+                    ack(Ack::Term).await?;
                     state.consumer_last_ok.store(now(), Ordering::Relaxed);
                     continue;
                 }
@@ -202,15 +205,15 @@ async fn request_consumer(state: AppState) -> Result<()> {
                     if result == InsertResult::Inserted {
                         queue_notification(&state, &envelope)?;
                     }
-                    (message.ack).await?;
+                    ack(Ack::Ok).await?;
                 }
                 Ok(InsertResult::Conflict) => {
                     warn!(request_id=%envelope.request_id, "terminating conflicting request id reuse");
-                    (message.term).await?;
+                    ack(Ack::Term).await?;
                 }
                 Err(error) => {
                     warn!(%error, "terminating invalid or expired request");
-                    (message.term).await?;
+                    ack(Ack::Term).await?;
                 }
             }
             state.consumer_last_ok.store(now(), Ordering::Relaxed);
@@ -1104,8 +1107,9 @@ mod tests {
     }
 
     /// The request consumer double-acks identifiable requests and term-
-    /// rejects malformed or conflicting envelopes through the transport
-    /// seam, preserving the store/derive-contract: the request rows land before the ack.
+    /// rejects oversized, malformed, or conflicting envelopes through the
+    /// transport seam, preserving the store contract: the request row lands
+    /// before the ack.
     #[tokio::test]
     async fn mock_transport_drives_request_consumer() {
         async fn wait_for(rx: &std::sync::mpsc::Receiver<()>, what: &str) {
@@ -1151,6 +1155,13 @@ mod tests {
         let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
         let (term_tx, term_rx) = std::sync::mpsc::channel::<()>();
         let transport = oshioki_transport::MockTransport::new();
+        // Oversized envelopes are terminated on length alone, before any
+        // parse: a redelivery would only cost the same bytes again.
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            payload: vec![b'x'; oshioki_protocol::v1::MAX_ENVELOPE_BYTES + 1],
+            on_term: Some(term_tx.clone()),
+            on_ack: None,
+        });
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
             payload: b"not json".to_vec(),
             on_term: Some(term_tx.clone()),
@@ -1177,8 +1188,10 @@ mod tests {
             ntfy_url: None,
         };
         let worker = tokio::spawn(request_consumer(state));
-        // Malformed → term; valid → ack; conflict → term. Poll without
-        // blocking so the single-threaded runtime keeps driving the worker.
+        // Oversized → term; malformed → term; valid → ack; conflict → term.
+        // Poll without blocking so the single-threaded runtime keeps driving
+        // the worker.
+        wait_for(&term_rx, "oversized envelope term").await;
         wait_for(&term_rx, "malformed envelope term").await;
         wait_for(&ack_rx, "valid request ack").await;
         wait_for(&term_rx, "conflicting request term").await;

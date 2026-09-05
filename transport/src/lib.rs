@@ -37,11 +37,23 @@ pub trait HookTransport: Send + Sync {
         timeout: std::time::Duration,
     ) -> BoxFuture<'_, DecisionV1>;
 
-    /// Publishes the enrollment intent and waits for the device's
-    /// submission, bound by `submission_deadline`.
-    fn enroll(
+    /// Publishes the enrollment intent, confirming server-side delivery
+    /// before returning. Returns the pre-publish reply subscription so the
+    /// caller can hand it to `await_submission`: dropping it here would
+    /// lose the reply, so the caller owns it.
+    fn publish_enrollment_intent(
         &self,
         intent: &EnrollmentIntentV1,
+    ) -> BoxFuture<'_, InboundStream>;
+
+    /// Waits for the device's submission on the reply stream opened by
+    /// `publish_enrollment_intent`, bound by `submission_deadline`. Legal
+    /// only on a stream that call returned: the subscription must predate
+    /// the intent or the reply can race past it.
+    fn await_submission(
+        &self,
+        enrollment_id: &str,
+        reply_stream: InboundStream,
         submission_deadline: tokio::time::Instant,
     ) -> BoxFuture<'_, EnrollmentSubmissionV1>;
 
@@ -71,12 +83,24 @@ pub struct InboundMessage {
 /// move-safe through the store-transaction boundary.
 pub type AckFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
-/// One durable request-stream delivery. `term` and `ack` are single-use:
-/// each consumes the message's acknowledgement exactly once.
+/// Which acknowledgement a delivery resolves to: `Term` rejects the message
+/// permanently so it never redelivers, `Ok` accepts it with server-side
+/// confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ack {
+    Term,
+    Ok,
+}
+
+/// Builds a delivery's one acknowledgement on demand, so only the arm the
+/// consumer actually reaches is ever constructed.
+pub type AckFn = Box<dyn FnOnce(Ack) -> AckFuture + Send>;
+
+/// One durable request-stream delivery. `ack` is single-use: calling it
+/// consumes the message's acknowledgement exactly once.
 pub struct JetStreamMessage {
     pub payload: Vec<u8>,
-    pub term: AckFuture,
-    pub ack: AckFuture,
+    pub ack: AckFn,
 }
 
 /// What the server needs from a transport: the durable request source plus

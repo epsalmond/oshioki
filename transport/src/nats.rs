@@ -19,7 +19,7 @@ use oshioki_protocol::{
 };
 
 use crate::{
-    AckFuture, BoxFuture, HookTransport, InboundMessage, InboundStream, JetStreamMessage,
+    Ack, AckFuture, BoxFuture, HookTransport, InboundMessage, InboundStream, JetStreamMessage,
     RequestStream, ServerTransport,
 };
 
@@ -172,16 +172,14 @@ impl HookTransport for NatsTransport {
         })
     }
 
-    fn enroll(
+    fn publish_enrollment_intent(
         &self,
         intent: &EnrollmentIntentV1,
-        submission_deadline: tokio::time::Instant,
-    ) -> BoxFuture<'_, EnrollmentSubmissionV1> {
+    ) -> BoxFuture<'_, InboundStream> {
         let reply_subject = intent.reply_subject.clone();
-        let enrollment_id = intent.enrollment_id.clone();
         let payload = serde_json::to_vec(intent);
         Box::pin(async move {
-            let mut subscription = self
+            let subscription = self
                 .client
                 .subscribe(reply_subject)
                 .await
@@ -194,10 +192,25 @@ impl HookTransport for NatsTransport {
                 .publish("oshioki.enrollment.intent", payload?.into())
                 .await?;
             self.client.flush().await?;
+            Ok(Box::pin(subscription.map(|message| InboundMessage {
+                subject: message.subject.to_string(),
+                payload: message.payload.to_vec(),
+            })) as InboundStream)
+        })
+    }
+
+    fn await_submission(
+        &self,
+        enrollment_id: &str,
+        mut reply_stream: InboundStream,
+        submission_deadline: tokio::time::Instant,
+    ) -> BoxFuture<'_, EnrollmentSubmissionV1> {
+        let enrollment_id = enrollment_id.to_owned();
+        Box::pin(async move {
             let wait = submission_deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::ZERO);
-            let message = tokio::time::timeout(wait, subscription.next())
+            let message = tokio::time::timeout(wait, reply_stream.next())
                 .await
                 .context("enrollment timeout")?
                 .context("enrollment stream closed")?;
@@ -280,26 +293,26 @@ impl ServerTransport for NatsTransport {
             Ok(Box::pin(messages.map(|result| {
                 result
                     .map(|message| {
-                        // Payload out first, then the handle is shared between
-                        // the two single-use ack futures: the consumer
-                        // resolves exactly one.
+                        // Payload out first, then the handle moves into one
+                        // closure: the consumer names the acknowledgement it
+                        // wants and only that future is ever built.
                         let payload = message.payload.to_vec();
-                        let message = std::sync::Arc::new(message);
-                        let term_message = std::sync::Arc::clone(&message);
                         vec![JetStreamMessage {
                             payload,
-                            term: Box::pin(async move {
-                                term_message
-                                    .ack_with(AckKind::Term)
-                                    .await
-                                    .map_err(|error| anyhow::anyhow!(error.to_string()))
-                            }) as AckFuture,
-                            ack: Box::pin(async move {
-                                message
-                                    .double_ack()
-                                    .await
-                                    .map_err(|error| anyhow::anyhow!(error.to_string()))
-                            }) as AckFuture,
+                            ack: Box::new(move |kind| match kind {
+                                Ack::Term => Box::pin(async move {
+                                    message
+                                        .ack_with(AckKind::Term)
+                                        .await
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                                }) as AckFuture,
+                                Ack::Ok => Box::pin(async move {
+                                    message
+                                        .double_ack()
+                                        .await
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                                }) as AckFuture,
+                            }),
                         }]
                     })
                     .map_err(Into::into)

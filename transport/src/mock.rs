@@ -12,9 +12,13 @@ use anyhow::{Result, anyhow};
 use oshioki_protocol::{ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1};
 
 use crate::{
-    AckFuture, BoxFuture, HookTransport, InboundStream, JetStreamMessage, RequestStream,
-    ServerTransport,
+    Ack, AckFuture, BoxFuture, HookTransport, InboundMessage, InboundStream, JetStreamMessage,
+    RequestStream, ServerTransport,
 };
+
+/// The subject the hook's enrollment intent goes out on, mirrored from the
+/// NATS transport so recordings compare against the real one.
+const ENROLLMENT_INTENT_SUBJECT: &str = "oshioki.enrollment.intent";
 
 /// Test-side stub for one `JetStream` message: payload plus a channel each
 /// acknowledgement resolves, so the test observes which ack the consumer
@@ -29,7 +33,7 @@ pub struct JetStreamMessageStub {
 struct MockState {
     /// Verdicts queued by the test for `HookTransport::request_decision`.
     hook_verdicts: VecDeque<Result<DecisionV1>>,
-    /// Submissions queued by the test for `HookTransport::enroll`.
+    /// Submissions queued by the test for `publish_enrollment_intent`.
     hook_submissions: VecDeque<Result<EnrollmentSubmissionV1>>,
     /// Requests queued by the test for `ServerTransport::requests`.
     server_requests: VecDeque<JetStreamMessageStub>,
@@ -56,7 +60,7 @@ impl MockTransport {
         self.lock().hook_verdicts.push_back(Ok(decision));
     }
 
-    /// Queues one submission for the next `enroll` call.
+    /// Queues one submission for the next enrollment round trip.
     pub fn push_submission(&self, submission: EnrollmentSubmissionV1) {
         self.lock().hook_submissions.push_back(Ok(submission));
     }
@@ -102,17 +106,55 @@ impl HookTransport for MockTransport {
         Box::pin(async move { outcome })
     }
 
-    fn enroll(
+    fn publish_enrollment_intent(
         &self,
-        _intent: &EnrollmentIntentV1,
+        intent: &EnrollmentIntentV1,
+    ) -> BoxFuture<'_, InboundStream> {
+        let reply_subject = intent.reply_subject.clone();
+        let encoded = serde_json::to_vec(intent);
+        let queued = {
+            let mut state = self.lock();
+            if let Ok(payload) = &encoded {
+                state
+                    .published
+                    .push((ENROLLMENT_INTENT_SUBJECT.to_owned(), payload.clone()));
+            }
+            state
+                .hook_submissions
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow!("mock transport timed out: no queued submission")))
+        };
+        Box::pin(async move {
+            encoded?;
+            // The queued submission rides back on the reply subject, so
+            // `await_submission` decodes exactly what the wire would carry.
+            let payload = serde_json::to_vec(&queued?)?;
+            Ok(Box::pin(futures::stream::iter([InboundMessage {
+                subject: reply_subject,
+                payload,
+            }])) as InboundStream)
+        })
+    }
+
+    fn await_submission(
+        &self,
+        enrollment_id: &str,
+        mut reply_stream: InboundStream,
         _submission_deadline: tokio::time::Instant,
     ) -> BoxFuture<'_, EnrollmentSubmissionV1> {
-        let outcome = self
-            .lock()
-            .hook_submissions
-            .pop_front()
-            .unwrap_or_else(|| Err(anyhow!("mock transport timed out: no queued submission")));
-        Box::pin(async move { outcome })
+        let enrollment_id = enrollment_id.to_owned();
+        Box::pin(async move {
+            use futures::StreamExt as _;
+            let message = reply_stream
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("enrollment stream closed"))?;
+            let submission: EnrollmentSubmissionV1 = serde_json::from_slice(&message.payload)?;
+            if submission.enrollment_id() != enrollment_id {
+                anyhow::bail!("enrollment id mismatch");
+            }
+            Ok(submission)
+        })
     }
 
     fn publish_activation(&self, activation: &ActivationV1) -> BoxFuture<'_, ()> {
@@ -149,10 +191,13 @@ impl ServerTransport for MockTransport {
         let batches: Vec<Result<Vec<JetStreamMessage>>> = stubs
             .into_iter()
             .map(|stub| {
+                let (on_term, on_ack) = (stub.on_term, stub.on_ack);
                 Ok(vec![JetStreamMessage {
                     payload: stub.payload,
-                    term: stub_ack(stub.on_term),
-                    ack: stub_ack(stub.on_ack),
+                    ack: Box::new(move |kind| match kind {
+                        Ack::Term => stub_ack(on_term),
+                        Ack::Ok => stub_ack(on_ack),
+                    }),
                 }])
             })
             .collect();
@@ -205,5 +250,46 @@ mod tests {
         assert_eq!(transport.revoked(), ["fp-1"]);
         assert_eq!(transport.activations(), [activation]);
         assert_eq!(transport.published(), [("a.b".to_string(), b"x".to_vec())]);
+    }
+
+    /// The enrollment round trip records the intent on the real subject and
+    /// hands the queued submission back on the reply stream, so the hook's
+    /// publish-then-wait ordering is exercised without a wire.
+    #[tokio::test]
+    async fn mock_carries_an_enrollment_submission() {
+        let transport = MockTransport::new();
+        let submission =
+            EnrollmentSubmissionV1::SecureEnclave(oshioki_protocol::NativeEnrollmentSubmissionV1 {
+                version: VERSION_V1,
+                enrollment_id: "enroll-1".into(),
+                credential_public_key: "pub".into(),
+                box_public_key: "box".into(),
+                api_token_hash: "hash".into(),
+                label: "device".into(),
+                proof_signature: "sig".into(),
+                transcript_hmac: "hmac".into(),
+            });
+        transport.push_submission(submission.clone());
+        let intent = EnrollmentIntentV1 {
+            version: VERSION_V1,
+            enrollment_id: "enroll-1".into(),
+            secret_hash: "hash".into(),
+            expires_at: 0,
+            reply_subject: "oshioki.enrollment.submission.enroll-1".into(),
+        };
+        let stream = transport.publish_enrollment_intent(&intent).await.unwrap();
+        assert_eq!(
+            transport
+                .published()
+                .first()
+                .map(|(subject, _)| subject.clone()),
+            Some(ENROLLMENT_INTENT_SUBJECT.to_owned()),
+            "the intent must be recorded before the wait begins"
+        );
+        let received = transport
+            .await_submission("enroll-1", stream, tokio::time::Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(received.enrollment_id(), submission.enrollment_id());
     }
 }
