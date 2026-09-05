@@ -181,7 +181,9 @@ and `--yes` skips the apply prompt.
 oshioki-laptop-setup --local
 ```
 
-The steps, spelled out for when something needs a hand:
+The steps, spelled out for when something needs a hand: the device exports
+its own record and the host pins it with the same fingerprint confirmation
+as `pin`, no NATS or server involved.
 
 ```bash
 oshioki-agent init

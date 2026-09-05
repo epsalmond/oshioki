@@ -169,10 +169,9 @@ async fn main() -> Result<()> {
         }
         Verb::DeviceRecord { label } => {
             let identity = Identity::load(&identity_path)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&identity.device_record(&label))?
-            );
+            let record = identity.device_record(&label);
+            record.validate().context("device record")?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
             Ok(())
         }
         Verb::Init { signer, force } => {

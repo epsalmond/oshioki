@@ -1393,6 +1393,33 @@ mod tests {
         (device, signing)
     }
 
+    /// A device distinct from `deny_test_device`, for tests that need to
+    /// seed the registry with an unrelated entry before pinning.
+    fn other_test_device() -> DevicePublicRecordV1 {
+        let signing = p256::ecdsa::SigningKey::from_bytes((&[31; 32]).into()).unwrap();
+        let public = signing
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let credential_id = oshioki_protocol::native_credential_id(&public);
+        let fingerprint = oshioki_protocol::device_fingerprint(&credential_id, &public, &[32; 32]);
+        let device = DevicePublicRecordV1 {
+            version: VERSION_V1,
+            kind: DeviceKindV1::SecureEnclave,
+            fingerprint,
+            credential_id: URL_SAFE_NO_PAD.encode(&credential_id),
+            credential_public_key: URL_SAFE_NO_PAD.encode(&public),
+            box_public_key: URL_SAFE_NO_PAD.encode([32; 32]),
+            label: "test".into(),
+            api_token_hash: URL_SAFE_NO_PAD.encode([33; 32]),
+            sign_count: 0,
+            active: true,
+        };
+        device.validate().unwrap();
+        device
+    }
+
     fn deny_for(
         signing: &p256::ecdsa::SigningKey,
         request_id: &str,
@@ -1509,14 +1536,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oshioki-pinrefuse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (device, _) = deny_test_device();
+        let (unrelated, _) = deny_test_device();
+        write_registry_to(
+            &dir,
+            &DeviceRegistryV1 {
+                version: 1,
+                devices: vec![unrelated.clone()],
+            },
+        )
+        .unwrap();
+        let device = other_test_device();
         let mut input = std::io::Cursor::new("not-the-fingerprint\n");
         let error = pin_device_record(&dir, &device, &mut input).unwrap_err();
         assert!(
             error.to_string().contains("confirmation mismatch"),
             "{error:#}"
         );
-        assert!(load_registry_from(&dir).unwrap().devices.is_empty());
+        assert_eq!(load_registry_from(&dir).unwrap().devices, vec![unrelated]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1526,11 +1562,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oshioki-pinbad-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (mut device, _) = deny_test_device();
+        let (unrelated, _) = deny_test_device();
+        write_registry_to(
+            &dir,
+            &DeviceRegistryV1 {
+                version: 1,
+                devices: vec![unrelated.clone()],
+            },
+        )
+        .unwrap();
+        let mut device = other_test_device();
         device.label.clear();
         let mut input = std::io::Cursor::new(format!("{}\n", device.fingerprint));
         assert!(pin_device_record(&dir, &device, &mut input).is_err());
-        assert!(load_registry_from(&dir).unwrap().devices.is_empty());
+        assert_eq!(load_registry_from(&dir).unwrap().devices, vec![unrelated]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
