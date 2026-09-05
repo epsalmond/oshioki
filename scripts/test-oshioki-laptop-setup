@@ -136,6 +136,7 @@ cat > "$TEST_ROOT/fake-bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$CALL_LOG"
 if [ "${1:-} ${2:-}" = "--user enable" ] && [ -n "${SOCKET_TO_MAKE:-}" ]; then
+  rm -f "$SOCKET_TO_MAKE"
   python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(120)' "$SOCKET_TO_MAKE" &
   echo "$!" >> "$HOLDER_PIDS"
 fi

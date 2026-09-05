@@ -1270,12 +1270,12 @@ name = "oshioki-hook"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-nats",
  "base64",
  "clap",
  "futures",
  "nix",
  "oshioki-protocol",
+ "oshioki-transport",
  "p256",
  "rand 0.8.8",
  "serde",
@@ -1323,10 +1323,10 @@ name = "oshioki-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-nats",
  "axum",
  "futures",
  "oshioki-protocol",
+ "oshioki-transport",
  "p256",
  "reqwest",
  "rusqlite",
@@ -1339,6 +1339,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "oshioki-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "futures",
+ "oshioki-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
 ]
 
 [[package]]

@@ -261,11 +261,15 @@ if ! command -v sudo >/dev/null 2>&1 || ! command -v file >/dev/null 2>&1; then
   apt-get install -y -qq sudo file >/dev/null
 fi
 
-"$SERVICE_DIR/scripts/install-oshioki-hook" --standalone-e2e
-echo "[inner] install-oshioki-hook OK"
-
+install -d -m 0750 -o root -g root /etc/oshioki
 cp "$SHARE_DIR/devices.json" /etc/oshioki/devices.json
 echo "[inner] devices.json planted"
+
+# The installer enables the hook only when a device is already active, so
+# the registry is planted first; otherwise sudo falls back to NOPASSWD and
+# the hook never publishes the request over NATS.
+"$SERVICE_DIR/scripts/install-oshioki-hook" --standalone-e2e
+echo "[inner] install-oshioki-hook OK"
 
 cleanup_e2e_sudoers() {
   rm -f /etc/sudoers.d/oshioki-e2e
