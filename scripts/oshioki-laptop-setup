@@ -282,11 +282,6 @@ try:
     sock = socket.create_connection((host, port), timeout=4)
 except OSError as error:
     sys.exit("NATS probe: cannot reach %s:%s: %s" % (host, port, error))
-if parts.scheme.lower() == "tls":
-    try:
-        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
-    except ssl.SSLError as error:
-        sys.exit("NATS probe: TLS to %s:%s failed: %s" % (host, port, error))
 lines = b""
 while b"\r\n" not in lines:
     chunk = sock.recv(4096)
@@ -297,6 +292,17 @@ try:
     info = json.loads(lines.split(b"\r\n", 1)[0].split(None, 1)[1])
 except Exception:
     sys.exit("NATS probe: unreadable server INFO")
+# NATS sends INFO in the clear and upgrades to TLS afterwards, so the
+# handshake comes after that first line, on a tls:// URL or when the server
+# says it requires TLS. A server that demands TLS on a nats:// URL would
+# also fail at the hook, so say so here.
+if info.get("tls_required") and parts.scheme.lower() != "tls":
+    sys.exit("NATS probe: server requires TLS; use a tls:// URL")
+if parts.scheme.lower() == "tls":
+    try:
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+    except ssl.SSLError as error:
+        sys.exit("NATS probe: TLS to %s:%s failed: %s" % (host, port, error))
 if info.get("nonce"):
     sys.exit("NATS probe: server wants NKey auth, which setup does not configure")
 required = info.get("auth_required", False)
