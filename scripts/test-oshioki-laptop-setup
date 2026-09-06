@@ -18,6 +18,17 @@ stop_holders() {
 trap 'stop_holders; if [ -n "${STUB_PID:-}" ]; then kill "$STUB_PID" 2>/dev/null || true; fi; rm -rf "$TEST_ROOT"' EXIT
 fail() { echo "test-oshioki-laptop-setup: $*" >&2; exit 1; }
 
+# The verify step ends differently per platform: macOS boots the agent and
+# waits for its socket, Linux leaves the agent to a terminal and says the
+# install is done. $1 log, $2 what failed.
+verify_done() {
+  if [ "$(uname -s)" = Darwin ]; then
+    grep -Fq 'agent socket is live' "$1" || fail "$2"
+  else
+    grep -Fq 'install complete' "$1" || fail "$2"
+  fi
+}
+
 mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/stage/libexec" "$TEST_ROOT/home" "$TEST_ROOT/etc"
 cp "$SCRIPT_DIR/oshioki-laptop-setup" "$TEST_ROOT/stage/"
 chmod 0755 "$TEST_ROOT/stage/oshioki-laptop-setup" "$TEST_ROOT/fake-bin"/* 2>/dev/null || true
@@ -112,7 +123,7 @@ case "${1:-}" in
   *) echo "fake agent saw unexpected verb: $*" >&2; exit 1 ;;
 esac
 SH
-# Fake service managers record their calls; bootstrap also holds the agent
+# Fake service managers record their calls; launchctl bootstrap also holds the agent
 # socket open the way a booted agent would. The holder is netcat, not
 # python: an interpreted holder starts unreliably under load here, while nc
 # binds instantly. It replaces any stale socket file first (each scenario
@@ -132,14 +143,11 @@ if [ "${1:-}" = bootstrap ] && [ -n "${SOCKET_TO_MAKE:-}" ]; then
   done
 fi
 SH
+# systemctl only ever records: Linux installs no unit, so the only calls
+# left are the ones that take a stale one away.
 cat > "$TEST_ROOT/fake-bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$CALL_LOG"
-if [ "${1:-} ${2:-}" = "--user enable" ] && [ -n "${SOCKET_TO_MAKE:-}" ]; then
-  rm -f "$SOCKET_TO_MAKE"
-  python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(120)' "$SOCKET_TO_MAKE" &
-  echo "$!" >> "$HOLDER_PIDS"
-fi
 SH
 chmod 0755 "$TEST_ROOT/fake-bin"/*
 
@@ -283,11 +291,25 @@ if [ "$(uname -s)" = Darwin ]; then
   [ "$(file_mode "$plist")" = 600 ] || fail "plist is not 0600"
   grep -Fq 'bootstrap' "$CALL_LOG" || fail "launchctl bootstrap never ran"
 else
+  # No autostart on Linux: the agent needs a terminal for its prompt, so
+  # the setup writes only the environment and says how to run it.
   unit="$TEST_ROOT/home/.config/systemd/user/com.oshioki.agent.service"
-  [ -f "$unit" ] || fail "systemd unit missing"
-  grep -Fq 'enable --now' "$CALL_LOG" || fail "systemctl enable never ran"
+  agent_env="$AGENT_STATE/agent.env"
+  if [ -f "$unit" ]; then fail "systemd unit written on Linux"; fi
+  if grep -Fq 'enable' "$CALL_LOG"; then fail "systemctl enable ran on Linux"; fi
+  [ -f "$agent_env" ] || fail "agent.env missing"
+  grep -Fxq "NATS_URL=$SETUP_NATS_URL" "$agent_env" || fail "agent.env missing NATS URL"
+  grep -Fxq 'NATS_USER=oshioki' "$agent_env" || fail "agent.env missing NATS user"
+  grep -Fxq 'NATS_PASS=test-secret' "$agent_env" || fail "agent.env missing NATS password"
+  grep -Fxq "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" "$agent_env" || fail "agent.env missing agent socket"
+  grep -Fxq "OSHIOKI_AGENT_STATE=$AGENT_STATE" "$agent_env" || fail "agent.env missing agent state"
+  [ "$(file_mode "$agent_env")" = 600 ] || fail "agent.env is not 0600"
+  grep -Fq ". $agent_env" "$TEST_ROOT/fresh.log" || fail "setup never printed the run one-liner"
+  grep -Fq 'install complete' "$TEST_ROOT/fresh.log" || fail "verify never completed"
 fi
-grep -Fq 'agent socket is live' "$TEST_ROOT/fresh.log" || fail "verify never completed"
+if [ "$(uname -s)" = Darwin ]; then
+  grep -Fq 'agent socket is live' "$TEST_ROOT/fresh.log" || fail "verify never completed"
+fi
 
 # Scenario B: re-run is idempotent. Identity exists, devices active, enroll
 # must not run again.
@@ -318,15 +340,25 @@ if [ "$(uname -s)" = Darwin ]; then
   grep -Fq "<string>$NASTY</string>" "$plist" || fail "plist mangled the password"
 else
   agent_env="$TEST_ROOT/home/.config/oshioki/agent.env"
-  grep -Fq "NATS_PASS=$NASTY" "$agent_env" || fail "agent.env mangled the password"
-  # Exact line: systemd rejects a quoted EnvironmentFile path as
-  # non-absolute and silently drops the whole setting.
-  grep -Fxq "EnvironmentFile=$agent_env" "$unit" || fail "unit EnvironmentFile is quoted or wrong"
-  if grep -Fq 'EnvironmentFile="' "$unit"; then fail "unit quotes EnvironmentFile"; fi
-  if grep -Eq '^Environment=[^=]* ' "$unit"; then fail "unit packs values into one Environment line"; fi
+  grep -Fxq "NATS_PASS=$NASTY" "$agent_env" || fail "agent.env mangled the password"
   grep -Fq 'OSHIOKI_AGENT_SOCKET=' "$agent_env" || fail "agent.env missing agent socket"
   grep -Fq 'OSHIOKI_AGENT_STATE=' "$agent_env" || fail "agent.env missing agent state"
   [ "$(file_mode "$agent_env")" = 600 ] || fail "agent.env is not 0600"
+fi
+
+# Scenario D2 (Linux): a unit left by an earlier setup is disabled and
+# removed, so nothing keeps restarting an agent that cannot prompt.
+if [ "$(uname -s)" != Darwin ]; then
+  unit_dir="$TEST_ROOT/home/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  printf '%s\n' '[Service]' 'ExecStart=/stale/oshioki-agent run' > "$unit_dir/com.oshioki.agent.service"
+  : > "$CALL_LOG"
+  # --reconfigure: scenario D left the nasty password in install.env, and a
+  # plain re-run would probe the stub with it.
+  run_setup --yes --reconfigure >"$TEST_ROOT/stale-unit.log" 2>&1 || fail "setup with a stale unit failed"
+  grep -Fq 'disable --now' "$CALL_LOG" || fail "stale unit was never disabled"
+  if [ -f "$unit_dir/com.oshioki.agent.service" ]; then fail "stale unit survived"; fi
+  grep -Fq 'removed the old systemd unit' "$TEST_ROOT/stale-unit.log" || fail "stale unit removal was silent"
 fi
 
 # Scenario E: --local pairs with itself and never touches enrollment. Fresh
@@ -342,7 +374,7 @@ if grep -Fq 'enrolling a new device' "$TEST_ROOT/local.log"; then fail "local fl
 [ -f "$AGENT_STATE/agent.json" ] || fail "init never created the identity"
 [ -f "$AGENT_STATE/pinned" ] || fail "pin-record never pinned"
 [ "$(grep -c '^installed ' "$TEST_ROOT/local.log")" = 2 ] || fail "plugin was not enabled after pinning"
-grep -Fq 'agent socket is live' "$TEST_ROOT/local.log" || fail "local verify never completed"
+verify_done "$TEST_ROOT/local.log" "local verify never completed"
 if [ "$(uname -s)" = Darwin ]; then
   plist="$TEST_ROOT/home/Library/LaunchAgents/com.oshioki.agent.plist"
   if grep -Eq '<key>NATS_(URL|USER|PASS)</key>' "$plist"; then fail "socket-only plist claims a NATS"; fi
@@ -390,7 +422,7 @@ if [ "$(uname -s)" = Darwin ]; then
   grep -Fq "<string>$BUNDLE_BIN</string>" "$TEST_ROOT/home/Library/LaunchAgents/com.oshioki.agent.plist" \
     || fail "plist does not run the agent from the bundle"
 fi
-grep -Fq 'agent socket is live' "$TEST_ROOT/bundle.log" || fail "local bundle verify never completed"
+verify_done "$TEST_ROOT/bundle.log" "local bundle verify never completed"
 
 # Scenario G: a staged NATS that answers with the wrong credentials refuses
 # the install before anything is written.
@@ -413,7 +445,7 @@ DEVICES_ACTIVE=0 run_setup_local --local --yes --reconfigure >"$TEST_ROOT/migrat
 if grep -Eq '^NATS_' "$TEST_ROOT/etc/install.env"; then fail "migration kept placeholder NATS keys"; fi
 grep -Fq 'OSHIOKI_LOCAL=1' "$TEST_ROOT/etc/install.env" || fail "migration dropped the local flag"
 grep -Fq "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" "$TEST_ROOT/etc/install.env" || fail "migration dropped the socket"
-grep -Fq 'agent socket is live' "$TEST_ROOT/migrate.log" || fail "migration verify never completed"
+verify_done "$TEST_ROOT/migrate.log" "migration verify never completed"
 
 # Scenario I: a plain re-run against a stale placeholder install.env
 # refuses instead of reinstalling the placeholders. install.env must be

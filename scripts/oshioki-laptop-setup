@@ -660,38 +660,44 @@ case "$(uname -s)" in
     $LAUNCHCTL bootstrap "gui/$(id -u)" "$plist"
     ;;
   Linux)
-    unit_dir="$HOME/.config/systemd/user"
-    if command -v "$SYSTEMCTL" >/dev/null 2>&1 && mkdir -p "$unit_dir" 2>/dev/null; then
-      # One EnvironmentFile instead of Environment= lines: Environment=
-      # whitespace-splits and expands % specifiers, so values with spaces
-      # or % would be mangled. The env file is line-based like install.env,
-      # so values travel literally; it also carries the socket and state
-      # dir the booted agent must agree on with the hook.
-      agent_env="$AGENT_STATE/agent.env"
-      {
-        if [ -n "$NATS_URL_V" ]; then
-          printf 'NATS_URL=%s\n' "$NATS_URL_V"
-          printf 'NATS_USER=%s\n' "$NATS_USER_V"
-          printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
-        fi
-        printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET_V"
-        printf 'OSHIOKI_AGENT_STATE=%s\n' "$AGENT_STATE"
-      } > "$agent_env"
-      chmod 0600 "$agent_env"
-      systemd_escape() { printf '%s' "$1" | sed -e 's/%/%%/g'; }
-      unit="$unit_dir/$LABEL.service"
-      {
-        printf '%s\n' '[Unit]' 'Description=oshioki sudo approval agent' '' '[Service]'
-        printf 'ExecStart="%s" run\n' "$(systemd_escape "$AGENT_BIN")"
-        printf 'EnvironmentFile=%s\n' "$(systemd_escape "$agent_env")"
-        printf '%s\n' 'Restart=always' '' '[Install]' 'WantedBy=default.target'
-      } > "$unit"
-      chmod 0600 "$unit"
-      $SYSTEMCTL --user daemon-reload
-      $SYSTEMCTL --user enable --now "$LABEL"
-    else
-      info "no user systemd; start '$AGENT_BIN run' yourself (with NATS_* in the environment)"
+    # There is no autostart on Linux. The agent has no enclave here, so it
+    # approves through the terminal prompt, and a service unit gives it no
+    # terminal: under systemd stdin is /dev/null, the agent stops at once
+    # rather than leaving every request to time out, and Restart=always
+    # loops it. So write the environment the agent and hook must agree on
+    # and let the user run it where the prompt can be answered.
+    #
+    # One env file instead of exported variables: it is line-based like
+    # install.env, so a value with spaces or % travels literally, and it
+    # carries the socket and state dir alongside any NATS credentials.
+    agent_env="$AGENT_STATE/agent.env"
+    {
+      if [ -n "$NATS_URL_V" ]; then
+        printf 'NATS_URL=%s\n' "$NATS_URL_V"
+        printf 'NATS_USER=%s\n' "$NATS_USER_V"
+        printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
+      fi
+      printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET_V"
+      printf 'OSHIOKI_AGENT_STATE=%s\n' "$AGENT_STATE"
+    } > "$agent_env"
+    chmod 0600 "$agent_env"
+    # An earlier setup installed such a unit. Leaving it enabled leaves it
+    # restarting a process that bails on every start, and it would race the
+    # terminal agent for the socket.
+    unit="$HOME/.config/systemd/user/$LABEL.service"
+    if [ -f "$unit" ]; then
+      if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
+        $SYSTEMCTL --user disable --now "$LABEL" 2>/dev/null || true
+      fi
+      rm -f "$unit"
+      if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
+        $SYSTEMCTL --user daemon-reload 2>/dev/null || true
+      fi
+      info "removed the old systemd unit; it could never answer a prompt"
     fi
+    info "run the agent on a terminal you keep open:"
+    info "  set -a; . $agent_env; set +a; $AGENT_BIN run"
+    info "every sudo prompts there; answering it is what approves the request"
     ;;
   *) die "unsupported operating system: $(uname -s)" ;;
 esac
@@ -701,6 +707,19 @@ info "step $VERIFY_STEP/$TOTAL_STEPS: verify"
 # server mode checks it here, after pairing.
 if [ "$LOCAL" -eq 0 ]; then
 run_installer --prelaunch-status
+fi
+# Linux has no autostart, so a live socket only happens when the agent is
+# already running on a terminal. That is the finished state, not a
+# precondition: without it the install is still complete and sudo starts
+# working the moment the agent does.
+if command -v python3 >/dev/null 2>&1; then
+  agent_running() { socket_live "$1"; }
+else
+  agent_running() { [ -S "$1" ]; }
+fi
+if [ "$(uname -s)" = Linux ] && ! agent_running "$AGENT_SOCKET_V"; then
+  info "install complete. Start the agent on a terminal (above); sudo works from then on."
+  exit 0
 fi
 # The socket file outlives its listener across agent restarts (notably the
 # autostart cycle just above), so wait for a live listener, not a path.
