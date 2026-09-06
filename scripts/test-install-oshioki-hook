@@ -238,7 +238,7 @@ grep -Fq '# BEGIN oshioki' "$ACTIVE_REGISTRY/sudo.conf" || fail "active registry
 # and status couples the two.
 SUDOERS="$TEST_ROOT/with-dropin"; mkdir -p "$SUDOERS/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SUDOERS/state/devices.json"
-printf '# sudoers test file\n#includedir %s\n' "$SUDOERS/sudoers.d" > "$SUDOERS/sudoers"
+printf '# sudoers test file\n@includedir %s\n' "$SUDOERS/sudoers.d" > "$SUDOERS/sudoers"
 OSHIOKI_SUDO_USER=testuser run_installer "$SUDOERS" --prelaunch >"$SUDOERS/log" 2>&1
 grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$SUDOERS/sudoers.d/oshioki" || fail "drop-in has the wrong content"
 [ "$(stat -c '%a' "$SUDOERS/sudoers.d/oshioki" 2>/dev/null || stat -f '%Lp' "$SUDOERS/sudoers.d/oshioki")" = 440 ] || fail "drop-in is not 0440"
