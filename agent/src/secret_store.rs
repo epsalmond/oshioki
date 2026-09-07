@@ -144,6 +144,19 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    struct KeychainCleanup<'a> {
+        store: &'a KeychainStore,
+        account: String,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for KeychainCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = self.store.remove(&self.account);
+        }
+    }
+
     #[test]
     fn the_memory_store_round_trips_and_forgets() {
         let store = MemoryStore::new();
@@ -169,6 +182,10 @@ mod tests {
         let store = KeychainStore::under("dev.oshioki.agent-test");
         let account = format!("test-{}", uuidish());
         assert_eq!(store.get(&account).unwrap(), None);
+        let _cleanup = KeychainCleanup {
+            store: &store,
+            account: account.clone(),
+        };
         store.put(&account, &[21; 32]).unwrap();
         assert_eq!(store.get(&account).unwrap(), Some([21; 32]));
         store.remove(&account).unwrap();

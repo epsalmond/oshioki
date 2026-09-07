@@ -306,10 +306,20 @@ impl Identity {
                 SigningFileV1::Enclave { blob } => SigningFileV1::Enclave { blob: blob.clone() },
             },
             box_secret: None,
-            box_secret_ref: Some(reference),
+            box_secret_ref: Some(reference.clone()),
             api_token_hash: encode_base64url(&self.api_token_hash),
         };
-        write_identity_file(path, &file, true)
+        if let Err(error) = write_identity_file(path, &file, true) {
+            return match store.remove(&reference) {
+                Ok(()) => Err(error).context(
+                    "identity file write failed; stored box secret was rolled back",
+                ),
+                Err(cleanup_error) => Err(error).context(format!(
+                    "identity file failed and removing the box secret also failed: {cleanup_error:#}"
+                )),
+            };
+        }
+        Ok(())
     }
 
     /// Persists with the box secret inline. The only form outside macOS.
@@ -705,6 +715,36 @@ mod tests {
     };
     use std::os::unix::fs::PermissionsExt as _;
 
+    #[derive(Default)]
+    struct RecordingStore {
+        entries: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
+    }
+
+    impl RecordingStore {
+        fn entry_count(&self) -> usize {
+            self.entries.lock().unwrap().len()
+        }
+    }
+
+    impl secret_store::SecretStore for RecordingStore {
+        fn put(&self, account: &str, secret: &[u8; 32]) -> anyhow::Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(account.to_owned(), *secret);
+            Ok(())
+        }
+
+        fn get(&self, account: &str) -> anyhow::Result<Option<[u8; 32]>> {
+            Ok(self.entries.lock().unwrap().get(account).copied())
+        }
+
+        fn remove(&self, account: &str) -> anyhow::Result<()> {
+            self.entries.lock().unwrap().remove(account);
+            Ok(())
+        }
+    }
+
     fn identity() -> Identity {
         Identity::from_material([0x11; 32], [0x22; 32], [0x33; 32]).unwrap()
     }
@@ -896,6 +936,33 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Secret storage happens before the identity file is created. A failed
+    /// create must roll the new secret back, or every failed pairing leaks a
+    /// keychain entry that no file can ever reference.
+    #[test]
+    fn identity_file_failure_rolls_back_the_new_secret() {
+        let dir = std::env::temp_dir().join(format!("oshioki-rollback-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // `create_new` fails after the store has accepted the secret, while
+        // preserving the pre-existing file.
+        fs::write(&path, b"existing identity").unwrap();
+        let store = RecordingStore::default();
+        let Err(error) = Identity::generate_to_with(&path, SignerKind::Software, &store) else {
+            panic!("identity generation unexpectedly replaced the existing file");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("stored box secret was rolled back"),
+            "{error:#}"
+        );
+        assert_eq!(store.entry_count(), 0);
+        assert_eq!(fs::read(&path).unwrap(), b"existing identity");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The signing key is a tagged field, so the file says which backend holds
     /// it. A file that only carried bytes could not describe an enclave key.
     #[test]
@@ -1031,7 +1098,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oshioki-noenclave-{}", std::process::id()));
         let path = dir.join("agent.json");
         let _ = fs::remove_dir_all(&dir);
-        let Err(error) = Identity::generate_to(&path, SignerKind::Enclave) else {
+        let store = secret_store::MemoryStore::new();
+        let Err(error) = Identity::generate_to_with(&path, SignerKind::Enclave, &store) else {
             panic!("this machine has no Secure Enclave");
         };
         assert!(error.to_string().contains("macOS"));

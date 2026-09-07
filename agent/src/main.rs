@@ -1453,10 +1453,12 @@ mod tests {
     #[tokio::test]
     async fn encrypted_request_flood_never_admits_more_than_the_fixed_capacity() {
         let dir = socket_test_dir("flood");
+        let store = MemoryStore::new();
         let identity = std::sync::Arc::new(
-            oshioki_agent::Identity::generate_to(
+            oshioki_agent::Identity::generate_to_with(
                 &dir.join("agent.json"),
                 oshioki_agent::SignerKind::Software,
+                &store,
             )
             .unwrap(),
         );
@@ -1481,10 +1483,12 @@ mod tests {
     #[tokio::test]
     async fn invalid_and_foreign_envelopes_do_not_poison_request_id_dedupe() {
         let dir = socket_test_dir("dedupe");
+        let store = MemoryStore::new();
         let identity = std::sync::Arc::new(
-            oshioki_agent::Identity::generate_to(
+            oshioki_agent::Identity::generate_to_with(
                 &dir.join("agent.json"),
                 oshioki_agent::SignerKind::Software,
+                &store,
             )
             .unwrap(),
         );
@@ -2273,10 +2277,12 @@ mod tests {
         let _ = tracing::dispatcher::set_global_default(tracing::Dispatch::new(subscriber));
 
         let dir = socket_test_dir("logprobe");
+        let store = MemoryStore::new();
         let identity = std::sync::Arc::new(
-            oshioki_agent::Identity::generate_to(
+            oshioki_agent::Identity::generate_to_with(
                 &dir.join("agent.json"),
                 oshioki_agent::SignerKind::Software,
+                &store,
             )
             .unwrap(),
         );
