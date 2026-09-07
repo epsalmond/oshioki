@@ -306,3 +306,25 @@ sudo -V
 The installer restores the prior `sudo.conf` automatically if validation
 fails. Production integration must also stop its server and NATS resources,
 restore routing, and confirm ordinary sudo behavior.
+
+## Logs
+
+A sudo that is approved prints nothing, like sudo itself. The hook writes
+warnings and errors to the terminal, and the audit trail (every approval,
+denial, and a request left to NATS by the local agent) to the system log
+under the `authpriv` facility, the one sudo uses:
+
+```bash
+journalctl -t oshioki                                            # Linux
+sudo log stream --predicate 'eventMessage CONTAINS "oshioki["'   # macOS, best effort
+```
+
+On macOS the hook talks to the legacy syslog socket and what the unified
+log shows of it varies by release; journald is the supported path.
+
+To see more on the terminal, put `OSHIOKI_LOG=info` (the hook's own
+chatter) or `OSHIOKI_LOG=audit=info` (the audit trail) in
+`/etc/oshioki/config.env`; both together also work. The sudo path reads its terminal level from
+that root-owned file and ignores `RUST_LOG`, so a caller cannot change what
+root prints. The other `oshioki` verbs, run by a person, honour `RUST_LOG`.
+The system log keeps its own level regardless.
