@@ -70,8 +70,9 @@ oshioki-agent pair '<enrollment-url>' --label <label>
 oshioki-agent run
 ```
 
-From then on, each sudo request costs one fingerprint tap to approve, no
-password. Details in [docs/native-agent.md](docs/native-agent.md) and
+From then on, hardware-backed approvals can replace the sudo password; a
+software native identity still requires normal sudo authentication. Details
+in [docs/native-agent.md](docs/native-agent.md) and
 [docs/mac-approvals.md](docs/mac-approvals.md).
 
 ```bash

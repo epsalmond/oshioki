@@ -2,12 +2,20 @@
 
 On a Mac the Touch ID sheet is the approval. The signing key lives in the
 Secure Enclave behind `biometryCurrentSet`, so the signature cannot exist
-without the fingerprint, and there is no second confirmation to give. The
-sheet reads "Oshioki is trying to run `<command and arguments>` as
-`<account>` on `<host>`. Touch ID to allow this." The arguments are there
-because `rm` and `rm -rf /` are different requests, rendered the same way the
-terminal prompt renders them. The working directory and the caller process
-chain go to the log, where there is room for them.
+without the fingerprint. Before that sheet appears, the LaunchAgent opens a
+transient native review window containing the exact signed request in a
+read-only, scrollable text view. It includes every command argument and every
+environment entry, with JSON escaping and a SHA-256 of the retained bytes.
+Only the explicit `Continue to Touch ID` button raises the biometric sheet;
+Cancel, an expired request, a missing GUI session, or any review failure
+publishes no verdict. The short Touch ID reason contains only the request ID
+and digest, so an operating-system length limit cannot hide executable input.
+
+The review text is passed through an owner-only temporary file to a constant
+JXA/AppKit helper and the file is unlinked on every path. No TextEdit document
+or other persistent user document is created. The helper runs as the same
+signed Oshioki bundle launched by the per-user LaunchAgent, so a headless
+launch session fails closed rather than falling back to an unreadable log.
 
 ```bash
 scripts/mac/bundle-agent

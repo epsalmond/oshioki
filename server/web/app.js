@@ -63,6 +63,39 @@ const PLAIN_ARGUMENT = /^[A-Za-z0-9@%+=:,./_-]+$/;
 function quoteArgument(argument) {
   return PLAIN_ARGUMENT.test(argument) ? argument : `'${argument.split("'").join("'\\''")}'`;
 }
+// JSON-like quoting makes environment names and values unambiguous without
+// putting attacker-controlled markup in the page. Escape non-ASCII characters
+// as well: look-alike Unicode and invisible format characters must not make a
+// signed variable appear to be a different one.
+function quoteReviewString(value) {
+  if (typeof value !== "string") throw new Error("request field is not a string");
+  let escaped = '"';
+  for (const character of value) {
+    const code = character.codePointAt(0);
+    if (character === "\\") escaped += "\\\\";
+    else if (character === '"') escaped += '\\"';
+    else if (character === "\b") escaped += "\\b";
+    else if (character === "\f") escaped += "\\f";
+    else if (character === "\n") escaped += "\\n";
+    else if (character === "\r") escaped += "\\r";
+    else if (character === "\t") escaped += "\\t";
+    else if (code < 0x20 || code === 0x7f || code > 0x7e) {
+      escaped += code <= 0xffff
+        ? `\\u${code.toString(16).padStart(4, "0")}`
+        : `\\u{${code.toString(16)}}`;
+    } else escaped += character;
+  }
+  return `${escaped}"`;
+}
+function formatEnvironment(environment) {
+  if (!Array.isArray(environment)) throw new Error("request environment is not a list");
+  return environment.map((entry, index) => {
+    if (!entry || typeof entry.name !== "string" || typeof entry.value !== "string") {
+      throw new Error("request environment entry is invalid");
+    }
+    return `[${index}] name=${quoteReviewString(entry.name)} value=${quoteReviewString(entry.value)}`;
+  }).join("\n") || "(none)";
+}
 function text(id, value) { document.getElementById(id).textContent = value; }
 function failure(error) { console.error(error); text("status", "This request could not be verified."); }
 
@@ -125,6 +158,7 @@ async function approval() {
   const request = JSON.parse(dec.decode(raw)); if (request.version !== 1 || request.request_id !== id) throw new Error("request mismatch");
   text("host", request.host); text("user", `${request.user} / ${request.uid}`); text("runas", runAsLabel(request.runas_uid)); text("command", request.command);
   text("argv", request.argv.map(quoteArgument).join("\n")); text("cwd", request.cwd); text("process-chain", request.pid_chain.join("\n"));
+  text("env", formatEnvironment(request.env ?? []));
   text("status", `Expires ${new Date(request.expires_at * 1000).toLocaleTimeString()}`); document.getElementById("request").hidden = false; document.getElementById("actions").hidden = false;
   const headers = { authorization: `Bearer ${selected.device.apiToken}`, "content-type": "application/json" };
   document.getElementById("deny").addEventListener("click", async () => {
@@ -143,4 +177,9 @@ async function approval() {
   }, { once: true });
 }
 
-(document.body.dataset.page === "enroll" ? enrollment() : approval()).catch(failure);
+// Keep the formatter available to the small, DOM-free unit test as well as
+// the page. The approval flow still starts only in a browser document.
+if (typeof globalThis !== "undefined") globalThis.OshiokiApprovalReview = { formatEnvironment, quoteReviewString };
+if (typeof document !== "undefined" && document.body) {
+  (document.body.dataset.page === "enroll" ? enrollment() : approval()).catch(failure);
+}

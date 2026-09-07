@@ -24,7 +24,7 @@ use oshioki_protocol::{
     ApproveNativeV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1,
     NativeEnrollmentSubmissionV1, RequestEnvelopeV1, RequestV1, VERSION_V1, approve_challenge,
     decode_base64url, deny_challenge, device_fingerprint, encode_base64url, native_credential_id,
-    native_enrollment_proof, native_v1::native_transcript_hmac, unseal_v1,
+    native_enrollment_proof, native_transcript_hmac_for_kind, unseal_v1,
 };
 
 /// What the enrollment proof signature approves, for a backend that asks.
@@ -306,10 +306,20 @@ impl Identity {
                 SigningFileV1::Enclave { blob } => SigningFileV1::Enclave { blob: blob.clone() },
             },
             box_secret: None,
-            box_secret_ref: Some(reference),
+            box_secret_ref: Some(reference.clone()),
             api_token_hash: encode_base64url(&self.api_token_hash),
         };
-        write_identity_file(path, &file, true)
+        if let Err(error) = write_identity_file(path, &file, true) {
+            return match store.remove(&reference) {
+                Ok(()) => Err(error).context(
+                    "identity file write failed; stored box secret was rolled back",
+                ),
+                Err(cleanup_error) => Err(error).context(format!(
+                    "identity file failed and removing the box secret also failed: {cleanup_error:#}"
+                )),
+            };
+        }
+        Ok(())
     }
 
     /// Persists with the box secret inline. The only form outside macOS.
@@ -417,10 +427,16 @@ impl Identity {
     }
 
     /// The record the host pins after a successful enrollment.
+    ///
+    /// The assurance kind is derived from the signer backend, rather than
+    /// being a caller-supplied label. A software key must never be serialized
+    /// as `secure-enclave`, because the host uses this distinction when
+    /// deciding whether passwordless sudo is safe.
     pub fn device_record(&self, label: &str) -> DevicePublicRecordV1 {
+        let kind = self.device_kind();
         DevicePublicRecordV1 {
             version: VERSION_V1,
-            kind: DeviceKindV1::SecureEnclave,
+            kind,
             fingerprint: self.fingerprint(),
             credential_id: encode_base64url(&self.credential_id()),
             credential_public_key: encode_base64url(&self.public_key_sec1()),
@@ -453,8 +469,10 @@ impl Identity {
             proof_signature: encode_base64url(&self.signer.sign_der(&proof, ENROLL_REASON)?),
             transcript_hmac: String::new(),
         };
-        submission.transcript_hmac =
-            encode_base64url(&native_transcript_hmac(secret, &submission).context("transcript")?);
+        submission.transcript_hmac = encode_base64url(
+            &native_transcript_hmac_for_kind(secret, &submission, self.device_kind())
+                .context("transcript")?,
+        );
         submission.validate_shape().context("submission shape")?;
         Ok(submission)
     }
@@ -463,7 +481,20 @@ impl Identity {
     /// `None` when the envelope carries nothing for this device, which is
     /// the normal case for a host this device never enrolled with.
     pub fn open_request(&self, envelope: &RequestEnvelopeV1) -> Result<Option<OpenedRequest>> {
-        envelope.validate().context("envelope")?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        self.open_request_at(envelope, now)
+    }
+
+    /// Finds and opens this device's body using a receiver-local timestamp.
+    /// The explicit clock keeps tests deterministic and makes it impossible
+    /// for the envelope and opened request to be checked against different
+    /// seconds at a boundary.
+    pub fn open_request_at(
+        &self,
+        envelope: &RequestEnvelopeV1,
+        now: i64,
+    ) -> Result<Option<OpenedRequest>> {
+        envelope.validate_at(now).context("envelope")?;
         let fingerprint = self.fingerprint();
         let Some(sealed) = envelope
             .sealed
@@ -474,10 +505,11 @@ impl Identity {
         };
         let raw = unseal_v1(sealed, &self.box_secret).context("open sealed body")?;
         let request: RequestV1 = serde_json::from_slice(&raw).context("decode request")?;
-        request.validate().context("request")?;
+        request.validate_at(now).context("request")?;
         if request.request_id != envelope.request_id
             || request.host != envelope.host
             || request.user != envelope.user
+            || request.issued_at != envelope.issued_at
             || request.expires_at != envelope.expires_at
         {
             bail!("sealed request does not match its envelope");
@@ -515,6 +547,14 @@ impl Identity {
             device_fingerprint: self.fingerprint(),
             signature: Some(encode_base64url(&signature)),
         }))
+    }
+
+    /// The protocol assurance kind corresponding to this identity's signer.
+    pub fn device_kind(&self) -> DeviceKindV1 {
+        match self.signer_kind() {
+            SignerKind::Software => DeviceKindV1::Software,
+            SignerKind::Enclave => DeviceKindV1::SecureEnclave,
+        }
     }
 }
 
@@ -671,9 +711,39 @@ mod tests {
     use crate::secret_store::SecretStore as _;
     use oshioki_protocol::{
         DeviceRegistryV1, seal_v1, verify_deny_v1, verify_native_approval_v1,
-        verify_native_enrollment_v1,
+        verify_native_enrollment_v1, verify_software_native_enrollment_v1,
     };
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[derive(Default)]
+    struct RecordingStore {
+        entries: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
+    }
+
+    impl RecordingStore {
+        fn entry_count(&self) -> usize {
+            self.entries.lock().unwrap().len()
+        }
+    }
+
+    impl secret_store::SecretStore for RecordingStore {
+        fn put(&self, account: &str, secret: &[u8; 32]) -> anyhow::Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(account.to_owned(), *secret);
+            Ok(())
+        }
+
+        fn get(&self, account: &str) -> anyhow::Result<Option<[u8; 32]>> {
+            Ok(self.entries.lock().unwrap().get(account).copied())
+        }
+
+        fn remove(&self, account: &str) -> anyhow::Result<()> {
+            self.entries.lock().unwrap().remove(account);
+            Ok(())
+        }
+    }
 
     fn identity() -> Identity {
         Identity::from_material([0x11; 32], [0x22; 32], [0x33; 32]).unwrap()
@@ -729,7 +799,7 @@ mod tests {
         let submission = identity
             .enrollment_submission("enroll-1", &secret, "laptop")
             .unwrap();
-        let device = verify_native_enrollment_v1(&submission, &secret).unwrap();
+        let device = verify_software_native_enrollment_v1(&submission, &secret).unwrap();
         assert_eq!(device, identity.device_record("laptop"));
         DeviceRegistryV1 {
             version: VERSION_V1,
@@ -744,9 +814,10 @@ mod tests {
     fn opens_own_body_and_signs_a_verifiable_approval() {
         let identity = identity();
         let device = identity.device_record("laptop");
+        assert_eq!(device.kind, DeviceKindV1::Software);
         let request = request();
         let (envelope, raw) = envelope(&request, std::slice::from_ref(&device));
-        let opened = identity.open_request(&envelope).unwrap().unwrap();
+        let opened = identity.open_request_at(&envelope, 1_000).unwrap().unwrap();
         assert_eq!(opened.raw, raw);
         assert_eq!(opened.request, request);
         let DecisionV1::ApproveNative(approval) = identity.approve(&opened, "run true").unwrap()
@@ -779,10 +850,49 @@ mod tests {
     }
 
     #[test]
+    fn receiver_rejects_requests_outside_time_bounds_before_prompting() {
+        let identity = identity();
+        let device = identity.device_record("laptop");
+        let now = 1_000;
+        for (issued_at, expires_at) in [
+            (
+                now + oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS + 1,
+                now + oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS + 91,
+            ),
+            (
+                now - oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS - 1,
+                now + 1,
+            ),
+            (now, now + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS + 1),
+        ] {
+            let mut request = request();
+            request.issued_at = issued_at;
+            request.expires_at = expires_at;
+            let (envelope, _) = envelope(&request, std::slice::from_ref(&device));
+            assert!(identity.open_request_at(&envelope, now).is_err());
+        }
+    }
+
+    #[test]
+    fn receiver_checks_envelope_and_opened_issued_at_consistency() {
+        let identity = identity();
+        let device = identity.device_record("laptop");
+        let request = request();
+        let (mut envelope, _) = envelope(&request, std::slice::from_ref(&device));
+        envelope.issued_at += 1;
+        assert!(identity.open_request_at(&envelope, 1_000).is_err());
+    }
+
+    #[test]
     fn ignores_envelopes_for_other_devices() {
         let other = Identity::from_material([0x44; 32], [0x55; 32], [0x66; 32]).unwrap();
         let (envelope, _) = envelope(&request(), &[other.device_record("other")]);
-        assert!(identity().open_request(&envelope).unwrap().is_none());
+        assert!(
+            identity()
+                .open_request_at(&envelope, 1_000)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -790,7 +900,7 @@ mod tests {
         let identity = identity();
         let (mut envelope, _) = envelope(&request(), &[identity.device_record("laptop")]);
         envelope.user = "mallory".into();
-        assert!(identity.open_request(&envelope).is_err());
+        assert!(identity.open_request_at(&envelope, 1_000).is_err());
     }
 
     #[test]
@@ -823,6 +933,33 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Secret storage happens before the identity file is created. A failed
+    /// create must roll the new secret back, or every failed pairing leaks a
+    /// keychain entry that no file can ever reference.
+    #[test]
+    fn identity_file_failure_rolls_back_the_new_secret() {
+        let dir = std::env::temp_dir().join(format!("oshioki-rollback-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // `create_new` fails after the store has accepted the secret, while
+        // preserving the pre-existing file.
+        fs::write(&path, b"existing identity").unwrap();
+        let store = RecordingStore::default();
+        let Err(error) = Identity::generate_to_with(&path, SignerKind::Software, &store) else {
+            panic!("identity generation unexpectedly replaced the existing file");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("stored box secret was rolled back"),
+            "{error:#}"
+        );
+        assert_eq!(store.entry_count(), 0);
+        assert_eq!(fs::read(&path).unwrap(), b"existing identity");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -961,7 +1098,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oshioki-noenclave-{}", std::process::id()));
         let path = dir.join("agent.json");
         let _ = fs::remove_dir_all(&dir);
-        let Err(error) = Identity::generate_to(&path, SignerKind::Enclave) else {
+        let store = secret_store::MemoryStore::new();
+        let Err(error) = Identity::generate_to_with(&path, SignerKind::Enclave, &store) else {
             panic!("this machine has no Secure Enclave");
         };
         assert!(error.to_string().contains("macOS"));

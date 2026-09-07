@@ -8,6 +8,54 @@
 # `systemctl disable` cannot resolve the name. Nothing here may fail.
 set -e
 
+SUDOERS_D="${SUDOERS_D:-/etc/sudoers.d}"
+SUDOERS_FILE="${SUDOERS_FILE:-$SUDOERS_D/oshioki}"
+
+valid_sudoers_user() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_.-]*) return 1 ;;
+  esac
+}
+
+# The package may be gone by the time postrm runs. Keep this verifier here,
+# independent of the installer, and remove only the complete root-owned 0440
+# Oshioki rule. Both the current NOSETENV form and the pre-#50 form are
+# recognized so upgrades cannot strand the older Oshioki artifact.
+owned_sudoers_dropin_user() {
+  local line user owner mode lines last
+  [ -f "$SUDOERS_FILE" ] && [ ! -L "$SUDOERS_FILE" ] || return 1
+  if owner="$(stat -c '%u' "$SUDOERS_FILE" 2>/dev/null)"; then
+    mode="$(stat -c '%a' "$SUDOERS_FILE")"
+  else
+    owner="$(stat -f '%u' "$SUDOERS_FILE" 2>/dev/null)" || return 1
+    mode="$(stat -f '%Lp' "$SUDOERS_FILE")"
+  fi
+  [ "$owner" = 0 ] || return 1
+  [ "$mode" = 440 ] || return 1
+  lines="$(wc -l < "$SUDOERS_FILE" | tr -d '[:space:]')"
+  [ "$lines" = 1 ] || return 1
+  last="$(tail -c 1 "$SUDOERS_FILE" | od -An -t x1 | tr -d '[:space:]')"
+  [ "$last" = 0a ] || return 1
+  line="$(sed -n '1p' "$SUDOERS_FILE")"
+  case "$line" in
+    *' ALL=(ALL) NOSETENV: NOPASSWD: ALL')
+      user="${line% ALL=(ALL) NOSETENV: NOPASSWD: ALL}" ;;
+    *' ALL=(ALL) NOPASSWD: ALL')
+      user="${line% ALL=(ALL) NOPASSWD: ALL}" ;;
+    *) return 1 ;;
+  esac
+  valid_sudoers_user "$user" || return 1
+  [ "$line" = "$user ALL=(ALL) NOSETENV: NOPASSWD: ALL" ] ||
+    [ "$line" = "$user ALL=(ALL) NOPASSWD: ALL" ] || return 1
+  printf '%s\n' "$user"
+}
+
+remove_verified_sudoers_dropin() {
+  [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ] || return 0
+  owned_sudoers_dropin_user >/dev/null || return 1
+  rm -f "$SUDOERS_FILE"
+}
+
 case "$1" in
   remove)
     # Mask, don't disable: the unit file is already deleted, so only a
@@ -18,6 +66,11 @@ case "$1" in
   purge)
     deb-systemd-helper purge oshioki-server.service >/dev/null || true
     deb-systemd-helper unmask oshioki-server.service >/dev/null || true
+    # prerm normally removes this first, but purge is the last opportunity
+    # after a partial or interrupted removal. This verifier is self-contained
+    # because the packaged installer may already have been deleted.
+    remove_verified_sudoers_dropin ||
+      echo "oshioki: warning: could not remove an unverified sudoers drop-in; leaving it in place" >&2
     rm -rf /etc/oshioki /var/lib/oshioki
     rm -f /usr/local/sbin/oshioki /usr/local/libexec/sudo/oshioki.so
     ;;

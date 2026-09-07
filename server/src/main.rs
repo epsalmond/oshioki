@@ -993,13 +993,14 @@ mod tests {
         store.ready().unwrap();
         let device = test_device();
         store.put_device(&device).unwrap();
+        let request_now = now();
         let envelope = RequestEnvelopeV1 {
             version: 1,
             request_id: "req-1".into(),
             host: "nas".into(),
             user: "eric".into(),
-            issued_at: 10,
-            expires_at: now() + 600,
+            issued_at: request_now,
+            expires_at: request_now + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS,
             sealed: vec![SealedDeviceBodyV1 {
                 device_fingerprint: device.fingerprint.clone(),
                 ephemeral_pub: oshioki_protocol::v1::encode_base64url(&[4; 32]),
@@ -1132,13 +1133,14 @@ mod tests {
         store.ready().unwrap();
         let device = test_device();
         store.put_device(&device).unwrap();
+        let request_now = now();
         let valid_envelope = RequestEnvelopeV1 {
             version: 1,
             request_id: "req-consume".into(),
             host: "nas".into(),
             user: "eric".into(),
-            issued_at: 10,
-            expires_at: now() + 600,
+            issued_at: request_now,
+            expires_at: request_now + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS,
             sealed: vec![SealedDeviceBodyV1 {
                 device_fingerprint: device.fingerprint.clone(),
                 ephemeral_pub: oshioki_protocol::v1::encode_base64url(&[4; 32]),
@@ -1210,25 +1212,30 @@ mod tests {
         let credential_id = vec![1; 16];
         let signing = p256::ecdsa::SigningKey::from_bytes((&[2; 32]).into()).unwrap();
         let point = signing.verifying_key().to_encoded_point(false);
-        let mut cose = std::collections::BTreeMap::new();
-        cose.insert(serde_cbor::Value::Integer(1), serde_cbor::Value::Integer(2));
-        cose.insert(
-            serde_cbor::Value::Integer(3),
-            serde_cbor::Value::Integer(-7),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-1),
-            serde_cbor::Value::Integer(1),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-2),
-            serde_cbor::Value::Bytes(point.x().unwrap().to_vec()),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-3),
-            serde_cbor::Value::Bytes(point.y().unwrap().to_vec()),
-        );
-        let credential_public_key = serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap();
+        let cose = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Integer(1.into()),
+                ciborium::Value::Integer(2.into()),
+            ),
+            (
+                ciborium::Value::Integer(3.into()),
+                ciborium::Value::Integer((-7).into()),
+            ),
+            (
+                ciborium::Value::Integer((-1).into()),
+                ciborium::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::Value::Integer((-2).into()),
+                ciborium::Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                ciborium::Value::Integer((-3).into()),
+                ciborium::Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ]);
+        let mut credential_public_key = Vec::new();
+        ciborium::ser::into_writer(&cose, &mut credential_public_key).unwrap();
         let box_public_key = vec![3; 32];
         let fingerprint = oshioki_protocol::device_fingerprint(
             &credential_id,

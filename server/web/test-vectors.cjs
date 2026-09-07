@@ -2,11 +2,27 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const vm = require("node:vm");
 const sodium = require("libsodium-wrappers");
 
 const decode = value => Buffer.from(value, "base64url");
 
 sodium.ready.then(() => {
+  const browserSource = fs.readFileSync(`${__dirname}/app.js`, "utf8");
+  const browserContext = { console, TextEncoder, TextDecoder, crypto: {}, globalThis: {} };
+  vm.createContext(browserContext);
+  vm.runInContext(browserSource, browserContext, { filename: "app.js" });
+  const { formatEnvironment, quoteReviewString } = browserContext.globalThis.OshiokiApprovalReview;
+  assert.equal(
+    formatEnvironment([
+      { name: "BASH_ENV", value: "/tmp/attacker-init" },
+      { name: "LD_PRELOAD", value: "/tmp/evil\\n.so\\\";echo pwned" },
+    ]),
+    '[0] name="BASH_ENV" value="/tmp/attacker-init"\n[1] name="LD_PRELOAD" value="/tmp/evil\\\\n.so\\\\\\\";echo pwned"',
+  );
+  assert.equal(quoteReviewString("suffix\u202e-hidden"), '"suffix\\u202e-hidden"');
+
   const raw = Buffer.from('{"version":1,"request_id":"vector-1"}');
   const challenge = crypto.createHash("sha256")
     .update(Buffer.from("oshioki/approve/v1\0"))

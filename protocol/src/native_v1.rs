@@ -1,10 +1,12 @@
-//! Native (Secure Enclave) approval and enrollment verification.
+//! Native approval and enrollment verification.
 //!
 //! A native device holds a P-256 key outside any browser. It signs the same
 //! 32-byte challenge the `WebAuthn` path signs, with no authenticator data,
 //! client data, origin, or relying party ID. Signatures are DER ECDSA with
 //! SHA-256 as the message hash, which is what the Secure Enclave produces for
-//! `ecdsaSignatureMessageX962SHA256`.
+//! `ecdsaSignatureMessageX962SHA256`. The `software` kind is deliberately
+//! distinct from `secure-enclave`; it may authenticate an approval only when
+//! the host still requires its normal sudo authentication.
 
 use hmac::Mac as _;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
@@ -20,7 +22,6 @@ use crate::{
 };
 
 const NATIVE_PROOF_DOMAIN: &[u8] = b"oshioki/enroll/native-proof/v1\0";
-const NATIVE_KIND_TAG: &[u8] = DeviceKindV1::SecureEnclave.as_str().as_bytes();
 
 /// Parses a 65-byte SEC1 uncompressed P-256 point.
 pub fn sec1_p256_verifying_key(sec1: &[u8]) -> Result<VerifyingKey, Error> {
@@ -43,8 +44,10 @@ pub fn verify_native_approval_v1(
 ) -> Result<(), Error> {
     device.validate()?;
     approval.validate_shape()?;
-    if device.kind != DeviceKindV1::SecureEnclave
-        || approval.device_fingerprint != device.fingerprint
+    if !matches!(
+        device.kind,
+        DeviceKindV1::Software | DeviceKindV1::SecureEnclave
+    ) || approval.device_fingerprint != device.fingerprint
     {
         return Err(Error::BadVerdict(
             "native approval does not match pinned device".into(),
@@ -84,10 +87,11 @@ pub fn native_enrollment_proof(
 /// would make every enrollment fail with no explanation.
 fn native_transcript_fields(
     submission: &NativeEnrollmentSubmissionV1,
+    kind: DeviceKindV1,
 ) -> Result<Vec<Vec<u8>>, Error> {
     Ok(vec![
         submission.enrollment_id.as_bytes().to_vec(),
-        NATIVE_KIND_TAG.to_vec(),
+        kind.as_str().as_bytes().to_vec(),
         decode_base64url(&submission.credential_public_key)?,
         decode_base64url(&submission.box_public_key)?,
         decode_base64url(&submission.api_token_hash)?,
@@ -101,7 +105,25 @@ pub fn native_transcript_hmac(
     secret: &[u8; 32],
     submission: &NativeEnrollmentSubmissionV1,
 ) -> Result<[u8; 32], Error> {
-    let fields = native_transcript_fields(submission)?;
+    native_transcript_hmac_for_kind(secret, submission, DeviceKindV1::SecureEnclave)
+}
+
+/// Computes the enrollment transcript MAC for a native assurance kind.
+///
+/// The kind is part of the authenticated transcript. In particular, the
+/// software agent cannot reuse a transcript for a Secure Enclave record, and
+/// the host can persist the assurance level it actually received.
+pub fn native_transcript_hmac_for_kind(
+    secret: &[u8; 32],
+    submission: &NativeEnrollmentSubmissionV1,
+    kind: DeviceKindV1,
+) -> Result<[u8; 32], Error> {
+    if !matches!(kind, DeviceKindV1::Software | DeviceKindV1::SecureEnclave) {
+        return Err(Error::InvalidRequest(
+            "native enrollment needs a native device kind".into(),
+        ));
+    }
+    let fields = native_transcript_fields(submission, kind)?;
     let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
     Ok(enrollment_hmac(secret, TRANSCRIPT_DOMAIN, &fields))
 }
@@ -111,6 +133,22 @@ pub fn verify_native_enrollment_v1(
     submission: &NativeEnrollmentSubmissionV1,
     secret: &[u8; 32],
 ) -> Result<DevicePublicRecordV1, Error> {
+    verify_native_enrollment_for_kind(submission, secret, DeviceKindV1::SecureEnclave)
+}
+
+/// Verifies a software native enrollment and returns a non-hardware record.
+pub fn verify_software_native_enrollment_v1(
+    submission: &NativeEnrollmentSubmissionV1,
+    secret: &[u8; 32],
+) -> Result<DevicePublicRecordV1, Error> {
+    verify_native_enrollment_for_kind(submission, secret, DeviceKindV1::Software)
+}
+
+fn verify_native_enrollment_for_kind(
+    submission: &NativeEnrollmentSubmissionV1,
+    secret: &[u8; 32],
+    kind: DeviceKindV1,
+) -> Result<DevicePublicRecordV1, Error> {
     submission.validate_shape()?;
     let credential_public_key = decode_base64url(&submission.credential_public_key)?;
     let box_public_key = decode_base64url(&submission.box_public_key)?;
@@ -118,7 +156,7 @@ pub fn verify_native_enrollment_v1(
     let proof_signature = decode_base64url(&submission.proof_signature)?;
     let supplied_hmac = decode_base64url(&submission.transcript_hmac)?;
 
-    let fields = native_transcript_fields(submission)?;
+    let fields = native_transcript_fields(submission, kind)?;
     let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
     transcript_mac(secret, TRANSCRIPT_DOMAIN, &fields)
         .verify_slice(&supplied_hmac)
@@ -139,7 +177,7 @@ pub fn verify_native_enrollment_v1(
     let credential_id = native_credential_id(&credential_public_key);
     let device = DevicePublicRecordV1 {
         version: VERSION_V1,
-        kind: DeviceKindV1::SecureEnclave,
+        kind,
         fingerprint: device_fingerprint(&credential_id, &credential_public_key, &box_public_key),
         credential_id: encode_base64url(&credential_id),
         credential_public_key: submission.credential_public_key.clone(),
@@ -216,6 +254,22 @@ mod tests {
         assert_eq!(device.sign_count, 0);
         let approval = approval(&signing_key(), RAW, &device);
         verify_native_approval_v1(&approval, RAW, &device).unwrap();
+    }
+
+    #[test]
+    fn software_enrollment_has_a_distinct_non_hardware_kind() {
+        let submission = submission(&signing_key(), "linux");
+        let software_mac =
+            native_transcript_hmac_for_kind(&SECRET, &submission, DeviceKindV1::Software).unwrap();
+        let mut software = submission.clone();
+        software.transcript_hmac = encode_base64url(&software_mac);
+        let device = verify_software_native_enrollment_v1(&software, &SECRET).unwrap();
+        assert_eq!(device.kind, DeviceKindV1::Software);
+        assert!(verify_native_enrollment_v1(&software, &SECRET).is_err());
+        assert_ne!(
+            software_mac,
+            native_transcript_hmac(&SECRET, &submission).unwrap()
+        );
     }
 
     #[test]

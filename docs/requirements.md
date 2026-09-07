@@ -24,9 +24,10 @@ Production must provide:
 The runtime must not log or notify with request plaintext. An ntfy message may
 contain host, user, request ID, and `/r/<id>` URL only.
 
-A device is either kind `webauthn` (a browser) or kind `secure-enclave` (the
-native agent). The native agent is a NATS consumer only; it never calls the
-server over HTTP. The NATS permissions above must
+A device is kind `webauthn` (a browser), `software` (a native software key),
+or `secure-enclave` (the native agent's hardware-backed key). Software native
+devices never qualify for passwordless sudo. The native agent is a NATS
+consumer only; it never calls the server over HTTP. The NATS permissions above must
 cover it the same as any other consumer.
 
 ## The Mac installer (future — nothing ships yet)

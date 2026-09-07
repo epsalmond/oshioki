@@ -35,4 +35,4 @@ workspace = true
 
 [dev-dependencies]
 p256 = { workspace = true }
-serde_cbor = { workspace = true }
+ciborium = { workspace = true }
