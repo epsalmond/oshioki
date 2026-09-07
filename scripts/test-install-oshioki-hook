@@ -255,7 +255,7 @@ SUDOERS="$TEST_ROOT/with-dropin"; mkdir -p "$SUDOERS/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SUDOERS/state/devices.json"
 printf '# sudoers test file\n@includedir %s\n' "$SUDOERS/sudoers.d" > "$SUDOERS/sudoers"
 OSHIOKI_SUDO_USER=testuser run_installer "$SUDOERS" --prelaunch >"$SUDOERS/log" 2>&1
-grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$SUDOERS/sudoers.d/oshioki" || fail "drop-in has the wrong content"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$SUDOERS/sudoers.d/oshioki" || fail "drop-in has the wrong content"
 [ "$(stat -c '%a' "$SUDOERS/sudoers.d/oshioki" 2>/dev/null || stat -f '%Lp' "$SUDOERS/sudoers.d/oshioki")" = 440 ] || fail "drop-in is not 0440"
 grep -Fq -- '-c -f' "$SUDOERS/visudo.calls" || fail "visudo gate never ran"
 grep -Fq 'sudoers.d/oshioki' "$SUDOERS/visudo.calls" || fail "visudo checked the wrong file"
@@ -283,7 +283,7 @@ SPACEINC="$TEST_ROOT/space-include"; mkdir -p "$SPACEINC/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SPACEINC/state/devices.json"
 printf '# sudoers test file\n#  includedir %s\n' "$SPACEINC/sudoers.d" > "$SPACEINC/sudoers"
 OSHIOKI_SUDO_USER=testuser run_installer "$SPACEINC" --prelaunch >"$SPACEINC/log" 2>&1
-grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$SPACEINC/sudoers.d/oshioki" || fail "spaced # includedir was not honoured"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$SPACEINC/sudoers.d/oshioki" || fail "spaced # includedir was not honoured"
 
 # Dry runs plan without writing.
 DRYUSER="$TEST_ROOT/dry-user"; mkdir -p "$DRYUSER/state"
@@ -356,7 +356,7 @@ printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$STALE
 printf '#includedir %s\n' "$STALEBLOCK/sudoers.d" > "$STALEBLOCK/sudoers"
 OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCK" --prelaunch >"$STALEBLOCK/first.log" 2>&1
 grep -Fq '# BEGIN oshioki' "$STALEBLOCK/sudo.conf" || fail "setup did not enable the plugin"
-grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$STALEBLOCK/sudoers.d/oshioki" || fail "setup did not write the drop-in"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$STALEBLOCK/sudoers.d/oshioki" || fail "setup did not write the drop-in"
 printf '{"version":1,"devices":[]}\n' > "$STALEBLOCK/state/devices.json"
 OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCK" --prelaunch --dry-run >"$STALEBLOCK/dry.log" 2>&1
 grep -Fq "DRY: remove exact managed block from $STALEBLOCK/sudo.conf" "$STALEBLOCK/dry.log" || fail "dry run did not predict the block removal"
@@ -375,7 +375,7 @@ OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCKRB" --prelaunch >"$STALEBLO
 printf '{"version":1,"devices":[]}\n' > "$STALEBLOCKRB/state/devices.json"
 if FAIL_SUDO=1 run_installer "$STALEBLOCKRB" --prelaunch >"$STALEBLOCKRB/log" 2>&1; then fail "accepted sudo validation failure on stale removal"; fi
 grep -Fq '# BEGIN oshioki' "$STALEBLOCKRB/sudo.conf" || fail "rollback did not restore the stale block"
-grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$STALEBLOCKRB/sudoers.d/oshioki" || fail "rollback did not restore the stale drop-in"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$STALEBLOCKRB/sudoers.d/oshioki" || fail "rollback did not restore the stale drop-in"
 
 UNSAFE="$TEST_ROOT/unsafe"; mkdir -p "$UNSAFE"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE/sudo.conf"
 if run_installer "$UNSAFE" --prelaunch >"$UNSAFE/log" 2>&1; then fail "accepted symlink sudo.conf"; fi

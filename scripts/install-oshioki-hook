@@ -90,7 +90,9 @@ valid_sudoers_user() {
   esac
   return 0
 }
-sudoers_line() { printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$1"; }
+# `ALL` would imply SETENV; explicitly deny it so the approved environment is
+# exactly the one the plugin authenticated in its RequestV1.
+sudoers_line() { printf '%s ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' "$1"; }
 # The drop-in takes effect only when the main sudoers file includes its
 # directory. Either spelling of the system path counts, and so does either
 # include marker: sudo 1.9.1 added @includedir, which Ubuntu 24.04 writes.

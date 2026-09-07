@@ -20,10 +20,22 @@ The browser token identifies one device. The request API returns only that
 device's sealed body. Plaintext commands never enter SQLite, logs,
 notifications, or metrics.
 
-The request also carries the curated execution environment — loader,
-resolution, shell, interpreter, pager, and trust variables. Approvals sign
-those bytes alongside the command, so a different environment is a different
-approval; the environment travels only inside the sealed bodies.
+The request also carries the complete effective execution environment in its
+original order, including duplicate names. Approvals sign those bytes
+alongside the command, so a different environment is a different approval;
+the environment travels only inside the sealed bodies. The finite list of
+well-known behavior-changing names is display emphasis only and never filters
+authentication coverage. Values that cannot be represented by the private
+line-framed plugin payload (invalid UTF-8, line delimiters, or an environment
+entry without `=`) cause the request to be denied. A NUL is the C-string
+terminator in sudo's `run_envp` ABI and therefore cannot be an environment
+byte; bytes after it are not part of the effective entry.
+
+The plugin adds an environment-complete marker and count to its private
+payload. The hook requires and checks both, preventing a new hook from
+silently accepting the partial environment emitted by an older plugin. This
+does not change the v1 JSON schema: `RequestV1.env` already defaults to empty
+and is omitted when empty, so old requests and signatures remain readable.
 
 The hook and the server route through `oshioki-transport`. The hook holds a `HookTransport`; the server holds a `ServerTransport`. `OSHIOKI_TRANSPORT=nats` is the default and the only transport this issue lands. The wire format (SMTP-style subjects and v1 JSON payloads) is identical to what shipped before the seam. The agent keeps talking to NATS directly until a device-side transport ships (#6/#7).
 

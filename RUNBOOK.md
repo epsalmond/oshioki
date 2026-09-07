@@ -88,8 +88,8 @@ sudo scripts/install-oshioki-hook --prelaunch-status
 The installer rejects unknown config keys, symlinks, non-root ownership, and
 modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
 With an active device it also writes `/etc/sudoers.d/oshioki`
-(`<user> ALL=(ALL) NOPASSWD: ALL`, visudo-checked), so the Touch ID approval
-is the only gate and sudo stops asking for a password. The user comes from
+(`<user> ALL=(ALL) NOSETENV: NOPASSWD: ALL`, visudo-checked), so Touch ID is
+the only authorization step and sudo stops asking for a password. The user comes from
 `OSHIOKI_SUDO_USER` (else `SUDO_USER`); without either, or without a
 `sudoers.d` include in the main sudoers file, the installer warns and keeps
 password authentication. The block and the drop-in go away together with

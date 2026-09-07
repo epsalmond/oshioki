@@ -30,12 +30,11 @@ pub struct EnvEntryV1 {
     pub value: String,
 }
 
-/// Environment variables that can change what a command does without
-/// changing its path or arguments: the dynamic loader, command resolution,
-/// shell startup files, interpreter search paths, pagers and editors, and
-/// trust configuration. The plugin sends only these, so secrets that happen
-/// to sit in the environment never enter the request at all — not the sealed
-/// body, not server storage, not logs.
+/// Environment variable names that deserve emphasis in an approval display.
+/// This is deliberately a finite classification, not an authentication
+/// allowlist: [`RequestV1::env`] carries every effective environment entry.
+/// A command-specific variable can change execution just as surely as one of
+/// these well-known names.
 pub fn is_approval_env(name: &str) -> bool {
     matches!(
         name,
@@ -96,11 +95,13 @@ pub struct RequestV1 {
     pub command: String,
     pub argv: Vec<String>,
     pub pid_chain: Vec<String>,
-    /// Curated execution environment (see [`is_approval_env`]). Signed as
-    /// part of the raw request bytes, so two different environments never
-    /// share an approval. Empty environments serialize to nothing, so
-    /// requests written before the field existed are byte-identical to new
-    /// ones without it — and old signatures keep verifying.
+    /// Complete effective execution environment, in the order supplied to
+    /// `execve`. Duplicate names are retained because their order can affect
+    /// which value a program observes. Every entry is signed as part of the
+    /// raw request bytes, so an omitted or reordered entry cannot share an
+    /// approval. Empty environments serialize to nothing, so requests written
+    /// before this field existed remain byte-identical to new ones without
+    /// it, and old signatures keep verifying.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvEntryV1>,
     pub issued_at: i64,
@@ -845,10 +846,10 @@ mod tests {
         }
     }
 
-    /// The allowlist pins behavior-shaping variables and nothing else:
-    /// loaders, resolution, shells, interpreters, pagers, trust config.
-    /// Anything carrying secrets or mere preferences stays out, so it never
-    /// enters the sealed request.
+    /// The classification identifies behavior-shaping variables for display
+    /// emphasis. It does not determine authentication coverage: all effective
+    /// environment entries are retained in the request, including unknown
+    /// application-specific variables.
     #[test]
     fn approval_env_list_covers_the_dangerous_and_little_else() {
         for name in [
@@ -919,9 +920,10 @@ mod tests {
         assert!(request.validate().is_err());
     }
 
-    /// The approval signs the raw request bytes, so requests that differ
-    /// only in environment hash — and sign — differently. Two materially
-    /// different environments can never share an approval payload.
+    /// The approval signs the raw request bytes, so requests that differ only
+    /// in an environment entry — including its order or duplicate placement —
+    /// sign differently. Two materially different environments can never
+    /// share an approval payload.
     #[test]
     fn different_environments_never_share_an_approval() {
         let bare = minimal_request();

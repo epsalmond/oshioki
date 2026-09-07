@@ -205,7 +205,9 @@ extern "C" fn check(
 /// Serialized sudo context, ready to hand to the hook child process.
 struct SudoContext {
     /// Newline-separated `key=value` pairs from `command_info`, `user_info`,
-    /// and `run_envp`. `run_argv` is appended as positional entries.
+    /// and `run_envp`. `run_argv` is appended as positional entries. The
+    /// `meta.env_count` line lets the hook reject a payload from an older or
+    /// incomplete plugin instead of signing a partial environment.
     payload: Vec<u8>,
 }
 
@@ -285,8 +287,11 @@ unsafe fn gather_context(
     let info = unsafe { parse_sudo_array(command_info) }?;
     // SAFETY: same contract as above.
     let argv = unsafe { parse_sudo_argv(run_argv) }?;
-    // SAFETY: same contract as above.
-    let envp = unsafe { parse_sudo_array(run_envp) }?;
+    // SAFETY: same contract as above. Environment entries must contain `=`;
+    // otherwise line framing would turn `NAME` into the different input
+    // `NAME=`. A malformed effective environment is denied rather than
+    // authenticated ambiguously.
+    let envp = unsafe { parse_sudo_environment(run_envp) }?;
 
     let mut payload = Vec::new();
 
@@ -306,14 +311,17 @@ unsafe fn gather_context(
         let key = format!("argv.{}", i + 1); // 1-based for readability
         push_kv(&mut payload, "", &key, value);
     }
-    // Only behavior-shaping variables cross into the approval: the full
-    // environment can carry secrets, and the curated list (shared with the
-    // hook, which re-filters) is what the approver is shown and signs.
+    // The complete effective environment crosses into the approval. The
+    // protocol's finite `is_approval_env` classification is display policy
+    // only; it must never decide which execution bytes are authenticated.
     for (k, v) in &envp {
-        if oshioki_protocol::is_approval_env(k) {
-            push_kv(&mut payload, "env.", k, v);
-        }
+        push_kv(&mut payload, "env.", k, v);
     }
+    // These markers are part of the private plugin-to-hook framing, not the
+    // v1 request wire format. A new hook requires them so an old plugin cannot
+    // silently reintroduce the partial-environment behavior.
+    push_kv(&mut payload, "meta.", "env_complete", "1");
+    push_kv(&mut payload, "meta.", "env_count", &envp.len().to_string());
 
     Some(SudoContext { payload })
 }
@@ -345,6 +353,24 @@ unsafe fn parse_sudo_array(arr: *const *const c_char) -> Option<Vec<(String, Str
             })
             .collect(),
     )
+}
+
+/// Parse the effective environment while retaining its original order and
+/// duplicate names. Every entry must have an equals sign so the line-framed
+/// plugin-to-hook payload can reconstruct its bytes exactly.
+///
+/// # Safety
+///
+/// `arr` has the same valid sudo array contract as [`parse_sudo_array`].
+unsafe fn parse_sudo_environment(arr: *const *const c_char) -> Option<Vec<(String, String)>> {
+    // SAFETY: the caller supplies sudo's valid NUL-terminated array.
+    unsafe { parse_sudo_argv(arr) }?
+        .into_iter()
+        .map(|item| {
+            item.split_once('=')
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 /// Walk a NUL-terminated `char **` array without interpreting its entries.
@@ -694,32 +720,55 @@ mod tests {
                 "argv.2=hello\n",
                 "argv.3=world with spaces\n",
                 "argv.4=-n\n",
+                "meta.env_complete=1\n",
+                "meta.env_count=0\n",
             )
         );
     }
 
-    /// Only behavior-shaping variables cross into the approval: the loader
-    /// override and the command search path are bound, while preferences
-    /// and secrets stay out of the payload entirely.
+    /// Every effective environment entry crosses into the approval, including
+    /// interpreter toggles and application-specific values that are not in
+    /// the finite display classification.
     #[test]
-    fn gather_context_filters_the_environment_to_policy_variables() {
+    fn gather_context_binds_the_complete_environment() {
         let context = gather_test_context(
             &[b"command=/usr/bin/python3"],
             &[b"/usr/bin/python3", b"app.py"],
             &[
                 b"LD_PRELOAD=/tmp/evil.so",
                 b"PATH=/tmp/bin:/usr/bin",
+                b"PYTHONINSPECT=1",
+                b"PERL5OPT=-M/tmp/attacker",
+                b"APP_MODE=unsafe",
                 b"HOME=/root",
-                b"AWS_SECRET_ACCESS_KEY=hunter2",
             ],
         )
         .unwrap();
         let payload = String::from_utf8(context.payload).unwrap();
         assert!(payload.contains("env.LD_PRELOAD=/tmp/evil.so\n"));
         assert!(payload.contains("env.PATH=/tmp/bin:/usr/bin\n"));
-        assert!(!payload.contains("HOME="));
-        assert!(!payload.contains("AWS_SECRET_ACCESS_KEY="));
-        assert!(!payload.contains("hunter2"));
+        assert!(payload.contains("env.PYTHONINSPECT=1\n"));
+        assert!(payload.contains("env.PERL5OPT=-M/tmp/attacker\n"));
+        assert!(payload.contains("env.APP_MODE=unsafe\n"));
+        assert!(payload.contains("env.HOME=/root\n"));
+        assert!(payload.contains("meta.env_complete=1\n"));
+        assert!(payload.contains("meta.env_count=6\n"));
+    }
+
+    #[test]
+    fn gather_context_preserves_environment_order_and_duplicates() {
+        let context = gather_test_context(
+            &[b"command=/usr/bin/env"],
+            &[b"/usr/bin/env"],
+            &[b"APP_MODE=first", b"PATH=/one", b"APP_MODE=second"],
+        )
+        .unwrap();
+        let payload = String::from_utf8(context.payload).unwrap();
+        let first = payload.find("env.APP_MODE=first\n").unwrap();
+        let path = payload.find("env.PATH=/one\n").unwrap();
+        let second = payload.find("env.APP_MODE=second\n").unwrap();
+        assert!(first < path && path < second, "{payload}");
+        assert!(payload.ends_with("meta.env_count=3\n"));
     }
 
     #[test]
@@ -758,6 +807,14 @@ mod tests {
                 &[b"command=/usr/bin/echo"],
                 &[b"/usr/bin/echo"],
                 &[b"NAME=line\nbreak"],
+            )
+            .is_none()
+        );
+        assert!(
+            gather_test_context(
+                &[b"command=/usr/bin/echo"],
+                &[b"/usr/bin/echo"],
+                &[b"MALFORMED"],
             )
             .is_none()
         );
