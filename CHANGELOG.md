@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set. There is no rolling negotiation; mixed versions fail closed with an
   upgrade diagnostic. The v1 request and decision formats and cryptography
   are unchanged.
+- A socket agent that disconnects after acknowledging a request causes that
+  sudo to be denied, including during an agent restart or laptop suspend.
+  The hook does not retry that request through NATS.
 
 ### Fixed
 

@@ -319,8 +319,8 @@ restore routing, and confirm ordinary sudo behavior.
 
 ## Logs
 
-A sudo that is approved prints nothing, like sudo itself. The hook writes
-warnings and errors to the terminal, and the audit trail (every approval,
+The hook writes approval progress, warnings, and errors to stderr. It sends
+the audit trail (every approval,
 denial, and a request left to NATS by the local agent) to the system log
 under the `authpriv` facility, the one sudo uses:
 
@@ -338,3 +338,8 @@ chatter) or `OSHIOKI_LOG=audit=info` (the audit trail) in
 that root-owned file and ignores `RUST_LOG`, so a caller cannot change what
 root prints. The other `oshioki` verbs, run by a person, honour `RUST_LOG`.
 The system log keeps its own level regardless.
+
+If a browser delivery receipt times out while NATS and the server are healthy,
+check that the browser device is active in both the hook's pinned registry and
+the server's device records. A device revoked only on the server cannot receive
+a delivery receipt even when the hook still lists it as active.

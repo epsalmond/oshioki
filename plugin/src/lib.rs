@@ -564,7 +564,7 @@ fn run_hook_with_password(ctx: &SudoContext, hook: &mut HookChild) -> c_int {
         }
 
         if hook_done && password_done {
-            cancel_password(password.take(), false);
+            cancel_password(password.take(), true);
             return 0;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -786,23 +786,45 @@ fn drain_password_ready(worker: Option<&mut PasswordWorker>) {
     let Some(worker) = worker else {
         return;
     };
-    let Some(ready) = worker.ready.as_ref() else {
+    let Some(ready_fd) = worker.ready.as_ref().map(std::os::fd::AsRawFd::as_raw_fd) else {
         return;
     };
-    let mut byte = [0u8; 1];
-    // SAFETY: byte is writable storage and ready is an open pipe descriptor.
-    let read = unsafe { libc::read(ready.as_raw_fd(), byte.as_mut_ptr().cast(), byte.len()) };
-    if read == 1 || read == 0 {
-        worker.ready = None;
-        if read == 1 {
-            worker.prompt_ready = true;
+    let mut bytes = [0u8; 16];
+    loop {
+        // SAFETY: bytes is writable storage and ready is an open pipe
+        // descriptor owned by this process.
+        let read = unsafe { libc::read(ready_fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        if read > 0 {
+            let read = usize::try_from(read).expect("positive ready-pipe read length");
+            for state in &bytes[..read] {
+                worker.prompt_ready = *state == 1 && worker.pid.is_some();
+            }
+            // Drain all queued state transitions before forwarding hook output
+            // so a submitted password cannot be followed by a redraw.
+            continue;
         }
+        if read == 0 {
+            worker.ready = None;
+            worker.prompt_ready = false;
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if error.raw_os_error() != Some(libc::EAGAIN)
+                && error.raw_os_error() != Some(libc::EWOULDBLOCK)
+            {
+                worker.ready = None;
+                worker.prompt_ready = false;
+            }
+        }
+        break;
     }
 }
 
 #[cfg(target_os = "linux")]
 fn redraw_password_prompt(worker: &mut PasswordWorker) {
-    if worker.prompt_ready {
+    if worker.prompt_ready && worker.pid.is_some() && worker.ready.is_some() {
         write_fd(worker.tty.as_raw_fd(), &worker.prompt);
     }
 }
@@ -847,6 +869,7 @@ fn drain_hook_stderr(
     #[cfg(target_os = "linux")]
     if output_seen {
         if let Some(worker) = password {
+            drain_password_ready(Some(&mut *worker));
             redraw_password_prompt(worker);
         }
     }
@@ -891,7 +914,7 @@ fn cancel_password(worker: Option<PasswordWorker>, flush_input: bool) {
         // The parent keeps an independent tty descriptor and termios
         // snapshot. Restore echo and flush partially typed input even when
         // PAM is blocked and the password process must be terminated.
-        let flush = worker.terminal_needs_flush || (flush_input && worker.pid.is_some());
+        let flush = worker.terminal_needs_flush || flush_input;
         restore_terminal(worker.tty.as_raw_fd(), &worker.saved_termios, flush);
     }
 }
@@ -989,6 +1012,8 @@ fn reap_password(worker: &mut PasswordWorker) -> Option<PasswordResult> {
         Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(nix::errno::Errno::EINTR) => None,
         Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
             worker.pid = None;
+            worker.prompt_ready = false;
+            worker.terminal_needs_flush = true;
             let result = match code {
                 0 => PasswordResult::Approved,
                 1 => PasswordResult::Rejected,
@@ -1004,6 +1029,7 @@ fn reap_password(worker: &mut PasswordWorker) -> Option<PasswordResult> {
         }
         Ok(_) | Err(_) => {
             worker.pid = None;
+            worker.prompt_ready = false;
             worker.terminal_needs_flush = true;
             restore_terminal(worker.tty.as_raw_fd(), &worker.saved_termios, true);
             Some(PasswordResult::Failed)
@@ -1141,10 +1167,11 @@ fn read_and_authenticate_password(
     write_fd(ready.as_raw_fd(), &[1]);
 
     let deadline = std::time::Instant::now() + PASSWORD_RACE_TIMEOUT;
-    let mut input = Vec::with_capacity(128);
+    let mut input = Vec::with_capacity(4096);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            zeroize_bytes(&mut input);
             guard.flush_input = true;
             return PasswordResult::Unavailable;
         }
@@ -1160,6 +1187,7 @@ fn read_and_authenticate_password(
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
+            zeroize_bytes(&mut input);
             guard.flush_input = true;
             return PasswordResult::Unavailable;
         }
@@ -1168,25 +1196,38 @@ fn read_and_authenticate_password(
             // SAFETY: bytes is writable storage and fd is open.
             let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
             if read <= 0 {
+                zeroize_bytes(&mut input);
                 guard.flush_input = true;
                 return PasswordResult::Unavailable;
             }
             let read = usize::try_from(read).expect("positive read length");
-            input.extend_from_slice(&bytes[..read]);
-            if input.len() > 4096 {
+            if read > 4096 - input.len() {
+                zeroize_bytes(&mut bytes[..read]);
+                zeroize_bytes(&mut input);
                 guard.flush_input = true;
                 return PasswordResult::Rejected;
             }
+            input.extend_from_slice(&bytes[..read]);
+            zeroize_bytes(&mut bytes[..read]);
             if let Some(end) = input.iter().position(|byte| *byte == b'\n') {
-                input.truncate(end);
-                if input.last() == Some(&b'\r') {
-                    input.pop();
-                }
-                if input.contains(&0) {
+                // Stop advertising an input reader before handing the line to
+                // PAM. The child remains alive while PAM authenticates, but it
+                // no longer accepts another password line.
+                write_fd(ready.as_raw_fd(), &[0]);
+                let password_end = end
+                    .checked_sub(1)
+                    .filter(|index| input[*index] == b'\r')
+                    .unwrap_or(end);
+                let result = if input[..password_end].contains(&0) {
                     guard.flush_input = true;
-                    return PasswordResult::Rejected;
-                }
-                let result = authenticate_password_line(username, &input, authenticate_with_pam);
+                    PasswordResult::Rejected
+                } else {
+                    authenticate_password_line(
+                        username,
+                        &input[..password_end],
+                        authenticate_with_pam,
+                    )
+                };
                 zeroize_bytes(&mut input);
                 let _ = tty_file.write_all(b"\n");
                 let _ = tty_file.flush();
