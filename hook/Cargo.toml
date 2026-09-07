@@ -33,7 +33,7 @@ futures = { version = "0.3" }
 
 [dev-dependencies]
 p256 = { workspace = true }
-serde_cbor = { workspace = true }
+ciborium = { workspace = true }
 x25519-dalek = { workspace = true }
 
 [lints]

@@ -80,6 +80,12 @@ relays the HMAC-bound browser transcript. The hook verifies registration,
 the immediate proof assertion, origin, RP ID, UP, UV, and the ES256 key before
 atomically replacing its local registry.
 
+Attestation and COSE CBOR are decoded with `ciborium` in bounded strict mode:
+attestation objects are capped at 128 KiB, COSE keys at 4 KiB, nesting at 16
+levels, and total CBOR items at 256. Each input must contain exactly one value;
+duplicate map keys are rejected before the existing ES256 key, coordinate, and
+`none` attestation-format checks run.
+
 A native enrollment submission carries `credential_public_key`,
 `box_public_key`, `api_token_hash`, `label`, `proof_signature`, and
 `transcript_hmac`. The proof is a DER ECDSA P-256 signature over an HMAC of

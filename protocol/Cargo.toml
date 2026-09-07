@@ -15,7 +15,7 @@ publish = { workspace = true }
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_cbor = { workspace = true }
+ciborium = { workspace = true }
 p256 = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }

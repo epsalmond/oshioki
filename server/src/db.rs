@@ -687,7 +687,6 @@ mod tests {
     };
     use p256::ecdsa::SigningKey;
     use std::{
-        collections::BTreeMap,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -713,25 +712,30 @@ mod tests {
         let credential_id = vec![1; 16];
         let signing = SigningKey::from_bytes((&[2; 32]).into()).unwrap();
         let point = signing.verifying_key().to_encoded_point(false);
-        let mut cose = BTreeMap::new();
-        cose.insert(serde_cbor::Value::Integer(1), serde_cbor::Value::Integer(2));
-        cose.insert(
-            serde_cbor::Value::Integer(3),
-            serde_cbor::Value::Integer(-7),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-1),
-            serde_cbor::Value::Integer(1),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-2),
-            serde_cbor::Value::Bytes(point.x().unwrap().to_vec()),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-3),
-            serde_cbor::Value::Bytes(point.y().unwrap().to_vec()),
-        );
-        let credential_public_key = serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap();
+        let cose = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Integer(1.into()),
+                ciborium::Value::Integer(2.into()),
+            ),
+            (
+                ciborium::Value::Integer(3.into()),
+                ciborium::Value::Integer((-7).into()),
+            ),
+            (
+                ciborium::Value::Integer((-1).into()),
+                ciborium::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::Value::Integer((-2).into()),
+                ciborium::Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                ciborium::Value::Integer((-3).into()),
+                ciborium::Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ]);
+        let mut credential_public_key = Vec::new();
+        ciborium::ser::into_writer(&cose, &mut credential_public_key).unwrap();
         let box_public_key = vec![3; 32];
         let fingerprint = oshioki_protocol::device_fingerprint(
             &credential_id,

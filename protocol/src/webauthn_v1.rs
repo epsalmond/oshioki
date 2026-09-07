@@ -1,9 +1,11 @@
 //! `WebAuthn` assertion verification for version one approvals.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ciborium::Value;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::io::Cursor;
 
 use crate::{
     Error,
@@ -12,6 +14,14 @@ use crate::{
         decode_base64url,
     },
 };
+
+/// Maximum encoded size accepted for a `WebAuthn` attestation object.
+pub(crate) const MAX_ATTESTATION_CBOR_BYTES: usize = 128 * 1024;
+/// COSE keys are small maps. Keep malformed persisted records from allocating
+/// unbounded memory while decoding them.
+pub(crate) const MAX_COSE_CBOR_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_CBOR_DEPTH: usize = 16;
+pub(crate) const MAX_CBOR_ITEMS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssertionOutcomeV1 {
@@ -102,9 +112,9 @@ pub fn verify_approval_v1(
 }
 
 pub fn cose_p256_verifying_key(cose_bytes: &[u8]) -> Result<VerifyingKey, Error> {
-    let value: serde_cbor::Value =
-        serde_cbor::from_slice(cose_bytes).map_err(|_| Error::InvalidSignature)?;
-    let serde_cbor::Value::Map(entries) = value else {
+    let value =
+        decode_cbor_value(cose_bytes, MAX_COSE_CBOR_BYTES).map_err(|()| Error::InvalidSignature)?;
+    let Value::Map(entries) = value else {
         return Err(Error::InvalidSignature);
     };
     let mut kty = None;
@@ -113,19 +123,19 @@ pub fn cose_p256_verifying_key(cose_bytes: &[u8]) -> Result<VerifyingKey, Error>
     let mut x = None;
     let mut y = None;
     for (key, value) in entries {
-        let serde_cbor::Value::Integer(label) = key else {
+        let Value::Integer(label) = key else {
             continue;
         };
         match (label, value) {
-            (1, serde_cbor::Value::Integer(value)) => kty = Some(value),
-            (3, serde_cbor::Value::Integer(value)) => alg = Some(value),
-            (-1, serde_cbor::Value::Integer(value)) => crv = Some(value),
-            (-2, serde_cbor::Value::Bytes(value)) => x = Some(value),
-            (-3, serde_cbor::Value::Bytes(value)) => y = Some(value),
+            (label, Value::Integer(value)) if label == 1.into() => kty = Some(value),
+            (label, Value::Integer(value)) if label == 3.into() => alg = Some(value),
+            (label, Value::Integer(value)) if label == (-1).into() => crv = Some(value),
+            (label, Value::Bytes(value)) if label == (-2).into() => x = Some(value),
+            (label, Value::Bytes(value)) if label == (-3).into() => y = Some(value),
             _ => {}
         }
     }
-    if kty != Some(2) || alg != Some(-7) || crv != Some(1) {
+    if kty != Some(2.into()) || alg != Some((-7).into()) || crv != Some(1.into()) {
         return Err(Error::InvalidSignature);
     }
     let (Some(x), Some(y)) = (x, y) else {
@@ -141,6 +151,104 @@ pub fn cose_p256_verifying_key(cose_bytes: &[u8]) -> Result<VerifyingKey, Error>
     VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| Error::InvalidSignature)
 }
 
+/// Decode exactly one bounded CBOR value and reject duplicate map keys.
+///
+/// `ciborium` supplies a recursion limit, while the value walk bounds the
+/// total number of nodes and catches duplicate keys without relying on a map
+/// implementation that might silently overwrite them. The cursor check is
+/// deliberately kept outside the decoder: serde decoders generally consume
+/// one value, so accepting an unexamined suffix would make the signed data
+/// ambiguous.
+pub(crate) fn decode_cbor_value(bytes: &[u8], max_bytes: usize) -> Result<Value, ()> {
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        return Err(());
+    }
+    let mut cursor = Cursor::new(bytes);
+    let value =
+        ciborium::de::from_reader_with_recursion_limit::<Value, _>(&mut cursor, MAX_CBOR_DEPTH)
+            .map_err(|_| ())?;
+    if usize::try_from(cursor.position()).map_err(|_| ())? != bytes.len() {
+        return Err(());
+    }
+    let mut item_count = 0;
+    validate_cbor_value(&value, 0, &mut item_count)?;
+    Ok(value)
+}
+
+fn validate_cbor_value(value: &Value, depth: usize, item_count: &mut usize) -> Result<(), ()> {
+    if depth > MAX_CBOR_DEPTH {
+        return Err(());
+    }
+    *item_count = item_count.checked_add(1).ok_or(())?;
+    if *item_count > MAX_CBOR_ITEMS {
+        return Err(());
+    }
+    match value {
+        Value::Tag(_, value) => validate_cbor_value(value, depth + 1, item_count),
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| validate_cbor_value(value, depth + 1, item_count)),
+        Value::Map(entries) => {
+            for (index, (key, value)) in entries.iter().enumerate() {
+                if entries[..index]
+                    .iter()
+                    .any(|(previous, _)| cbor_values_equal(previous, key))
+                {
+                    return Err(());
+                }
+                validate_cbor_value(key, depth + 1, item_count)?;
+                validate_cbor_value(value, depth + 1, item_count)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// CBOR map keys are values, and maps are unordered. `Value`'s derived
+// equality compares map entry order, so compare nested maps as sets here.
+fn cbor_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Bytes(left), Value::Bytes(right)) => left == right,
+        (Value::Text(left), Value::Text(right)) => left == right,
+        (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits(),
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Null, Value::Null) => true,
+        (Value::Tag(left_tag, left), Value::Tag(right_tag, right)) => {
+            left_tag == right_tag && cbor_values_equal(left, right)
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| cbor_values_equal(left, right))
+        }
+        (Value::Map(left), Value::Map(right)) => {
+            if left.len() != right.len() {
+                return false;
+            }
+            let mut matched = vec![false; right.len()];
+            left.iter().all(|(left_key, left_value)| {
+                right
+                    .iter()
+                    .enumerate()
+                    .any(|(index, (right_key, right_value))| {
+                        !matched[index]
+                            && cbor_values_equal(left_key, right_key)
+                            && cbor_values_equal(left_value, right_value)
+                            && {
+                                matched[index] = true;
+                                true
+                            }
+                    })
+            })
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -149,29 +257,19 @@ pub(crate) mod tests {
         ecdsa::{SigningKey, signature::Signer as _},
         elliptic_curve::rand_core::OsRng,
     };
-    use std::collections::BTreeMap;
 
     /// Encodes a P-256 point as a COSE ES256 key, for fixtures.
     pub(crate) fn cose_key(x: &[u8], y: &[u8]) -> Vec<u8> {
-        let mut cose = BTreeMap::new();
-        cose.insert(serde_cbor::Value::Integer(1), serde_cbor::Value::Integer(2));
-        cose.insert(
-            serde_cbor::Value::Integer(3),
-            serde_cbor::Value::Integer(-7),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-1),
-            serde_cbor::Value::Integer(1),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-2),
-            serde_cbor::Value::Bytes(x.to_vec()),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-3),
-            serde_cbor::Value::Bytes(y.to_vec()),
-        );
-        serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap()
+        let cose = vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(3.into()), Value::Integer((-7).into())),
+            (Value::Integer((-1).into()), Value::Integer(1.into())),
+            (Value::Integer((-2).into()), Value::Bytes(x.to_vec())),
+            (Value::Integer((-3).into()), Value::Bytes(y.to_vec())),
+        ];
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(cose), &mut encoded).unwrap();
+        encoded
     }
 
     fn fixture() -> (SigningKey, DevicePublicRecordV1, HookConfigV1) {
@@ -291,6 +389,54 @@ pub(crate) mod tests {
             verify_approval_v1(&approval, raw, &device, &config),
             Err(Error::MissingUserVerification)
         ));
+    }
+
+    #[test]
+    fn rejects_malformed_cose() {
+        assert!(cose_p256_verifying_key(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn rejects_deeply_nested_cose() {
+        let mut value = Value::Integer(0.into());
+        for _ in 0..=MAX_CBOR_DEPTH {
+            value = Value::Array(vec![value]);
+        }
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&value, &mut encoded).unwrap();
+        assert!(cose_p256_verifying_key(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_cose() {
+        assert!(cose_p256_verifying_key(&vec![0; MAX_COSE_CBOR_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn rejects_cose_with_duplicate_map_key() {
+        let value = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+        ]);
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&value, &mut encoded).unwrap();
+        assert!(cose_p256_verifying_key(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_cose_with_trailing_data() {
+        let (_, device, _) = fixture();
+        let mut encoded = decode_base64url(&device.credential_public_key).unwrap();
+        encoded.push(0);
+        assert!(cose_p256_verifying_key(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_cose_with_too_many_items() {
+        let value = Value::Array(vec![Value::Null; MAX_CBOR_ITEMS]);
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&value, &mut encoded).unwrap();
+        assert!(cose_p256_verifying_key(&encoded).is_err());
     }
 
     #[test]
