@@ -121,9 +121,9 @@ mod logging {
 
     use tracing::field::{Field, Visit};
     use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
     use tracing_subscriber::util::SubscriberInitExt as _;
-    use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
     /// syslog(3) facility for security and authorization messages, the one
     /// sudo itself logs under.
@@ -141,7 +141,9 @@ mod logging {
             )
             .with(
                 SyslogLayer::new(move |severity, line| syslog.send(severity, line))
-                    .with_filter(LevelFilter::INFO),
+                    // Our own records at info; a library's connection
+                    // chatter only when it is a warning.
+                    .with_filter(EnvFilter::new("warn,oshioki=info,audit=info")),
             )
             .init();
     }
