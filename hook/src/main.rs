@@ -198,17 +198,34 @@ mod logging {
         EnvFilter::new(SYSLOG_DIRECTIVES)
     }
 
-    /// The local syslog datagram socket, spoken to in the BSD format every
-    /// syslogd, journald, and the macOS unified log accept. Nonblocking: a
-    /// missing socket or a full buffer drops the line, because an audit sink
-    /// must never stall or fail a sudo.
+    /// The system log. On Linux the local syslog datagram socket, spoken
+    /// to in the BSD format syslogd and journald accept. On macOS the
+    /// unified log via logger(1): datagrams to the legacy socket are
+    /// accepted there and then dropped, verified on Sequoia. Best effort
+    /// either way and never waited on: a missing sink, a full buffer, or a
+    /// slow log daemon drops the line, because an audit sink must never
+    /// stall or fail a sudo.
     struct Syslog {
-        socket: Option<UnixDatagram>,
+        sink: Option<Sink>,
         pid: u32,
     }
 
+    enum Sink {
+        Socket(UnixDatagram),
+        Logger,
+    }
+
+    const LOGGER: &str = "/usr/bin/logger";
+
     impl Syslog {
         fn connect() -> Self {
+            let pid = std::process::id();
+            if cfg!(target_os = "macos") && std::path::Path::new(LOGGER).is_file() {
+                return Self {
+                    sink: Some(Sink::Logger),
+                    pid,
+                };
+            }
             let socket = ["/dev/log", "/var/run/syslog", "/var/run/log"]
                 .iter()
                 .find_map(|path| {
@@ -218,21 +235,43 @@ mod logging {
                     Some(socket)
                 });
             Self {
-                socket,
-                pid: std::process::id(),
+                sink: socket.map(Sink::Socket),
+                pid,
             }
         }
 
         fn send(&self, severity: u8, line: &str) {
-            let Some(socket) = &self.socket else { return };
-            let _ = socket.send(datagram(self.pid, severity, line).as_bytes());
+            match &self.sink {
+                None => {}
+                Some(Sink::Socket(socket)) => {
+                    let _ = socket.send(datagram(self.pid, severity, line).as_bytes());
+                }
+                Some(Sink::Logger) => {
+                    // Fire and forget: the hook exits right after the
+                    // record and launchd reaps the child, and a wedged
+                    // log daemon must not hold a sudo. The message keeps
+                    // the same `oshioki[pid]:` prefix as the datagram so
+                    // the unified log can be filtered on it; `--` keeps a
+                    // line starting with `-` from being read as an option.
+                    let _ = std::process::Command::new(LOGGER)
+                        .env_clear()
+                        .args(["-t", "oshioki", "-p"])
+                        .arg(format!("authpriv.{}", severity_name(severity)))
+                        .arg("--")
+                        .arg(format!("oshioki[{}]: {}", self.pid, sanitize(line)))
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+            }
         }
     }
 
-    /// `<PRI>oshioki[pid]: line`, with the line cut to a datagram-safe
-    /// length and every control character (newlines above all) replaced, so
-    /// a value that came from outside cannot forge a second record.
-    pub fn datagram(pid: u32, severity: u8, line: &str) -> String {
+    /// The line cut to a datagram-safe length with every control character
+    /// (newlines above all) replaced, so a value that came from outside
+    /// cannot forge a second record.
+    pub fn sanitize(line: &str) -> String {
         let mut clean = String::with_capacity(line.len().min(MAX_DATAGRAM_LINE));
         for c in line.chars() {
             let c = if c.is_control() { ' ' } else { c };
@@ -241,7 +280,26 @@ mod logging {
             }
             clean.push(c);
         }
-        format!("<{}>oshioki[{pid}]: {clean}", LOG_AUTHPRIV * 8 + severity)
+        clean
+    }
+
+    /// `<PRI>oshioki[pid]: line`, the BSD syslog datagram.
+    pub fn datagram(pid: u32, severity: u8, line: &str) -> String {
+        format!(
+            "<{}>oshioki[{pid}]: {}",
+            LOG_AUTHPRIV * 8 + severity,
+            sanitize(line)
+        )
+    }
+
+    /// syslog(3) severity names, as logger(1) -p takes them.
+    pub fn severity_name(severity: u8) -> &'static str {
+        match severity {
+            3 => "err",
+            4 => "warning",
+            6 => "info",
+            _ => "debug",
+        }
     }
 
     /// One syslog line per event: the message, then `key=value` fields.
@@ -442,7 +500,31 @@ mod logging {
         }
 
         #[test]
+        fn sanitize_replaces_every_control_character_and_bounds_the_line() {
+            let dirty = "a\nb\rc\0d\te\u{85}f";
+            let clean = super::sanitize(dirty);
+            assert_eq!(clean, "a b c d e f");
+            assert!(clean.chars().all(|c| !c.is_control()));
+            let long = super::sanitize(&"ü".repeat(5000));
+            assert!(long.len() <= super::MAX_DATAGRAM_LINE);
+            assert!(long.len() > super::MAX_DATAGRAM_LINE - 2);
+            assert!(long.chars().all(|c| c == 'ü'));
+        }
+
+        #[test]
         fn severities_map_like_syslog() {
+            assert_eq!(
+                super::severity_name(severity(tracing::Level::TRACE)),
+                "debug"
+            );
+            for (level, name) in [
+                (tracing::Level::ERROR, "err"),
+                (tracing::Level::WARN, "warning"),
+                (tracing::Level::INFO, "info"),
+                (tracing::Level::DEBUG, "debug"),
+            ] {
+                assert_eq!(super::severity_name(severity(level)), name);
+            }
             assert_eq!(severity(tracing::Level::ERROR), 3);
             assert_eq!(severity(tracing::Level::WARN), 4);
             assert_eq!(severity(tracing::Level::INFO), 6);

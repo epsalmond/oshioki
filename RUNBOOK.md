@@ -315,12 +315,12 @@ denial, and a request left to NATS by the local agent) to the system log
 under the `authpriv` facility, the one sudo uses:
 
 ```bash
-journalctl -t oshioki                                            # Linux
-sudo log stream --predicate 'eventMessage CONTAINS "oshioki["'   # macOS, best effort
+journalctl -t oshioki                                                   # Linux
+sudo log show --info --last 1h --predicate 'eventMessage BEGINSWITH "oshioki["'   # macOS
 ```
 
-On macOS the hook talks to the legacy syslog socket and what the unified
-log shows of it varies by release; journald is the supported path.
+On macOS the hook hands each record to logger(1), which is what the unified
+log keeps; approvals are info level, so `log show` needs `--info`.
 
 To see more on the terminal, put `OSHIOKI_LOG=info` (the hook's own
 chatter) or `OSHIOKI_LOG=audit=info` (the audit trail) in
