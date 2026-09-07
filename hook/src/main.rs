@@ -198,17 +198,33 @@ mod logging {
         EnvFilter::new(SYSLOG_DIRECTIVES)
     }
 
-    /// The local syslog datagram socket, spoken to in the BSD format every
-    /// syslogd, journald, and the macOS unified log accept. Nonblocking: a
-    /// missing socket or a full buffer drops the line, because an audit sink
-    /// must never stall or fail a sudo.
+    /// The system log. On Linux the local syslog datagram socket, spoken
+    /// to in the BSD format syslogd and journald accept. On macOS the
+    /// unified log via logger(1): datagrams to the legacy socket are
+    /// accepted there and then dropped, verified on Sequoia. Nonblocking
+    /// and best effort either way: a missing sink or a full buffer drops
+    /// the line, because an audit sink must never stall or fail a sudo.
     struct Syslog {
-        socket: Option<UnixDatagram>,
+        sink: Option<Sink>,
         pid: u32,
     }
 
+    enum Sink {
+        Socket(UnixDatagram),
+        Logger,
+    }
+
+    const LOGGER: &str = "/usr/bin/logger";
+
     impl Syslog {
         fn connect() -> Self {
+            let pid = std::process::id();
+            if cfg!(target_os = "macos") && std::path::Path::new(LOGGER).is_file() {
+                return Self {
+                    sink: Some(Sink::Logger),
+                    pid,
+                };
+            }
             let socket = ["/dev/log", "/var/run/syslog", "/var/run/log"]
                 .iter()
                 .find_map(|path| {
@@ -218,21 +234,37 @@ mod logging {
                     Some(socket)
                 });
             Self {
-                socket,
-                pid: std::process::id(),
+                sink: socket.map(Sink::Socket),
+                pid,
             }
         }
 
         fn send(&self, severity: u8, line: &str) {
-            let Some(socket) = &self.socket else { return };
-            let _ = socket.send(datagram(self.pid, severity, line).as_bytes());
+            match &self.sink {
+                None => {}
+                Some(Sink::Socket(socket)) => {
+                    let _ = socket.send(datagram(self.pid, severity, line).as_bytes());
+                }
+                Some(Sink::Logger) => {
+                    // logger(1) takes the message as one argument; the
+                    // sanitized line has no newline left to split it.
+                    let _ = std::process::Command::new(LOGGER)
+                        .args(["-t", "oshioki", "-p"])
+                        .arg(format!("authpriv.{}", severity_name(severity)))
+                        .arg(sanitize(line))
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
         }
     }
 
-    /// `<PRI>oshioki[pid]: line`, with the line cut to a datagram-safe
-    /// length and every control character (newlines above all) replaced, so
-    /// a value that came from outside cannot forge a second record.
-    pub fn datagram(pid: u32, severity: u8, line: &str) -> String {
+    /// The line cut to a datagram-safe length with every control character
+    /// (newlines above all) replaced, so a value that came from outside
+    /// cannot forge a second record.
+    pub fn sanitize(line: &str) -> String {
         let mut clean = String::with_capacity(line.len().min(MAX_DATAGRAM_LINE));
         for c in line.chars() {
             let c = if c.is_control() { ' ' } else { c };
@@ -241,7 +273,26 @@ mod logging {
             }
             clean.push(c);
         }
-        format!("<{}>oshioki[{pid}]: {clean}", LOG_AUTHPRIV * 8 + severity)
+        clean
+    }
+
+    /// `<PRI>oshioki[pid]: line`, the BSD syslog datagram.
+    pub fn datagram(pid: u32, severity: u8, line: &str) -> String {
+        format!(
+            "<{}>oshioki[{pid}]: {}",
+            LOG_AUTHPRIV * 8 + severity,
+            sanitize(line)
+        )
+    }
+
+    /// syslog(3) severity names, as logger(1) -p takes them.
+    pub fn severity_name(severity: u8) -> &'static str {
+        match severity {
+            3 => "err",
+            4 => "warning",
+            6 => "info",
+            _ => "debug",
+        }
     }
 
     /// One syslog line per event: the message, then `key=value` fields.
@@ -443,6 +494,14 @@ mod logging {
 
         #[test]
         fn severities_map_like_syslog() {
+            for (level, name) in [
+                (tracing::Level::ERROR, "err"),
+                (tracing::Level::WARN, "warning"),
+                (tracing::Level::INFO, "info"),
+                (tracing::Level::DEBUG, "debug"),
+            ] {
+                assert_eq!(super::severity_name(severity(level)), name);
+            }
             assert_eq!(severity(tracing::Level::ERROR), 3);
             assert_eq!(severity(tracing::Level::WARN), 4);
             assert_eq!(severity(tracing::Level::INFO), 6);

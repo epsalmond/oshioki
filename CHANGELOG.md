@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On macOS the audit trail reaches the unified log. The hook hands each
+  record to logger(1); datagrams to the legacy syslog socket were accepted
+  and then dropped, so nothing was kept.
+
 ## [0.1.3] - 2026-09-07
 
 ### Changed
