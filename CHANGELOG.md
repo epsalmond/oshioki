@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The hook is quiet on an approved sudo. Approvals, denials, and transport
+  fallbacks go to the system log (`authpriv`, like sudo; `journalctl -t
+  oshioki`), and only warnings and errors reach the terminal, on stderr.
+  `RUST_LOG=oshioki=info` restores the chatter for development.
+
 ### Fixed
 
 - The agent keeps connecting to NATS in the background instead of giving up

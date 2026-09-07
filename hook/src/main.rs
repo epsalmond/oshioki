@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use oshioki_protocol::{
@@ -83,14 +83,10 @@ struct EnrollmentStateV1 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("oshioki=info".parse().expect("valid directive")),
-        )
-        .with_writer(io::stdout)
-        .init();
-    let result = match Cli::parse().verb {
+    logging::init();
+    let cli = Cli::parse();
+    let checking = matches!(cli.verb, Verb::Check);
+    let result = match cli.verb {
         Verb::Check => cmd_check().await,
         Verb::Enroll { resume } => cmd_enroll(resume.as_deref()).await,
         Verb::Revoke { fingerprint } => cmd_revoke(&fingerprint).await,
@@ -101,10 +97,189 @@ async fn main() -> Result<()> {
         Verb::Test => cmd_test().await,
     };
     if let Err(error) = result {
+        // The terminal gets sudo's one line; the system log gets the audit
+        // record, on a target the terminal layer does not carry.
+        if checking {
+            warn!(target: "audit", error = %format!("{error:#}"), "sudo request denied");
+        }
         eprintln!("error: {error:#}");
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Two sinks, like sudo: the terminal sees warnings and errors only, the
+/// system log keeps the audit trail. A sudo that works prints nothing, and
+/// agents driving a shell do not pay for approval chatter in their output.
+///
+/// `RUST_LOG` overrides the terminal filter for development. The system
+/// log stays at info regardless so the record does not depend on the
+/// caller's environment.
+mod logging {
+    use std::fmt::Write as _;
+    use std::os::unix::net::UnixDatagram;
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{EnvFilter, filter::LevelFilter};
+
+    /// syslog(3) facility for security and authorization messages, the one
+    /// sudo itself logs under.
+    const LOG_AUTHPRIV: u8 = 10;
+
+    pub fn init() {
+        let terminal =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,audit=off"));
+        let syslog = Syslog::connect();
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(terminal),
+            )
+            .with(
+                SyslogLayer::new(move |severity, line| syslog.send(severity, line))
+                    .with_filter(LevelFilter::INFO),
+            )
+            .init();
+    }
+
+    /// The local syslog datagram socket, spoken to in the BSD format every
+    /// syslogd, journald, and the macOS unified log accept. Missing socket
+    /// or a full buffer drops the line: an audit sink must never block or
+    /// fail a sudo.
+    struct Syslog {
+        socket: Option<UnixDatagram>,
+        pid: u32,
+    }
+
+    impl Syslog {
+        fn connect() -> Self {
+            let socket = UnixDatagram::unbound().ok().and_then(|socket| {
+                ["/dev/log", "/var/run/syslog", "/var/run/log"]
+                    .iter()
+                    .any(|path| socket.connect(path).is_ok())
+                    .then_some(socket)
+            });
+            Self {
+                socket,
+                pid: std::process::id(),
+            }
+        }
+
+        fn send(&self, severity: u8, line: &str) {
+            let Some(socket) = &self.socket else { return };
+            let datagram = format!(
+                "<{}>oshioki[{}]: {line}",
+                LOG_AUTHPRIV * 8 + severity,
+                self.pid
+            );
+            let _ = socket.send(datagram.as_bytes());
+        }
+    }
+
+    /// One syslog line per event: the message, then `key=value` fields.
+    pub struct SyslogLayer<F> {
+        sink: F,
+    }
+
+    impl<F: Fn(u8, &str) + Send + Sync + 'static> SyslogLayer<F> {
+        pub fn new(sink: F) -> Self {
+            Self { sink }
+        }
+    }
+
+    /// syslog(3) severities: err 3, warning 4, info 6, debug 7.
+    pub fn severity(level: Level) -> u8 {
+        match level {
+            Level::ERROR => 3,
+            Level::WARN => 4,
+            Level::INFO => 6,
+            _ => 7,
+        }
+    }
+
+    #[derive(Default)]
+    struct Line {
+        message: String,
+        fields: String,
+    }
+
+    impl Visit for Line {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                let _ = write!(self.message, "{value:?}");
+            } else {
+                let _ = write!(self.fields, " {}={value:?}", field.name());
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message.push_str(value);
+            } else {
+                let _ = write!(self.fields, " {}={value}", field.name());
+            }
+        }
+    }
+
+    pub fn render(event: &Event<'_>) -> String {
+        let mut line = Line::default();
+        event.record(&mut line);
+        format!("{}{}", line.message, line.fields)
+    }
+
+    impl<S, F> Layer<S> for SyslogLayer<F>
+    where
+        S: Subscriber,
+        F: Fn(u8, &str) + Send + Sync + 'static,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            (self.sink)(severity(*event.metadata().level()), &render(event));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        use super::{SyslogLayer, severity};
+
+        #[test]
+        fn events_become_one_line_with_sudo_priorities() {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            let subscriber =
+                tracing_subscriber::registry().with(SyslogLayer::new(move |priority, line| {
+                    sink.lock().unwrap().push((priority, line.to_string()));
+                }));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(request_id = "r1", kind = %"secure-enclave", "sudo request approved");
+                tracing::warn!(target: "audit", error = "deadline", "sudo request denied");
+            });
+            let seen = seen.lock().unwrap();
+            assert_eq!(
+                seen[0],
+                (
+                    6,
+                    "sudo request approved request_id=r1 kind=secure-enclave".to_string()
+                )
+            );
+            assert_eq!(
+                seen[1],
+                (4, "sudo request denied error=deadline".to_string())
+            );
+        }
+
+        #[test]
+        fn severities_map_like_syslog() {
+            assert_eq!(severity(tracing::Level::ERROR), 3);
+            assert_eq!(severity(tracing::Level::DEBUG), 7);
+        }
+    }
 }
 
 async fn cmd_check() -> Result<()> {
@@ -152,7 +327,7 @@ async fn execute_request_at(
         SocketOutcome::Decision(decision) => decision,
         SocketOutcome::Unconfigured => match &nats_url {
             Some(url) => {
-                info!("no agent socket configured; trying NATS");
+                debug!("no agent socket configured; trying NATS");
                 nats_fallback(directory, &request, payload, deadline, announce_url, url).await?
             }
             // The transport check above guarantees a fallback here.
@@ -163,7 +338,7 @@ async fn execute_request_at(
         },
         SocketOutcome::Silent(SocketSilence::NoAgent(path)) => match &nats_url {
             Some(url) => {
-                info!(path = %path.display(), "no agent on the socket; trying NATS");
+                debug!(path = %path.display(), "no agent on the socket; trying NATS");
                 nats_fallback(directory, &request, payload, deadline, announce_url, url).await?
             }
             None => bail!(
