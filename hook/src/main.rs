@@ -201,9 +201,10 @@ mod logging {
     /// The system log. On Linux the local syslog datagram socket, spoken
     /// to in the BSD format syslogd and journald accept. On macOS the
     /// unified log via logger(1): datagrams to the legacy socket are
-    /// accepted there and then dropped, verified on Sequoia. Nonblocking
-    /// and best effort either way: a missing sink or a full buffer drops
-    /// the line, because an audit sink must never stall or fail a sudo.
+    /// accepted there and then dropped, verified on Sequoia. Best effort
+    /// either way and never waited on: a missing sink, a full buffer, or a
+    /// slow log daemon drops the line, because an audit sink must never
+    /// stall or fail a sudo.
     struct Syslog {
         sink: Option<Sink>,
         pid: u32,
@@ -246,16 +247,22 @@ mod logging {
                     let _ = socket.send(datagram(self.pid, severity, line).as_bytes());
                 }
                 Some(Sink::Logger) => {
-                    // logger(1) takes the message as one argument; the
-                    // sanitized line has no newline left to split it.
+                    // Fire and forget: the hook exits right after the
+                    // record and launchd reaps the child, and a wedged
+                    // log daemon must not hold a sudo. The message keeps
+                    // the same `oshioki[pid]:` prefix as the datagram so
+                    // the unified log can be filtered on it; `--` keeps a
+                    // line starting with `-` from being read as an option.
                     let _ = std::process::Command::new(LOGGER)
+                        .env_clear()
                         .args(["-t", "oshioki", "-p"])
                         .arg(format!("authpriv.{}", severity_name(severity)))
-                        .arg(sanitize(line))
+                        .arg("--")
+                        .arg(format!("oshioki[{}]: {}", self.pid, sanitize(line)))
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
-                        .status();
+                        .spawn();
                 }
             }
         }
@@ -493,7 +500,23 @@ mod logging {
         }
 
         #[test]
+        fn sanitize_replaces_every_control_character_and_bounds_the_line() {
+            let dirty = "a\nb\rc\0d\te\u{85}f";
+            let clean = super::sanitize(dirty);
+            assert_eq!(clean, "a b c d e f");
+            assert!(clean.chars().all(|c| !c.is_control()));
+            let long = super::sanitize(&"ü".repeat(5000));
+            assert!(long.len() <= super::MAX_DATAGRAM_LINE);
+            assert!(long.len() > super::MAX_DATAGRAM_LINE - 2);
+            assert!(long.chars().all(|c| c == 'ü'));
+        }
+
+        #[test]
         fn severities_map_like_syslog() {
+            assert_eq!(
+                super::severity_name(severity(tracing::Level::TRACE)),
+                "debug"
+            );
             for (level, name) in [
                 (tracing::Level::ERROR, "err"),
                 (tracing::Level::WARN, "warning"),

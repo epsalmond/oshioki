@@ -316,7 +316,7 @@ under the `authpriv` facility, the one sudo uses:
 
 ```bash
 journalctl -t oshioki                                                   # Linux
-sudo log show --info --last 1h --predicate 'process == "logger"'        # macOS
+sudo log show --info --last 1h --predicate 'eventMessage BEGINSWITH "oshioki["'   # macOS
 ```
 
 On macOS the hook hands each record to logger(1), which is what the unified
