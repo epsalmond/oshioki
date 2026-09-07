@@ -26,6 +26,7 @@ case "$(uname -s)" in
   Linux) BUILD_PLUGIN=liboshioki_plugin.so ;;
   *) fail "unsupported test operating system" ;;
 esac
+PLUGIN_NAME="oshioki.${BUILD_PLUGIN##*.}"
 cp /usr/bin/true "$TEST_ROOT/service/target/release/oshioki"
 cp /usr/bin/true "$TEST_ROOT/service/target/release/$BUILD_PLUGIN"
 (
@@ -267,6 +268,34 @@ if OSHIOKI_SUDO_USER=testuser run_installer "$SUDOERS" --prelaunch-status >/dev/
 run_installer "$SUDOERS" --disable-prelaunch
 if grep -Fq '# BEGIN oshioki' "$SUDOERS/sudo.conf"; then fail "disable left managed block"; fi
 [ ! -e "$SUDOERS/sudoers.d/oshioki" ] || fail "disable left the drop-in"
+
+# Package removal must clean the drop-in even when sudo.conf was removed or
+# its managed markers were damaged. The drop-in mode checks ownership, mode,
+# and the complete Oshioki rule without consulting sudo.conf.
+MISSING_CONF="$TEST_ROOT/missing-sudo-conf"; mkdir -p "$MISSING_CONF/state" "$MISSING_CONF/sudoers.d"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$MISSING_CONF/sudoers.d/oshioki"
+run_installer "$MISSING_CONF" --disable-prelaunch
+[ ! -e "$MISSING_CONF/sudoers.d/oshioki" ] || fail "missing sudo.conf left the Oshioki drop-in"
+
+MALFORMED_CONF="$TEST_ROOT/malformed-sudo-conf"; mkdir -p "$MALFORMED_CONF/state" "$MALFORMED_CONF/sudoers.d"
+printf '%s\n' '# BEGIN oshioki' "Plugin approval_exec $MALFORMED_CONF/plugin/$PLUGIN_NAME" > "$MALFORMED_CONF/sudo.conf"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$MALFORMED_CONF/sudoers.d/oshioki"
+run_installer "$MALFORMED_CONF" --disable-prelaunch
+if grep -Fq "Plugin approval_exec $MALFORMED_CONF/plugin/$PLUGIN_NAME" "$MALFORMED_CONF/sudo.conf"; then fail "malformed sudo.conf left the Oshioki plugin"; fi
+[ ! -e "$MALFORMED_CONF/sudoers.d/oshioki" ] || fail "malformed sudo.conf left the Oshioki drop-in"
+
+PARTIAL_CONF="$TEST_ROOT/partial-sudo-conf"; mkdir -p "$PARTIAL_CONF/state" "$PARTIAL_CONF/sudoers.d"
+printf '%s\n' '# END oshioki' 'outside' > "$PARTIAL_CONF/sudo.conf"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$PARTIAL_CONF/sudoers.d/oshioki"
+run_installer "$PARTIAL_CONF" --disable-prelaunch
+if grep -Fq '# END oshioki' "$PARTIAL_CONF/sudo.conf"; then fail "partial sudo.conf left the Oshioki marker"; fi
+[ ! -e "$PARTIAL_CONF/sudoers.d/oshioki" ] || fail "partial sudo.conf left the Oshioki drop-in"
+
+UNRELATED_DROPIN="$TEST_ROOT/unrelated-dropin"; mkdir -p "$UNRELATED_DROPIN/state" "$UNRELATED_DROPIN/sudoers.d"
+printf 'administrator ALL=(ALL) NOPASSWD: /usr/bin/id\n' > "$UNRELATED_DROPIN/sudoers.d/oshioki"
+if run_installer "$UNRELATED_DROPIN" --remove-sudoers-dropin >"$UNRELATED_DROPIN/log" 2>&1; then fail "drop-in cleanup accepted unrelated sudoers content"; fi
+grep -Fq 'unverified sudoers drop-in' "$UNRELATED_DROPIN/log" || fail "unrelated drop-in rejection was not explained"
+[ -e "$UNRELATED_DROPIN/sudoers.d/oshioki" ] || fail "unrelated sudoers content was deleted"
 
 # sudo accepts "# includedir" with space but requires @includedir contiguous,
 # so "@ includedir" includes nothing. Writing the drop-in on the strength of

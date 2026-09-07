@@ -1,9 +1,12 @@
 #!/bin/sh
-# oshioki prerm: stop the server and remove the sudo managed block this
-# package enabled, if any. Both steps fail loudly: removing the package
-# while the server still runs or the hook still manages sudo.conf would
-# strand a live system with its manager deleted.
+# oshioki prerm: stop the server and remove each sudo privilege artifact this
+# package enabled, if any. The plugin block and sudoers drop-in are inspected
+# independently because either one may have been damaged by an administrator.
 set -e
+
+INSTALLER="${OSHIOKI_INSTALLER:-/usr/share/oshioki/install-oshioki-hook}"
+SUDO_CONF="${SUDO_CONF:-/etc/sudo.conf}"
+SUDOERS_FILE="${SUDOERS_FILE:-${SUDOERS_D:-/etc/sudoers.d}/oshioki}"
 
 case "$1" in
   remove|purge)
@@ -13,13 +16,29 @@ case "$1" in
         exit 1
       }
     fi
-    if /usr/share/oshioki/install-oshioki-hook --prelaunch-status >/dev/null 2>&1; then
-      /usr/share/oshioki/install-oshioki-hook --disable-prelaunch || {
+    cleanup_failed=0
+    # Status intentionally is not used here: it cannot answer safely when
+    # sudo.conf is missing or malformed. Presence of either Oshioki marker or
+    # the exact plugin directive is enough to request independent cleanup.
+    if [ -f "$SUDO_CONF" ] && {
+      grep -Fq '# BEGIN oshioki' "$SUDO_CONF" ||
+      grep -Fq '# END oshioki' "$SUDO_CONF" ||
+      grep -Fq 'Plugin approval_exec /usr/local/libexec/sudo/oshioki.so' "$SUDO_CONF";
+    }; then
+      "$INSTALLER" --disable-prelaunch || {
         echo "oshioki: failed to disable the sudo hook; resolve it first with:" >&2
-        echo "oshioki:   /usr/share/oshioki/install-oshioki-hook --disable-prelaunch" >&2
-        exit 1
+        echo "oshioki:   $INSTALLER --disable-prelaunch" >&2
+        cleanup_failed=1
       }
     fi
+    if [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ]; then
+      "$INSTALLER" --remove-sudoers-dropin || {
+        echo "oshioki: failed to remove the verified Oshioki sudoers drop-in; resolve it first with:" >&2
+        echo "oshioki:   $INSTALLER --remove-sudoers-dropin" >&2
+        cleanup_failed=1
+      }
+    fi
+    [ "$cleanup_failed" -eq 0 ] || exit 1
     ;;
 esac
 
