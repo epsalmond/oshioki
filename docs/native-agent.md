@@ -54,9 +54,11 @@ every request without asking, exist only when the agent is built with
 The terminal prompt and the browser page render the same request: the host, the
 invoking user with their uid, the target account the command would run as
 (`root (uid 0)` for sudo's default, otherwise the bare uid), the command, its
-arguments, the working directory, and the caller process chain. An argument
-that is empty or holds anything but plainly printable characters is shown in
-shell single quotes, so one argument holding a space never reads as two.
+arguments, the working directory, the caller process chain, and every signed
+environment entry. Environment values are escaped for the terminal/browser;
+none are summarized or cut. An argument that is empty or holds anything but
+plainly printable characters is shown in shell single quotes, so one argument
+holding a space never reads as two.
 A prompt nobody answers before the request expires publishes no verdict at
 all, and the hook fails closed on its own deadline. The terminal prompt needs
 a terminal: with stdin closed nothing could answer, so `run` stops rather than
@@ -72,8 +74,9 @@ open:
 set -a; . ~/.config/oshioki/agent.env; set +a; oshioki-agent run
 ```
 
-macOS is different: the LaunchAgent runs the Touch ID sheet, which needs no
-terminal.
+macOS is different: the LaunchAgent opens the complete request in its native
+review window before it runs the Touch ID sheet, so it needs no terminal. A
+missing GUI session or canceled review fails closed.
 
 `enroll` pins the device locally and then confirms the server stored it by
 reading `GET /api/v1/devices/<fingerprint>` back over HTTPS for up to fifteen

@@ -26,6 +26,7 @@ use oshioki_protocol::{
     ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, RequestEnvelopeV1, allow_plaintext_nats,
     check_nats_url, escape_for_terminal, nats_url_is_tls,
 };
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
@@ -578,13 +579,14 @@ async fn decide(
             answer
         }
     };
+    let reason = approval_reason_for_raw(request, &opened.raw);
     let decision = if approve {
-        identity.approve(opened, &approval_reason(request))?
+        identity.approve(opened, &reason)?
     } else {
         // An explicit refusal signs like an approval: the hook verifies the
         // denial against the pinned device, so no NATS credential suffices
         // to deny for it. Silence (timeout, dismissal) signs nothing.
-        identity.deny(opened, &approval_reason(request))?
+        identity.deny(opened, &reason)?
     };
     Ok(Some(decision))
 }
@@ -851,97 +853,74 @@ enum Decider {
     TouchId(oshioki_agent::touchid::TouchIdPrompt),
 }
 
-/// What the operator is being asked to allow, in the second person.
-///
-/// The Touch ID sheet reads "Oshioki is trying to `<this>`. Touch ID to allow
-/// this", and it is one line on somebody's screen. It carries the arguments,
-/// rendered exactly as the terminal prompt renders them: `rm` and `rm -rf /`
-/// are different requests and must not read the same. The working directory
-/// and the caller process chain go to the log instead, where there is room.
-fn approval_reason(request: &oshioki_protocol::RequestV1) -> String {
-    // Truncate before escaping. escape_for_terminal turns one byte into a
-    // multi-character sequence, and a cut through the middle of one would put
-    // half an escape on the sheet.
-    let command = truncate(
-        &format!("{} {}", request.command, quote_argv(&request.argv)),
-        MAX_COMMAND_CHARS,
-    );
-    // The sheet has room for one line, so a request carrying environment
-    // only announces how much: the count tells the approver something is
-    // bound beyond the command, and the signature binds the values.
-    let env = if request.env.is_empty() {
-        String::new()
-    } else {
-        format!(" (+{} env)", request.env.len())
-    };
+/// Computes the fingerprint shown in the companion review and the biometric
+/// reason. The digest is over the exact bytes retained for signature
+/// verification, rather than a re-serialization that could hide a mismatch.
+fn request_digest(raw: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(raw) {
+        let _ = write!(digest, "{byte:02x}");
+    }
+    digest
+}
+
+/// Builds the complete read-only document shown before a native approval.
+/// `raw` is JSON produced by the requesting hook, so its string escapes are
+/// also the unambiguous representation of every command, argument, and
+/// environment value that the signature covers.
+fn full_review_document(request: &oshioki_protocol::RequestV1, raw: &[u8]) -> String {
     format!(
-        "run {} as {} on {}{}",
-        escape_for_terminal(command.trim_end()),
-        runas_label(request.runas_uid),
-        escape_for_terminal(&truncate(&request.host, MAX_HOST_CHARS)),
-        env,
+        "Oshioki approval review\n\nRequest ID: {}\nExact signed request SHA-256: {}\n\nThe JSON below is the complete signed request. Review every field, including every argv and env entry, before continuing to Touch ID.\n\n{}\n",
+        escape_for_terminal(&request.request_id),
+        request_digest(raw),
+        String::from_utf8_lossy(raw),
     )
 }
 
-/// The bound environment as approver-visible lines, empty when the request
-/// carries none. Terminal prompts show these; the Touch ID sheet only has
-/// room for a count (see [`approval_reason`]).
-///
-/// Both dimensions are bounded: values are attacker-controlled and can be
-/// kilobytes each, and lines print after the command block just before the
-/// prompt, so an unbounded environment would scroll the command off the
-/// approver's screen. Truncation is display-only; the signature still binds
-/// the whole values.
+/// What the operator is being asked to allow after the complete companion
+/// document has been reviewed. No executable input is put in this string:
+/// `LocalAuthentication` may truncate a localized reason, so it must never be
+/// the only place a behavior-changing field appears.
+fn approval_reason_for_raw(request: &oshioki_protocol::RequestV1, raw: &[u8]) -> String {
+    let digest = request_digest(raw);
+    let reason = format!(
+        "Approve {} [sha256:{}] after full review.",
+        escape_for_terminal(&request.request_id),
+        &digest[..16],
+    );
+    debug_assert!(reason.chars().count() <= MAX_APPROVAL_REASON_CHARS);
+    reason
+}
+
+/// The request ID is bounded to 128 ASCII bytes by the protocol. Together
+/// with this fixed wording and a 16-hex digest prefix, the reason stays below
+/// the conservative limit used for a system-owned biometric prompt.
+const MAX_APPROVAL_REASON_CHARS: usize = 96;
+
+/// Test helper for the short reason generated from a semantically valid
+/// request. Production paths use the exact retained bytes directly.
+#[cfg(test)]
+fn approval_reason(request: &oshioki_protocol::RequestV1) -> String {
+    let raw = request.raw_json().unwrap_or_default();
+    approval_reason_for_raw(request, &raw)
+}
+
+/// The complete bound environment as approver-visible lines, empty when the
+/// request carries none. The terminal is scrollable, so hiding a suffix or
+/// summarizing entries would let an unreviewed value affect execution.
 fn format_env(request: &oshioki_protocol::RequestV1) -> String {
     use std::fmt::Write as _;
     let mut shown = String::new();
-    for entry in request.env.iter().take(MAX_ENV_LINES_SHOWN) {
-        // Truncate before escaping, as in approval_reason: escaping turns
-        // one byte into several characters, and a cut through the middle of
-        // one would put half an escape on the screen.
+    for (index, entry) in request.env.iter().enumerate() {
         let _ = writeln!(
             shown,
-            "  env {}={}",
-            escape_for_terminal(&truncate(&entry.name, MAX_ENV_NAME_CHARS)),
-            escape_for_terminal(&truncate(&entry.value, MAX_ENV_VALUE_CHARS))
-        );
-    }
-    if request.env.len() > MAX_ENV_LINES_SHOWN {
-        let _ = writeln!(
-            shown,
-            "  ... ({} more)",
-            request.env.len() - MAX_ENV_LINES_SHOWN
+            "  env[{index}] {}={}",
+            escape_for_terminal(&entry.name),
+            escape_for_terminal(&entry.value)
         );
     }
     shown
-}
-
-/// How much of one environment name the terminal prompt shows. Allowlisted
-/// names are short; this only caps a hostile one.
-const MAX_ENV_NAME_CHARS: usize = 64;
-
-/// How much of one environment value the terminal prompt shows. Enough to
-/// recognize a PATH, not enough to fill a screen.
-const MAX_ENV_VALUE_CHARS: usize = 128;
-
-/// How many bound variables the terminal prompt lists before summarizing
-/// the rest.
-const MAX_ENV_LINES_SHOWN: usize = 10;
-
-/// How much of the command line the sheet gets. Past this it is not a sentence
-/// anybody reads before touching the sensor.
-const MAX_COMMAND_CHARS: usize = 100;
-
-/// How much of the host name the sheet gets. Long enough for any real name.
-const MAX_HOST_CHARS: usize = 64;
-
-/// Shortens to `limit` characters, marking that it was shortened.
-fn truncate(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_owned();
-    }
-    let kept: String = text.chars().take(limit.saturating_sub(3)).collect();
-    format!("{kept}...")
 }
 
 /// The terminal prompt, serialized across concurrent requests.
@@ -1086,9 +1065,17 @@ fn now() -> i64 {
 /// screen is locked, and how to tear a sheet down at a deadline.
 #[cfg(target_os = "macos")]
 mod mac {
-    use std::sync::Arc;
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write as _,
+        os::unix::fs::OpenOptionsExt as _,
+        path::PathBuf,
+        process::{Command, Stdio},
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use anyhow::Result;
+    use anyhow::{Context as _, Result, bail};
     use oshioki_agent::{
         Identity, OpenedRequest,
         touchid::{AttemptError, Outcome, PromptCancel, ScreenLock, TouchIdPrompt},
@@ -1097,7 +1084,54 @@ mod mac {
     use oshioki_protocol::{DecisionV1, escape_for_terminal};
     use tracing::{error, info};
 
-    use super::approval_reason;
+    use super::{approval_reason_for_raw, full_review_document, now};
+
+    /// The request is shown in a transient, read-only `AppKit` view rather than
+    /// in `LocalAuthentication`'s one-line reason. The JXA is constant and the
+    /// path is passed as data, so neither request contents nor shell syntax
+    /// are interpreted by the helper.
+    const REVIEW_SCRIPT: &str = r"
+ObjC.import('AppKit');
+ObjC.import('Foundation');
+
+function run(argv) {
+    if (argv.length !== 1) throw new Error('invalid review arguments');
+    const path = $(argv[0]);
+    const contents = $.NSString.stringWithContentsOfFileEncodingError(
+        path, $.NSUTF8StringEncoding, null);
+    if (contents === null) throw new Error('could not read the approval review');
+
+    const alert = $.NSAlert.alloc.init;
+    alert.messageText = 'Review sudo request';
+    alert.informativeText = 'Read the complete signed request below. Continue only if every command, argument, and environment entry is expected.';
+    alert.addButtonWithTitle('Cancel');
+    alert.addButtonWithTitle('Continue to Touch ID');
+
+    const frame = $.NSMakeRect(0, 0, 700, 420);
+    const textView = $.NSTextView.alloc.initWithFrame(frame);
+    textView.string = ObjC.unwrap(contents);
+    textView.editable = false;
+    textView.selectable = true;
+    textView.richText = false;
+    textView.horizontallyResizable = true;
+    textView.verticallyResizable = true;
+    textView.maxSize = $.NSMakeSize(100000, 100000);
+
+    const scrollView = $.NSScrollView.alloc.initWithFrame(frame);
+    scrollView.hasVerticalScroller = true;
+    scrollView.hasHorizontalScroller = true;
+    scrollView.autohidesScrollers = false;
+    scrollView.documentView = textView;
+    alert.accessoryView = scrollView;
+    alert.layout();
+
+    $.NSApplication.sharedApplication;
+    $.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
+    const response = alert.runModal();
+    if (response != 1001) throw new Error('approval review was canceled');
+    return 0;
+}
+";
 
     /// The login session's lock state, read fresh each time it is asked for.
     pub struct Screen;
@@ -1131,14 +1165,32 @@ mod mac {
         opened: &OpenedRequest,
     ) -> Result<Option<DecisionV1>> {
         let request = &opened.request;
-        let reason = approval_reason(request);
-        // The sheet has room for one line, so the reason is shown there and
-        // only there: stdout and stderr both back the persistent agent log
-        // under launchd, and the command line can carry credentials. The log
-        // gets the opaque request id, nothing that identifies the request.
+        // LocalAuthentication can truncate localized reasons, so the full
+        // signed bytes must be inspected in the companion first. A launchd
+        // agent has no terminal; failure to reach the GUI is therefore a
+        // deliberate fail-closed result.
+        let document = full_review_document(request, &opened.raw);
+        let reviewed = tokio::task::spawn_blocking(move || show_review(&document))
+            .await
+            .context("the approval review thread panicked")??;
+        if !reviewed {
+            info!(
+                request_id = %escape_for_terminal(&request.request_id),
+                "approval review was canceled"
+            );
+            return Ok(None);
+        }
+        if request.expires_at <= now() {
+            info!(
+                request_id = %escape_for_terminal(&request.request_id),
+                "request expired during approval review"
+            );
+            return Ok(None);
+        }
+        let reason = approval_reason_for_raw(request, &opened.raw);
         info!(
             request_id = %escape_for_terminal(&request.request_id),
-            "asking for Touch ID"
+            "request reviewed; asking for Touch ID"
         );
         let sign = {
             let (identity, opened, reason) = (Arc::clone(identity), opened.clone(), reason.clone());
@@ -1175,6 +1227,60 @@ mod mac {
         }
     }
 
+    /// Displays the exact signed request in a transient `AppKit` alert and waits
+    /// for the operator to explicitly continue. The file is owner-only and
+    /// is unlinked on every path; if either display or cleanup fails, approval
+    /// is refused rather than leaving secrets behind or signing blindly.
+    fn show_review(document: &str) -> Result<bool> {
+        let (path, file) = create_review_file()?;
+        let display_result = (|| -> Result<bool> {
+            let mut file = file;
+            file.write_all(document.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            let path_string = path
+                .to_str()
+                .context("approval review path is not valid UTF-8")?;
+            let status = Command::new("/usr/bin/osascript")
+                .env_clear()
+                .args(["-l", "JavaScript", "-e", REVIEW_SCRIPT, path_string])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("launch the approval review")?;
+            Ok(status.success())
+        })();
+        let cleanup_result = fs::remove_file(&path)
+            .map_err(|error| anyhow::anyhow!("remove the temporary approval review: {error}"));
+        cleanup_result?;
+        display_result
+    }
+
+    fn create_review_file() -> Result<(PathBuf, fs::File)> {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..100u8 {
+            let path = std::env::temp_dir().join(format!(
+                "oshioki-review-{}-{stamp}-{attempt}.txt",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error).context("create the approval review"),
+            }
+        }
+        bail!("could not allocate a unique approval review file")
+    }
+
     /// A dismissed sheet is an answer; anything else is a broken key.
     fn classify(error: anyhow::Error) -> AttemptError {
         if matches!(error.downcast_ref::<SignError>(), Some(SignError::Canceled)) {
@@ -1188,9 +1294,10 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Decider, MAX_ENV_LINES_SHOWN, Pairing, Prompter, Verb, approval_reason, bind_socket,
-        decide, format_env, load_or_create_with, now, prompt_output, quote_argv, runas_label,
-        socket_path, truncate,
+        Cli, Decider, MAX_APPROVAL_REASON_CHARS, Pairing, Prompter, Verb, approval_reason,
+        approval_reason_for_raw, bind_socket, decide, format_env, full_review_document,
+        load_or_create_with, now, prompt_output, quote_argv, request_digest, runas_label,
+        socket_path,
     };
     use clap::Parser as _;
     use oshioki_agent::SignerKind;
@@ -1259,44 +1366,28 @@ mod tests {
         assert_eq!(runas_label(1000), "uid 1000");
     }
 
-    /// The Touch ID sheet gets one sentence: what would run, as whom, where.
-    /// The arguments are in it, because `rm` and `rm -rf /` are different
-    /// requests and one fingerprint answers only one of them.
+    /// Touch ID receives only a short reference to the companion review. No
+    /// command or environment suffix is delegated to a potentially truncated
+    /// `LocalAuthentication` reason.
     #[test]
-    fn the_sheet_reason_names_the_command_the_account_and_the_host() {
+    fn the_sheet_reason_references_the_full_review_compactly() {
         let mut request = request_for_reason();
-        assert_eq!(
-            approval_reason(&request),
-            "run /usr/bin/apt apt update as root (uid 0) on host.example"
-        );
+        let raw = request.raw_json().unwrap();
+        let reason = approval_reason_for_raw(&request, &raw);
+        assert!(reason.contains("req-1"));
+        assert!(reason.contains(&request_digest(&raw)[..16]));
+        assert!(!reason.contains("/usr/bin/apt"));
+        assert!(reason.chars().count() <= MAX_APPROVAL_REASON_CHARS);
         request.runas_uid = 1000;
-        assert!(approval_reason(&request).contains("as uid 1000"));
-
-        let mut dangerous = request_for_reason();
-        dangerous.command = "/bin/rm".into();
-        dangerous.argv = vec!["rm".into()];
-        let mut worse = dangerous.clone();
-        worse.argv = vec!["rm".into(), "-rf".into(), "/".into()];
-        assert_ne!(approval_reason(&dangerous), approval_reason(&worse));
-        assert!(approval_reason(&worse).contains("rm -rf /"));
-
-        // A command with no arguments must not trail a space onto the sheet.
-        let mut bare = request_for_reason();
-        bare.argv = vec![];
-        assert_eq!(
-            approval_reason(&bare),
-            "run /usr/bin/apt as root (uid 0) on host.example"
-        );
+        assert_ne!(approval_reason(&request), reason);
     }
 
-    /// The terminal summary shows the bound environment line by line, while
-    /// an empty environment shows nothing; the sheet reason only announces
-    /// the count, because one line cannot hold the values.
+    /// The terminal summary shows the complete bound environment line by line,
+    /// while an empty environment shows nothing.
     #[test]
     fn summary_shows_the_bound_environment() {
         let mut request = request_for_reason();
         assert!(!format_env(&request).contains("env "));
-        assert!(!approval_reason(&request).contains("env)"));
         request.env = vec![
             EnvEntryV1 {
                 name: "LD_PRELOAD".into(),
@@ -1308,10 +1399,14 @@ mod tests {
             },
         ];
         let shown = format_env(&request);
-        assert!(shown.contains("  env LD_PRELOAD=/tmp/evil.so\n"), "{shown}");
-        assert!(shown.contains("  env PATH=/tmp/bin:/usr/bin\n"), "{shown}");
-        let reason = approval_reason(&request);
-        assert!(reason.ends_with(" (+2 env)"), "{reason}");
+        assert!(
+            shown.contains("  env[0] LD_PRELOAD=/tmp/evil.so\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  env[1] PATH=/tmp/bin:/usr/bin\n"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -1341,10 +1436,10 @@ mod tests {
         ));
     }
 
-    /// A hostile environment cannot scroll the command off the screen: long
-    /// values are cut and the list is capped with a count of what is hidden.
+    /// A hostile environment remains fully visible. It is escaped for the
+    /// terminal, but no value or entry is cut or replaced by a count.
     #[test]
-    fn a_hostile_environment_stays_bounded() {
+    fn a_hostile_environment_is_not_summarized() {
         let mut request = request_for_reason();
         request.env = (0..64)
             .map(|n| EnvEntryV1 {
@@ -1353,12 +1448,38 @@ mod tests {
             })
             .collect();
         let shown = format_env(&request);
-        assert_eq!(shown.lines().count(), MAX_ENV_LINES_SHOWN + 1, "{shown}");
-        assert!(shown.ends_with("  ... (54 more)\n"), "{shown}");
-        assert!(shown.contains("..."), "{shown}");
-        assert!(!shown.contains(&"x".repeat(129)), "{shown}");
-        // The count still announces the binding on the one-line sheet.
-        assert!(approval_reason(&request).ends_with(" (+64 env)"));
+        assert_eq!(shown.lines().count(), 64, "{shown}");
+        assert!(shown.ends_with(&format!("  env[63] PATH63={}\n", "x".repeat(1024))));
+        assert!(shown.contains(&"x".repeat(1024)), "{shown}");
+    }
+
+    /// The native companion contains the exact signed bytes, including
+    /// behavior-changing variables and a suffix beyond the former
+    /// `LocalAuthentication` reason cut.
+    #[test]
+    fn full_review_keeps_bash_env_ld_preload_and_long_suffix() {
+        let mut request = request_for_reason();
+        request.command = "/bin/sh".into();
+        request.argv = vec![
+            "-c".into(),
+            format!("{}{}", "x".repeat(100), ";echo malicious-suffix"),
+        ];
+        request.env = vec![
+            EnvEntryV1 {
+                name: "BASH_ENV".into(),
+                value: "/tmp/attacker-init".into(),
+            },
+            EnvEntryV1 {
+                name: "LD_PRELOAD".into(),
+                value: "/tmp/evil.so".into(),
+            },
+        ];
+        let raw = request.raw_json().unwrap();
+        let document = full_review_document(&request, &raw);
+        assert!(document.contains("BASH_ENV"), "{document}");
+        assert!(document.contains("LD_PRELOAD"), "{document}");
+        assert!(document.contains("malicious-suffix"), "{document}");
+        assert!(document.contains(&request_digest(&raw)), "{document}");
     }
 
     /// Same command, different environments: the signatures differ, because
@@ -1401,50 +1522,6 @@ mod tests {
         assert_ne!(bare, one);
         assert_ne!(one, other);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A command line long enough to fill the screen is cut, and says so.
-    #[test]
-    fn a_long_reason_is_cut_rather_than_wrapped() {
-        assert_eq!(truncate("abcdef", 6), "abcdef");
-        assert_eq!(truncate("abcdefg", 6), "abc...");
-        let mut request = request_for_reason();
-        request.command = "/usr/bin/".to_owned() + &"x".repeat(400);
-        let reason = approval_reason(&request);
-        assert!(reason.contains("..."));
-        assert!(reason.chars().count() < 200, "{reason}");
-    }
-
-    /// Cutting the rendered command before escaping keeps whole escape
-    /// sequences on the sheet. Cutting after would leave half of one.
-    #[test]
-    fn truncation_never_splits_an_escape_sequence() {
-        let mut request = request_for_reason();
-        request.command = "/usr/bin/x".to_owned();
-        request.argv = vec!["x".to_owned(), "\u{1b}[31m".repeat(60)];
-        let reason = approval_reason(&request);
-        assert!(
-            !reason.contains('\u{1b}'),
-            "an escape byte reached the sheet"
-        );
-        // Every rendered escape is whole: `\u{` then four hex digits and `}`.
-        let mut rest = reason.as_str();
-        let mut rendered = 0;
-        while let Some(at) = rest.find("\\u{") {
-            let tail = &rest[at + 3..];
-            let (digits, closer) = tail.split_at(tail.len().min(4));
-            assert!(
-                digits.chars().count() == 4 && digits.chars().all(|c| c.is_ascii_hexdigit()),
-                "a cut landed inside an escape: {reason}"
-            );
-            assert!(
-                closer.starts_with('}'),
-                "a cut landed inside an escape: {reason}"
-            );
-            rendered += 1;
-            rest = &tail[4..];
-        }
-        assert!(rendered > 0, "{reason}");
     }
 
     /// One identity serves every host, so a second `pair` reuses it. A
@@ -1855,28 +1932,6 @@ mod tests {
         (Prompter::new(receiver), delivery)
     }
 
-    #[cfg(target_os = "macos")]
-    struct UnlockedScreen;
-
-    #[cfg(target_os = "macos")]
-    impl oshioki_agent::touchid::ScreenLock for UnlockedScreen {
-        fn is_locked(&self) -> bool {
-            false
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    struct NoopCanceller;
-
-    #[cfg(target_os = "macos")]
-    impl oshioki_agent::touchid::PromptCancel for NoopCanceller {
-        fn begin(&self) -> u64 {
-            0
-        }
-
-        fn cancel(&self, _attempt: u64) {}
-    }
-
     /// Decrypted request details must never enter the tracing log: no
     /// command, arguments, working directory, user, or process chain. The
     /// positive controls keep this honest — the probe proves the request
@@ -2001,7 +2056,7 @@ mod tests {
         // must not see it.
         let request = request_for_log_probe();
         let reason = approval_reason(&request);
-        assert!(reason.contains(LOG_PROBE), "{reason}");
+        assert!(!reason.contains(LOG_PROBE), "{reason}");
 
         // Terminal prompt path: answer yes to the canned prompt.
         let envelope: RequestEnvelopeV1 =
@@ -2034,24 +2089,6 @@ mod tests {
         hook_side.read_exact(&mut prefix).await.unwrap();
         let len = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
         assert!(len > 0, "the socket path should answer");
-
-        #[cfg(target_os = "macos")]
-        {
-            let prompt = oshioki_agent::touchid::TouchIdPrompt::new(
-                Box::new(UnlockedScreen),
-                std::sync::Arc::new(NoopCanceller),
-            );
-            let decision = super::mac::decide(&prompt, &identity, &opened)
-                .await
-                .unwrap();
-            assert!(
-                matches!(
-                    decision,
-                    Some(oshioki_protocol::DecisionV1::ApproveNative(_))
-                ),
-                "the software key should sign behind the mocked sheet"
-            );
-        }
 
         let text = logs.text();
         assert!(
