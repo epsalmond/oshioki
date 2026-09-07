@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-06
+
 Toward the 1.0 release. The v1 protocol and its three approval paths are
 implemented and covered by the local end-to-end loop; production deployment
 (OCI publication, CI, Homebrew/Debian packages) is deferred until the
