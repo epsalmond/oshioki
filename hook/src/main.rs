@@ -161,9 +161,7 @@ fn sanitize_terminal_text(text: &str) -> String {
 
 fn redact_url_token(token: &str) -> String {
     let Some((scheme, rest)) = token.split_once("://") else {
-        if let Some((userinfo, host)) = token.rsplit_once('@')
-            && userinfo.contains(':')
-        {
+        if let Some((_, host)) = token.rsplit_once('@') {
             return format!("<redacted>@{host}");
         }
         return token.to_owned();
@@ -193,8 +191,8 @@ fn check_error_exit_code(error: &anyhow::Error) -> i32 {
 }
 
 /// Two sinks, like sudo: the terminal sees warnings and errors only, the
-/// system log keeps the audit trail. A sudo that works prints nothing, and
-/// agents driving a shell do not pay for approval chatter in their output.
+/// system log keeps the audit trail. Approval progress is intentionally shown
+/// on the terminal so an operator knows which transport state is active.
 ///
 /// Audit records carry the `audit` target: approvals, denials, and a local
 /// agent leaving a request to NATS. The terminal layer drops that target and
@@ -656,6 +654,12 @@ async fn execute_request_at(
     if active.is_empty() {
         bail!("no active approval devices");
     }
+    // This is the hook's trusted capability decision. A server delivery
+    // receipt may extend the short native liveness wait only when a pinned,
+    // active WebAuthn device is actually among this request's recipients.
+    let has_browser_recipient = active
+        .iter()
+        .any(|device| device.kind == DeviceKindV1::Webauthn);
     let envelope = seal_request(&request, &raw_request, &active)?;
     let payload = serde_json::to_vec(&envelope)?;
     if payload.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
@@ -669,9 +673,19 @@ async fn execute_request_at(
             HookProgress::DaemonNotResponding(error) => {
                 eprintln!("Daemon not responding: {}", sanitize_terminal_text(&error));
             }
+            HookProgress::RequestDelivered => {
+                eprintln!("Request delivered; waiting for approver...");
+                let _ = io::stderr().flush();
+            }
             HookProgress::WaitingForApproval => {
                 eprintln!("Waiting for approval...");
                 let _ = io::stderr().flush();
+            }
+            HookProgress::ProtocolFailed(error) => {
+                eprintln!(
+                    "Transport protocol failed: {}",
+                    sanitize_terminal_text(&error)
+                );
             }
         });
     // One deadline covers both transports: whatever the socket attempt
@@ -698,8 +712,11 @@ async fn execute_request_at(
                     &request,
                     payload,
                     deadline,
-                    announce_url,
                     url,
+                    NatsFallbackOptions {
+                        announce_url,
+                        has_browser_recipient,
+                    },
                     progress.clone(),
                 )
                 .await?
@@ -723,8 +740,11 @@ async fn execute_request_at(
                     &request,
                     payload,
                     deadline,
-                    announce_url,
                     url,
+                    NatsFallbackOptions {
+                        announce_url,
+                        has_browser_recipient,
+                    },
                     progress.clone(),
                 )
                 .await?
@@ -754,8 +774,11 @@ async fn execute_request_at(
                     &request,
                     payload,
                     deadline,
-                    announce_url,
                     url,
+                    NatsFallbackOptions {
+                        announce_url,
+                        has_browser_recipient,
+                    },
                     progress.clone(),
                 )
                 .await?
@@ -769,31 +792,6 @@ async fn execute_request_at(
                 return Err(approval_unavailable(format!(
                     "daemon not responding on {} ({error}) and no NATS fallback configured — denying request {}",
                     path.display(),
-                    request.request_id
-                )));
-            }
-        },
-        SocketOutcome::Silent(SocketSilence::Undecided) => match &nats_url {
-            Some(url) => {
-                info!(
-                    target: "audit",
-                    request_id = %request.request_id,
-                    "local agent left the request undecided; waiting on NATS until the deadline"
-                );
-                nats_fallback(
-                    directory,
-                    &request,
-                    payload,
-                    deadline,
-                    announce_url,
-                    url,
-                    progress.clone(),
-                )
-                .await?
-            }
-            None => {
-                return Err(approval_unavailable(format!(
-                    "local agent left request {} undecided (dismissed, expired, or unusable key) and no NATS fallback is configured — denying",
                     request.request_id
                 )));
             }
@@ -818,6 +816,12 @@ async fn execute_request_at(
 struct Transports {
     socket: Option<PathBuf>,
     nats_url: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct NatsFallbackOptions {
+    announce_url: bool,
+    has_browser_recipient: bool,
 }
 
 /// Reads the transport set from `config.env`. A missing or empty
@@ -845,7 +849,7 @@ fn transports_from(directory: &Path) -> Result<Transports> {
     Ok(transports)
 }
 
-/// Runs the NATS fallback for a request the socket left undecided. Only
+/// Runs the NATS fallback for a request the socket did not answer. Only
 /// called when `config.env` names a NATS URL. Failures name the server and
 /// the failed step with the credentials redacted, so a dead or
 /// misconfigured NATS reads as what it is instead of a library error.
@@ -854,8 +858,8 @@ async fn nats_fallback(
     request: &RequestV1,
     payload: Vec<u8>,
     deadline: tokio::time::Instant,
-    announce_url: bool,
     nats_url: &str,
+    options: NatsFallbackOptions,
     progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
 ) -> Result<DecisionV1> {
     let remaining = deadline
@@ -905,7 +909,7 @@ async fn nats_fallback(
             "sudo decision deadline exceeded before the NATS verdict wait",
         ));
     }
-    if announce_url {
+    if options.announce_url {
         let config = load_hook_config_from(directory)?;
         println!(
             "Approval URL (expires in {} seconds):\n  {}",
@@ -920,6 +924,7 @@ async fn nats_fallback(
             &request.request_id,
             payload,
             remaining,
+            options.has_browser_recipient,
             progress,
         )
         .await
@@ -963,20 +968,15 @@ enum SocketSilence {
     /// The socket accepted the request but never sent the required alive
     /// acknowledgement.
     NoAck { path: PathBuf, error: String },
-    /// An agent took the connection but hung up without a verdict: the
-    /// sheet was dismissed, the deadline passed unanswered, or the key
-    /// refused and the operator was told to re-pair. Silence is not a
-    /// denial anyone signed, so the request stays undecided.
-    Undecided,
 }
 
 /// Ask the local agent over its Unix socket, if one is configured.
 ///
-/// Only a missing or unreachable socket, a connection that dies before
-/// delivering a verdict, or an agent that hangs up without answering falls
-/// back: in all three cases no agent took responsibility for the request. A
-/// verdict, a malformed reply, or the deadline expiring while an agent holds
-/// the request is final, and fails closed on error.
+/// Only a missing or unreachable socket, or an agent that hangs up before
+/// acknowledging falls back: in those cases no agent took responsibility for
+/// the request. A verdict, a malformed reply, a post-ack hangup, or the
+/// deadline expiring while an agent holds the request is final and fails
+/// closed on error.
 #[allow(clippy::too_many_lines)]
 async fn try_agent_socket(
     directory: &Path,
@@ -1073,9 +1073,12 @@ async fn try_agent_socket(
             }));
         }
     };
-    let acknowledgement: oshioki_protocol::AliveV1 =
-        serde_json::from_slice(&bytes).context("decode socket daemon acknowledgement")?;
-    acknowledgement.validate(request_id)?;
+    let acknowledgement: oshioki_protocol::AliveV1 = serde_json::from_slice(&bytes).context(
+        "decode socket daemon acknowledgement; upgrade oshioki-agent before using this hook",
+    )?;
+    acknowledgement.validate(request_id).context(
+        "invalid socket daemon acknowledgement; upgrade oshioki-agent before using this hook",
+    )?;
     progress(HookProgress::WaitingForApproval);
     let remaining = deadline
         .checked_duration_since(tokio::time::Instant::now())
@@ -1087,7 +1090,15 @@ async fn try_agent_socket(
     }
     let bytes = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
         Ok(Ok(Some(bytes))) => bytes,
-        Ok(Ok(None)) => return Ok(SocketOutcome::Silent(SocketSilence::Undecided)),
+        Ok(Ok(None)) => {
+            // Once an agent has sent AliveV1 it owns this request. An EOF
+            // before a verdict is therefore an unexpected cancellation and
+            // must deny; an ordinary timeout below remains unavailable so an
+            // unanswered request can expire normally.
+            return Err(anyhow::anyhow!(
+                "agent closed after acknowledging without a verdict"
+            ));
+        }
         Ok(Err(error)) => return Err(error),
         Err(_) => {
             return Err(approval_unavailable(
@@ -2488,7 +2499,7 @@ mod tests {
     /// An agent that takes the connection but sends no alive acknowledgement
     /// is unavailable, rather than an approval or denial.
     #[tokio::test]
-    async fn hanging_up_without_a_verdict_reports_undecided() {
+    async fn hanging_up_before_ack_reports_no_ack() {
         let dir = socket_test_dir("hangup");
         let socket_path = dir.join("agent.sock");
         socket_test_config(&dir, Some(&socket_path));
@@ -2751,6 +2762,10 @@ mod tests {
             sanitize_terminal_text("connect to oshioki:s3cret@nats.example.com:4222 failed"),
             "connect to <redacted>@nats.example.com:4222 failed"
         );
+        assert_eq!(
+            sanitize_terminal_text("connect to sometoken@nats.example.com:4222 failed"),
+            "connect to <redacted>@nats.example.com:4222 failed"
+        );
     }
 
     /// Credentials are both-or-neither: one without the other is a config
@@ -2810,6 +2825,25 @@ mod tests {
         drop(stream);
     }
 
+    /// A peer that acknowledges and then disconnects has taken responsibility
+    /// for the request. The hook treats that unexpected post-ack EOF as a
+    /// denial instead of falling back to another approval path.
+    async fn acknowledged_hangup_stub(listener: tokio::net::UnixListener) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let length = oshioki_protocol::socket_v1::decode_frame_len(prefix).unwrap();
+        let mut request = vec![0u8; length];
+        stream.read_exact(&mut request).await.unwrap();
+        let request: oshioki_protocol::RequestEnvelopeV1 =
+            serde_json::from_slice(&request).unwrap();
+        let alive = oshioki_protocol::AliveV1::for_request(&request.request_id);
+        let frame = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+            .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
     /// Binds a stub socket synchronously, before the hook can connect, and
     /// returns the listener for [`hangup_stub`].
     fn hangup_listener(socket_path: &Path) -> tokio::net::UnixListener {
@@ -2835,6 +2869,26 @@ mod tests {
         );
         assert!(
             format!("{error:#}").contains("daemon not responding"),
+            "{error:#}"
+        );
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn post_ack_socket_hangup_is_a_terminal_denial() {
+        let (dir, request) = decided_test_dir("post-ack-hangup-deny");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config_no_nats(&dir, Some(&socket_path));
+        let serve = tokio::spawn(acknowledged_hangup_stub(hangup_listener(&socket_path)));
+        let started = std::time::Instant::now();
+        let error = execute_request_at(request, Duration::from_secs(30), &dir, false)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(
+            format!("{error:#}").contains("closed after acknowledging"),
             "{error:#}"
         );
         serve.await.unwrap();
@@ -2889,6 +2943,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A browser-capable request still fails promptly when its relay is down:
+    /// the browser delivery receipt is an extension of native liveness only
+    /// after a real server response, never a reason to wait ninety seconds
+    /// for a server that cannot be reached.
+    #[tokio::test]
+    async fn browser_fallback_without_a_server_fails_fast() {
+        let dir = socket_test_dir("browser-nats-down");
+        let port = closed_loopback_port();
+        std::fs::write(
+            dir.join("config.env"),
+            format!("NATS_URL=nats://127.0.0.1:{port}\nNATS_USER=u\nNATS_PASS=p\n"),
+        )
+        .unwrap();
+        let request = build_synthetic_request();
+        let started = std::time::Instant::now();
+        let error = nats_fallback(
+            &dir,
+            &request,
+            b"{}".to_vec(),
+            tokio::time::Instant::now() + Duration::from_secs(90),
+            &format!("nats://127.0.0.1:{port}"),
+            NatsFallbackOptions {
+                announce_url: false,
+                has_browser_recipient: true,
+            },
+            test_progress(),
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(format!("{error:#}").contains("NATS fallback"), "{error:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A loopback TCP port nothing listens on: binding then dropping leaves
     /// a port the fallback connect refuses fast.
     fn closed_loopback_port() -> u16 {
@@ -2921,6 +3010,7 @@ mod tests {
                 "req-1",
                 b"{}".to_vec(),
                 Duration::from_secs(1),
+                false,
                 test_progress(),
             )
             .await
@@ -2971,6 +3061,7 @@ mod tests {
                 &request.request_id,
                 raw.clone(),
                 Duration::from_secs(1),
+                false,
                 test_progress(),
             )
             .await

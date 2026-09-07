@@ -324,6 +324,43 @@ test("two browser profiles enroll independently and own their approvals", async 
   await second.context.close();
 });
 
+test("server delivery receipt permits a delayed browser open and approval", async ({ browser }) => {
+  const consoleErrors = [];
+  const profile = await virtualProfile(browser, consoleErrors);
+  const device = await enroll(profile);
+  const requestStarted = Date.now();
+  const { envelope, processHandle } = await pendingRequest();
+
+  // Ingestion and the durable delivery outbox must produce a fast receipt,
+  // even though the browser has not opened the per-request URL yet.
+  await waitForMatch(processHandle, /Request delivered; waiting for approver\.\.\./, 5_000);
+  expect(Date.now() - requestStarted).toBeLessThan(5_000);
+
+  // Model the real notification path: the operator does not open the browser
+  // until ten seconds after sudo started.
+  await new Promise((resolve) => setTimeout(resolve, 10_000));
+  await navigate(profile.page, `${origin}/healthz`);
+  await waitForRouted(profile.page, envelope.request_id, device.apiToken);
+  await navigate(profile.page, `${origin}/r/${envelope.request_id}`);
+  await expect(profile.page.locator("#request")).toBeVisible();
+  await expect(profile.page.locator("#actions")).toBeVisible();
+  await waitForMatch(processHandle, /Waiting for approval\.\.\./, 5_000);
+
+  // Keep the approval tap at roughly T+20s, after the page has acknowledged
+  // that it opened and checked the sealed request.
+  const remaining = 20_000 - (Date.now() - requestStarted);
+  if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+  await profile.page.getByRole("button", { name: "Approve" }).click();
+  await expect(profile.page.locator("#status")).toContainText("Approval sent");
+  const result = await processHandle.exited;
+  expect(result.code, result.stderr).toBe(0);
+  expect(Date.now() - requestStarted).toBeGreaterThanOrEqual(19_000);
+  expect(consoleErrors).toEqual([]);
+
+  await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
+  await profile.context.close();
+});
+
 test("enrollment resumes with the same secret and rejects expired local state", async ({ browser }) => {
   const consoleErrors = [];
   const profile = await virtualProfile(browser, consoleErrors);

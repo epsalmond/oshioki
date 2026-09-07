@@ -11,10 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Approval transports now send a short liveness receipt before waiting for a
-  decision. Socket and NATS agents use `AliveV1`, and the browser sends the
-  same authenticated receipt; the existing v1 request and decision formats
-  remain unchanged.
+- Browser requests receive a durable server delivery receipt after routing.
+  The browser sends its authenticated opened receipt after decrypting and
+  checking the request. Native agents send `AliveV1` before asking for a
+  decision. Human browser opening time does not consume the short delivery
+  wait.
 
 ### Changed
 
@@ -25,10 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On Linux, the sudo plugin races the hook with an interactive PAM password
   fallback. The installer’s `NOPASSWD` rule makes this fallback available
   when approval transport is unavailable; `sudo -n` skips password
-  authentication and never reads a password terminal.
-- The hook and agents must be upgraded together because an older agent that
-  sends only a verdict does not satisfy the new liveness receipt. No v1
-  request or decision crypto has changed.
+  authentication and never reads a password terminal. Enter skips the
+  password attempt without calling PAM.
+- Upgrade the server, browser bundle, hook, and agent as one compatibility
+  set. There is no rolling negotiation; mixed versions fail closed with an
+  upgrade diagnostic. The v1 request and decision formats and cryptography
+  are unchanged.
 
 ### Fixed
 

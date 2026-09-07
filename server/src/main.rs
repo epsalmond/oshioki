@@ -313,9 +313,10 @@ async fn handle_revocation(state: &AppState, subject: String) -> Result<()> {
     Ok(())
 }
 
-/// Publishes verdicts (and enrollment relays) to NATS. This lane never
-/// touches a notification row, so a dead ntfy endpoint cannot delay an
-/// approval: while this worker is healthy, `/healthz` is healthy.
+/// Publishes verdicts, browser delivery receipts, and enrollment relays to
+/// NATS. This lane never touches a notification row, so a dead ntfy endpoint
+/// cannot delay an approval: while this worker is healthy, `/healthz` is
+/// healthy.
 async fn verdict_worker(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     loop {
@@ -1083,11 +1084,15 @@ mod tests {
         let published = transport.published();
         assert_eq!(
             published.len(),
-            1,
+            2,
             "duplicate publish means commit-before-ack flipped"
         );
-        assert_eq!(published[0].0, "oshioki.verdict.req-1");
-        assert_eq!(published[0].1, serde_json::to_vec(&decision).unwrap());
+        assert_eq!(published[0].0, "oshioki.delivery.req-1");
+        let delivery: oshioki_protocol::DeliveryV1 =
+            serde_json::from_slice(&published[0].1).unwrap();
+        delivery.validate("req-1").unwrap();
+        assert_eq!(published[1].0, "oshioki.verdict.req-1");
+        assert_eq!(published[1].1, serde_json::to_vec(&decision).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

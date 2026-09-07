@@ -9,6 +9,38 @@
 
 use crate::{Error, VERSION_V1, v1::MAX_ENVELOPE_BYTES};
 
+/// The server's durable routing receipt for a browser-capable request. It is
+/// published on a subject distinct from the agent/browser liveness subject:
+/// receipt of this message proves only that the relay committed a request to
+/// an active browser recipient, never that a browser has opened it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeliveryV1 {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub version: u8,
+    pub request_id: String,
+}
+
+impl DeliveryV1 {
+    pub fn for_request(request_id: &str) -> Self {
+        Self {
+            message_type: "delivery".into(),
+            version: VERSION_V1,
+            request_id: request_id.into(),
+        }
+    }
+
+    pub fn validate(&self, request_id: &str) -> Result<(), Error> {
+        if self.message_type != "delivery"
+            || self.version != VERSION_V1
+            || self.request_id != request_id
+        {
+            return Err(Error::BadVerdict("invalid delivery receipt".into()));
+        }
+        Ok(())
+    }
+}
+
 /// The first response a native agent sends for a request. It proves that an
 /// agent received and accepted responsibility for the request; it carries no
 /// authorization and is never sufficient to approve sudo.
@@ -88,6 +120,18 @@ mod tests {
         );
         ack.validate("req-1").unwrap();
         assert!(ack.validate("req-2").is_err());
+    }
+
+    #[test]
+    fn delivery_receipt_is_typed_and_binds_the_request() {
+        let delivery = DeliveryV1::for_request("req-1");
+        let encoded = serde_json::to_vec(&delivery).unwrap();
+        assert_eq!(
+            encoded,
+            br#"{"type":"delivery","version":1,"request_id":"req-1"}"#
+        );
+        delivery.validate("req-1").unwrap();
+        assert!(delivery.validate("req-2").is_err());
     }
 
     #[test]

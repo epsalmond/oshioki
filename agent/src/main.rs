@@ -466,7 +466,7 @@ async fn answer_opened_request(
             warn!(
                 request_id = %escape_for_terminal(&opened.request.request_id),
                 error = %escape_for_terminal(&error.to_string()),
-                "daemon acknowledgement failed"
+                "native liveness acknowledgement failed; approval prompt suppressed"
             );
             return;
         }

@@ -37,9 +37,11 @@ the moment the agent is running. Run it as yourself, never under sudo. A root ru
 bundle loses its readable icon that way). Non-interactive with `--yes`
 plus values in the environment. Setup costs two Touch ID approvals, the
 elevation and the proof (plus the sudo password on a machine that has never
-run setup). Day-to-day sudo costs one approval, no password: the installer
-couples a `sudoers.d` NOPASSWD drop-in to the plugin block. The manual
-steps below remain for non-brew layouts.
+run setup). Day-to-day sudo uses one device approval when the installer
+couples a `sudoers.d` `NOPASSWD` drop-in to the plugin block. On Linux, an
+interactive request also races the invoking account password through the
+host's `sudo` PAM service. Press Enter to skip that fallback and wait for
+device approval. The manual steps below remain for non-brew layouts.
 
 ## Prelaunch installer
 
@@ -85,20 +87,22 @@ sudo scripts/install-oshioki-hook --prelaunch-status
 The installer rejects unknown config keys, symlinks, non-root ownership, and
 modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
 With an active device it also writes `/etc/sudoers.d/oshioki`
-(`<user> ALL=(ALL) NOPASSWD: ALL`, visudo-checked), so the Touch ID approval
-is the only gate and sudo stops asking for a password. The user comes from
+(`<user> ALL=(ALL) NOPASSWD: ALL`, visudo-checked), so sudo policy does not
+add a separate password prompt. The user comes from
 `OSHIOKI_SUDO_USER` (else `SUDO_USER`); without either, or without a
 `sudoers.d` include in the main sudoers file, the installer warns and keeps
 password authentication. The block and the drop-in go away together with
 `--disable-prelaunch`, and a re-run with no active devices removes both as
 well, so an enabled plugin never fails every sudo closed on an empty
 registry. `--prelaunch-status` checks both files.
-The plugin still keeps an interactive password fallback available when the
-approval transport is unavailable. It authenticates the invoking user through
-the system `sudo` PAM service, then runs account management. An explicit
-approval denial or invalid approval fails closed. `sudo -n` never reads a
-password tty. The password prompt is `[sudo/oshioki] password for <user>:` and
-the race ends within the 90-second approval deadline.
+On Linux, the plugin races an interactive password fallback with device
+approval from the start of each request. It authenticates the invoking user
+through the host's `sudo` PAM service, then runs account management. Press
+Enter at `[sudo/oshioki] password for <user>:` to skip the password branch.
+An explicit approval denial or invalid approval fails closed. `sudo -n` never
+opens the plugin password prompt. The hook's 90-second approval deadline is
+authoritative; the plugin keeps a five-second cleanup margin. Darwin ships
+device approval only and never opens this password branch.
 Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 `oshioki.dylib` in the same directory.
 

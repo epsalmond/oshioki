@@ -97,6 +97,7 @@ impl HookTransport for MockTransport {
         _request_id: &str,
         _payload: Vec<u8>,
         _timeout: std::time::Duration,
+        _has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
     ) -> BoxFuture<'_, DecisionV1> {
         let outcome = self

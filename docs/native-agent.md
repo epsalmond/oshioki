@@ -52,8 +52,11 @@ that is empty or holds anything but plainly printable characters is shown in
 shell single quotes, so one argument holding a space never reads as two.
 A running agent sends an `AliveV1` acknowledgement as soon as it receives a
 request, before it opens the terminal prompt. The hook reports the waiting
-state only after that acknowledgement. A missing acknowledgement fails the
-transport attempt quickly.
+state only after that acknowledgement. A missing acknowledgement fails a
+native-only transport attempt within three seconds. When the hook has a
+pinned WebAuthn recipient as well, it may first report the server's durable
+`DeliveryV1` receipt and wait for that browser to open and post `AliveV1`; the
+browser's bearer token remains bound to the pending sealed request.
 A prompt nobody answers before the request expires publishes no verdict at
 all, and the hook fails closed on its own deadline. The terminal prompt needs
 a terminal: with stdin closed nothing could answer, so `run` stops rather than

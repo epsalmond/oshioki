@@ -70,8 +70,12 @@ oshioki-agent pair '<enrollment-url>' --label <label>
 oshioki-agent run
 ```
 
-From then on, each sudo request costs one fingerprint tap to approve, no
-password. Details in [docs/native-agent.md](docs/native-agent.md) and
+From then on, a device can approve each sudo request with one fingerprint tap.
+On Linux, an interactive request also races the invoking account password
+through the host's `sudo` PAM service. Press Enter to skip that fallback and
+wait for device approval. `sudo -n` never opens the plugin password prompt.
+The device-only flow requires the installer's `sudoers.d` `NOPASSWD` rule.
+Details in [docs/native-agent.md](docs/native-agent.md) and
 [docs/mac-approvals.md](docs/mac-approvals.md).
 
 ```bash

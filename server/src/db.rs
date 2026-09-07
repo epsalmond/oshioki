@@ -2,8 +2,8 @@ use std::{path::Path, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use oshioki_protocol::{
-    DecisionV1, DeviceKindV1, DevicePublicRecordV1, EnrollmentStatusV1, EnrollmentSubmissionV1,
-    RequestEnvelopeV1, native_credential_id,
+    DecisionV1, DeliveryV1, DeviceKindV1, DevicePublicRecordV1, EnrollmentStatusV1,
+    EnrollmentSubmissionV1, RequestEnvelopeV1, native_credential_id,
 };
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::Serialize;
@@ -422,6 +422,33 @@ impl Store {
                 ],
             )?;
         }
+        // Routing is part of the same durable transaction as the request:
+        // only an active device record already bound to one of the sealed
+        // bodies can cause a server delivery receipt. A browser receipt is a
+        // relay commitment, never evidence that a browser has opened the
+        // request; that second signal remains the authenticated AliveV1 POST.
+        let has_active_browser = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sealed_bodies b
+                 JOIN devices d ON d.fingerprint=b.fingerprint
+                 WHERE b.request_id=?1 AND d.active=1
+                   AND COALESCE(json_extract(d.public_record_json, '$.kind'), 'webauthn')='webauthn'
+             )",
+            [&envelope.request_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if has_active_browser {
+            let delivery = serde_json::to_vec(&DeliveryV1::for_request(&envelope.request_id))?;
+            transaction.execute(
+                "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at)
+                 VALUES ('delivery', ?1, ?2, ?3, unixepoch())",
+                params![
+                    envelope.request_id,
+                    format!("oshioki.delivery.{}", envelope.request_id),
+                    delivery
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(InsertResult::Inserted)
     }
@@ -536,9 +563,9 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Verdicts and enrollment relays publish to NATS. Notifications are
-    /// deliberately not here: one failed ntfy delivery must never hold up
-    /// the approval path, so each lane drains its own rows.
+    /// Verdicts, delivery receipts, and enrollment relays publish to NATS.
+    /// Notifications are deliberately not here: one failed ntfy delivery
+    /// must never hold up the approval path, so each lane drains its own rows.
     pub fn pending_verdicts(&self, limit: usize) -> Result<Vec<OutboxItem>> {
         self.pending_outbox_where("kind != 'ntfy'", limit)
     }
@@ -786,6 +813,39 @@ mod tests {
     }
 
     #[test]
+    fn delivery_receipt_is_durable_only_for_an_active_browser_recipient() {
+        let store = Store::memory().unwrap();
+        let browser = device(b"delivery-token");
+        store.put_device(&browser).unwrap();
+        let browser_envelope = envelope(&browser.fingerprint);
+        let raw = serde_json::to_vec(&browser_envelope).unwrap();
+        assert_eq!(
+            store.ingest_request(&raw, &browser_envelope, 20).unwrap(),
+            InsertResult::Inserted
+        );
+        let pending = store.pending_verdicts(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].subject, "oshioki.delivery.request-1");
+        let receipt: DeliveryV1 = serde_json::from_slice(&pending[0].payload).unwrap();
+        receipt.validate("request-1").unwrap();
+
+        let mut inactive = browser;
+        inactive.active = false;
+        store.put_device(&inactive).unwrap();
+        let mut second = envelope(&inactive.fingerprint);
+        second.request_id = "request-2".into();
+        let second_raw = serde_json::to_vec(&second).unwrap();
+        store.ingest_request(&second_raw, &second, 20).unwrap();
+        assert!(
+            store
+                .pending_verdicts(10)
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != "oshioki.delivery.request-2")
+        );
+    }
+
+    #[test]
     fn first_decision_wins() {
         let store = Store::memory().unwrap();
         let device = device(b"first");
@@ -869,13 +929,23 @@ mod tests {
             .queue_notification("request-1", "https://ntfy.example/x", b"{}")
             .unwrap();
         let verdicts = store.pending_verdicts(10).unwrap();
-        assert_eq!(verdicts.len(), 1);
-        assert_eq!(verdicts[0].subject, "oshioki.verdict.request-1");
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(
+            verdicts
+                .iter()
+                .map(|item| item.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["oshioki.delivery.request-1", "oshioki.verdict.request-1"]
+        );
         let notifications = store.pending_notifications(10).unwrap();
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].subject, "https://ntfy.example/x");
-        store.mark_outbox_sent(verdicts[0].id).unwrap();
-        assert!(store.pending_verdicts(10).unwrap().is_empty());
+        let decision = verdicts
+            .iter()
+            .find(|item| item.subject == "oshioki.verdict.request-1")
+            .unwrap();
+        store.mark_outbox_sent(decision.id).unwrap();
+        assert_eq!(store.pending_verdicts(10).unwrap().len(), 1);
         assert_eq!(store.pending_notifications(10).unwrap().len(), 1);
     }
 
@@ -899,7 +969,7 @@ mod tests {
             store
                 .queue_decision("request-1", &device.fingerprint, &decision, 20)
                 .unwrap();
-            assert_eq!(store.pending_verdicts(10).unwrap().len(), 1);
+            assert_eq!(store.pending_verdicts(10).unwrap().len(), 2);
         }
 
         {
@@ -916,9 +986,12 @@ mod tests {
                     .is_none()
             );
             let pending = store.pending_verdicts(10).unwrap();
-            assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].subject, "oshioki.verdict.request-1");
-            store.mark_outbox_sent(pending[0].id).unwrap();
+            assert_eq!(pending.len(), 2);
+            assert_eq!(pending[0].subject, "oshioki.delivery.request-1");
+            assert_eq!(pending[1].subject, "oshioki.verdict.request-1");
+            for item in pending {
+                store.mark_outbox_sent(item.id).unwrap();
+            }
             assert!(store.pending_verdicts(10).unwrap().is_empty());
 
             let connection = store.lock().unwrap();

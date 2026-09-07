@@ -15,10 +15,11 @@
 #![deny(clippy::alloc_instead_of_core)]
 #![deny(clippy::std_instead_of_alloc)]
 
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::io::Write as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::panic::catch_unwind;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -234,7 +235,9 @@ struct SudoContext {
     /// Newline-separated `key=value` pairs from `command_info`, `user_info`,
     /// and `run_envp`. `run_argv` is appended as positional entries.
     payload: Vec<u8>,
+    #[cfg(target_os = "linux")]
     username: String,
+    #[cfg(target_os = "linux")]
     noninteractive: bool,
 }
 
@@ -326,13 +329,18 @@ unsafe fn gather_context(
         }
     }
 
+    #[cfg(target_os = "linux")]
     let username = user_info
         .iter()
         .rev()
         .find_map(|(key, value)| (key == "user").then_some(value.clone()))?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = noninteractive;
     Some(SudoContext {
         payload,
+        #[cfg(target_os = "linux")]
         username,
+        #[cfg(target_os = "linux")]
         noninteractive,
     })
 }
@@ -432,15 +440,59 @@ const HOOK_PATH: &str = "/usr/local/sbin/oshioki";
 /// Argument vector passed to the hook.
 const HOOK_ARGV: &[&str] = &["oshioki", "check"];
 
-/// Fork the hook and race its verdict with one cancellable password/PAM
-/// attempt. Hook status 0 approves, status 1 explicitly denies, and status 2
-/// means that the approval transport was unavailable, leaving the password
-/// branch eligible to win.
+/// Fork the hook and wait for its verdict. On Linux, a cancellable password/PAM
+/// attempt races the hook. Hook status 0 approves, status 1 explicitly denies,
+/// and status 2 means that the approval transport was unavailable, leaving the
+/// password branch eligible to win.
 fn run_hook(ctx: &SudoContext) -> c_int {
+    INTERRUPTED.store(false, Ordering::Relaxed);
+    let Some(_signals) = InterruptGuard::install() else {
+        return 0;
+    };
     let Some(mut hook) = spawn_hook(ctx) else {
         return 0;
     };
 
+    #[cfg(target_os = "linux")]
+    return run_hook_with_password(ctx, &mut hook);
+
+    #[cfg(not(target_os = "linux"))]
+    run_hook_without_password(&mut hook)
+}
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn interrupt_handler(_signal: c_int) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+struct InterruptGuard {
+    previous: libc::sighandler_t,
+}
+
+impl InterruptGuard {
+    fn install() -> Option<Self> {
+        // SAFETY: The handler only performs an atomic store, which is
+        // async-signal-safe. The returned disposition is restored on drop.
+        let previous = unsafe {
+            libc::signal(
+                libc::SIGINT,
+                interrupt_handler as *const () as libc::sighandler_t,
+            )
+        };
+        (previous != libc::SIG_ERR).then_some(Self { previous })
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        // SAFETY: Restore the disposition that was active before this check.
+        unsafe { libc::signal(libc::SIGINT, self.previous) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_hook_with_password(ctx: &SudoContext, hook: &mut HookChild) -> c_int {
     let mut password = if ctx.noninteractive {
         None
     } else {
@@ -453,15 +505,25 @@ fn run_hook(ctx: &SudoContext) -> c_int {
     let mut password_result = None;
 
     loop {
-        if std::time::Instant::now() >= deadline {
-            cancel_hook(&mut hook);
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            cancel_hook(hook);
+            drain_hook_stderr(hook, password.as_mut());
             cancel_password(password.take(), true);
             return 0;
         }
+        if std::time::Instant::now() >= deadline {
+            cancel_hook(hook);
+            drain_hook_stderr(hook, password.as_mut());
+            cancel_password(password.take(), true);
+            return 0;
+        }
+        drain_password_ready(password.as_mut());
+        drain_hook_stderr(hook, password.as_mut());
         if !hook_done {
-            if let Some(result) = reap_hook(&mut hook, true) {
+            if let Some(result) = reap_hook(hook, true) {
                 hook_done = true;
                 hook_result = Some(result);
+                drain_hook_stderr(hook, password.as_mut());
                 match result {
                     HookResult::Approved => {
                         cancel_password(password.take(), true);
@@ -481,6 +543,9 @@ fn run_hook(ctx: &SudoContext) -> c_int {
                 if let Some(result) = reap_password(worker) {
                     password_done = true;
                     password_result = Some(result);
+                    if matches!(result, PasswordResult::Rejected) {
+                        write_fd(libc::STDERR_FILENO, b"[sudo/oshioki] password rejected\n");
+                    }
                 }
             }
         }
@@ -492,7 +557,7 @@ fn run_hook(ctx: &SudoContext) -> c_int {
                 cancel_password(password.take(), false);
                 return 0;
             }
-            cancel_hook(&mut hook);
+            cancel_hook(hook);
             cancel_password(password.take(), false);
             audit_password_fallback(&ctx.username);
             return 1;
@@ -506,6 +571,28 @@ fn run_hook(ctx: &SudoContext) -> c_int {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn run_hook_without_password(hook: &mut HookChild) -> c_int {
+    let deadline = std::time::Instant::now() + PASSWORD_RACE_TIMEOUT;
+    loop {
+        if INTERRUPTED.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
+            cancel_hook(hook);
+            drain_hook_stderr(hook, None);
+            return 0;
+        }
+        drain_hook_stderr(hook, None);
+        if let Some(result) = reap_hook(hook, true) {
+            drain_hook_stderr(hook, None);
+            return match result {
+                HookResult::Approved => 1,
+                HookResult::Denied | HookResult::Unavailable | HookResult::Failed => 0,
+            };
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn audit_password_fallback(username: &str) {
     let Ok(format) = CString::new("[oshioki] password fallback approved for %s") else {
         return;
@@ -533,6 +620,7 @@ enum HookResult {
     Failed,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PasswordResult {
     Approved,
@@ -543,22 +631,33 @@ enum PasswordResult {
 
 struct HookChild {
     pid: Option<nix::unistd::Pid>,
+    stderr: Option<OwnedFd>,
 }
 
+#[cfg(target_os = "linux")]
 struct PasswordWorker {
     pid: Option<nix::unistd::Pid>,
     tty: OwnedFd,
     saved_termios: libc::termios,
     terminal_needs_flush: bool,
+    ready: Option<OwnedFd>,
+    prompt: Vec<u8>,
+    prompt_ready: bool,
 }
 
 /// Spawn the hook, feed its context, and return its verified child identity.
 /// The parent owns the returned pid and must reap it on every path.
 fn spawn_hook(ctx: &SudoContext) -> Option<HookChild> {
-    use nix::unistd::{ForkResult, execvp, fork};
+    use nix::unistd::{execvp, fork, ForkResult};
 
-    // Build the pipe before forking so the child inherits it.
+    // Build the stdin and stderr pipes before forking so the child inherits
+    // both. The parent forwards only stderr, leaving command stdout alone.
     let (read_fd, write_fd) = nix::unistd::pipe().ok()?;
+    let Ok((stderr_read, stderr_write)) = nix::unistd::pipe() else {
+        drop(read_fd);
+        drop(write_fd);
+        return None;
+    };
 
     // SAFETY: After fork(), only the child runs in the child branch. The
     // parent keeps its memory; the child gets a copy-on-write snapshot. We
@@ -576,18 +675,28 @@ fn spawn_hook(ctx: &SudoContext) -> Option<HookChild> {
 
             // Close read end in the parent (safe: we own it).
             drop(read_fd);
+            drop(stderr_write);
+            set_nonblocking(stderr_read.as_raw_fd());
 
-            Some(HookChild { pid: Some(child) })
+            Some(HookChild {
+                pid: Some(child),
+                stderr: Some(stderr_read),
+            })
         }
         Ok(ForkResult::Child) => {
             // Extract raw FDs for the unsafe fd operations below.
             let raw_read = read_fd.into_raw_fd();
             let raw_write = write_fd.into_raw_fd();
+            let raw_stderr_read = stderr_read.into_raw_fd();
+            let raw_stderr_write = stderr_write.into_raw_fd();
 
             // Replace stdin with the read end of the pipe.
             let _ = nix::unistd::dup2(raw_read, 0);
             let _ = nix::unistd::close(raw_read);
             let _ = nix::unistd::close(raw_write);
+            let _ = nix::unistd::dup2(raw_stderr_write, 2);
+            let _ = nix::unistd::close(raw_stderr_read);
+            let _ = nix::unistd::close(raw_stderr_write);
             reset_child_signals();
 
             // Build CStrings for exec.
@@ -605,7 +714,20 @@ fn spawn_hook(ctx: &SudoContext) -> Option<HookChild> {
             // fork failed; OwnedFd drop closes both ends.
             drop(read_fd);
             drop(write_fd);
+            drop(stderr_read);
+            drop(stderr_write);
             None
+        }
+    }
+}
+
+fn set_nonblocking(fd: RawFd) {
+    // SAFETY: fd is an open descriptor owned by the caller. The existing file
+    // status flags are preserved while adding O_NONBLOCK.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
     }
 }
@@ -622,7 +744,7 @@ fn hook_result(status: nix::sys::wait::WaitStatus) -> HookResult {
 /// Reap the child, optionally without blocking. The pid came directly from
 /// `fork`, so this cannot target an unrelated process.
 fn reap_hook(hook: &mut HookChild, nohang: bool) -> Option<HookResult> {
-    use nix::sys::wait::{WaitPidFlag, waitpid};
+    use nix::sys::wait::{waitpid, WaitPidFlag};
     let pid = hook.pid?;
     let flags = nohang.then_some(WaitPidFlag::WNOHANG);
     match waitpid(pid, flags) {
@@ -637,6 +759,95 @@ fn reap_hook(hook: &mut HookChild, nohang: bool) -> Option<HookResult> {
             // the pid in a later kill call.
             hook.pid = None;
             Some(HookResult::Failed)
+        }
+    }
+}
+
+fn write_fd(fd: RawFd, bytes: &[u8]) {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        // SAFETY: fd is an open descriptor owned by the caller and the slice
+        // remains valid for the duration of this write.
+        let written =
+            unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
+        if written > 0 {
+            offset += usize::try_from(written).unwrap_or(0);
+        } else if written < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {
+            // Retry after the signal interrupted the write.
+        } else {
+            return;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drain_password_ready(worker: Option<&mut PasswordWorker>) {
+    let Some(worker) = worker else {
+        return;
+    };
+    let Some(ready) = worker.ready.as_ref() else {
+        return;
+    };
+    let mut byte = [0u8; 1];
+    // SAFETY: byte is writable storage and ready is an open pipe descriptor.
+    let read = unsafe { libc::read(ready.as_raw_fd(), byte.as_mut_ptr().cast(), byte.len()) };
+    if read == 1 || read == 0 {
+        worker.ready = None;
+        if read == 1 {
+            worker.prompt_ready = true;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn redraw_password_prompt(worker: &mut PasswordWorker) {
+    if worker.prompt_ready {
+        write_fd(worker.tty.as_raw_fd(), &worker.prompt);
+    }
+}
+
+fn drain_hook_stderr(
+    hook: &mut HookChild,
+    #[cfg(target_os = "linux")] password: Option<&mut PasswordWorker>,
+    #[cfg(not(target_os = "linux"))] _password: Option<&mut ()>,
+) {
+    #[cfg(target_os = "linux")]
+    let mut output_seen = false;
+    let Some(stderr_fd) = hook.stderr.as_ref().map(std::os::fd::AsRawFd::as_raw_fd) else {
+        return;
+    };
+    loop {
+        let mut bytes = [0u8; 4096];
+        // SAFETY: bytes is writable storage and stderr is an open pipe
+        // descriptor owned by this process.
+        let read = unsafe { libc::read(stderr_fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        if read > 0 {
+            let read = usize::try_from(read).unwrap_or(0);
+            // The hook sanitizes its own diagnostics. Forward the bytes to the
+            // original stderr only; command stdout remains untouched.
+            write_fd(libc::STDERR_FILENO, &bytes[..read]);
+            #[cfg(target_os = "linux")]
+            {
+                output_seen = true;
+            }
+            continue;
+        }
+        if read == 0 {
+            hook.stderr = None;
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN)
+            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK)
+        {
+            hook.stderr = None;
+        }
+        break;
+    }
+    #[cfg(target_os = "linux")]
+    if output_seen {
+        if let Some(worker) = password {
+            redraw_password_prompt(worker);
         }
     }
 }
@@ -669,6 +880,7 @@ fn reap_after_signal_hook(hook: &mut HookChild) {
     reap_hook_blocking(hook);
 }
 
+#[cfg(target_os = "linux")]
 fn cancel_password(worker: Option<PasswordWorker>, flush_input: bool) {
     if let Some(worker) = worker {
         if let Some(pid) = worker.pid {
@@ -684,6 +896,7 @@ fn cancel_password(worker: Option<PasswordWorker>, flush_input: bool) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn reap_after_signal_password(pid: nix::unistd::Pid) {
     let deadline = std::time::Instant::now() + CHILD_TERM_GRACE;
     while std::time::Instant::now() < deadline {
@@ -710,31 +923,45 @@ fn reap_hook_blocking(hook: &mut HookChild) {
     }
 }
 
-const PASSWORD_RACE_TIMEOUT: Duration = Duration::from_secs(90);
+const PASSWORD_RACE_TIMEOUT: Duration = Duration::from_secs(95);
 
 /// Start a separate password process before any password bytes are read. A
 /// process boundary makes a stuck PAM module cancellable; the parent owns a
 /// duplicate tty fd so it can restore termios after killing that process.
+#[cfg(target_os = "linux")]
 fn spawn_password_process(username: &str) -> Option<PasswordWorker> {
     let (tty, saved_termios) = open_tty_for_password()?;
     let child_tty = duplicate_fd(&tty)?;
+    let (ready_read, ready_write) = nix::unistd::pipe().ok()?;
+    set_nonblocking(ready_read.as_raw_fd());
+    if !set_quiet_terminal(tty.as_raw_fd(), &saved_termios) {
+        return None;
+    }
     let username = username.to_owned();
+    let prompt = format!("[sudo/oshioki] password for {username}: ").into_bytes();
     // SAFETY: This fork occurs before any worker threads. The child only uses
     // inherited tty/cancellation fds and exits after tty/PAM cleanup.
-    match unsafe { nix::unistd::fork() }.ok()? {
-        nix::unistd::ForkResult::Parent { child } => {
+    let forked = unsafe { nix::unistd::fork() };
+    match forked {
+        Ok(nix::unistd::ForkResult::Parent { child }) => {
             drop(child_tty);
+            drop(ready_write);
             Some(PasswordWorker {
                 pid: Some(child),
                 tty,
                 saved_termios,
                 terminal_needs_flush: false,
+                ready: Some(ready_read),
+                prompt,
+                prompt_ready: false,
             })
         }
-        nix::unistd::ForkResult::Child => {
+        Ok(nix::unistd::ForkResult::Child) => {
             drop(tty);
+            drop(ready_read);
             reset_child_signals();
-            let result = read_and_authenticate_password(&username, child_tty);
+            let result =
+                read_and_authenticate_password(&username, child_tty, saved_termios, &ready_write);
             let code = match result {
                 PasswordResult::Approved => 0,
                 PasswordResult::Rejected => 1,
@@ -744,11 +971,19 @@ fn spawn_password_process(username: &str) -> Option<PasswordWorker> {
             // SAFETY: The child has restored its terminal before exiting.
             unsafe { libc::_exit(code) }
         }
+        Err(_) => {
+            drop(child_tty);
+            drop(ready_read);
+            drop(ready_write);
+            restore_terminal(tty.as_raw_fd(), &saved_termios, true);
+            None
+        }
     }
 }
 
+#[cfg(target_os = "linux")]
 fn reap_password(worker: &mut PasswordWorker) -> Option<PasswordResult> {
-    use nix::sys::wait::{WaitPidFlag, waitpid};
+    use nix::sys::wait::{waitpid, WaitPidFlag};
     let pid = worker.pid?;
     match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
         Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(nix::errno::Errno::EINTR) => None,
@@ -789,6 +1024,7 @@ fn reset_child_signals() {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn duplicate_fd(fd: &OwnedFd) -> Option<OwnedFd> {
     let duplicate = unsafe { libc::dup(fd.as_raw_fd()) };
     if duplicate < 0 {
@@ -800,6 +1036,7 @@ fn duplicate_fd(fd: &OwnedFd) -> Option<OwnedFd> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn open_tty_for_password() -> Option<(OwnedFd, libc::termios)> {
     let path = CString::new("/dev/tty").expect("tty path contains no NUL");
     // SAFETY: The path is a fixed NUL-terminated string and no borrowed
@@ -816,6 +1053,14 @@ fn open_tty_for_password() -> Option<(OwnedFd, libc::termios)> {
     // SAFETY: `fd` is a fresh descriptor returned by open and is transferred
     // to OwnedFd exactly once.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // A background process group must not touch terminal attributes. This
+    // check runs before any tcsetattr or fork, avoiding SIGTTOU for jobs.
+    // SAFETY: fd is an open terminal descriptor and getpgrp has no arguments.
+    let foreground = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
+    let process_group = unsafe { libc::getpgrp() };
+    if foreground < 0 || foreground != process_group {
+        return None;
+    }
     let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
     // SAFETY: `saved` points to writable storage and fd is a terminal owned by
     // this process.
@@ -826,6 +1071,15 @@ fn open_tty_for_password() -> Option<(OwnedFd, libc::termios)> {
     Some((fd, unsafe { saved.assume_init() }))
 }
 
+#[cfg(target_os = "linux")]
+fn set_quiet_terminal(fd: RawFd, saved: &libc::termios) -> bool {
+    let mut quiet = *saved;
+    quiet.c_lflag &= !(libc::ECHO | libc::ECHONL);
+    // SAFETY: quiet was copied from a termios value read from this terminal.
+    unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const quiet) == 0 }
+}
+
+#[cfg(target_os = "linux")]
 fn restore_terminal(fd: RawFd, saved: &libc::termios, flush_input: bool) {
     // SAFETY: fd is an open /dev/tty descriptor owned by the caller, and the
     // termios value came from tcgetattr on that same terminal.
@@ -843,12 +1097,14 @@ fn restore_terminal(fd: RawFd, saved: &libc::termios, flush_input: bool) {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct PasswordTtyGuard {
     fd: RawFd,
     saved: libc::termios,
     flush_input: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for PasswordTtyGuard {
     fn drop(&mut self) {
         restore_terminal(self.fd, &self.saved, self.flush_input);
@@ -859,21 +1115,14 @@ impl Drop for PasswordTtyGuard {
 /// system's `sudo` PAM service. The parent cancels this process with SIGTERM;
 /// the parent-held tty descriptor then restores and flushes input before the
 /// plugin returns.
-fn read_and_authenticate_password(username: &str, tty: OwnedFd) -> PasswordResult {
+#[cfg(target_os = "linux")]
+fn read_and_authenticate_password(
+    username: &str,
+    tty: OwnedFd,
+    saved: libc::termios,
+    ready: &OwnedFd,
+) -> PasswordResult {
     let fd = tty.as_raw_fd();
-    let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
-    // SAFETY: fd is the inherited /dev/tty descriptor and saved is writable.
-    if unsafe { libc::tcgetattr(fd, saved.as_mut_ptr()) } != 0 {
-        return PasswordResult::Unavailable;
-    }
-    // SAFETY: tcgetattr initialized saved on success.
-    let saved = unsafe { saved.assume_init() };
-    let mut quiet = saved;
-    quiet.c_lflag &= !(libc::ECHO | libc::ECHONL);
-    // SAFETY: quiet was copied from the same terminal and remains valid.
-    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const quiet) } != 0 {
-        return PasswordResult::Unavailable;
-    }
     let mut tty_file = unsafe { std::fs::File::from_raw_fd(tty.into_raw_fd()) };
     // Declare the file before the guard so Rust drops the guard first; its
     // restore operation therefore always sees a live tty descriptor.
@@ -887,6 +1136,9 @@ fn read_and_authenticate_password(username: &str, tty: OwnedFd) -> PasswordResul
         guard.flush_input = true;
         return PasswordResult::Unavailable;
     }
+    // The parent set quiet mode before fork. Signal readiness only after the
+    // prompt is visible, so a redraw can never precede echo suppression.
+    write_fd(ready.as_raw_fd(), &[1]);
 
     let deadline = std::time::Instant::now() + PASSWORD_RACE_TIMEOUT;
     let mut input = Vec::with_capacity(128);
@@ -934,8 +1186,8 @@ fn read_and_authenticate_password(username: &str, tty: OwnedFd) -> PasswordResul
                     guard.flush_input = true;
                     return PasswordResult::Rejected;
                 }
-                let result = authenticate_with_pam(username, &input);
-                input.fill(0);
+                let result = authenticate_password_line(username, &input, authenticate_with_pam);
+                zeroize_bytes(&mut input);
                 let _ = tty_file.write_all(b"\n");
                 let _ = tty_file.flush();
                 drop(tty_file);
@@ -946,20 +1198,37 @@ fn read_and_authenticate_password(username: &str, tty: OwnedFd) -> PasswordResul
 }
 
 #[cfg(target_os = "linux")]
-fn authenticate_with_pam(username: &str, password: &[u8]) -> PasswordResult {
-    pam::authenticate(username, password)
+fn authenticate_password_line<F>(username: &str, password: &[u8], authenticate: F) -> PasswordResult
+where
+    F: FnOnce(&str, &[u8]) -> PasswordResult,
+{
+    // Enter means "skip". Do not send an empty password through PAM, since
+    // the host's sudo stack may count it as a failed authentication attempt.
+    if password.is_empty() {
+        return PasswordResult::Unavailable;
+    }
+    authenticate(username, password)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn authenticate_with_pam(_username: &str, _password: &[u8]) -> PasswordResult {
-    PasswordResult::Unavailable
+#[cfg(target_os = "linux")]
+fn zeroize_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        // SAFETY: byte points into the uniquely borrowed secret buffer.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+fn authenticate_with_pam(username: &str, password: &[u8]) -> PasswordResult {
+    pam::authenticate(username, password)
 }
 
 #[cfg(target_os = "linux")]
 mod pam {
     use super::PasswordResult;
-    use std::ffi::{CStr, CString, c_char, c_int, c_void};
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::ptr;
 
     const PAM_SUCCESS: c_int = 0;
@@ -968,6 +1237,8 @@ mod pam {
     const PAM_PROMPT_ECHO_ON: c_int = 2;
     const PAM_ERROR_MSG: c_int = 3;
     const PAM_TEXT_INFO: c_int = 4;
+    const PAM_TTY: c_int = 3;
+    const PAM_RUSER: c_int = 8;
     const PAM_SILENT: c_int = 0x8000;
 
     #[repr(C)]
@@ -1003,6 +1274,7 @@ mod pam {
     ) -> c_int;
     type PamAuthenticate = unsafe extern "C" fn(*mut PamHandle, c_int) -> c_int;
     type PamAcctMgmt = unsafe extern "C" fn(*mut PamHandle, c_int) -> c_int;
+    type PamSetItem = unsafe extern "C" fn(*mut PamHandle, c_int, *const c_void) -> c_int;
     type PamEnd = unsafe extern "C" fn(*mut PamHandle, c_int) -> c_int;
 
     struct PamApi {
@@ -1010,6 +1282,7 @@ mod pam {
         start: PamStart,
         authenticate: PamAuthenticate,
         acct_mgmt: PamAcctMgmt,
+        set_item: PamSetItem,
         end: PamEnd,
     }
 
@@ -1037,8 +1310,9 @@ mod pam {
             let start = symbol(b"pam_start\0");
             let authenticate = symbol(b"pam_authenticate\0");
             let acct_mgmt = symbol(b"pam_acct_mgmt\0");
+            let set_item = symbol(b"pam_set_item\0");
             let end = symbol(b"pam_end\0");
-            if [start, authenticate, acct_mgmt, end]
+            if [start, authenticate, acct_mgmt, set_item, end]
                 .iter()
                 .any(|ptr| ptr.is_null())
             {
@@ -1057,6 +1331,7 @@ mod pam {
                     std::mem::transmute::<*mut c_void, PamAuthenticate>(authenticate)
                 },
                 acct_mgmt: unsafe { std::mem::transmute::<*mut c_void, PamAcctMgmt>(acct_mgmt) },
+                set_item: unsafe { std::mem::transmute::<*mut c_void, PamSetItem>(set_item) },
                 end: unsafe { std::mem::transmute::<*mut c_void, PamEnd>(end) },
             })
         }
@@ -1064,7 +1339,13 @@ mod pam {
 
     struct ConversationData {
         username: CString,
-        password: CString,
+        password: Vec<u8>,
+    }
+
+    impl Drop for ConversationData {
+        fn drop(&mut self) {
+            super::zeroize_bytes(&mut self.password);
+        }
     }
 
     unsafe extern "C" fn conversation(
@@ -1111,7 +1392,7 @@ mod pam {
                 response.resp = ptr::null_mut();
                 response.resp_retcode = 0;
                 let source = match unsafe { (*message).style } {
-                    PAM_PROMPT_ECHO_OFF => data.password.as_bytes_with_nul(),
+                    PAM_PROMPT_ECHO_OFF => &data.password,
                     PAM_PROMPT_ECHO_ON => data.username.as_bytes_with_nul(),
                     PAM_ERROR_MSG | PAM_TEXT_INFO => continue,
                     _ => {
@@ -1153,7 +1434,10 @@ mod pam {
                 // bytes are private password/username material.
                 unsafe {
                     let length = CStr::from_ptr(response.resp).to_bytes().len();
-                    std::ptr::write_bytes(response.resp.cast::<u8>(), 0, length);
+                    super::zeroize_bytes(std::slice::from_raw_parts_mut(
+                        response.resp.cast::<u8>(),
+                        length,
+                    ));
                     libc::free(response.resp.cast());
                 }
             }
@@ -1174,7 +1458,7 @@ mod pam {
         };
         let mut data = ConversationData {
             username: user,
-            password: pass,
+            password: pass.into_bytes_with_nul(),
         };
         let conv = PamConv {
             conv: Some(conversation),
@@ -1203,6 +1487,19 @@ mod pam {
         if handle.is_null() {
             return PasswordResult::Rejected;
         }
+        let tty = CString::new("/dev/tty").expect("PAM tty contains no NUL");
+        // Keep the host's sudo PAM service while supplying the same context
+        // that sudo supplies to its own PAM conversation.
+        let tty_result = unsafe { (api.set_item)(handle, PAM_TTY, tty.as_ptr().cast()) };
+        let ruser_result =
+            unsafe { (api.set_item)(handle, PAM_RUSER, data.username.as_ptr().cast()) };
+        if tty_result != PAM_SUCCESS || ruser_result != PAM_SUCCESS {
+            // PAM may reject optional context items. Treat that as a failed
+            // authentication rather than silently running with weaker audit
+            // context.
+            unsafe { (api.end)(handle, PAM_CONV_ERR) };
+            return PasswordResult::Rejected;
+        }
         // SAFETY: handle was initialized by successful pam_start and the
         // callback remains valid for the lifetime of this handle.
         let auth = unsafe { (api.authenticate)(handle, 0) };
@@ -1214,17 +1511,6 @@ mod pam {
         };
         // SAFETY: handle is ended exactly once after the final PAM operation.
         unsafe { (api.end)(handle, account) };
-        // Clear our copy before dropping it. PAM has already completed the
-        // conversation and owns/frees only its own copies of each response.
-        // SAFETY: `data.password` is uniquely owned here and its allocation contains
-        // the password bytes followed by one NUL terminator.
-        unsafe {
-            std::ptr::write_bytes(
-                data.password.as_ptr().cast_mut().cast::<u8>(),
-                0,
-                data.password.as_bytes_with_nul().len(),
-            );
-        }
         if auth == PAM_SUCCESS && account == PAM_SUCCESS {
             PasswordResult::Approved
         } else {
@@ -1239,7 +1525,7 @@ mod pam {
         fn conversation_data() -> ConversationData {
             ConversationData {
                 username: CString::new("fixture").unwrap(),
-                password: CString::new("password").unwrap(),
+                password: CString::new("password").unwrap().into_bytes_with_nul(),
             }
         }
 
@@ -1321,6 +1607,26 @@ mod pam {
             );
             // SAFETY: the successful callback allocated one response array.
             unsafe { free_responses(responses, 1) };
+        }
+
+        #[test]
+        fn empty_password_skips_pam_but_whitespace_reaches_it() {
+            let mut calls = 0;
+            let empty = super::super::authenticate_password_line("fixture", b"", |_, _| {
+                calls += 1;
+                PasswordResult::Approved
+            });
+            assert_eq!(empty, PasswordResult::Unavailable);
+            assert_eq!(calls, 0);
+
+            let whitespace =
+                super::super::authenticate_password_line("fixture", b" ", |_, password| {
+                    calls += 1;
+                    assert_eq!(password, b" ");
+                    PasswordResult::Rejected
+                });
+            assert_eq!(whitespace, PasswordResult::Rejected);
+            assert_eq!(calls, 1);
         }
     }
 }
@@ -1454,6 +1760,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn open_captures_noninteractive_without_trusting_caller_environment() {
         let _serial = identity_test();
         assert_eq!(
@@ -1496,10 +1803,12 @@ mod tests {
             capture_test_open_with_settings(&[], &[b"user=missing-uid"]),
             SUDO_RC_ERROR
         );
-        assert!(
-            gather_after_captured_identity(&[b"command=/usr/bin/true"], &[b"/usr/bin/true"], &[],)
-                .is_none()
-        );
+        assert!(gather_after_captured_identity(
+            &[b"command=/usr/bin/true"],
+            &[b"/usr/bin/true"],
+            &[],
+        )
+        .is_none());
     }
 
     #[test]
@@ -1517,26 +1826,32 @@ mod tests {
         assert!(payload.contains("info.user=approvalcaller\n"));
         assert!(payload.contains("info.uid=12345\n"));
 
-        assert!(
-            gather_after_captured_identity(&[b"command=/usr/bin/echo"], &[b"/usr/bin/echo"], &[],)
-                .is_none()
-        );
+        assert!(gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[],
+        )
+        .is_none());
     }
 
     #[test]
     fn missing_or_replaced_identity_denies_without_reusing_stale_state() {
         let _serial = identity_test();
-        assert!(
-            gather_after_captured_identity(&[b"command=/usr/bin/echo"], &[b"/usr/bin/echo"], &[],)
-                .is_none()
-        );
+        assert!(gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[],
+        )
+        .is_none());
 
         assert!(capture_test_identity(&[b"user=old", b"uid=1000"]));
         assert!(!capture_test_identity(&[b"user=new"]));
-        assert!(
-            gather_after_captured_identity(&[b"command=/usr/bin/echo"], &[b"/usr/bin/echo"], &[],)
-                .is_none()
-        );
+        assert!(gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[],
+        )
+        .is_none());
     }
 
     #[test]
@@ -1544,10 +1859,12 @@ mod tests {
         let _serial = identity_test();
         assert!(capture_test_identity(&[b"user=old", b"uid=1000"]));
         assert!(!capture_test_identity(&[b"user=line\nbreak", b"uid=12345"]));
-        assert!(
-            gather_after_captured_identity(&[b"command=/usr/bin/echo"], &[b"/usr/bin/echo"], &[],)
-                .is_none()
-        );
+        assert!(gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[],
+        )
+        .is_none());
 
         assert!(!capture_test_identity(&[b"user=bad\xff", b"uid=12345"]));
     }
@@ -1630,64 +1947,50 @@ mod tests {
             &[b"NAME=value"],
         )
         .unwrap();
-        assert!(
-            with_space
-                .payload
-                .windows(b"argv.2=line break\n".len())
-                .any(|window| window == b"argv.2=line break\n")
-        );
+        assert!(with_space
+            .payload
+            .windows(b"argv.2=line break\n".len())
+            .any(|window| window == b"argv.2=line break\n"));
 
-        assert!(
-            gather_test_context(
-                &[b"command=/usr/bin/echo"],
-                &[b"/usr/bin/echo", b"line\nbreak"],
-                &[b"NAME=value"],
-            )
-            .is_none()
-        );
-        assert!(
-            gather_test_context(
-                &[b"command=/usr/bin/echo\r"],
-                &[b"/usr/bin/echo"],
-                &[b"NAME=value"],
-            )
-            .is_none()
-        );
-        assert!(
-            gather_test_context(
-                &[b"command=/usr/bin/echo"],
-                &[b"/usr/bin/echo"],
-                &[b"NAME=line\nbreak"],
-            )
-            .is_none()
-        );
+        assert!(gather_test_context(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo", b"line\nbreak"],
+            &[b"NAME=value"],
+        )
+        .is_none());
+        assert!(gather_test_context(
+            &[b"command=/usr/bin/echo\r"],
+            &[b"/usr/bin/echo"],
+            &[b"NAME=value"],
+        )
+        .is_none());
+        assert!(gather_test_context(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[b"NAME=line\nbreak"],
+        )
+        .is_none());
     }
 
     #[test]
     fn gather_context_rejects_invalid_utf8_in_all_sudo_arrays() {
-        assert!(
-            gather_test_context(
-                &[b"command=/usr/bin/\xff"],
-                &[b"/usr/bin/echo"],
-                &[b"NAME=value"],
-            )
-            .is_none()
-        );
-        assert!(
-            gather_test_context(
-                &[b"command=/usr/bin/echo"],
-                &[b"/usr/bin/\xff"],
-                &[b"NAME=value"],
-            )
-            .is_none()
-        );
-        assert!(
-            gather_test_context(
-                &[b"command=/usr/bin/echo"],
-                &[b"/usr/bin/echo"],
-                &[b"NAME=\xff"],
-            )
-            .is_none()
-        );
+        assert!(gather_test_context(
+            &[b"command=/usr/bin/\xff"],
+            &[b"/usr/bin/echo"],
+            &[b"NAME=value"],
+        )
+        .is_none());
+        assert!(gather_test_context(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/\xff"],
+            &[b"NAME=value"],
+        )
+        .is_none());
+        assert!(gather_test_context(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[b"NAME=\xff"],
+        )
+        .is_none());
     }
 }

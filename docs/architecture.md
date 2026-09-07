@@ -60,11 +60,22 @@ device whose kind and fingerprint both match a pinned record.
 
 Each approval path reports liveness before it waits for a human decision. A
 native socket agent sends an `AliveV1` frame first. A native NATS agent sends
-the same message on `oshioki.ack.<request-id>`. A browser posts the message
-after it authenticates, decrypts, and checks the sealed request. The server
-relays that browser message only after the authenticated post, so request
-ingestion cannot impersonate a live browser. The acknowledgement carries no
-authorization.
+the same message on `oshioki.ack.<request-id>`. For a request that includes an
+active pinned WebAuthn recipient, the server records a `DeliveryV1` outbox row
+in the request ingestion transaction after joining the sealed body to the
+active device record, then publishes it on `oshioki.delivery.<request-id>`.
+That receipt proves durable relay routing and lets the hook wait for the
+browser beyond the native three-second liveness bound. The browser posts
+`AliveV1` only after it authenticates, decrypts, and checks the sealed request;
+the server relays that browser message only after the authenticated post, so
+request ingestion cannot impersonate a live browser. The acknowledgement and
+delivery receipt carry no authorization.
+
+The delivery control message has no rolling negotiation. Browser-capable
+deployments must update the server, its browser bundle, and the hook together;
+native socket deployments must update the hook and agent together. An older
+server or peer leaves the corresponding receipt unavailable and the hook
+reports the required upgrade while failing closed.
 
 The sudo plugin starts the hook and, for an interactive Linux invocation, a
 separate PAM password attempt at the same time. The installer normally adds a
