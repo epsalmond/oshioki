@@ -253,6 +253,23 @@ run_installer "$SUDOERS" --disable-prelaunch
 if grep -Fq '# BEGIN oshioki' "$SUDOERS/sudo.conf"; then fail "disable left managed block"; fi
 [ ! -e "$SUDOERS/sudoers.d/oshioki" ] || fail "disable left the drop-in"
 
+# sudo accepts "# includedir" with space but requires @includedir contiguous,
+# so "@ includedir" includes nothing. Writing the drop-in on the strength of
+# it would leave the user with neither a prompt nor passwordless sudo.
+BADINC="$TEST_ROOT/bad-include"; mkdir -p "$BADINC/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$BADINC/state/devices.json"
+printf '# sudoers test file\n@ includedir %s\n' "$BADINC/sudoers.d" > "$BADINC/sudoers"
+OSHIOKI_SUDO_USER=testuser run_installer "$BADINC" --prelaunch >"$BADINC/log" 2>&1
+[ ! -e "$BADINC/sudoers.d/oshioki" ] || fail "drop-in written despite a non-contiguous @ includedir"
+grep -Fq 'includes no sudoers.d directory' "$BADINC/log" || fail "no warning for a non-contiguous @ includedir"
+
+# The spaced # form is legal and must still be honoured.
+SPACEINC="$TEST_ROOT/space-include"; mkdir -p "$SPACEINC/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SPACEINC/state/devices.json"
+printf '# sudoers test file\n#  includedir %s\n' "$SPACEINC/sudoers.d" > "$SPACEINC/sudoers"
+OSHIOKI_SUDO_USER=testuser run_installer "$SPACEINC" --prelaunch >"$SPACEINC/log" 2>&1
+grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$SPACEINC/sudoers.d/oshioki" || fail "spaced # includedir was not honoured"
+
 # Dry runs plan without writing.
 DRYUSER="$TEST_ROOT/dry-user"; mkdir -p "$DRYUSER/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$DRYUSER/state/devices.json"

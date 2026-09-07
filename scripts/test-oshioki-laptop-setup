@@ -220,7 +220,9 @@ python3 -c 'import socket,os;s=socket.socket();s.settimeout(1);s.connect(("127.0
   || fail "NATS stub never listened on $STUB_PORT"
 
 run_setup() {
-  env -i PATH="/usr/bin:/bin" HOME="$TEST_ROOT/home" \
+  # SETUP_PATH lets a scenario stage a host that lacks a tool (python3), so
+  # the script's own `command -v` probes take the fallback branch.
+  env -i PATH="${SETUP_PATH:-/usr/bin:/bin}" HOME="$TEST_ROOT/home" \
     AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
     APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
@@ -298,13 +300,16 @@ else
   if [ -f "$unit" ]; then fail "systemd unit written on Linux"; fi
   if grep -Fq 'enable' "$CALL_LOG"; then fail "systemctl enable ran on Linux"; fi
   [ -f "$agent_env" ] || fail "agent.env missing"
-  grep -Fxq "NATS_URL=$SETUP_NATS_URL" "$agent_env" || fail "agent.env missing NATS URL"
-  grep -Fxq 'NATS_USER=oshioki' "$agent_env" || fail "agent.env missing NATS user"
-  grep -Fxq 'NATS_PASS=test-secret' "$agent_env" || fail "agent.env missing NATS password"
-  grep -Fxq "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" "$agent_env" || fail "agent.env missing agent socket"
-  grep -Fxq "OSHIOKI_AGENT_STATE=$AGENT_STATE" "$agent_env" || fail "agent.env missing agent state"
+  # Source it the way the printed one-liner does: what matters is the value
+  # the agent ends up with, not the bytes on disk.
+  env_value() { (set -a; . "$1"; set +a; eval "printf '%s' \"\$$2\""); }
+  [ "$(env_value "$agent_env" NATS_URL)" = "$SETUP_NATS_URL" ] || fail "agent.env NATS URL did not survive sourcing"
+  [ "$(env_value "$agent_env" NATS_USER)" = oshioki ] || fail "agent.env NATS user did not survive sourcing"
+  [ "$(env_value "$agent_env" NATS_PASS)" = test-secret ] || fail "agent.env NATS password did not survive sourcing"
+  [ "$(env_value "$agent_env" OSHIOKI_AGENT_SOCKET)" = "$AGENT_STATE/agent.sock" ] || fail "agent.env socket did not survive sourcing"
+  [ "$(env_value "$agent_env" OSHIOKI_AGENT_STATE)" = "$AGENT_STATE" ] || fail "agent.env state dir did not survive sourcing"
   [ "$(file_mode "$agent_env")" = 600 ] || fail "agent.env is not 0600"
-  grep -Fq ". $agent_env" "$TEST_ROOT/fresh.log" || fail "setup never printed the run one-liner"
+  grep -Fq ". '$agent_env'" "$TEST_ROOT/fresh.log" || fail "setup never printed the run one-liner"
   grep -Fq 'install complete' "$TEST_ROOT/fresh.log" || fail "verify never completed"
 fi
 if [ "$(uname -s)" = Darwin ]; then
@@ -340,7 +345,10 @@ if [ "$(uname -s)" = Darwin ]; then
   grep -Fq "<string>$NASTY</string>" "$plist" || fail "plist mangled the password"
 else
   agent_env="$TEST_ROOT/home/.config/oshioki/agent.env"
-  grep -Fxq "NATS_PASS=$NASTY" "$agent_env" || fail "agent.env mangled the password"
+  # Sourcing is how the agent is started, so the password has to come back
+  # byte-for-byte through it -- bare bytes on disk would not.
+  got=$(set -a; . "$agent_env"; set +a; printf '%s' "$NATS_PASS")
+  [ "$got" = "$NASTY" ] || fail "agent.env mangled the password: [$got]"
   grep -Fq 'OSHIOKI_AGENT_SOCKET=' "$agent_env" || fail "agent.env missing agent socket"
   grep -Fq 'OSHIOKI_AGENT_STATE=' "$agent_env" || fail "agent.env missing agent state"
   [ "$(file_mode "$agent_env")" = 600 ] || fail "agent.env is not 0600"
@@ -359,6 +367,92 @@ if [ "$(uname -s)" != Darwin ]; then
   grep -Fq 'disable --now' "$CALL_LOG" || fail "stale unit was never disabled"
   if [ -f "$unit_dir/com.oshioki.agent.service" ]; then fail "stale unit survived"; fi
   grep -Fq 'removed the old systemd unit' "$TEST_ROOT/stale-unit.log" || fail "stale unit removal was silent"
+fi
+
+# Scenario D3 (Linux): the enable symlink goes with the unit. disable would
+# normally clear it, but it is removed by hand so a host without systemctl
+# does not keep a dangling link pointing at a deleted unit.
+if [ "$(uname -s)" != Darwin ]; then
+  unit_dir="$TEST_ROOT/home/.config/systemd/user"
+  wants="$unit_dir/default.target.wants"
+  mkdir -p "$wants"
+  printf '%s\n' '[Service]' 'ExecStart=/stale/oshioki-agent run' > "$unit_dir/com.oshioki.agent.service"
+  ln -sf "$unit_dir/com.oshioki.agent.service" "$wants/com.oshioki.agent.service"
+  : > "$CALL_LOG"
+  run_setup --yes --reconfigure >"$TEST_ROOT/stale-wants.log" 2>&1 || fail "setup with a stale wants link failed"
+  if [ -e "$wants/com.oshioki.agent.service" ] || [ -L "$wants/com.oshioki.agent.service" ]; then
+    fail "stale enable symlink survived the unit it pointed at"
+  fi
+fi
+
+# Scenario D4 (Linux): a live socket is the "agent already running" state, so
+# setup must go on to the sudo proof rather than take the early exit. Without
+# this, scenario A's early exit would pass even if the branch broke.
+if [ "$(uname -s)" != Darwin ] && command -v python3 >/dev/null 2>&1; then
+  live_sock="$AGENT_STATE/agent.sock"
+  mkdir -p "$AGENT_STATE"
+  rm -f "$live_sock"
+  python3 -c 'import socket,sys,time
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.bind(sys.argv[1]); s.listen(8)
+time.sleep(120)' "$live_sock" &
+  holder=$!
+  # Register it the way every other holder is, so a fail between here and the
+  # kill below still gets reaped by the EXIT trap instead of leaking.
+  echo "$holder" >> "$TEST_ROOT/holder-pids"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$live_sock" ] && break; sleep 0.2; done
+  [ -S "$live_sock" ] || fail "could not stage a live socket"
+  : > "$CALL_LOG"
+  # Not `|| fail`: the point is which branch was taken, and the sudo proof
+  # may legitimately fail in the harness. The assertions below read the log.
+  run_setup --yes --reconfigure >"$TEST_ROOT/live-sock.log" 2>&1 || true
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  rm -f "$live_sock"
+  if grep -Fq 'Start the agent on a terminal' "$TEST_ROOT/live-sock.log"; then
+    fail "setup took the early exit even though the socket was live"
+  fi
+  # Without this the test would also pass on a run that died before reaching
+  # the branch at all, which is the opposite of what it is here to show.
+  grep -Eq 'step [0-9]+/[0-9]+: verify' "$TEST_ROOT/live-sock.log" || fail "setup never reached verify with a live socket"
+fi
+
+# Scenario D5 (Linux): a socket FILE with no listener behind it, on a host
+# with no python3 to tell the difference. A crash or an earlier run leaves
+# exactly this. Trusting [ -S ] here would skip the early exit and fall
+# through to a sudo proof nobody can answer, failing an install that is in
+# fact complete.
+if [ "$(uname -s)" != Darwin ]; then
+  nopy="$TEST_ROOT/nopy-bin"
+  mkdir -p "$nopy"
+  # Every tool the default PATH offers except python, so `command -v python3`
+  # fails the way it would on a host that ships without it and nothing else
+  # goes missing by accident.
+  for d in /usr/bin /bin; do
+    [ -d "$d" ] || continue
+    for p_abs in "$d"/*; do
+      t="${p_abs##*/}"
+      case "$t" in python*) continue ;; esac
+      [ -e "$nopy/$t" ] || ln -sf "$p_abs" "$nopy/$t"
+    done
+  done
+  if [ -x "$nopy/bash" ] && ! "$nopy/env" -i PATH="$nopy" command -v python3 >/dev/null 2>&1; then
+    stale_sock="$AGENT_STATE/agent.sock"
+    mkdir -p "$AGENT_STATE"
+    rm -f "$stale_sock"
+    # A real socket file with nothing listening: bind, then drop the listener.
+    python3 -c 'import socket,sys,os
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.bind(sys.argv[1]); s.close()' "$stale_sock"
+    [ -S "$stale_sock" ] || fail "could not stage a stale socket file"
+    : > "$CALL_LOG"
+    SETUP_PATH="$nopy" run_setup --yes --reconfigure >"$TEST_ROOT/stale-sock.log" 2>&1 || fail "setup with a stale socket and no python3 failed"
+    grep -Fq 'install complete' "$TEST_ROOT/stale-sock.log" || fail "stale socket without python3 did not finish the install"
+    if grep -Fq 'was denied' "$TEST_ROOT/stale-sock.log"; then
+      fail "stale socket without python3 fell through to the sudo proof"
+    fi
+    rm -f "$stale_sock"
+  fi
 fi
 
 # Scenario E: --local pairs with itself and never touches enrollment. Fresh

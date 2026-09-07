@@ -94,8 +94,9 @@ sudoers_line() { printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$1"; }
 # The drop-in takes effect only when the main sudoers file includes its
 # directory. Either spelling of the system path counts, and so does either
 # include marker: sudo 1.9.1 added @includedir, which Ubuntu 24.04 writes.
+# Only the # form may be followed by space; @includedir must be contiguous.
 sudoers_included() {
-  [ -f "$MAIN_SUDOERS" ] && grep -Eq "^[[:space:]]*[#@][[:space:]]*includedir[[:space:]]+($SUDOERS_D|/private$SUDOERS_D)([[:space:]]|$)" "$MAIN_SUDOERS" 2>/dev/null
+  [ -f "$MAIN_SUDOERS" ] && grep -Eq "^[[:space:]]*(#[[:space:]]*|@)includedir[[:space:]]+($SUDOERS_D|/private$SUDOERS_D)([[:space:]]|$)" "$MAIN_SUDOERS" 2>/dev/null
 }
 find_visudo() {
   if command -v visudo >/dev/null 2>&1; then command -v visudo; return 0; fi

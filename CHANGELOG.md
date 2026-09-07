@@ -44,9 +44,12 @@ protocol and local E2E stabilize.
   pairs the agent, installs the macOS LaunchAgent, and proves it with a real
   `sudo true`. On Linux it installs no unit — the agent approves through a
   terminal prompt, which a service manager cannot give it — and instead writes
-  `agent.env` and prints the one-liner that runs the agent on a terminal.
+  `agent.env` (shell-quoted, so a password holding spaces or shell
+  metacharacters survives being sourced) and prints the one-liner that runs
+  the agent on a terminal.
   Idempotent for post-upgrade re-runs; a unit left by an earlier version is
-  disabled and removed.
+  disabled and removed. Without python3 the NATS reachability check uses
+  `nc`, or bash's own TCP when there is no `nc` either.
 
 ### Changed
 
