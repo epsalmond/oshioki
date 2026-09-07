@@ -7,11 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-07
+
+### Added
+
+- Approval transports now send a short liveness receipt before waiting for a
+  decision. Socket and NATS agents use `AliveV1`, and the browser sends the
+  same authenticated receipt; the existing v1 request and decision formats
+  remain unchanged.
+
+### Changed
+
+- The hook reports immediate progress on stderr: the command it is trying,
+  transport failures, an unresponsive daemon, and the transition to waiting
+  for approval. Socket and NATS connection, delivery, and receipt waits are
+  bounded before the remaining approval deadline is used for the decision.
+- On Linux, the sudo plugin races the hook with an interactive PAM password
+  fallback. The installer’s `NOPASSWD` rule makes this fallback available
+  when approval transport is unavailable; `sudo -n` skips password
+  authentication and never reads a password terminal.
+- The hook and agents must be upgraded together because an older agent that
+  sends only a verdict does not satisfy the new liveness receipt. No v1
+  request or decision crypto has changed.
+
 ### Fixed
 
 - On macOS the audit trail reaches the unified log. The hook hands each
   record to logger(1); datagrams to the legacy syslog socket were accepted
   and then dropped, so nothing was kept.
+- Explicit approval denials and invalid approval results fail closed even
+  while the password attempt is running. Whichever branch wins cancels and
+  reaps the other process, and restores terminal echo and pending input.
 
 ## [0.1.3] - 2026-09-07
 
