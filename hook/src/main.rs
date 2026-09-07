@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
-    fs,
+    error::Error as StdError,
+    fmt, fs,
     io::{self, BufRead as _, Write as _},
     os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
@@ -27,15 +28,33 @@ use oshioki_protocol::{
     RequestV1, VERSION_V1, escape_for_terminal, is_approval_env, verify_approval_v1,
     verify_deny_v1, verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
 };
-use oshioki_transport::{HookTransport, NatsTransport};
+use oshioki_transport::{HookProgress, HookTransport, HookTransportFailure, NatsTransport};
 
 const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
 /// How long the hook waits to connect to the local agent socket. A missing
 /// socket fails fast into the NATS fallback; the approval deadline still
 /// governs the wait for a verdict.
 const AGENT_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
+const CHECK_RC_DENIED: i32 = 1;
+const CHECK_RC_UNAVAILABLE: i32 = 2;
+
+#[derive(Debug)]
+struct ApprovalUnavailable(String);
+
+impl fmt::Display for ApprovalUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl StdError for ApprovalUnavailable {}
+
+fn approval_unavailable(detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ApprovalUnavailable(detail.into()))
+}
 /// How long enroll waits for the server to confirm it stored the device.
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -97,15 +116,80 @@ async fn main() -> Result<()> {
         Verb::Test => cmd_test().await,
     };
     if let Err(error) = result {
+        let exit_code = checking.then(|| check_error_exit_code(&error));
+        let detail = display_error(&error);
         // The terminal gets sudo's one line; the system log gets the audit
         // record.
         if checking {
-            warn!(target: "audit", error = %format!("{error:#}"), "sudo request denied");
+            if exit_code == Some(CHECK_RC_UNAVAILABLE) {
+                warn!(target: "audit", error = %detail, "sudo approval unavailable; password fallback remains eligible");
+            } else {
+                warn!(target: "audit", error = %detail, "sudo request denied");
+            }
         }
-        eprintln!("error: {error:#}");
-        std::process::exit(1);
+        eprintln!("error: {detail}");
+        std::process::exit(exit_code.unwrap_or(CHECK_RC_DENIED));
     }
     Ok(())
+}
+
+const MAX_TERMINAL_ERROR_BYTES: usize = 4096;
+
+fn display_error(error: &anyhow::Error) -> String {
+    sanitize_terminal_text(&format!("{error:#}"))
+}
+
+/// Redacts NATS/TLS userinfo, escapes terminal controls, and caps diagnostics
+/// before they reach stderr or the audit logger. Error details are useful for
+/// transport repair, but they are still untrusted library text.
+fn sanitize_terminal_text(text: &str) -> String {
+    let redacted = text
+        .split_whitespace()
+        .map(redact_url_token)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let escaped = escape_for_terminal(&redacted);
+    let mut output = escaped
+        .chars()
+        .take(MAX_TERMINAL_ERROR_BYTES)
+        .collect::<String>();
+    if escaped.chars().count() > MAX_TERMINAL_ERROR_BYTES {
+        output.push_str("...");
+    }
+    output
+}
+
+fn redact_url_token(token: &str) -> String {
+    let Some((scheme, rest)) = token.split_once("://") else {
+        if let Some((userinfo, host)) = token.rsplit_once('@')
+            && userinfo.contains(':')
+        {
+            return format!("<redacted>@{host}");
+        }
+        return token.to_owned();
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "nats" | "tls") {
+        return token.to_owned();
+    }
+    let Some((_, host)) = rest.rsplit_once('@') else {
+        return token.to_owned();
+    };
+    format!("{scheme}://<redacted>@{host}")
+}
+
+/// Maps a failed check to the plugin's password-race contract. Explicit
+/// denials and malformed or invalid decisions fail closed. A transport that
+/// never became usable, or a request that expired without a decision, leaves
+/// password fallback available to the plugin.
+fn check_error_exit_code(error: &anyhow::Error) -> i32 {
+    if error.chain().any(|cause| {
+        cause.downcast_ref::<ApprovalUnavailable>().is_some()
+            || cause.downcast_ref::<HookTransportFailure>().is_some()
+    }) {
+        CHECK_RC_UNAVAILABLE
+    } else {
+        CHECK_RC_DENIED
+    }
 }
 
 /// Two sinks, like sudo: the terminal sees warnings and errors only, the
@@ -544,12 +628,20 @@ async fn execute_request(request: RequestV1, timeout: Duration) -> Result<()> {
     execute_request_at(request, timeout, &directory, true).await
 }
 
+// The transport state matrix is kept in one place so each outcome maps to a
+// distinct user-visible status and exit classification.
+#[allow(clippy::single_match_else, clippy::too_many_lines)]
 async fn execute_request_at(
     request: RequestV1,
     timeout: Duration,
     directory: &Path,
     announce_url: bool,
 ) -> Result<()> {
+    eprintln!(
+        "Oshioki is trying: {}",
+        escape_for_terminal(&request.command)
+    );
+    io::stderr().flush()?;
     // The transport set first: a config naming no working transport fails
     // before any request is built, not at the first sudo afterwards.
     let nats_url = transports_from(directory)?.nats_url;
@@ -569,18 +661,48 @@ async fn execute_request_at(
     if payload.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
         bail!("request envelope exceeds 3 MiB");
     }
+    let progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync> =
+        std::sync::Arc::new(|event: HookProgress| match event {
+            HookProgress::TransportFailed(error) => {
+                eprintln!("Transport failed: {}", sanitize_terminal_text(&error));
+            }
+            HookProgress::DaemonNotResponding(error) => {
+                eprintln!("Daemon not responding: {}", sanitize_terminal_text(&error));
+            }
+            HookProgress::WaitingForApproval => {
+                eprintln!("Waiting for approval...");
+                let _ = io::stderr().flush();
+            }
+        });
     // One deadline covers both transports: whatever the socket attempt
     // consumes comes out of the NATS fallback's budget, so a dead agent can
     // never stretch one sudo invocation past the approval timeout. With no
     // NATS fallback configured the socket answer is final: silence denies at
     // once instead of waiting out a deadline nobody else can meet.
     let deadline = tokio::time::Instant::now() + timeout;
-    let decision = match try_agent_socket(directory, &payload, deadline).await? {
+    let decision = match try_agent_socket(
+        directory,
+        &request.request_id,
+        &payload,
+        deadline,
+        &progress,
+    )
+    .await?
+    {
         SocketOutcome::Decision(decision) => decision,
         SocketOutcome::Unconfigured => match &nats_url {
             Some(url) => {
                 debug!("no agent socket configured; trying NATS");
-                nats_fallback(directory, &request, payload, deadline, announce_url, url).await?
+                nats_fallback(
+                    directory,
+                    &request,
+                    payload,
+                    deadline,
+                    announce_url,
+                    url,
+                    progress.clone(),
+                )
+                .await?
             }
             // The transport check above guarantees a fallback here.
             None => bail!(
@@ -588,16 +710,68 @@ async fn execute_request_at(
                 directory.join("config.env").display()
             ),
         },
-        SocketOutcome::Silent(SocketSilence::NoAgent(path)) => match &nats_url {
+        SocketOutcome::Silent(SocketSilence::NoAgent { path, error }) => match &nats_url {
             Some(url) => {
+                eprintln!(
+                    "Transport failed: socket {}: {}",
+                    sanitize_terminal_text(&path.display().to_string()),
+                    sanitize_terminal_text(&error)
+                );
                 debug!(path = %path.display(), "no agent on the socket; trying NATS");
-                nats_fallback(directory, &request, payload, deadline, announce_url, url).await?
+                nats_fallback(
+                    directory,
+                    &request,
+                    payload,
+                    deadline,
+                    announce_url,
+                    url,
+                    progress.clone(),
+                )
+                .await?
             }
-            None => bail!(
-                "no agent on {} and no NATS fallback configured — denying request {}",
-                path.display(),
-                request.request_id
-            ),
+            None => {
+                eprintln!(
+                    "Transport failed: socket {}: {}",
+                    sanitize_terminal_text(&path.display().to_string()),
+                    sanitize_terminal_text(&error)
+                );
+                return Err(approval_unavailable(format!(
+                    "no agent on {} ({error}) and no NATS fallback configured — denying request {}",
+                    path.display(),
+                    request.request_id
+                )));
+            }
+        },
+        SocketOutcome::Silent(SocketSilence::NoAck { path, error }) => match &nats_url {
+            Some(url) => {
+                eprintln!(
+                    "Daemon not responding: socket {}: {}",
+                    sanitize_terminal_text(&path.display().to_string()),
+                    sanitize_terminal_text(&error)
+                );
+                nats_fallback(
+                    directory,
+                    &request,
+                    payload,
+                    deadline,
+                    announce_url,
+                    url,
+                    progress.clone(),
+                )
+                .await?
+            }
+            None => {
+                eprintln!(
+                    "Daemon not responding: socket {}: {}",
+                    sanitize_terminal_text(&path.display().to_string()),
+                    sanitize_terminal_text(&error)
+                );
+                return Err(approval_unavailable(format!(
+                    "daemon not responding on {} ({error}) and no NATS fallback configured — denying request {}",
+                    path.display(),
+                    request.request_id
+                )));
+            }
         },
         SocketOutcome::Silent(SocketSilence::Undecided) => match &nats_url {
             Some(url) => {
@@ -606,12 +780,23 @@ async fn execute_request_at(
                     request_id = %request.request_id,
                     "local agent left the request undecided; waiting on NATS until the deadline"
                 );
-                nats_fallback(directory, &request, payload, deadline, announce_url, url).await?
+                nats_fallback(
+                    directory,
+                    &request,
+                    payload,
+                    deadline,
+                    announce_url,
+                    url,
+                    progress.clone(),
+                )
+                .await?
             }
-            None => bail!(
-                "local agent left request {} undecided (dismissed, expired, or unusable key) and no NATS fallback is configured — denying",
-                request.request_id
-            ),
+            None => {
+                return Err(approval_unavailable(format!(
+                    "local agent left request {} undecided (dismissed, expired, or unusable key) and no NATS fallback is configured — denying",
+                    request.request_id
+                )));
+            }
         },
     };
     apply_decision(
@@ -671,17 +856,55 @@ async fn nats_fallback(
     deadline: tokio::time::Instant,
     announce_url: bool,
     nats_url: &str,
+    progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
 ) -> Result<DecisionV1> {
     let remaining = deadline
         .checked_duration_since(tokio::time::Instant::now())
         .unwrap_or(Duration::ZERO);
     if remaining.is_zero() {
-        bail!("sudo decision deadline exceeded before the NATS fallback ran");
+        return Err(approval_unavailable(
+            "sudo decision deadline exceeded before the NATS fallback ran",
+        ));
     }
     let display = nats_display_url(nats_url);
-    let transport = transport_from(directory).await;
-    let transport =
-        transport.with_context(|| format!("NATS fallback to {display} failed: connect"))?;
+    let connect_timeout = remaining.min(DAEMON_ACK_TIMEOUT);
+    let transport = match tokio::time::timeout(connect_timeout, transport_from(directory)).await {
+        Err(_) => {
+            let error = format!(
+                "NATS connection timed out after {}ms",
+                connect_timeout.as_millis()
+            );
+            eprintln!(
+                "Transport failed: NATS fallback to {}: {}",
+                sanitize_terminal_text(&display),
+                sanitize_terminal_text(&error)
+            );
+            return Err(approval_unavailable(format!(
+                "NATS fallback to {display} failed: connect: {error}"
+            )));
+        }
+        Ok(transport) => match transport {
+            Ok(transport) => transport,
+            Err(error) => {
+                eprintln!(
+                    "Transport failed: NATS fallback to {} failed: connect: {}",
+                    sanitize_terminal_text(&display),
+                    display_error(&error)
+                );
+                return Err(approval_unavailable(format!(
+                    "NATS fallback to {display} failed: connect: {error:#}"
+                )));
+            }
+        },
+    };
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        return Err(approval_unavailable(
+            "sudo decision deadline exceeded before the NATS verdict wait",
+        ));
+    }
     if announce_url {
         let config = load_hook_config_from(directory)?;
         println!(
@@ -692,7 +915,13 @@ async fn nats_fallback(
         io::stdout().flush()?;
     }
     transport
-        .request_decision(&request.host, &request.request_id, payload, remaining)
+        .request_decision(
+            &request.host,
+            &request.request_id,
+            payload,
+            remaining,
+            progress,
+        )
         .await
         .with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))
 }
@@ -702,7 +931,7 @@ async fn nats_fallback(
 /// reach without leaking the password next to it.
 fn nats_display_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
-        return format!("{url} (invalid NATS URL)");
+        return "<invalid NATS URL>".into();
     };
     let after_credentials = rest.rsplit('@').next().unwrap_or(rest);
     let host = after_credentials
@@ -730,7 +959,10 @@ enum SocketOutcome {
 enum SocketSilence {
     /// Nothing answered at the path: missing or stale file, refused or
     /// timed-out connect, or a write that never landed.
-    NoAgent(PathBuf),
+    NoAgent { path: PathBuf, error: String },
+    /// The socket accepted the request but never sent the required alive
+    /// acknowledgement.
+    NoAck { path: PathBuf, error: String },
     /// An agent took the connection but hung up without a verdict: the
     /// sheet was dismissed, the deadline passed unanswered, or the key
     /// refused and the operator was told to re-pair. Silence is not a
@@ -745,35 +977,123 @@ enum SocketSilence {
 /// back: in all three cases no agent took responsibility for the request. A
 /// verdict, a malformed reply, or the deadline expiring while an agent holds
 /// the request is final, and fails closed on error.
+#[allow(clippy::too_many_lines)]
 async fn try_agent_socket(
     directory: &Path,
+    request_id: &str,
     payload: &[u8],
     deadline: tokio::time::Instant,
+    progress: &std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
 ) -> Result<SocketOutcome> {
     let Some(path) = agent_socket_from(directory)? else {
         return Ok(SocketOutcome::Unconfigured);
     };
-    let Ok(Ok(stream)) =
-        tokio::time::timeout(AGENT_SOCKET_CONNECT_TIMEOUT, UnixStream::connect(&path)).await
-    else {
-        return Ok(SocketOutcome::Silent(SocketSilence::NoAgent(path)));
+    let connect_wait = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or(Duration::ZERO)
+        .min(AGENT_SOCKET_CONNECT_TIMEOUT);
+    if connect_wait.is_zero() {
+        return Ok(SocketOutcome::Silent(SocketSilence::NoAgent {
+            path,
+            error: "request deadline expired before connect".into(),
+        }));
+    }
+    let stream = match tokio::time::timeout(connect_wait, UnixStream::connect(&path)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            return Ok(SocketOutcome::Silent(SocketSilence::NoAgent {
+                path,
+                error: error.to_string(),
+            }));
+        }
+        Err(_) => {
+            return Ok(SocketOutcome::Silent(SocketSilence::NoAgent {
+                path,
+                error: format!("connect timed out after {}ms", connect_wait.as_millis()),
+            }));
+        }
     };
     let (mut reader, mut writer) = stream.into_split();
     let frame = oshioki_protocol::socket_v1::encode_frame(payload)?;
-    if writer.write_all(&frame).await.is_err() {
-        return Ok(SocketOutcome::Silent(SocketSilence::NoAgent(path)));
+    let write_wait = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or(Duration::ZERO);
+    let write_wait = write_wait.min(DAEMON_ACK_TIMEOUT);
+    if write_wait.is_zero() {
+        return Ok(SocketOutcome::Silent(SocketSilence::NoAgent {
+            path,
+            error: "request deadline expired before write".into(),
+        }));
+    }
+    let write_result = tokio::time::timeout(write_wait, writer.write_all(&frame)).await;
+    let write_result = match write_result {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("write timed out after {}ms", write_wait.as_millis()),
+        )),
+    };
+    if let Err(error) = write_result {
+        return Ok(SocketOutcome::Silent(SocketSilence::NoAgent {
+            path,
+            error: error.to_string(),
+        }));
     }
     drop(writer);
     let remaining = deadline
         .checked_duration_since(tokio::time::Instant::now())
         .unwrap_or(Duration::ZERO);
     if remaining.is_zero() {
-        bail!("sudo decision deadline exceeded waiting for the local agent");
+        return Err(approval_unavailable(
+            "sudo decision deadline exceeded waiting for the local agent",
+        ));
+    }
+    let ack_wait = remaining.min(DAEMON_ACK_TIMEOUT);
+    let bytes = match tokio::time::timeout(ack_wait, read_frame(&mut reader)).await {
+        Ok(Ok(Some(bytes))) => bytes,
+        Ok(Ok(None)) => {
+            return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                path,
+                error: "agent closed before acknowledging".into(),
+            }));
+        }
+        Ok(Err(error)) => {
+            return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                path,
+                error: error.to_string(),
+            }));
+        }
+        Err(_) => {
+            return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                path,
+                error: format!(
+                    "daemon acknowledgement timed out after {}ms",
+                    ack_wait.as_millis()
+                ),
+            }));
+        }
+    };
+    let acknowledgement: oshioki_protocol::AliveV1 =
+        serde_json::from_slice(&bytes).context("decode socket daemon acknowledgement")?;
+    acknowledgement.validate(request_id)?;
+    progress(HookProgress::WaitingForApproval);
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        return Err(approval_unavailable(
+            "sudo decision deadline exceeded waiting for the local agent",
+        ));
     }
     let bytes = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
         Ok(Ok(Some(bytes))) => bytes,
-        Ok(_) => return Ok(SocketOutcome::Silent(SocketSilence::Undecided)),
-        Err(_) => bail!("sudo decision deadline exceeded waiting for the local agent"),
+        Ok(Ok(None)) => return Ok(SocketOutcome::Silent(SocketSilence::Undecided)),
+        Ok(Err(error)) => return Err(error),
+        Err(_) => {
+            return Err(approval_unavailable(
+                "sudo decision deadline exceeded waiting for the local agent",
+            ));
+        }
     };
     let decision: DecisionV1 = serde_json::from_slice(&bytes).context("decode socket decision")?;
     Ok(SocketOutcome::Decision(decision))
@@ -1628,6 +1948,47 @@ fn pid_chain_darwin() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_exit_codes_keep_password_fallback_only_for_unavailable_approval() {
+        let unavailable = [
+            approval_unavailable(
+                "no agent on /run/oshioki.sock (Connection refused) and no NATS fallback configured",
+            ),
+            anyhow::Error::new(HookTransportFailure::Daemon(
+                "daemon acknowledgement timed out".into(),
+            )),
+            anyhow::Error::new(HookTransportFailure::Transport(
+                "NATS connection failed: certificate expired".into(),
+            )),
+            anyhow::Error::new(HookTransportFailure::Expired(
+                "request expired without a verdict".into(),
+            )),
+        ];
+        for error in unavailable {
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_UNAVAILABLE,
+                "{error:#}"
+            );
+        }
+        let nested = approval_unavailable("connection refused")
+            .context("NATS fallback to tls://nats.example:4222 failed: connect");
+        assert_eq!(check_error_exit_code(&nested), CHECK_RC_UNAVAILABLE);
+        for message in [
+            "request explicitly denied",
+            "approval verification failed: invalid signature",
+            "invalid request context",
+            "NATS fallback to tls://nats.example:4222 failed: decode decision",
+            "invalid request context: timeout was present in the command",
+        ] {
+            assert_eq!(
+                check_error_exit_code(&anyhow::anyhow!(message)),
+                CHECK_RC_DENIED,
+                "{message}"
+            );
+        }
+    }
     use p256::ecdsa::SigningKey;
     use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2092,13 +2453,19 @@ mod tests {
         std::fs::write(dir.join("config.env"), config).unwrap();
     }
 
+    fn test_progress() -> std::sync::Arc<dyn Fn(HookProgress) + Send + Sync> {
+        std::sync::Arc::new(|_| {})
+    }
+
     #[tokio::test]
     async fn unconfigured_socket_reports_unconfigured() {
         let dir = socket_test_dir("unconfigured");
         socket_test_config(&dir, None);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         assert!(matches!(
-            try_agent_socket(&dir, b"{}", deadline).await.unwrap(),
+            try_agent_socket(&dir, "req-1", b"{}", deadline, &test_progress())
+                .await
+                .unwrap(),
             SocketOutcome::Unconfigured
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2110,14 +2477,16 @@ mod tests {
         socket_test_config(&dir, Some(Path::new("/nonexistent-oshioki-agent.sock")));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         assert!(matches!(
-            try_agent_socket(&dir, b"{}", deadline).await.unwrap(),
-            SocketOutcome::Silent(SocketSilence::NoAgent(_))
+            try_agent_socket(&dir, "req-1", b"{}", deadline, &test_progress())
+                .await
+                .unwrap(),
+            SocketOutcome::Silent(SocketSilence::NoAgent { .. })
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An agent that takes the connection but hangs up without a verdict
-    /// leaves the request undecided: silence is not a denial anyone signed.
+    /// An agent that takes the connection but sends no alive acknowledgement
+    /// is unavailable, rather than an approval or denial.
     #[tokio::test]
     async fn hanging_up_without_a_verdict_reports_undecided() {
         let dir = socket_test_dir("hangup");
@@ -2130,8 +2499,10 @@ mod tests {
         });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         assert!(matches!(
-            try_agent_socket(&dir, b"ping", deadline).await.unwrap(),
-            SocketOutcome::Silent(SocketSilence::Undecided)
+            try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+                .await
+                .unwrap(),
+            SocketOutcome::Silent(SocketSilence::NoAck { .. })
         ));
         serve.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2155,6 +2526,13 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!request.is_empty());
+            let alive = oshioki_protocol::AliveV1::for_request("req-1");
+            let alive_frame =
+                oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+                    .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &alive_frame)
+                .await
+                .unwrap();
             let decision = DecisionV1::Deny(oshioki_protocol::DenyV1 {
                 version: VERSION_V1,
                 request_id: "req-1".into(),
@@ -2167,7 +2545,10 @@ mod tests {
             AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
         });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        match try_agent_socket(&dir, b"ping", deadline).await.unwrap() {
+        match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+            .await
+            .unwrap()
+        {
             SocketOutcome::Decision(DecisionV1::Deny(denial)) => {
                 assert_eq!(denial.request_id, "req-1");
             }
@@ -2192,9 +2573,61 @@ mod tests {
             AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
         });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        assert!(try_agent_socket(&dir, b"ping", deadline).await.is_err());
+        assert!(
+            try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+                .await
+                .is_err()
+        );
         serve.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once an agent has acknowledged, a malformed verdict frame is a
+    /// terminal protocol failure. It cannot fall back to another transport or
+    /// become a password-eligible unavailable result.
+    #[tokio::test]
+    async fn malformed_socket_verdict_after_ack_fails_closed() {
+        for (name, prefix) in [
+            (
+                "oversized",
+                u32::try_from(oshioki_protocol::socket_v1::MAX_FRAME_BYTES + 1)
+                    .unwrap()
+                    .to_be_bytes(),
+            ),
+            ("empty", 0u32.to_be_bytes()),
+        ] {
+            let dir = socket_test_dir(name);
+            let socket_path = dir.join("agent.sock");
+            socket_test_config(&dir, Some(&socket_path));
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let serve = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request_prefix = [0u8; 4];
+                stream.read_exact(&mut request_prefix).await.unwrap();
+                let request_len = u32::from_be_bytes(request_prefix) as usize;
+                let mut request = vec![0u8; request_len];
+                stream.read_exact(&mut request).await.unwrap();
+                let alive = oshioki_protocol::AliveV1::for_request("req-1");
+                let alive_frame =
+                    oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+                        .unwrap();
+                stream.write_all(&alive_frame).await.unwrap();
+                stream.write_all(&prefix).await.unwrap();
+            });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let Err(error) =
+                try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress()).await
+            else {
+                panic!("malformed {name} verdict was accepted");
+            };
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_DENIED,
+                "{name}: {error:#}"
+            );
+            serve.await.unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[tokio::test]
@@ -2208,7 +2641,38 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-        assert!(try_agent_socket(&dir, b"ping", deadline).await.is_err());
+        assert!(matches!(
+            try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+                .await
+                .unwrap(),
+            SocketOutcome::Silent(SocketSilence::NoAck { .. })
+        ));
+        serve.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A connected socket that never acknowledges is bounded by the short
+    /// daemon liveness timeout, even when the approval deadline is long.
+    #[tokio::test]
+    async fn no_ack_socket_does_not_consume_the_approval_deadline() {
+        let dir = socket_test_dir("no-ack-timeout");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let outcome = try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert!(matches!(
+            outcome,
+            SocketOutcome::Silent(SocketSilence::NoAck { .. })
+        ));
         serve.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2272,6 +2736,21 @@ mod tests {
             "tls://nats.example.com:4222"
         );
         assert_eq!(nats_display_url("nats://[::1]:4222"), "nats://[::1]:4222");
+        assert_eq!(
+            nats_display_url("oshioki:s3cret@nats.example.com:4222"),
+            "<invalid NATS URL>"
+        );
+        let noisy = sanitize_terminal_text(&format!(
+            "tls://oshioki:s3cret@nats.example.com:4222\u{001b}[2K{}",
+            "x".repeat(MAX_TERMINAL_ERROR_BYTES)
+        ));
+        assert!(!noisy.contains("s3cret"));
+        assert!(!noisy.contains('\u{001b}'));
+        assert!(noisy.ends_with("..."));
+        assert_eq!(
+            sanitize_terminal_text("connect to oshioki:s3cret@nats.example.com:4222 failed"),
+            "connect to <redacted>@nats.example.com:4222 failed"
+        );
     }
 
     /// Credentials are both-or-neither: one without the other is a config
@@ -2319,9 +2798,9 @@ mod tests {
     }
 
     /// A stub agent that takes the connection, reads the request, and hangs
-    /// up without a verdict: a dismissed sheet. Reading first matters: the
-    /// hook always writes before reading, and a peer that vanishes before
-    /// the write lands reads as no agent rather than an undecided one.
+    /// up without an acknowledgement. Reading first matters: the hook always
+    /// writes before reading, and a peer that vanishes before the write lands
+    /// reads as no agent rather than an unavailable daemon.
     /// Takes an already-bound listener so the bind cannot race the hook's
     /// connect. Returns when the hook's side is done.
     async fn hangup_stub(listener: tokio::net::UnixListener) {
@@ -2345,14 +2824,19 @@ mod tests {
         let socket_path = dir.join("agent.sock");
         socket_test_config_no_nats(&dir, Some(&socket_path));
         let serve = tokio::spawn(hangup_stub(hangup_listener(&socket_path)));
+        let started = std::time::Instant::now();
         let error = execute_request_at(request, Duration::from_secs(30), &dir, false)
             .await
             .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(6));
         assert!(
-            format!("{error:#}").contains("no NATS fallback is configured"),
+            format!("{error:#}").contains("no NATS fallback configured"),
             "{error:#}"
         );
-        assert!(format!("{error:#}").contains("undecided"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("daemon not responding"),
+            "{error:#}"
+        );
         serve.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2390,9 +2874,11 @@ mod tests {
         )
         .unwrap();
         let serve = tokio::spawn(hangup_stub(hangup_listener(&socket_path)));
+        let started = std::time::Instant::now();
         let error = execute_request_at(request, Duration::from_secs(30), &dir, false)
             .await
             .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(6));
         let text = format!("{error:#}");
         assert!(
             text.contains(&format!("NATS fallback to nats://127.0.0.1:{port} failed")),
@@ -2430,7 +2916,13 @@ mod tests {
         let transport = oshioki_transport::MockTransport::new();
         transport.push_verdict(DecisionV1::Deny(deny_for(&signing, "req-1", &device)));
         let decision = transport
-            .request_decision("nas", "req-1", b"{}".to_vec(), Duration::from_secs(1))
+            .request_decision(
+                "nas",
+                "req-1",
+                b"{}".to_vec(),
+                Duration::from_secs(1),
+                test_progress(),
+            )
             .await
             .unwrap();
         let mut registry = DeviceRegistryV1 {
@@ -2479,6 +2971,7 @@ mod tests {
                 &request.request_id,
                 raw.clone(),
                 Duration::from_secs(1),
+                test_progress(),
             )
             .await
             .unwrap();

@@ -40,8 +40,8 @@ use `scripts/dev-acceptance`; see the [runbook](RUNBOOK.md).
 - `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and
   `scripts/dev test --quick` pass before opening a PR.
 - The workspace denies warnings and `unsafe_code`, with the only exceptions
-  documented in the root `Cargo.toml`. Every `unsafe` call lives in the
-  `enclave` crate, macOS only.
+  documented in the root `Cargo.toml`. Unsafe calls live in the macOS
+  `enclave` crate and the sudo plugin's documented FFI/PAM boundary.
 - Protocol changes require a new version and a compatibility decision: see
   [docs/architecture.md](docs/architecture.md). The v1 cryptographic domain
   strings (`oshioki/...`) and existing test vectors must not change.

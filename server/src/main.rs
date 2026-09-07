@@ -15,8 +15,8 @@ use axum::{
 use db::{InsertResult, RequestLifecycle, Store};
 use futures::StreamExt as _;
 use oshioki_protocol::{
-    ActivationV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
-    RequestEnvelopeV1, SealedDeviceBodyV1,
+    ActivationV1, AliveV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1,
+    EnrollmentSubmissionV1, RequestEnvelopeV1, SealedDeviceBodyV1,
 };
 use oshioki_transport::{Ack, JetStreamMessage, NatsTransport, ServerTransport};
 use serde::Serialize;
@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
         .route("/assets/app.css", get(app_css))
         .route("/assets/libsodium.js", get(libsodium_js))
         .route("/api/v1/requests/:id", get(get_request))
+        .route("/api/v1/requests/:id/ack", post(acknowledge_request))
         .route("/api/v1/requests/:id/approve", post(approve_request))
         .route("/api/v1/requests/:id/deny", post(deny_request))
         .route("/api/v1/requests/:id/verdict", get(recorded_verdict))
@@ -466,6 +467,37 @@ async fn approve_request(
     let fingerprint = approval.device_fingerprint.clone();
     queue_decision(&state, &id, &fingerprint, &DecisionV1::Approve(approval))
 }
+
+/// Relays an explicit browser liveness acknowledgement. The server does not
+/// acknowledge a request when it ingests one, because that would claim that a
+/// browser received it before any browser did. The browser posts this message
+/// after it has authenticated, fetched, decrypted, and checked the request.
+async fn acknowledge_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(acknowledgement): Json<AliveV1>,
+) -> Result<StatusCode, ApiError> {
+    acknowledgement
+        .validate(&id)
+        .map_err(|_| ApiError(StatusCode::CONFLICT))?;
+    require_pending(&state, &id)?;
+    let token = bearer_token(&headers)?;
+    state
+        .store
+        .sealed_request_for_token(&id, token.as_bytes(), now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let payload = serde_json::to_vec(&acknowledgement)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+    state
+        .transport
+        .publish(format!("oshioki.ack.{id}"), payload)
+        .await
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
 async fn deny_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -774,6 +806,7 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     fn dist_root(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("oshioki-dist-{name}-{}", std::process::id()));
@@ -1247,5 +1280,104 @@ mod tests {
             sign_count: 0,
             active: true,
         }
+    }
+
+    /// Browser liveness is an explicit authenticated message. Ingesting a
+    /// request alone publishes nothing, a wrong token cannot publish, and a
+    /// valid browser post is forwarded byte-for-byte on the ack subject.
+    #[tokio::test]
+    async fn browser_ack_requires_authenticated_pending_request() {
+        let dir =
+            std::env::temp_dir().join(format!("oshioki-server-browser-ack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("state.sqlite3")).unwrap());
+        store.ready().unwrap();
+        let token = "browser-token-012345678901234567890";
+        let mut device = test_device();
+        device.api_token_hash =
+            oshioki_protocol::encode_base64url(&sha2::Sha256::digest(token.as_bytes()));
+        store.put_device(&device).unwrap();
+        let request = RequestEnvelopeV1 {
+            version: oshioki_protocol::VERSION_V1,
+            request_id: "browser-ack-request".into(),
+            host: "nas".into(),
+            user: "eric".into(),
+            issued_at: now() - 1,
+            expires_at: now() + 600,
+            sealed: vec![SealedDeviceBodyV1 {
+                device_fingerprint: device.fingerprint.clone(),
+                ephemeral_pub: oshioki_protocol::encode_base64url(&[4; 32]),
+                nonce: oshioki_protocol::encode_base64url(&[5; 12]),
+                ciphertext: oshioki_protocol::encode_base64url(&[6; 32]),
+            }],
+        };
+        let raw = serde_json::to_vec(&request).unwrap();
+        store.ingest_request(&raw, &request, now()).unwrap();
+        let transport = oshioki_transport::MockTransport::new();
+        let state = AppState {
+            store,
+            transport: Arc::new(transport.clone()),
+            dist_root: Arc::new(PathBuf::from("/nonexistent")),
+            artifact_permits: Arc::new(Semaphore::new(1)),
+            consumer_last_ok: Arc::new(AtomicI64::new(0)),
+            outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            origin: Arc::new("https://sudo.test".into()),
+            ntfy_url: None,
+        };
+        assert!(transport.published().is_empty());
+
+        let ack = AliveV1::for_request(&request.request_id);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let response = acknowledge_request(
+            State(state.clone()),
+            Path(request.request_id.clone()),
+            headers.clone(),
+            Json(ack.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, StatusCode::ACCEPTED);
+        assert_eq!(
+            transport.published(),
+            vec![(
+                format!("oshioki.ack.{}", request.request_id),
+                serde_json::to_vec(&ack).unwrap()
+            )]
+        );
+
+        let bad = acknowledge_request(
+            State(state.clone()),
+            Path(request.request_id.clone()),
+            {
+                let mut bad_headers = HeaderMap::new();
+                bad_headers.insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Bearer wrong-token-012345678901234567890"),
+                );
+                bad_headers
+            },
+            Json(ack.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bad.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(transport.published().len(), 1);
+
+        let mismatch = acknowledge_request(
+            State(state),
+            Path("other-request".into()),
+            headers,
+            Json(ack),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatch.0, StatusCode::CONFLICT);
+        assert_eq!(transport.published().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

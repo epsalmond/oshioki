@@ -50,6 +50,10 @@ invoking user with their uid, the target account the command would run as
 arguments, the working directory, and the caller process chain. An argument
 that is empty or holds anything but plainly printable characters is shown in
 shell single quotes, so one argument holding a space never reads as two.
+A running agent sends an `AliveV1` acknowledgement as soon as it receives a
+request, before it opens the terminal prompt. The hook reports the waiting
+state only after that acknowledgement. A missing acknowledgement fails the
+transport attempt quickly.
 A prompt nobody answers before the request expires publishes no verdict at
 all, and the hook fails closed on its own deadline. The terminal prompt needs
 a terminal: with stdin closed nothing could answer, so `run` stops rather than

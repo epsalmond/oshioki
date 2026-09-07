@@ -7,7 +7,38 @@
 //! protocol already accepts. Everything here is pure: async I/O lives with
 //! the callers.
 
-use crate::{Error, v1::MAX_ENVELOPE_BYTES};
+use crate::{Error, VERSION_V1, v1::MAX_ENVELOPE_BYTES};
+
+/// The first response a native agent sends for a request. It proves that an
+/// agent received and accepted responsibility for the request; it carries no
+/// authorization and is never sufficient to approve sudo.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AliveV1 {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub version: u8,
+    pub request_id: String,
+}
+
+impl AliveV1 {
+    pub fn for_request(request_id: &str) -> Self {
+        Self {
+            message_type: "alive".into(),
+            version: VERSION_V1,
+            request_id: request_id.into(),
+        }
+    }
+
+    pub fn validate(&self, request_id: &str) -> Result<(), Error> {
+        if self.message_type != "alive"
+            || self.version != VERSION_V1
+            || self.request_id != request_id
+        {
+            return Err(Error::BadVerdict("invalid alive acknowledgement".into()));
+        }
+        Ok(())
+    }
+}
 
 /// Bytes of the big-endian length prefix on every frame.
 pub const FRAME_LEN_BYTES: usize = 4;
@@ -46,6 +77,18 @@ pub fn decode_frame_len(prefix: [u8; 4]) -> Result<usize, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alive_ack_binds_the_request_and_has_no_verdict_fields() {
+        let ack = AliveV1::for_request("req-1");
+        let encoded = serde_json::to_vec(&ack).unwrap();
+        assert_eq!(
+            encoded,
+            br#"{"type":"alive","version":1,"request_id":"req-1"}"#
+        );
+        ack.validate("req-1").unwrap();
+        assert!(ack.validate("req-2").is_err());
+    }
 
     #[test]
     fn frame_round_trips_arbitrary_bytes() {

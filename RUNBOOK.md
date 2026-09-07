@@ -93,6 +93,12 @@ password authentication. The block and the drop-in go away together with
 `--disable-prelaunch`, and a re-run with no active devices removes both as
 well, so an enabled plugin never fails every sudo closed on an empty
 registry. `--prelaunch-status` checks both files.
+The plugin still keeps an interactive password fallback available when the
+approval transport is unavailable. It authenticates the invoking user through
+the system `sudo` PAM service, then runs account management. An explicit
+approval denial or invalid approval fails closed. `sudo -n` never reads a
+password tty. The password prompt is `[sudo/oshioki] password for <user>:` and
+the race ends within the 90-second approval deadline.
 Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 `oshioki.dylib` in the same directory.
 

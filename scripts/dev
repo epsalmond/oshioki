@@ -137,6 +137,9 @@ case "$command_name" in
       exit 1
     fi
     rm -f -- "$ownership_report"
+    # The real sudo/PAM race uses its own disposable Docker container. Keep it
+    # out of --quick because it installs packages and drives a PTY.
+    "$REPO_ROOT/scripts/test-sudo-password-race"
     test_ok=1
     ;;
   down)

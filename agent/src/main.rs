@@ -23,8 +23,8 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, SignerKind, parse_enrollment_url, remaining_until};
 use oshioki_protocol::{
-    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, RequestEnvelopeV1, allow_plaintext_nats,
-    check_nats_url, escape_for_terminal, nats_url_is_tls,
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, AliveV1, DecisionV1, RequestEnvelopeV1,
+    allow_plaintext_nats, check_nats_url, escape_for_terminal, nats_url_is_tls,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -451,27 +451,44 @@ async fn cmd_run(
         let identity = Arc::clone(&identity);
         let nats = requests.as_ref().map(|(nats, _)| nats.clone());
         let decider = Arc::clone(&decider);
-        tokio::spawn(async move {
-            let verdict = decide(&identity, &decider, &opened).await;
-            let result = match verdict {
-                Ok(Some(decision)) => {
-                    if let Some(nats) = nats {
-                        publish(&nats, &opened.request, decision).await
-                    } else {
-                        Ok(())
-                    }
-                }
-                Ok(None) => Ok(()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                warn!(
-                    request_id = %escape_for_terminal(&opened.request.request_id),
-                    error = %escape_for_terminal(&error.to_string()),
-                    "decision failed"
-                );
+        tokio::spawn(answer_opened_request(identity, nats, decider, opened));
+    }
+}
+
+async fn answer_opened_request(
+    identity: Arc<Identity>,
+    nats: Option<async_nats::Client>,
+    decider: Arc<Decider>,
+    opened: OpenedRequest,
+) {
+    if let Some(nats) = &nats {
+        if let Err(error) = publish_alive(nats, &opened.request).await {
+            warn!(
+                request_id = %escape_for_terminal(&opened.request.request_id),
+                error = %escape_for_terminal(&error.to_string()),
+                "daemon acknowledgement failed"
+            );
+            return;
+        }
+    }
+    let verdict = decide(&identity, &decider, &opened).await;
+    let result = match verdict {
+        Ok(Some(decision)) => {
+            if let Some(nats) = nats {
+                publish(&nats, &opened.request, decision).await
+            } else {
+                Ok(())
             }
-        });
+        }
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        warn!(
+            request_id = %escape_for_terminal(&opened.request.request_id),
+            error = %escape_for_terminal(&error.to_string()),
+            "decision failed"
+        );
     }
 }
 
@@ -635,6 +652,22 @@ async fn publish(
     Ok(())
 }
 
+/// A liveness acknowledgement is published before the decider is invoked.
+/// It carries no signature and cannot authorize a request.
+async fn publish_alive(
+    nats: &async_nats::Client,
+    request: &oshioki_protocol::RequestV1,
+) -> Result<()> {
+    nats.publish(
+        format!("oshioki.ack.{}", request.request_id),
+        serde_json::to_vec(&AliveV1::for_request(&request.request_id))?.into(),
+    )
+    .await
+    .context("publish daemon acknowledgement")?;
+    nats.flush().await.context("flush daemon acknowledgement")?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Local socket — the hook's network-free fast path
 // ---------------------------------------------------------------------------
@@ -761,6 +794,17 @@ async fn handle_socket(
             return Ok(());
         }
     };
+    let alive = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(
+        &AliveV1::for_request(&opened.request.request_id),
+    )?)?;
+    writer
+        .write_all(&alive)
+        .await
+        .context("write socket acknowledgement")?;
+    writer
+        .flush()
+        .await
+        .context("flush socket acknowledgement")?;
     let Some(decision) = decide(identity, decider, &opened).await? else {
         return Ok(());
     };
@@ -1673,7 +1717,8 @@ mod tests {
         serde_json::to_vec(&envelope).unwrap()
     }
 
-    /// Drive `handle_socket` with one connected pair: frame in, verdict out.
+    /// Drive `handle_socket` with one connected pair: frame in, liveness ack,
+    /// then verdict out.
     /// `Auto` needs the `unattended` feature, so this whole happy-path test
     /// only exists in the E2E build, like `run --auto` itself.
     #[cfg(feature = "unattended")]
@@ -1691,6 +1736,15 @@ mod tests {
         let frame = oshioki_protocol::socket_v1::encode_frame(envelope).unwrap();
         hook_side.write_all(&frame).await.unwrap();
         let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        hook_side.read_exact(&mut prefix).await.unwrap();
+        let len = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+        let mut acknowledgement = vec![0u8; len];
+        hook_side.read_exact(&mut acknowledgement).await.unwrap();
+        let acknowledgement: oshioki_protocol::AliveV1 =
+            serde_json::from_slice(&acknowledgement).unwrap();
+        let request: oshioki_protocol::RequestEnvelopeV1 =
+            serde_json::from_slice(envelope).unwrap();
+        acknowledgement.validate(&request.request_id).unwrap();
         hook_side.read_exact(&mut prefix).await.unwrap();
         let len = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
         let mut verdict = vec![0u8; len];

@@ -14,14 +14,33 @@ use async_nats::jetstream::{
 };
 use futures::StreamExt as _;
 use oshioki_protocol::{
-    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
-    allow_plaintext_nats, check_nats_url, nats_url_is_tls,
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, AliveV1, DecisionV1, EnrollmentIntentV1,
+    EnrollmentSubmissionV1, allow_plaintext_nats, check_nats_url, nats_url_is_tls,
 };
 
 use crate::{
-    Ack, AckFuture, BoxFuture, HookTransport, InboundMessage, InboundStream, JetStreamMessage,
-    RequestStream, ServerTransport,
+    Ack, AckFuture, BoxFuture, HookProgress, HookTransport, HookTransportFailure, InboundMessage,
+    InboundStream, JetStreamMessage, RequestStream, ServerTransport,
 };
+
+const DAEMON_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[allow(clippy::needless_pass_by_value)]
+fn failure(kind: FailureKind, error: &anyhow::Error) -> anyhow::Error {
+    let detail = format!("{error:#}");
+    let error = match kind {
+        FailureKind::Transport => HookTransportFailure::Transport(detail),
+        FailureKind::Daemon => HookTransportFailure::Daemon(detail),
+        FailureKind::Expired => HookTransportFailure::Expired(detail),
+    };
+    anyhow::Error::new(error)
+}
+
+enum FailureKind {
+    Transport,
+    Daemon,
+    Expired,
+}
 
 pub const REQUEST_STREAM: &str = "OSHIOKI";
 pub const REQUEST_CONSUMER: &str = "oshioki-server-v1";
@@ -128,23 +147,37 @@ fn required_env(name: &str) -> Result<String> {
 }
 
 impl HookTransport for NatsTransport {
+    #[allow(clippy::too_many_lines)]
     fn request_decision(
         &self,
         host: &str,
         request_id: &str,
         payload: Vec<u8>,
         timeout: Duration,
+        progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
     ) -> BoxFuture<'_, DecisionV1> {
         let request_subject = format!("oshioki.request.{host}");
+        let request_id = request_id.to_owned();
+        let ack_subject = format!("oshioki.ack.{request_id}");
         let decision_subject = format!("oshioki.verdict.{request_id}");
         Box::pin(async move {
+            let started = tokio::time::Instant::now();
+            let setup_timeout = timeout.min(DAEMON_ACK_TIMEOUT);
             let mut stage = "subscribing to decision";
-            tokio::time::timeout(timeout, async {
-                let mut subscription = self
+            // Connection setup, subscriptions, request publication, and the
+            // liveness round trip have a short bound. The human decision gets
+            // the remainder of the caller's deadline after that.
+            let setup = tokio::time::timeout(setup_timeout, async {
+                let subscription = self
                     .client
                     .subscribe(decision_subject)
                     .await
                     .context("subscribe decision")?;
+                let mut acknowledgements = self
+                    .client
+                    .subscribe(ack_subject)
+                    .await
+                    .context("subscribe daemon acknowledgement")?;
                 stage = "confirming decision subscription readiness";
                 self.client
                     .flush()
@@ -155,20 +188,116 @@ impl HookTransport for NatsTransport {
                     .publish(request_subject, payload.into())
                     .await
                     .context("publish request")?;
-                stage = "waiting for decision";
-                let message = subscription
-                    .next()
+                self.client
+                    .flush()
                     .await
-                    .context("decision stream closed")?;
+                    .context("flush approval request")?;
+                stage = "waiting for daemon acknowledgement";
+                let ack_wait = setup_timeout;
+                let message = tokio::time::timeout(ack_wait, acknowledgements.next())
+                    .await
+                    .map_err(|_| {
+                        let error = anyhow::anyhow!("daemon acknowledgement timeout");
+                        failure(FailureKind::Daemon, &error)
+                    })?
+                    .ok_or_else(|| {
+                        let error = anyhow::anyhow!("daemon acknowledgement stream closed");
+                        failure(FailureKind::Daemon, &error)
+                    })?;
+                let acknowledgement: AliveV1 = serde_json::from_slice(&message.payload)
+                    .context("decode daemon acknowledgement")?;
+                acknowledgement.validate(&request_id)?;
+                Ok::<_, anyhow::Error>(subscription)
+            })
+            .await;
+            let mut subscription = match setup {
+                Ok(Ok(subscription)) => {
+                    progress(HookProgress::WaitingForApproval);
+                    subscription
+                }
+                Ok(Err(error)) => {
+                    let detail = format!("{error:#}");
+                    let typed = error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<HookTransportFailure>()
+                            .is_some_and(|failure| {
+                                matches!(
+                                    failure,
+                                    HookTransportFailure::Transport(_)
+                                        | HookTransportFailure::Daemon(_)
+                                )
+                            })
+                    });
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<HookTransportFailure>()
+                            .is_some_and(|failure| {
+                                matches!(failure, HookTransportFailure::Daemon(_))
+                            })
+                    }) {
+                        progress(HookProgress::DaemonNotResponding(detail));
+                    } else {
+                        progress(HookProgress::TransportFailed(detail));
+                    }
+                    return Err(if typed {
+                        error
+                    } else if stage == "waiting for daemon acknowledgement" {
+                        // Malformed acknowledgements remain ordinary errors
+                        // and therefore fail closed in the plugin.
+                        error
+                    } else {
+                        failure(FailureKind::Transport, &error)
+                    });
+                }
+                Err(_) => {
+                    let kind = if stage == "waiting for daemon acknowledgement" {
+                        FailureKind::Daemon
+                    } else {
+                        FailureKind::Transport
+                    };
+                    let detail = anyhow::anyhow!(
+                        "sudo transport deadline exceeded after {}ms while {stage}",
+                        setup_timeout.as_millis()
+                    );
+                    let error = failure(kind, &detail);
+                    if stage == "waiting for daemon acknowledgement" {
+                        progress(HookProgress::DaemonNotResponding(format!("{error:#}")));
+                    } else {
+                        progress(HookProgress::TransportFailed(format!("{error:#}")));
+                    }
+                    return Err(error);
+                }
+            };
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                let detail = anyhow::anyhow!(
+                    "sudo decision deadline exceeded after {}ms while waiting for decision",
+                    timeout.as_millis()
+                );
+                return Err(failure(FailureKind::Expired, &detail));
+            }
+            let result = tokio::time::timeout(remaining, async {
+                let message = subscription.next().await.ok_or_else(|| {
+                    let error = anyhow::anyhow!("decision stream closed");
+                    failure(FailureKind::Daemon, &error)
+                })?;
                 serde_json::from_slice(&message.payload).context("decode decision")
             })
-            .await
-            .with_context(|| {
-                format!(
-                    "sudo decision deadline exceeded after {}ms while {stage}",
-                    timeout.as_millis()
-                )
-            })?
+            .await;
+            match result {
+                Ok(Ok(decision)) => Ok(decision),
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    let detail = anyhow::anyhow!(
+                        "sudo decision deadline exceeded after {}ms while waiting for decision",
+                        timeout.as_millis()
+                    );
+                    let error = failure(FailureKind::Expired, &detail);
+                    Err(error)
+                }
+            }
         })
     }
 
