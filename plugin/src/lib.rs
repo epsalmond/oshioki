@@ -15,12 +15,12 @@
 #![deny(clippy::alloc_instead_of_core)]
 #![deny(clippy::std_instead_of_alloc)]
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::io::Write as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::panic::catch_unwind;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -648,7 +648,7 @@ struct PasswordWorker {
 /// Spawn the hook, feed its context, and return its verified child identity.
 /// The parent owns the returned pid and must reap it on every path.
 fn spawn_hook(ctx: &SudoContext) -> Option<HookChild> {
-    use nix::unistd::{execvp, fork, ForkResult};
+    use nix::unistd::{ForkResult, execvp, fork};
 
     // Build the stdin and stderr pipes before forking so the child inherits
     // both. The parent forwards only stderr, leaving command stdout alone.
@@ -744,7 +744,7 @@ fn hook_result(status: nix::sys::wait::WaitStatus) -> HookResult {
 /// Reap the child, optionally without blocking. The pid came directly from
 /// `fork`, so this cannot target an unrelated process.
 fn reap_hook(hook: &mut HookChild, nohang: bool) -> Option<HookResult> {
-    use nix::sys::wait::{waitpid, WaitPidFlag};
+    use nix::sys::wait::{WaitPidFlag, waitpid};
     let pid = hook.pid?;
     let flags = nohang.then_some(WaitPidFlag::WNOHANG);
     match waitpid(pid, flags) {
@@ -983,7 +983,7 @@ fn spawn_password_process(username: &str) -> Option<PasswordWorker> {
 
 #[cfg(target_os = "linux")]
 fn reap_password(worker: &mut PasswordWorker) -> Option<PasswordResult> {
-    use nix::sys::wait::{waitpid, WaitPidFlag};
+    use nix::sys::wait::{WaitPidFlag, waitpid};
     let pid = worker.pid?;
     match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
         Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(nix::errno::Errno::EINTR) => None,
@@ -1227,8 +1227,8 @@ fn authenticate_with_pam(username: &str, password: &[u8]) -> PasswordResult {
 #[cfg(target_os = "linux")]
 mod pam {
     use super::PasswordResult;
-    use std::ffi::{c_char, c_int, c_void, CStr, CString};
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr;
 
     const PAM_SUCCESS: c_int = 0;
@@ -1803,12 +1803,10 @@ mod tests {
             capture_test_open_with_settings(&[], &[b"user=missing-uid"]),
             SUDO_RC_ERROR
         );
-        assert!(gather_after_captured_identity(
-            &[b"command=/usr/bin/true"],
-            &[b"/usr/bin/true"],
-            &[],
-        )
-        .is_none());
+        assert!(
+            gather_after_captured_identity(&[b"command=/usr/bin/true"], &[b"/usr/bin/true"], &[],)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1826,32 +1824,26 @@ mod tests {
         assert!(payload.contains("info.user=approvalcaller\n"));
         assert!(payload.contains("info.uid=12345\n"));
 
-        assert!(gather_after_captured_identity(
-            &[b"command=/usr/bin/echo"],
-            &[b"/usr/bin/echo"],
-            &[],
-        )
-        .is_none());
+        assert!(
+            gather_after_captured_identity(&[b"command=/usr/bin/echo"], &[b"/usr/bin/echo"], &[],)
+                .is_none()
+        );
     }
 
     #[test]
     fn missing_or_replaced_identity_denies_without_reusing_stale_state() {
         let _serial = identity_test();
-        assert!(gather_after_captured_identity(
-            &[b"command=/usr/bin/echo"],
-            &[b"/usr/bin/echo"],
-            &[],
-        )
-        .is_none());
+        assert!(
+            gather_after_captured_identity(&[b"command=/usr/bin/echo"], &[b"/usr/bin/echo"], &[],)
+                .is_none()
+        );
 
         assert!(capture_test_identity(&[b"user=old", b"uid=1000"]));
         assert!(!capture_test_identity(&[b"user=new"]));
-        assert!(gather_after_captured_identity(
-            &[b"command=/usr/bin/echo"],
-            &[b"/usr/bin/echo"],
-            &[],
-        )
-        .is_none());
+        assert!(
+            gather_after_captured_identity(&[b"command=/usr/bin/echo"], &[b"/usr/bin/echo"], &[],)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1859,12 +1851,10 @@ mod tests {
         let _serial = identity_test();
         assert!(capture_test_identity(&[b"user=old", b"uid=1000"]));
         assert!(!capture_test_identity(&[b"user=line\nbreak", b"uid=12345"]));
-        assert!(gather_after_captured_identity(
-            &[b"command=/usr/bin/echo"],
-            &[b"/usr/bin/echo"],
-            &[],
-        )
-        .is_none());
+        assert!(
+            gather_after_captured_identity(&[b"command=/usr/bin/echo"], &[b"/usr/bin/echo"], &[],)
+                .is_none()
+        );
 
         assert!(!capture_test_identity(&[b"user=bad\xff", b"uid=12345"]));
     }
@@ -1947,50 +1937,64 @@ mod tests {
             &[b"NAME=value"],
         )
         .unwrap();
-        assert!(with_space
-            .payload
-            .windows(b"argv.2=line break\n".len())
-            .any(|window| window == b"argv.2=line break\n"));
+        assert!(
+            with_space
+                .payload
+                .windows(b"argv.2=line break\n".len())
+                .any(|window| window == b"argv.2=line break\n")
+        );
 
-        assert!(gather_test_context(
-            &[b"command=/usr/bin/echo"],
-            &[b"/usr/bin/echo", b"line\nbreak"],
-            &[b"NAME=value"],
-        )
-        .is_none());
-        assert!(gather_test_context(
-            &[b"command=/usr/bin/echo\r"],
-            &[b"/usr/bin/echo"],
-            &[b"NAME=value"],
-        )
-        .is_none());
-        assert!(gather_test_context(
-            &[b"command=/usr/bin/echo"],
-            &[b"/usr/bin/echo"],
-            &[b"NAME=line\nbreak"],
-        )
-        .is_none());
+        assert!(
+            gather_test_context(
+                &[b"command=/usr/bin/echo"],
+                &[b"/usr/bin/echo", b"line\nbreak"],
+                &[b"NAME=value"],
+            )
+            .is_none()
+        );
+        assert!(
+            gather_test_context(
+                &[b"command=/usr/bin/echo\r"],
+                &[b"/usr/bin/echo"],
+                &[b"NAME=value"],
+            )
+            .is_none()
+        );
+        assert!(
+            gather_test_context(
+                &[b"command=/usr/bin/echo"],
+                &[b"/usr/bin/echo"],
+                &[b"NAME=line\nbreak"],
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn gather_context_rejects_invalid_utf8_in_all_sudo_arrays() {
-        assert!(gather_test_context(
-            &[b"command=/usr/bin/\xff"],
-            &[b"/usr/bin/echo"],
-            &[b"NAME=value"],
-        )
-        .is_none());
-        assert!(gather_test_context(
-            &[b"command=/usr/bin/echo"],
-            &[b"/usr/bin/\xff"],
-            &[b"NAME=value"],
-        )
-        .is_none());
-        assert!(gather_test_context(
-            &[b"command=/usr/bin/echo"],
-            &[b"/usr/bin/echo"],
-            &[b"NAME=\xff"],
-        )
-        .is_none());
+        assert!(
+            gather_test_context(
+                &[b"command=/usr/bin/\xff"],
+                &[b"/usr/bin/echo"],
+                &[b"NAME=value"],
+            )
+            .is_none()
+        );
+        assert!(
+            gather_test_context(
+                &[b"command=/usr/bin/echo"],
+                &[b"/usr/bin/\xff"],
+                &[b"NAME=value"],
+            )
+            .is_none()
+        );
+        assert!(
+            gather_test_context(
+                &[b"command=/usr/bin/echo"],
+                &[b"/usr/bin/echo"],
+                &[b"NAME=\xff"],
+            )
+            .is_none()
+        );
     }
 }
