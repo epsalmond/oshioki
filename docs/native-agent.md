@@ -56,6 +56,18 @@ a terminal: with stdin closed nothing could answer, so `run` stops rather than
 leaving every request to time out. A Mac with an enclave key reads no stdin
 and does not check this.
 
+That is why there is no Linux autostart. A service manager gives the agent no
+terminal, so `oshioki-laptop-setup` installs no unit there; it writes
+`~/.config/oshioki/agent.env` and leaves the agent to a terminal you keep
+open:
+
+```bash
+set -a; . ~/.config/oshioki/agent.env; set +a; oshioki-agent run
+```
+
+macOS is different: the LaunchAgent runs the Touch ID sheet, which needs no
+terminal.
+
 `enroll` pins the device locally and then confirms the server stored it by
 reading `GET /api/v1/devices/<fingerprint>` back over HTTPS for up to fifteen
 seconds. If that confirmation times out, the device is still pinned and can

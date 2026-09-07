@@ -39,6 +39,13 @@ die() { echo "oshioki-laptop-setup: $*" >&2; exit 1; }
 # Everything human-facing goes to stderr: the privileged phase's stdout is a
 # machine-readable value block the outer run parses.
 info() { echo "oshioki-laptop-setup: $*" >&2; }
+# agent.env is read back by shell sourcing, so every value has to survive the
+# shell: a password holding a space, $, backtick, # or quote would otherwise
+# be split or expanded. Single quotes suppress all of that, and a literal
+# single quote is spliced in as '\'' -- the one character they cannot hold.
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
 
 YES=0
 RECONFIGURE=0
@@ -282,11 +289,6 @@ try:
     sock = socket.create_connection((host, port), timeout=4)
 except OSError as error:
     sys.exit("NATS probe: cannot reach %s:%s: %s" % (host, port, error))
-if parts.scheme.lower() == "tls":
-    try:
-        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
-    except ssl.SSLError as error:
-        sys.exit("NATS probe: TLS to %s:%s failed: %s" % (host, port, error))
 lines = b""
 while b"\r\n" not in lines:
     chunk = sock.recv(4096)
@@ -297,6 +299,17 @@ try:
     info = json.loads(lines.split(b"\r\n", 1)[0].split(None, 1)[1])
 except Exception:
     sys.exit("NATS probe: unreadable server INFO")
+# NATS sends INFO in the clear and upgrades to TLS afterwards, so the
+# handshake comes after that first line, on a tls:// URL or when the server
+# says it requires TLS. A server that demands TLS on a nats:// URL would
+# also fail at the hook, so say so here.
+if info.get("tls_required") and parts.scheme.lower() != "tls":
+    sys.exit("NATS probe: server requires TLS; use a tls:// URL")
+if parts.scheme.lower() == "tls":
+    try:
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+    except (ssl.SSLError, OSError) as error:
+        sys.exit("NATS probe: TLS to %s:%s failed: %s" % (host, port, error))
 if info.get("nonce"):
     sys.exit("NATS probe: server wants NKey auth, which setup does not configure")
 required = info.get("auth_required", False)
@@ -310,7 +323,13 @@ if user and password:
     # authentication the same way a wrong secret does, with no hint.
     hello.update(user=user, **{"pass": password})
 sock.sendall(("CONNECT %s\r\nPING\r\n" % json.dumps(hello)).encode())
-rest = lines.split(b"\r\n", 1)[1]
+# Bytes buffered after INFO are pre-handshake plaintext on a TLS connection:
+# the SSLSocket has its own stream, so carrying them across the upgrade would
+# feed plaintext to the post-upgrade parse. Only the cleartext path keeps them.
+if parts.scheme.lower() == "tls":
+    rest = b""
+else:
+    rest = lines.split(b"\r\n", 1)[1]
 while rest.count(b"\r\n") < 1:
     chunk = sock.recv(4096)
     if not chunk:
@@ -335,6 +354,17 @@ PYEOF
 
 # True when $1 (a NATS URL) accepts TCP. Scheme, userinfo, path, and
 # brackets are stripped; only reachability is tested.
+tcp_reachable() {
+  local pid i
+  ( exec 3<>"/dev/tcp/$1/$2" ) 2>/dev/null &
+  pid=$!
+  for i in 1 2 3 4; do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid"; return $?; }
+    sleep 0.5
+  done
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  return 1
+}
 nats_probe_reachable() {
   local rest hostport host port
   rest="${1#*://}"; rest="${rest%%/*}"; rest="${rest%%\?*}"
@@ -348,7 +378,11 @@ nats_probe_reachable() {
   # A bare host carries itself as the "port" (no colon to split on), and a
   # bracketed IPv6 host with no port yields an empty one; both mean 4222.
   if [ -z "$port" ] || [ "$host" = "$port" ]; then port=4222; fi
-  if [ "$(uname -s)" = Darwin ]; then
+  if ! command -v nc >/dev/null 2>&1; then
+    # No nc either: bash opens the TCP connection itself, bounded by hand
+    # because stock macOS has no timeout(1).
+    tcp_reachable "$host" "$port"
+  elif [ "$(uname -s)" = Darwin ]; then
     nc -z -G 2 "$host" "$port" 2>/dev/null
   else
     nc -z -w 2 "$host" "$port" 2>/dev/null
@@ -596,6 +630,9 @@ if ! "$AGENT_BIN" show >/dev/null 2>&1; then
     kill -0 "$enroll_pid" 2>/dev/null || break
     sleep 1
   done
+  # The process can exit between the grep and the liveness check with the
+  # URL already written: read the log once more before giving up.
+  [ -n "$url" ] || url="$(grep -oE 'https?://[^[:space:]'\'']+' "$enroll_log" 2>/dev/null | head -1 || true)"
   if [ -z "$url" ]; then cat "$enroll_log" >&2; rm -f "$enroll_log"; die "enrollment produced no URL"; fi
   NATS_URL="$NATS_URL_V" NATS_USER="$NATS_USER_V" NATS_PASS="$NATS_PASS_V" \
     "$AGENT_BIN" pair "$url" --label "$(hostname -s 2>/dev/null || hostname)"
@@ -660,38 +697,49 @@ case "$(uname -s)" in
     $LAUNCHCTL bootstrap "gui/$(id -u)" "$plist"
     ;;
   Linux)
-    unit_dir="$HOME/.config/systemd/user"
-    if command -v "$SYSTEMCTL" >/dev/null 2>&1 && mkdir -p "$unit_dir" 2>/dev/null; then
-      # One EnvironmentFile instead of Environment= lines: Environment=
-      # whitespace-splits and expands % specifiers, so values with spaces
-      # or % would be mangled. The env file is line-based like install.env,
-      # so values travel literally; it also carries the socket and state
-      # dir the booted agent must agree on with the hook.
-      agent_env="$AGENT_STATE/agent.env"
-      {
-        if [ -n "$NATS_URL_V" ]; then
-          printf 'NATS_URL=%s\n' "$NATS_URL_V"
-          printf 'NATS_USER=%s\n' "$NATS_USER_V"
-          printf 'NATS_PASS=%s\n' "$NATS_PASS_V"
-        fi
-        printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$AGENT_SOCKET_V"
-        printf 'OSHIOKI_AGENT_STATE=%s\n' "$AGENT_STATE"
-      } > "$agent_env"
-      chmod 0600 "$agent_env"
-      systemd_escape() { printf '%s' "$1" | sed -e 's/%/%%/g'; }
-      unit="$unit_dir/$LABEL.service"
-      {
-        printf '%s\n' '[Unit]' 'Description=oshioki sudo approval agent' '' '[Service]'
-        printf 'ExecStart="%s" run\n' "$(systemd_escape "$AGENT_BIN")"
-        printf 'EnvironmentFile=%s\n' "$(systemd_escape "$agent_env")"
-        printf '%s\n' 'Restart=always' '' '[Install]' 'WantedBy=default.target'
-      } > "$unit"
-      chmod 0600 "$unit"
-      $SYSTEMCTL --user daemon-reload
-      $SYSTEMCTL --user enable --now "$LABEL"
-    else
-      info "no user systemd; start '$AGENT_BIN run' yourself (with NATS_* in the environment)"
+    # There is no autostart on Linux. The agent has no enclave here, so it
+    # approves through the terminal prompt, and a service unit gives it no
+    # terminal: under systemd stdin is /dev/null, the agent stops at once
+    # rather than leaving every request to time out, and Restart=always
+    # loops it. So write the environment the agent and hook must agree on
+    # and let the user run it where the prompt can be answered.
+    #
+    # One env file instead of exported variables: it carries the socket and
+    # state dir alongside any NATS credentials. Values are shell-quoted
+    # because the agent is started by sourcing this file; the systemd unit
+    # that once wanted bare EnvironmentFile syntax is gone.
+    agent_env="$AGENT_STATE/agent.env"
+    {
+      if [ -n "$NATS_URL_V" ]; then
+        printf 'NATS_URL=%s\n' "$(shell_quote "$NATS_URL_V")"
+        printf 'NATS_USER=%s\n' "$(shell_quote "$NATS_USER_V")"
+        printf 'NATS_PASS=%s\n' "$(shell_quote "$NATS_PASS_V")"
+      fi
+      printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$(shell_quote "$AGENT_SOCKET_V")"
+      printf 'OSHIOKI_AGENT_STATE=%s\n' "$(shell_quote "$AGENT_STATE")"
+    } > "$agent_env"
+    chmod 0600 "$agent_env"
+    # An earlier setup installed such a unit. Leaving it enabled leaves it
+    # restarting a process that bails on every start, and it would race the
+    # terminal agent for the socket.
+    unit="$HOME/.config/systemd/user/$LABEL.service"
+    if [ -f "$unit" ]; then
+      if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
+        $SYSTEMCTL --user disable --now "$LABEL" 2>/dev/null || true
+      fi
+      rm -f "$unit"
+      # disable would normally clear this. Without systemctl the symlink
+      # outlives the unit it points at, and a later daemon-reload reports a
+      # failed unit, so drop it by hand.
+      rm -f "$HOME/.config/systemd/user/default.target.wants/$LABEL.service"
+      if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
+        $SYSTEMCTL --user daemon-reload 2>/dev/null || true
+      fi
+      info "removed the old systemd unit; it could never answer a prompt"
     fi
+    info "run the agent on a terminal you keep open:"
+    info "  set -a; . $(shell_quote "$agent_env"); set +a; $(shell_quote "$AGENT_BIN") run"
+    info "every sudo prompts there; answering it is what approves the request"
     ;;
   *) die "unsupported operating system: $(uname -s)" ;;
 esac
@@ -701,6 +749,23 @@ info "step $VERIFY_STEP/$TOTAL_STEPS: verify"
 # server mode checks it here, after pairing.
 if [ "$LOCAL" -eq 0 ]; then
 run_installer --prelaunch-status
+fi
+# Linux has no autostart, so a live socket only happens when the agent is
+# already running on a terminal. That is the finished state, not a
+# precondition: without it the install is still complete and sudo starts
+# working the moment the agent does.
+# Without python3 there is no way to tell a live listener from a socket file
+# left behind by a crash or an earlier run, and guessing wrong sends the
+# install down the macOS path to a sudo proof that cannot be answered. The
+# early exit is the safe guess: it is already the common case on Linux.
+if command -v python3 >/dev/null 2>&1; then
+  agent_running() { socket_live "$1"; }
+else
+  agent_running() { false; }
+fi
+if [ "$(uname -s)" = Linux ] && ! agent_running "$AGENT_SOCKET_V"; then
+  info "install complete. Start the agent on a terminal (above); sudo works from then on."
+  exit 0
 fi
 # The socket file outlives its listener across agent restarts (notably the
 # autostart cycle just above), so wait for a live listener, not a path.
