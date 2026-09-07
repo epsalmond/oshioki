@@ -122,6 +122,7 @@ mod logging {
     use tracing::field::{Field, Visit};
     use tracing::{Event, Level, Subscriber};
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
     use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -165,20 +166,32 @@ mod logging {
     }
 
     /// An override is added on top of the default rather than replacing
-    /// it. An empty string would otherwise mean "nothing", and a typo such
-    /// as `garbage` is a valid directive for a target that never logs,
-    /// which alone would silence the warnings too. `info` opens the
-    /// hook's own chatter; the audit trail stays off the terminal unless
-    /// asked for by name with `audit=info`, since the denial already has
-    /// sudo's own error line there.
+    /// it, and never below a warn floor. An empty string would otherwise
+    /// mean "nothing", a typo such as `garbage` is a valid directive for a
+    /// target that never logs, and a bare `off` or `error` replaces the
+    /// global level; each alone would take the warnings with it. `info`
+    /// opens the hook's own chatter; the audit trail stays off the terminal
+    /// unless asked for by name with `audit=info`, since a denial already
+    /// has sudo's own error line there.
     pub fn terminal_filter(directives: Option<&str>) -> EnvFilter {
         directives
             .map(str::trim)
-            .filter(|directives| !directives.is_empty())
+            .filter(|directives| !directives.is_empty() && keeps_the_warn_floor(directives))
             .and_then(|directives| {
                 EnvFilter::try_new(format!("{TERMINAL_DEFAULT},{directives}")).ok()
             })
             .unwrap_or_else(|| EnvFilter::new(TERMINAL_DEFAULT))
+    }
+
+    /// A bare level in an override becomes the global level, so `off` and
+    /// `error` are refused: the terminal never drops below warnings.
+    fn keeps_the_warn_floor(directives: &str) -> bool {
+        directives
+            .split(',')
+            .map(str::trim)
+            .filter(|directive| !directive.contains('='))
+            .filter_map(|level| level.parse::<LevelFilter>().ok())
+            .all(|level| level >= LevelFilter::WARN)
     }
 
     pub fn syslog_filter() -> EnvFilter {
@@ -375,7 +388,15 @@ mod logging {
 
         #[test]
         fn empty_or_broken_override_keeps_the_default_instead_of_silence() {
-            for broken in [Some(""), Some("   "), Some("garbage!!!")] {
+            for broken in [
+                Some(""),
+                Some("   "),
+                Some("garbage!!!"),
+                Some("="),
+                Some("off"),
+                Some("error"),
+                Some("audit=off,off"),
+            ] {
                 let (terminal, seen) = run_both(broken);
                 assert!(
                     terminal.contains("counter regressed"),
@@ -389,6 +410,9 @@ mod logging {
         #[test]
         fn a_real_override_opens_the_terminal_for_development() {
             let (terminal, seen) = run_both(Some("info"));
+            assert!(terminal.contains("trying NATS"), "{terminal}");
+            assert!(terminal.contains("counter regressed"), "{terminal}");
+            let (terminal, _) = run_both(Some("debug"));
             assert!(terminal.contains("trying NATS"), "{terminal}");
             assert!(terminal.contains("connected"), "{terminal}");
             assert!(!terminal.contains("sudo request"), "{terminal}");
