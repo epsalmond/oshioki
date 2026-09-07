@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The agent keeps connecting to NATS in the background instead of giving up
+  after one failed attempt at startup. After a reboot the VPN often comes up
+  a minute after the LaunchAgent, which left every remote sudo timing out
+  until the agent was restarted. Connection state is logged, and the default
+  log level is now `info` so that log says so.
+
 ## [0.1.2] - 2026-09-06
 
 Toward the 1.0 release. The v1 protocol and its three approval paths are

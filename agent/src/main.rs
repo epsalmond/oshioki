@@ -132,8 +132,13 @@ fn requested_signer_kind(flag: Option<SignerArg>) -> Option<SignerKind> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Silent by default hid a day of "NATS unreachable" from the LaunchAgent
+    // log; RUST_LOG still overrides.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .with_writer(io::stderr)
         .init();
     let cli = Cli::parse();
@@ -377,9 +382,9 @@ async fn cmd_run(
         fingerprint = %identity.fingerprint(),
         "agent socket listening"
     );
-    // NATS is the network transport; the socket above is the local one. When
-    // the network is down the agent still answers socket requests, and
-    // rejoining NATS needs a restart.
+    // NATS is the network transport; the socket above is the local one. The
+    // agent answers socket requests from the start and joins NATS whenever it
+    // becomes reachable: after a reboot the VPN is often a minute behind.
     let mut requests = subscribe_requests(&identity).await?;
     #[cfg(feature = "unattended")]
     let auto = auto.map(|auto| match auto {
@@ -471,33 +476,49 @@ async fn cmd_run(
 }
 
 /// Connect NATS and subscribe to requests, or return `None` when the network
-/// is down so the agent answers socket requests only.
+/// is unset so the agent answers socket requests only. An unreachable NATS
+/// is not an error: the client keeps connecting in the background and the
+/// subscription takes effect the moment it lands.
 async fn subscribe_requests(
     identity: &Identity,
 ) -> Result<Option<(async_nats::Client, async_nats::Subscriber)>> {
     // Unset and unreachable are different states: the first is a
     // socket-only install answering exactly what it was told to, the second
-    // is a fallback worth warning about.
-    if env_nonempty("NATS_URL").is_none() {
+    // is a network that has not come up yet.
+    let Some(url) = env_nonempty("NATS_URL") else {
         info!("NATS_URL is not set; answering socket requests only (socket-only)");
         return Ok(None);
-    }
-    let nats = match connect_nats().await {
-        Ok(nats) => nats,
-        Err(error) => {
-            warn!(
-                error = %escape_for_terminal(&format!("{error:#}")),
-                "NATS is unreachable; answering socket requests only until restart"
-            );
-            return Ok(None);
-        }
     };
+    let nats = nats_connect_options()?
+        .retry_on_initial_connect()
+        .max_reconnects(None)
+        .reconnect_delay_callback(reconnect_delay)
+        .event_callback(|event| async move {
+            match event {
+                async_nats::Event::Connected => info!("NATS connected; watching for requests"),
+                async_nats::Event::Disconnected => {
+                    warn!("NATS disconnected; reconnecting in the background");
+                }
+                async_nats::Event::ServerError(error) => {
+                    warn!(error = %escape_for_terminal(&error.to_string()), "NATS server error");
+                }
+                async_nats::Event::ClientError(error) => {
+                    warn!(error = %escape_for_terminal(&error.to_string()), "NATS connect failed; retrying");
+                }
+                other => info!(event = %other, "NATS event"),
+            }
+        })
+        .connect(&url)
+        .await
+        .context("connect to NATS")?;
     let requests = nats
         .subscribe("oshioki.request.>")
         .await
         .context("subscribe requests")?;
-    nats.flush().await?;
-    info!(fingerprint=%identity.fingerprint(), "watching for requests");
+    info!(
+        fingerprint = %identity.fingerprint(),
+        "NATS connection in progress; requests are answered once it is up"
+    );
     Ok(Some((nats, requests)))
 }
 
@@ -1011,7 +1032,9 @@ fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-async fn connect_nats() -> Result<async_nats::Client> {
+/// Connection options from the environment, validated up front so a
+/// misconfiguration fails fast even when the connect itself is retried.
+fn nats_connect_options() -> Result<async_nats::ConnectOptions> {
     let url = env_nonempty("NATS_URL").context("NATS_URL is not set")?;
     let mut options = async_nats::ConnectOptions::new();
     // Half a credential is a misconfiguration, not a request for an anonymous
@@ -1032,7 +1055,25 @@ async fn connect_nats() -> Result<async_nats::Client> {
     if nats_url_is_tls(&url) {
         options = options.require_tls(true);
     }
-    options.connect(&url).await.context("connect to NATS")
+    Ok(options)
+}
+
+/// One attempt, for the pairing flow: a user waiting at a terminal wants the
+/// failure now, not a background retry.
+async fn connect_nats() -> Result<async_nats::Client> {
+    let url = env_nonempty("NATS_URL").context("NATS_URL is not set")?;
+    nats_connect_options()?
+        .connect(&url)
+        .await
+        .context("connect to NATS")
+}
+
+/// Reconnect backoff: one second per attempt, capped at fifteen. Short
+/// enough that a returning network is joined well inside the hook's
+/// deadline, long enough that a laptop off the VPN does not log every
+/// few seconds forever.
+fn reconnect_delay(attempts: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(attempts.clamp(1, 15) as u64)
 }
 
 fn now() -> i64 {
@@ -1839,6 +1880,101 @@ mod tests {
     /// positive controls keep this honest — the probe proves the request
     /// really carried the marker, and the request ids in the log prove the
     /// capture really saw the decision paths.
+    #[test]
+    fn reconnect_backoff_is_bounded_on_both_ends() {
+        use std::time::Duration;
+        assert_eq!(super::reconnect_delay(0), Duration::from_secs(1));
+        assert_eq!(super::reconnect_delay(7), Duration::from_secs(7));
+        assert_eq!(super::reconnect_delay(10_000), Duration::from_secs(15));
+    }
+
+    /// After a reboot the VPN comes up a minute after the agent. The agent
+    /// must not need a restart for that: connect returns at once, the
+    /// subscription lands when the server does, and requests flow.
+    #[tokio::test]
+    async fn nats_subscription_survives_a_server_that_starts_late() {
+        use futures::StreamExt as _;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        let Ok(bin) = which_nats_server() else {
+            eprintln!("nats-server not on PATH; skipping");
+            return;
+        };
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let url = format!("nats://127.0.0.1:{port}");
+        let started = std::time::Instant::now();
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .max_reconnects(None)
+            .reconnect_delay_callback(super::reconnect_delay)
+            .connect(&url)
+            .await
+            .expect("connect returns before the server exists");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connect blocked on an absent server"
+        );
+        let mut requests = client.subscribe("oshioki.request.>").await.unwrap();
+
+        let server = Command::new(bin)
+            .args(["-a", "127.0.0.1", "-p", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn nats-server");
+        let _server = KillOnDrop(server);
+
+        // A fail-fast publisher that waits for the server, then keeps
+        // publishing until the late subscription answers.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let publisher = loop {
+            if let Ok(publisher) = async_nats::connect(&url).await {
+                break publisher;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nats-server never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        loop {
+            publisher
+                .publish("oshioki.request.test", "late".into())
+                .await
+                .unwrap();
+            let _ = publisher.flush().await;
+            match tokio::time::timeout(Duration::from_millis(300), requests.next()).await {
+                Ok(Some(message)) => {
+                    assert_eq!(message.payload.as_ref(), b"late");
+                    break;
+                }
+                _ => assert!(
+                    std::time::Instant::now() < deadline,
+                    "subscription never took effect after the server started"
+                ),
+            }
+        }
+    }
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn which_nats_server() -> Result<std::path::PathBuf, ()> {
+        let path = std::env::var_os("PATH").ok_or(())?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("nats-server"))
+            .find(|candidate| candidate.is_file())
+            .ok_or(())
+    }
+
     #[tokio::test]
     async fn request_plaintext_never_reaches_the_log() {
         let logs = CapturedLogs::default();
