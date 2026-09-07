@@ -83,9 +83,9 @@ struct EnrollmentStateV1 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    logging::init();
     let cli = Cli::parse();
     let checking = matches!(cli.verb, Verb::Check);
+    logging::init(checking);
     let result = match cli.verb {
         Verb::Check => cmd_check().await,
         Verb::Enroll { resume } => cmd_enroll(resume.as_deref()).await,
@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
     };
     if let Err(error) = result {
         // The terminal gets sudo's one line; the system log gets the audit
-        // record, on a target the terminal layer does not carry.
+        // record.
         if checking {
             warn!(target: "audit", error = %format!("{error:#}"), "sudo request denied");
         }
@@ -112,9 +112,9 @@ async fn main() -> Result<()> {
 /// system log keeps the audit trail. A sudo that works prints nothing, and
 /// agents driving a shell do not pay for approval chatter in their output.
 ///
-/// `RUST_LOG` overrides the terminal filter for development. The system
-/// log stays at info regardless so the record does not depend on the
-/// caller's environment.
+/// Audit records carry the `audit` target: approvals, denials, and a local
+/// agent leaving a request to NATS. The terminal layer drops that target and
+/// the syslog layer is the only place it lands.
 mod logging {
     use std::fmt::Write as _;
     use std::os::unix::net::UnixDatagram;
@@ -128,30 +128,67 @@ mod logging {
     /// syslog(3) facility for security and authorization messages, the one
     /// sudo itself logs under.
     const LOG_AUTHPRIV: u8 = 10;
+    /// Terminal default: warnings and errors, and never the audit trail.
+    const TERMINAL_DEFAULT: &str = "warn,audit=off";
+    /// System log: the audit trail at info, everything else only when it is
+    /// a warning, so a library's connection chatter stays out of authpriv.
+    const SYSLOG_DIRECTIVES: &str = "warn,audit=info";
+    /// Longest datagram sent. syslogd implementations cap datagrams somewhere
+    /// between 1 KiB and 8 KiB and drop anything over it whole; a bounded
+    /// line keeps the record.
+    const MAX_DATAGRAM_LINE: usize = 2048;
 
-    pub fn init() {
-        let terminal =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,audit=off"));
+    /// `checking` is the sudo path: its terminal level comes from
+    /// `OSHIOKI_LOG` in `config.env`, which root writes, never from the
+    /// caller's environment. Other verbs run for a person and honour
+    /// `RUST_LOG`.
+    pub fn init(checking: bool) {
+        let directives = if checking {
+            super::read_env_file(&super::check_config_dir().join("config.env"))
+                .ok()
+                .and_then(|env| env.get("OSHIOKI_LOG").cloned())
+        } else {
+            std::env::var("RUST_LOG").ok()
+        };
         let syslog = Syslog::connect();
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_writer(std::io::stderr)
-                    .with_filter(terminal),
+                    .with_filter(terminal_filter(directives.as_deref())),
             )
             .with(
                 SyslogLayer::new(move |severity, line| syslog.send(severity, line))
-                    // Our own records at info; a library's connection
-                    // chatter only when it is a warning.
-                    .with_filter(EnvFilter::new("warn,oshioki=info,audit=info")),
+                    .with_filter(syslog_filter()),
             )
             .init();
     }
 
+    /// An override is added on top of the default rather than replacing
+    /// it. An empty string would otherwise mean "nothing", and a typo such
+    /// as `garbage` is a valid directive for a target that never logs,
+    /// which alone would silence the warnings too. `info` opens the
+    /// hook's own chatter; the audit trail stays off the terminal unless
+    /// asked for by name with `audit=info`, since the denial already has
+    /// sudo's own error line there.
+    pub fn terminal_filter(directives: Option<&str>) -> EnvFilter {
+        directives
+            .map(str::trim)
+            .filter(|directives| !directives.is_empty())
+            .and_then(|directives| {
+                EnvFilter::try_new(format!("{TERMINAL_DEFAULT},{directives}")).ok()
+            })
+            .unwrap_or_else(|| EnvFilter::new(TERMINAL_DEFAULT))
+    }
+
+    pub fn syslog_filter() -> EnvFilter {
+        EnvFilter::new(SYSLOG_DIRECTIVES)
+    }
+
     /// The local syslog datagram socket, spoken to in the BSD format every
-    /// syslogd, journald, and the macOS unified log accept. Missing socket
-    /// or a full buffer drops the line: an audit sink must never block or
-    /// fail a sudo.
+    /// syslogd, journald, and the macOS unified log accept. Nonblocking: a
+    /// missing socket or a full buffer drops the line, because an audit sink
+    /// must never stall or fail a sudo.
     struct Syslog {
         socket: Option<UnixDatagram>,
         pid: u32,
@@ -159,12 +196,14 @@ mod logging {
 
     impl Syslog {
         fn connect() -> Self {
-            let socket = UnixDatagram::unbound().ok().and_then(|socket| {
-                ["/dev/log", "/var/run/syslog", "/var/run/log"]
-                    .iter()
-                    .any(|path| socket.connect(path).is_ok())
-                    .then_some(socket)
-            });
+            let socket = ["/dev/log", "/var/run/syslog", "/var/run/log"]
+                .iter()
+                .find_map(|path| {
+                    let socket = UnixDatagram::unbound().ok()?;
+                    socket.connect(path).ok()?;
+                    socket.set_nonblocking(true).ok()?;
+                    Some(socket)
+                });
             Self {
                 socket,
                 pid: std::process::id(),
@@ -173,13 +212,23 @@ mod logging {
 
         fn send(&self, severity: u8, line: &str) {
             let Some(socket) = &self.socket else { return };
-            let datagram = format!(
-                "<{}>oshioki[{}]: {line}",
-                LOG_AUTHPRIV * 8 + severity,
-                self.pid
-            );
-            let _ = socket.send(datagram.as_bytes());
+            let _ = socket.send(datagram(self.pid, severity, line).as_bytes());
         }
+    }
+
+    /// `<PRI>oshioki[pid]: line`, with the line cut to a datagram-safe
+    /// length and every control character (newlines above all) replaced, so
+    /// a value that came from outside cannot forge a second record.
+    pub fn datagram(pid: u32, severity: u8, line: &str) -> String {
+        let mut clean = String::with_capacity(line.len().min(MAX_DATAGRAM_LINE));
+        for c in line.chars() {
+            let c = if c.is_control() { ' ' } else { c };
+            if clean.len() + c.len_utf8() > MAX_DATAGRAM_LINE {
+                break;
+            }
+            clean.push(c);
+        }
+        format!("<{}>oshioki[{pid}]: {clean}", LOG_AUTHPRIV * 8 + severity)
     }
 
     /// One syslog line per event: the message, then `key=value` fields.
@@ -244,42 +293,137 @@ mod logging {
 
     #[cfg(test)]
     mod tests {
+        use std::io;
         use std::sync::{Arc, Mutex};
 
-        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
 
-        use super::{SyslogLayer, severity};
+        use super::{SyslogLayer, datagram, severity, syslog_filter, terminal_filter};
 
-        #[test]
-        fn events_become_one_line_with_sudo_priorities() {
+        /// A terminal captured in memory.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Captured {
+            fn text(&self) -> String {
+                String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+            }
+        }
+
+        /// Both production layers with their real filters, the terminal
+        /// under the given override; returns what each sink received after
+        /// one of every kind of event.
+        fn run_both(terminal_directives: Option<&str>) -> (String, Vec<(u8, String)>) {
+            let terminal = Captured::default();
+            let writer = terminal.clone();
             let seen = Arc::new(Mutex::new(Vec::new()));
             let sink = Arc::clone(&seen);
-            let subscriber =
-                tracing_subscriber::registry().with(SyslogLayer::new(move |priority, line| {
-                    sink.lock().unwrap().push((priority, line.to_string()));
-                }));
-            tracing::subscriber::with_default(subscriber, || {
-                tracing::info!(request_id = "r1", kind = %"secure-enclave", "sudo request approved");
-                tracing::warn!(target: "audit", error = "deadline", "sudo request denied");
-            });
-            let seen = seen.lock().unwrap();
-            assert_eq!(
-                seen[0],
-                (
-                    6,
-                    "sudo request approved request_id=r1 kind=secure-enclave".to_string()
+            let subscriber = tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(move || writer.clone())
+                        .with_filter(terminal_filter(terminal_directives)),
                 )
-            );
+                .with(
+                    SyslogLayer::new(move |severity, line| {
+                        sink.lock().unwrap().push((severity, line.to_string()));
+                    })
+                    .with_filter(syslog_filter()),
+                );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "audit", request_id = "r1", "sudo request approved");
+                tracing::warn!(target: "audit", error = "deadline", "sudo request denied");
+                tracing::warn!("counter regressed");
+                tracing::info!("no agent on the socket; trying NATS");
+                tracing::info!(target: "oshioki_transport::nats", "connected successfully");
+                tracing::info!(target: "async_nats", "event: connected");
+            });
+            let seen = seen.lock().unwrap().clone();
+            (terminal.text(), seen)
+        }
+
+        #[test]
+        fn terminal_shows_warnings_and_never_the_audit_trail() {
+            let (terminal, _) = run_both(None);
+            assert!(terminal.contains("counter regressed"), "{terminal}");
+            assert!(!terminal.contains("sudo request"), "{terminal}");
+            assert!(!terminal.contains("trying NATS"), "{terminal}");
+            assert!(!terminal.contains("connected"), "{terminal}");
+        }
+
+        #[test]
+        fn syslog_carries_the_audit_trail_and_warnings_only() {
+            let (_, seen) = run_both(None);
             assert_eq!(
-                seen[1],
-                (4, "sudo request denied error=deadline".to_string())
+                seen,
+                vec![
+                    (6, "sudo request approved request_id=r1".to_string()),
+                    (4, "sudo request denied error=deadline".to_string()),
+                    (4, "counter regressed".to_string()),
+                ]
             );
+        }
+
+        #[test]
+        fn empty_or_broken_override_keeps_the_default_instead_of_silence() {
+            for broken in [Some(""), Some("   "), Some("garbage!!!")] {
+                let (terminal, seen) = run_both(broken);
+                assert!(
+                    terminal.contains("counter regressed"),
+                    "{broken:?}: {terminal}"
+                );
+                assert!(!terminal.contains("sudo request"), "{broken:?}: {terminal}");
+                assert_eq!(seen.len(), 3, "{broken:?}");
+            }
+        }
+
+        #[test]
+        fn a_real_override_opens_the_terminal_for_development() {
+            let (terminal, seen) = run_both(Some("info"));
+            assert!(terminal.contains("trying NATS"), "{terminal}");
+            assert!(terminal.contains("connected"), "{terminal}");
+            assert!(!terminal.contains("sudo request"), "{terminal}");
+            // The system log is not the terminal's to change.
+            assert_eq!(seen.len(), 3);
+            // The audit trail on a terminal is asked for by name.
+            let (terminal, _) = run_both(Some("audit=info"));
+            assert!(terminal.contains("sudo request approved"), "{terminal}");
+            assert!(terminal.contains("sudo request denied"), "{terminal}");
+            assert!(!terminal.contains("trying NATS"), "{terminal}");
+        }
+
+        #[test]
+        fn datagram_is_bounded_and_cannot_forge_a_second_record() {
+            let forged = "curl failed\n<86>oshioki[1]: sudo request approved\r\0tail";
+            let line = datagram(42, 6, forged);
+            assert_eq!(
+                line,
+                "<86>oshioki[42]: curl failed <86>oshioki[1]: sudo request approved  tail"
+            );
+            assert!(!line[1..].contains(['\n', '\r', '\0']));
+            let long = "é".repeat(3000);
+            let line = datagram(1, 4, &long);
+            assert!(line.starts_with("<84>oshioki[1]: "));
+            assert!(line.len() <= "<84>oshioki[1]: ".len() + super::MAX_DATAGRAM_LINE);
+            assert!(line.ends_with('é'), "cut on a char boundary");
         }
 
         #[test]
         fn severities_map_like_syslog() {
             assert_eq!(severity(tracing::Level::ERROR), 3);
+            assert_eq!(severity(tracing::Level::WARN), 4);
+            assert_eq!(severity(tracing::Level::INFO), 6);
             assert_eq!(severity(tracing::Level::DEBUG), 7);
+            assert_eq!(severity(tracing::Level::TRACE), 7);
         }
     }
 }
@@ -352,6 +496,7 @@ async fn execute_request_at(
         SocketOutcome::Silent(SocketSilence::Undecided) => match &nats_url {
             Some(url) => {
                 info!(
+                    target: "audit",
                     request_id = %request.request_id,
                     "local agent left the request undecided; waiting on NATS until the deadline"
                 );
@@ -635,7 +780,7 @@ async fn apply_decision(
                 }
                 write_registry_to(directory, registry)?;
             }
-            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
+            info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
             Ok(())
         }
         DecisionV1::ApproveNative(approval) => {
@@ -654,7 +799,7 @@ async fn apply_decision(
                 .context("native approval does not name one pinned secure-enclave device")?;
             verify_native_approval_v1(&approval, raw_request, device)
                 .context("native approval verification failed")?;
-            info!(request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
+            info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
             Ok(())
         }
     }

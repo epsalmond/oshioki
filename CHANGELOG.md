@@ -9,10 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The hook is quiet on an approved sudo. Approvals, denials, and transport
-  fallbacks go to the system log (`authpriv`, like sudo; `journalctl -t
-  oshioki`), and only warnings and errors reach the terminal, on stderr.
-  `RUST_LOG=oshioki=info` restores the chatter for development.
+- The hook is quiet on an approved sudo. Approvals, denials, and a request
+  left to NATS by the local agent go to the system log (`authpriv`, like
+  sudo; `journalctl -t oshioki`), and only warnings and errors reach the
+  terminal, on stderr. The sudo path takes its terminal level from
+  `OSHIOKI_LOG` in `config.env`, never from the caller's environment;
+  `OSHIOKI_LOG=info` restores the chatter for development and
+  `OSHIOKI_LOG=audit=info` shows the audit trail there too.
 
 ### Fixed
 
