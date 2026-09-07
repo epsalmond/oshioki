@@ -471,7 +471,20 @@ impl Identity {
     /// `None` when the envelope carries nothing for this device, which is
     /// the normal case for a host this device never enrolled with.
     pub fn open_request(&self, envelope: &RequestEnvelopeV1) -> Result<Option<OpenedRequest>> {
-        envelope.validate().context("envelope")?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        self.open_request_at(envelope, now)
+    }
+
+    /// Finds and opens this device's body using a receiver-local timestamp.
+    /// The explicit clock keeps tests deterministic and makes it impossible
+    /// for the envelope and opened request to be checked against different
+    /// seconds at a boundary.
+    pub fn open_request_at(
+        &self,
+        envelope: &RequestEnvelopeV1,
+        now: i64,
+    ) -> Result<Option<OpenedRequest>> {
+        envelope.validate_at(now).context("envelope")?;
         let fingerprint = self.fingerprint();
         let Some(sealed) = envelope
             .sealed
@@ -482,10 +495,11 @@ impl Identity {
         };
         let raw = unseal_v1(sealed, &self.box_secret).context("open sealed body")?;
         let request: RequestV1 = serde_json::from_slice(&raw).context("decode request")?;
-        request.validate().context("request")?;
+        request.validate_at(now).context("request")?;
         if request.request_id != envelope.request_id
             || request.host != envelope.host
             || request.user != envelope.user
+            || request.issued_at != envelope.issued_at
             || request.expires_at != envelope.expires_at
         {
             bail!("sealed request does not match its envelope");
@@ -763,7 +777,7 @@ mod tests {
         assert_eq!(device.kind, DeviceKindV1::Software);
         let request = request();
         let (envelope, raw) = envelope(&request, std::slice::from_ref(&device));
-        let opened = identity.open_request(&envelope).unwrap().unwrap();
+        let opened = identity.open_request_at(&envelope, 1_000).unwrap().unwrap();
         assert_eq!(opened.raw, raw);
         assert_eq!(opened.request, request);
         let DecisionV1::ApproveNative(approval) = identity.approve(&opened, "run true").unwrap()
@@ -796,10 +810,49 @@ mod tests {
     }
 
     #[test]
+    fn receiver_rejects_requests_outside_time_bounds_before_prompting() {
+        let identity = identity();
+        let device = identity.device_record("laptop");
+        let now = 1_000;
+        for (issued_at, expires_at) in [
+            (
+                now + oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS + 1,
+                now + oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS + 91,
+            ),
+            (
+                now - oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS - 1,
+                now + 1,
+            ),
+            (now, now + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS + 1),
+        ] {
+            let mut request = request();
+            request.issued_at = issued_at;
+            request.expires_at = expires_at;
+            let (envelope, _) = envelope(&request, std::slice::from_ref(&device));
+            assert!(identity.open_request_at(&envelope, now).is_err());
+        }
+    }
+
+    #[test]
+    fn receiver_checks_envelope_and_opened_issued_at_consistency() {
+        let identity = identity();
+        let device = identity.device_record("laptop");
+        let request = request();
+        let (mut envelope, _) = envelope(&request, std::slice::from_ref(&device));
+        envelope.issued_at += 1;
+        assert!(identity.open_request_at(&envelope, 1_000).is_err());
+    }
+
+    #[test]
     fn ignores_envelopes_for_other_devices() {
         let other = Identity::from_material([0x44; 32], [0x55; 32], [0x66; 32]).unwrap();
         let (envelope, _) = envelope(&request(), &[other.device_record("other")]);
-        assert!(identity().open_request(&envelope).unwrap().is_none());
+        assert!(
+            identity()
+                .open_request_at(&envelope, 1_000)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -807,7 +860,7 @@ mod tests {
         let identity = identity();
         let (mut envelope, _) = envelope(&request(), &[identity.device_record("laptop")]);
         envelope.user = "mallory".into();
-        assert!(identity.open_request(&envelope).is_err());
+        assert!(identity.open_request_at(&envelope, 1_000).is_err());
     }
 
     #[test]

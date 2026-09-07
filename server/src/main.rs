@@ -993,13 +993,14 @@ mod tests {
         store.ready().unwrap();
         let device = test_device();
         store.put_device(&device).unwrap();
+        let request_now = now();
         let envelope = RequestEnvelopeV1 {
             version: 1,
             request_id: "req-1".into(),
             host: "nas".into(),
             user: "eric".into(),
-            issued_at: 10,
-            expires_at: now() + 600,
+            issued_at: request_now,
+            expires_at: request_now + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS,
             sealed: vec![SealedDeviceBodyV1 {
                 device_fingerprint: device.fingerprint.clone(),
                 ephemeral_pub: oshioki_protocol::v1::encode_base64url(&[4; 32]),
@@ -1132,13 +1133,14 @@ mod tests {
         store.ready().unwrap();
         let device = test_device();
         store.put_device(&device).unwrap();
+        let request_now = now();
         let valid_envelope = RequestEnvelopeV1 {
             version: 1,
             request_id: "req-consume".into(),
             host: "nas".into(),
             user: "eric".into(),
-            issued_at: 10,
-            expires_at: now() + 600,
+            issued_at: request_now,
+            expires_at: request_now + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS,
             sealed: vec![SealedDeviceBodyV1 {
                 device_fingerprint: device.fingerprint.clone(),
                 ephemeral_pub: oshioki_protocol::v1::encode_base64url(&[4; 32]),

@@ -9,6 +9,11 @@ use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+/// The server keeps request state only briefly after its local receipt time.
+/// This bound is intentionally independent of timestamps supplied by a
+/// publisher, including timestamps in a conflicting redelivery.
+pub const SERVER_REQUEST_RETENTION_SECS: i64 = 5 * 60;
+
 pub struct Store {
     connection: Mutex<Connection>,
 }
@@ -384,10 +389,7 @@ impl Store {
         if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
             bail!("oversized request envelope");
         }
-        envelope.validate().context("validate envelope")?;
-        if envelope.expires_at <= now {
-            bail!("expired request");
-        }
+        envelope.validate_at(now).context("validate envelope")?;
         let hash = Sha256::digest(raw).to_vec();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -404,15 +406,30 @@ impl Store {
             }
             transaction.execute(
                 "INSERT OR IGNORE INTO tombstones(kind, object_id, payload_hash, expires_at) VALUES ('request_conflict', ?1, ?2, ?3)",
-                params![envelope.request_id, hash, envelope.expires_at],
+                params![
+                    envelope.request_id,
+                    hash,
+                    envelope
+                        .expires_at
+                        .min(now.saturating_add(SERVER_REQUEST_RETENTION_SECS))
+                ],
             )?;
             transaction.commit()?;
             return Ok(InsertResult::Conflict);
         }
         transaction.execute(
             "INSERT INTO requests(id, envelope_hash, envelope_json, host, user, issued_at, expires_at, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', unixepoch())",
-            params![envelope.request_id, hash, raw, envelope.host, envelope.user, envelope.issued_at, envelope.expires_at],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+            params![
+                envelope.request_id,
+                hash,
+                raw,
+                envelope.host,
+                envelope.user,
+                envelope.issued_at,
+                envelope.expires_at,
+                now,
+            ],
         )?;
         for body in &envelope.sealed {
             transaction.execute(
@@ -601,7 +618,10 @@ impl Store {
             "UPDATE enrollments SET status='expired' WHERE status='pending' AND expires_at<=?1",
             [now],
         )?;
-        connection.execute("DELETE FROM requests WHERE expires_at < ?1", [now - 3600])?;
+        connection.execute(
+            "DELETE FROM requests WHERE created_at < ?1",
+            [now.saturating_sub(SERVER_REQUEST_RETENTION_SECS)],
+        )?;
         connection.execute("DELETE FROM tombstones WHERE expires_at < ?1", [now])?;
         connection.execute(
             "DELETE FROM outbox WHERE sent_at IS NOT NULL AND sent_at < ?1",
@@ -651,6 +671,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   UNIQUE(kind, dedupe_key)
 );
 CREATE INDEX IF NOT EXISTS requests_expiry_idx ON requests(expires_at);
+CREATE INDEX IF NOT EXISTS requests_created_idx ON requests(created_at);
 CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox(sent_at, id);
 PRAGMA user_version = 1;
 COMMIT;
@@ -737,8 +758,8 @@ mod tests {
             request_id: "request-1".into(),
             host: "nas".into(),
             user: "eric".into(),
-            issued_at: 10,
-            expires_at: 100,
+            issued_at: 20,
+            expires_at: 110,
             sealed: vec![SealedDeviceBodyV1 {
                 device_fingerprint: fingerprint.into(),
                 ephemeral_pub: encode_base64url(&[4; 32]),
@@ -784,6 +805,59 @@ mod tests {
                 .ingest_request(&conflicting_raw, &conflicting, 20)
                 .unwrap(),
             InsertResult::Conflict
+        );
+    }
+
+    #[test]
+    fn request_receiver_rejects_stale_future_skew_and_long_lived_envelopes() {
+        let store = Store::memory().unwrap();
+        let fingerprint = device(b"timing-token").fingerprint;
+        let now = 1_000;
+        let base = envelope(&fingerprint);
+
+        let mut future = base.clone();
+        future.issued_at = now + oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS + 1;
+        future.expires_at = future.issued_at + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS;
+        let future_raw = serde_json::to_vec(&future).unwrap();
+        assert!(store.ingest_request(&future_raw, &future, now).is_err());
+
+        let mut stale = base.clone();
+        stale.issued_at = now - oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS - 1;
+        stale.expires_at = now + 1;
+        let stale_raw = serde_json::to_vec(&stale).unwrap();
+        assert!(store.ingest_request(&stale_raw, &stale, now).is_err());
+
+        let mut long_lived = base;
+        long_lived.issued_at = now;
+        long_lived.expires_at = now + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS + 1;
+        let long_lived_raw = serde_json::to_vec(&long_lived).unwrap();
+        assert!(
+            store
+                .ingest_request(&long_lived_raw, &long_lived, now)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cleanup_uses_server_receipt_time_not_message_expiry() {
+        let store = Store::memory().unwrap();
+        let device = device(b"retention-token");
+        store.put_device(&device).unwrap();
+        let received_at = 1_000;
+        let mut request = envelope(&device.fingerprint);
+        request.issued_at = received_at;
+        request.expires_at = received_at + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS;
+        let raw = serde_json::to_vec(&request).unwrap();
+        store.ingest_request(&raw, &request, received_at).unwrap();
+
+        store
+            .cleanup(received_at + SERVER_REQUEST_RETENTION_SECS + 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .request_lifecycle("request-1", received_at + SERVER_REQUEST_RETENTION_SECS + 1)
+                .unwrap(),
+            None
         );
     }
 

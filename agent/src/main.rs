@@ -7,13 +7,14 @@
 //! backend and a native prompt on top of the same library.
 
 use std::{
+    collections::HashMap,
     future::Future,
     io::{self, BufRead, IsTerminal as _, Write as _},
     os::unix::fs::{FileTypeExt as _, PermissionsExt as _},
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -28,10 +29,82 @@ use oshioki_protocol::{
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{info, warn};
 
 const PAIR_TIMEOUT: Duration = Duration::from_secs(300);
+/// Maximum number of request handlers, across both transports, that may be
+/// waiting on a prompt or doing request work at once. Admission is
+/// nonblocking: a flood is discarded instead of queued behind Touch ID.
+const MAX_IN_FLIGHT_REQUESTS: usize = 8;
+/// Keep accepted request IDs for at least the complete protocol validity
+/// window, while bounding memory if a publisher sends many unique IDs.
+const MAX_SEEN_REQUEST_IDS: usize = 1024;
+const SEEN_REQUEST_RETENTION: Duration = Duration::from_secs(
+    (oshioki_protocol::MAX_REQUEST_LIFETIME_SECS + oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS)
+        as u64,
+);
+/// A connected socket peer must deliver its complete frame promptly; without
+/// this bound an idle local connection could occupy one work slot forever.
+const SOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shared request admission for NATS and the local socket. The semaphore
+/// bounds task and prompt work; the recent-ID set prevents one request from
+/// being presented twice while its first decision is in flight or shortly
+/// after it completes.
+#[derive(Clone)]
+struct RequestAdmission {
+    permits: Arc<Semaphore>,
+    request_ids: Arc<StdMutex<HashMap<String, Instant>>>,
+}
+
+struct RequestPermit {
+    _permit: OwnedSemaphorePermit,
+    request_ids: Arc<StdMutex<HashMap<String, Instant>>>,
+}
+
+impl RequestAdmission {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
+            request_ids: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    fn reserve(&self) -> Option<RequestPermit> {
+        Some(RequestPermit {
+            _permit: Arc::clone(&self.permits).try_acquire_owned().ok()?,
+            request_ids: Arc::clone(&self.request_ids),
+        })
+    }
+}
+
+impl RequestPermit {
+    /// Claims an ID after the envelope is decoded. A duplicate releases its
+    /// permit when this lease is dropped and never reaches request opening or
+    /// a prompt. IDs remain remembered for the protocol validity window, so a
+    /// sequential replay cannot raise another prompt after the first ends.
+    fn claim(&self, request_id: &str) -> bool {
+        let Ok(mut request_ids) = self.request_ids.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        request_ids.retain(|_, seen_at| now.duration_since(*seen_at) < SEEN_REQUEST_RETENTION);
+        if request_ids.contains_key(request_id) {
+            return false;
+        }
+        if request_ids.len() >= MAX_SEEN_REQUEST_IDS
+            && let Some(oldest) = request_ids
+                .iter()
+                .min_by_key(|(_, seen_at)| **seen_at)
+                .map(|(request_id, _)| request_id.clone())
+        {
+            request_ids.remove(&oldest);
+        }
+        request_ids.insert(request_id.to_owned(), now);
+        true
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "oshioki-agent", version, about)]
@@ -414,10 +487,12 @@ async fn cmd_run(
         Decider::Prompt(prompter)
     };
     let decider = Arc::new(decider);
+    let admission = Arc::new(RequestAdmission::new());
     tokio::spawn(serve_socket(
         socket,
         Arc::clone(&identity),
         Arc::clone(&decider),
+        Arc::clone(&admission),
     ));
     loop {
         let message = tokio::select! {
@@ -432,50 +507,82 @@ async fn cmd_run(
                 }
             } => message.context("request stream closed")?,
         };
-        let envelope: RequestEnvelopeV1 = match serde_json::from_slice(&message.payload) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                warn!(error = %escape_for_terminal(&error.to_string()), "ignoring malformed request");
-                continue;
-            }
-        };
-        let opened = match identity.open_request(&envelope) {
-            Ok(Some(opened)) => opened,
-            Ok(None) => continue,
-            Err(error) => {
-                warn!(
-                    request_id = %escape_for_terminal(&envelope.request_id),
-                    error = %escape_for_terminal(&error.to_string()),
-                    "ignoring request"
-                );
-                continue;
-            }
-        };
-        let identity = Arc::clone(&identity);
-        let nats = requests.as_ref().map(|(nats, _)| nats.clone());
-        let decider = Arc::clone(&decider);
-        tokio::spawn(async move {
-            let verdict = decide(&identity, &decider, &opened).await;
-            let result = match verdict {
-                Ok(Some(decision)) => {
-                    if let Some(nats) = nats {
-                        publish(&nats, &opened.request, decision).await
-                    } else {
-                        Ok(())
-                    }
-                }
-                Ok(None) => Ok(()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                warn!(
-                    request_id = %escape_for_terminal(&opened.request.request_id),
-                    error = %escape_for_terminal(&error.to_string()),
-                    "decision failed"
-                );
-            }
-        });
+        dispatch_nats_request(
+            &message.payload,
+            &identity,
+            &decider,
+            requests.as_ref().map(|(nats, _)| nats.clone()),
+            &admission,
+        );
     }
+}
+
+/// Decodes and admits one NATS delivery. Admission happens before opening the
+/// sealed body, so capacity drops do not spend crypto work or create tasks.
+fn dispatch_nats_request(
+    payload: &[u8],
+    identity: &Arc<Identity>,
+    decider: &Arc<Decider>,
+    nats: Option<async_nats::Client>,
+    admission: &RequestAdmission,
+) {
+    let envelope: RequestEnvelopeV1 = match serde_json::from_slice(payload) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            warn!(
+                error = %escape_for_terminal(&error.to_string()),
+                "ignoring malformed request"
+            );
+            return;
+        }
+    };
+    let Some(permit) = admission.reserve() else {
+        warn!("discarding request while agent work is at capacity");
+        return;
+    };
+    let opened = match identity.open_request(&envelope) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(
+                request_id = %escape_for_terminal(&envelope.request_id),
+                error = %escape_for_terminal(&error.to_string()),
+                "ignoring request"
+            );
+            return;
+        }
+    };
+    if !permit.claim(&envelope.request_id) {
+        warn!(
+            request_id = %escape_for_terminal(&envelope.request_id),
+            "discarding duplicate request"
+        );
+        return;
+    }
+    let identity = Arc::clone(identity);
+    let decider = Arc::clone(decider);
+    tokio::spawn(async move {
+        let _permit = permit;
+        let verdict = decide(&identity, &decider, &opened).await;
+        let result = match verdict {
+            Ok(Some(decision)) => {
+                if let Some(nats) = nats {
+                    publish(&nats, &opened.request, decision).await
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            warn!(
+                request_id = %escape_for_terminal(&opened.request.request_id),
+                error = %escape_for_terminal(&error.to_string()),
+                "decision failed"
+            );
+        }
+    });
 }
 
 /// Connect NATS and subscribe to requests, or return `None` when the network
@@ -713,6 +820,7 @@ async fn serve_socket(
     listener: tokio::net::UnixListener,
     identity: Arc<Identity>,
     decider: Arc<Decider>,
+    admission: Arc<RequestAdmission>,
 ) {
     loop {
         let (stream, _) = match listener.accept().await {
@@ -726,10 +834,14 @@ async fn serve_socket(
                 continue;
             }
         };
+        let Some(permit) = admission.reserve() else {
+            warn!("discarding socket request while agent work is at capacity");
+            continue;
+        };
         let identity = Arc::clone(&identity);
         let decider = Arc::clone(&decider);
         tokio::spawn(async move {
-            if let Err(error) = handle_socket(stream, &identity, &decider).await {
+            if let Err(error) = handle_socket(stream, &identity, &decider, permit).await {
                 warn!(
                     error = %escape_for_terminal(&error.to_string()),
                     "socket request failed"
@@ -746,9 +858,13 @@ async fn handle_socket(
     stream: tokio::net::UnixStream,
     identity: &Arc<Identity>,
     decider: &Decider,
+    permit: RequestPermit,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
-    let Some(bytes) = read_frame(&mut reader).await? else {
+    let Some(bytes) = tokio::time::timeout(SOCKET_FRAME_TIMEOUT, read_frame(&mut reader))
+        .await
+        .context("socket frame timed out")??
+    else {
         return Ok(());
     };
     let envelope: RequestEnvelopeV1 =
@@ -765,6 +881,13 @@ async fn handle_socket(
             return Ok(());
         }
     };
+    if !permit.claim(&envelope.request_id) {
+        warn!(
+            request_id = %escape_for_terminal(&envelope.request_id),
+            "discarding duplicate socket request"
+        );
+        return Ok(());
+    }
     let Some(decision) = decide(identity, decider, &opened).await? else {
         return Ok(());
     };
@@ -1294,10 +1417,10 @@ function run(argv) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Decider, MAX_APPROVAL_REASON_CHARS, Pairing, Prompter, Verb, approval_reason,
-        approval_reason_for_raw, bind_socket, decide, format_env, full_review_document,
-        load_or_create_with, now, prompt_output, quote_argv, request_digest, runas_label,
-        socket_path,
+        Cli, Decider, MAX_APPROVAL_REASON_CHARS, MAX_IN_FLIGHT_REQUESTS, Pairing, Prompter,
+        RequestAdmission, Verb, approval_reason, approval_reason_for_raw, bind_socket, decide,
+        dispatch_nats_request, format_env, full_review_document, load_or_create_with, now,
+        prompt_output, quote_argv, request_digest, runas_label, socket_path,
     };
     use clap::Parser as _;
     use oshioki_agent::SignerKind;
@@ -1307,6 +1430,106 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn request_admission_is_bounded_and_deduplicates_ids() {
+        let admission = RequestAdmission::new();
+        let mut leases = Vec::new();
+        for index in 0..MAX_IN_FLIGHT_REQUESTS {
+            let lease = admission.reserve().expect("capacity should be available");
+            assert!(lease.claim(&format!("request-{index}")));
+            leases.push(lease);
+        }
+        assert!(admission.reserve().is_none());
+
+        drop(leases.pop());
+        let duplicate = admission.reserve().expect("one slot was released");
+        assert!(!duplicate.claim("request-0"));
+        drop(duplicate);
+        let replacement = admission.reserve().expect("duplicate released its slot");
+        assert!(replacement.claim("replacement"));
+    }
+
+    #[tokio::test]
+    async fn encrypted_request_flood_never_admits_more_than_the_fixed_capacity() {
+        let dir = socket_test_dir("flood");
+        let identity = std::sync::Arc::new(
+            oshioki_agent::Identity::generate_to(
+                &dir.join("agent.json"),
+                oshioki_agent::SignerKind::Software,
+            )
+            .unwrap(),
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        let decider = std::sync::Arc::new(Decider::Prompt(Prompter::new(receiver)));
+        let admission = std::sync::Arc::new(RequestAdmission::new());
+        for index in 0..(MAX_IN_FLIGHT_REQUESTS * 4) {
+            let mut request = request_for_log_probe();
+            request.request_id = format!("encrypted-flood-{index}");
+            request.issued_at = now();
+            request.expires_at = request.issued_at + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS;
+            let payload = sealed_envelope_bytes(&identity, &request);
+            dispatch_nats_request(&payload, &identity, &decider, None, &admission);
+        }
+        assert_eq!(
+            admission.request_ids.lock().unwrap().len(),
+            MAX_IN_FLIGHT_REQUESTS
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_and_foreign_envelopes_do_not_poison_request_id_dedupe() {
+        let dir = socket_test_dir("dedupe");
+        let identity = std::sync::Arc::new(
+            oshioki_agent::Identity::generate_to(
+                &dir.join("agent.json"),
+                oshioki_agent::SignerKind::Software,
+            )
+            .unwrap(),
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        let decider = std::sync::Arc::new(Decider::Prompt(Prompter::new(receiver)));
+        let admission = std::sync::Arc::new(RequestAdmission::new());
+        let mut request = request_for_log_probe();
+        request.request_id = "claim-after-rejection".into();
+        request.issued_at = now();
+        request.expires_at = request.issued_at + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS;
+
+        let mut invalid: RequestEnvelopeV1 =
+            serde_json::from_slice(&sealed_envelope_bytes(&identity, &request)).unwrap();
+        invalid.issued_at = now() + oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS + 1;
+        invalid.expires_at = invalid.issued_at + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS;
+        dispatch_nats_request(
+            &serde_json::to_vec(&invalid).unwrap(),
+            &identity,
+            &decider,
+            None,
+            &admission,
+        );
+        assert!(admission.request_ids.lock().unwrap().is_empty());
+
+        let foreign =
+            oshioki_agent::Identity::from_material([0x44; 32], [0x55; 32], [0x66; 32]).unwrap();
+        dispatch_nats_request(
+            &sealed_envelope_bytes(&foreign, &request),
+            &identity,
+            &decider,
+            None,
+            &admission,
+        );
+        assert!(admission.request_ids.lock().unwrap().is_empty());
+
+        dispatch_nats_request(
+            &sealed_envelope_bytes(&identity, &request),
+            &identity,
+            &decider,
+            None,
+            &admission,
+        );
+        assert_eq!(admission.request_ids.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn request_for_reason() -> RequestV1 {
         RequestV1 {
@@ -1765,7 +1988,13 @@ mod tests {
         let (mut hook_side, agent_side) = tokio::net::UnixStream::pair().unwrap();
         let serve = tokio::spawn(async move {
             let decider = super::Decider::Auto(approve);
-            super::handle_socket(agent_side, &identity, &decider).await
+            super::handle_socket(
+                agent_side,
+                &identity,
+                &decider,
+                super::RequestAdmission::new().reserve().unwrap(),
+            )
+            .await
         });
         let frame = oshioki_protocol::socket_v1::encode_frame(envelope).unwrap();
         hook_side.write_all(&frame).await.unwrap();
@@ -2082,9 +2311,14 @@ mod tests {
         hook_side.write_all(&frame).await.unwrap();
         let (prompter, _sender) = canned_prompter("y");
         let decider = Decider::Prompt(prompter);
-        super::handle_socket(agent_side, &identity, &decider)
-            .await
-            .unwrap();
+        super::handle_socket(
+            agent_side,
+            &identity,
+            &decider,
+            RequestAdmission::new().reserve().unwrap(),
+        )
+        .await
+        .unwrap();
         let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
         hook_side.read_exact(&mut prefix).await.unwrap();
         let len = usize::try_from(u32::from_be_bytes(prefix)).unwrap();

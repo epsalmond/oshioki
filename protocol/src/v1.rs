@@ -20,6 +20,13 @@ pub const VERSION_V1: u8 = 1;
 pub const MAX_DEVICES: usize = 8;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 3 * 1024 * 1024;
+/// The longest a request may be valid after it was issued. This is a
+/// receiver policy rather than part of structural decoding, so old callers
+/// that only need to inspect a request can keep using [`RequestV1::validate`].
+pub const MAX_REQUEST_LIFETIME_SECS: i64 = 90;
+/// The amount of clock skew receivers tolerate around their own wall clock
+/// when checking a request's issuance time.
+pub const MAX_REQUEST_ISSUANCE_SKEW_SECS: i64 = 30;
 const CHALLENGE_DOMAIN: &[u8] = b"oshioki/approve/v1\0";
 const DENY_DOMAIN: &[u8] = b"oshioki/deny/v1\0";
 const FINGERPRINT_DOMAIN: &[u8] = b"oshioki/fingerprint/v1\0";
@@ -139,6 +146,14 @@ impl RequestV1 {
         Ok(())
     }
 
+    /// Validates the request's timestamps against a receiver-local clock.
+    /// Structural validation intentionally remains separate: timestamps are
+    /// meaningful only at a trust boundary that has a current clock.
+    pub fn validate_at(&self, now: i64) -> Result<(), Error> {
+        self.validate()?;
+        validate_request_timing(self.issued_at, self.expires_at, now)
+    }
+
     pub fn raw_json(&self) -> Result<Vec<u8>, Error> {
         self.validate()?;
         let raw = serde_json::to_vec(self).map_err(|e| Error::InvalidRequest(e.to_string()))?;
@@ -197,6 +212,36 @@ impl RequestEnvelopeV1 {
         }
         Ok(())
     }
+
+    /// Validates the envelope's timestamps against a receiver-local clock.
+    /// The opened request is checked independently by the agent because the
+    /// envelope timestamps are not authenticated until its sealed body opens.
+    pub fn validate_at(&self, now: i64) -> Result<(), Error> {
+        self.validate()?;
+        validate_request_timing(self.issued_at, self.expires_at, now)
+    }
+}
+
+fn validate_request_timing(issued_at: i64, expires_at: i64, now: i64) -> Result<(), Error> {
+    let oldest_issued_at = now.saturating_sub(MAX_REQUEST_ISSUANCE_SKEW_SECS);
+    let newest_issued_at = now.saturating_add(MAX_REQUEST_ISSUANCE_SKEW_SECS);
+    if issued_at < oldest_issued_at || issued_at > newest_issued_at {
+        return Err(Error::InvalidRequest(
+            "request issuance time is outside clock skew".into(),
+        ));
+    }
+    if expires_at <= now {
+        return Err(Error::InvalidRequest("request has expired".into()));
+    }
+    let lifetime = expires_at
+        .checked_sub(issued_at)
+        .ok_or_else(|| Error::InvalidRequest("invalid request lifetime".into()))?;
+    if lifetime > MAX_REQUEST_LIFETIME_SECS {
+        return Err(Error::InvalidRequest(
+            "request lifetime exceeds maximum".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// How a device proves an approval.
@@ -844,6 +889,31 @@ mod tests {
             issued_at: 1_000,
             expires_at: 1_090,
         }
+    }
+
+    #[test]
+    fn receiver_timing_is_bounded_without_changing_structural_validation() {
+        let now = 1_000;
+        let mut request = minimal_request();
+        request.issued_at = now;
+        request.expires_at = now + MAX_REQUEST_LIFETIME_SECS;
+        request.validate().unwrap();
+        request.validate_at(now).unwrap();
+
+        request.expires_at += 1;
+        request.validate().unwrap();
+        assert!(request.validate_at(now).is_err());
+
+        request.expires_at = now + 90;
+        request.issued_at = now + MAX_REQUEST_ISSUANCE_SKEW_SECS + 1;
+        assert!(request.validate_at(now).is_err());
+
+        request.issued_at = now - MAX_REQUEST_ISSUANCE_SKEW_SECS - 1;
+        assert!(request.validate_at(now).is_err());
+
+        request.issued_at = now - 1;
+        request.expires_at = now;
+        assert!(request.validate_at(now).is_err());
     }
 
     /// The classification identifies behavior-shaping variables for display
