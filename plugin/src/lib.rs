@@ -21,6 +21,8 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::panic::catch_unwind;
 use std::sync::Mutex;
 
+use oshioki_protocol::PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION;
+
 // ---------------------------------------------------------------------------
 // Sudo plugin ABI constants (from /usr/include/sudo_plugin.h)
 // ---------------------------------------------------------------------------
@@ -318,8 +320,15 @@ unsafe fn gather_context(
         push_kv(&mut payload, "env.", k, v);
     }
     // These markers are part of the private plugin-to-hook framing, not the
-    // v1 request wire format. A new hook requires them so an old plugin cannot
-    // silently reintroduce the partial-environment behavior.
+    // v1 request wire format. Both sides require the version and environment
+    // attestation so an artifact mix cannot silently reintroduce partial
+    // environment behavior.
+    push_kv(
+        &mut payload,
+        "meta.",
+        "protocol_version",
+        &PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION.to_string(),
+    );
     push_kv(&mut payload, "meta.", "env_complete", "1");
     push_kv(&mut payload, "meta.", "env_count", &envp.len().to_string());
 
@@ -437,7 +446,8 @@ fn push_kv(buf: &mut Vec<u8>, prefix: &str, key: &str, value: &str) {
 const HOOK_PATH: &str = "/usr/local/sbin/oshioki";
 
 /// Argument vector passed to the hook.
-const HOOK_ARGV: &[&str] = &["oshioki", "check"];
+const HOOK_PROTOCOL_ARG: &str = "--plugin-protocol-version=2";
+const HOOK_ARGV: &[&str] = &["oshioki", "check", HOOK_PROTOCOL_ARG];
 
 /// Fork the hook, pipe `ctx` to its stdin, wait for it, and map the exit
 /// status to the sudo approval contract.
@@ -493,7 +503,8 @@ fn spawn_and_wait(ctx: &SudoContext) -> Option<c_int> {
             let path = CString::new(HOOK_PATH).expect("hook path contains no NUL");
             let arg0 = CString::new(HOOK_ARGV[0]).expect("argv[0] contains no NUL");
             let arg1 = CString::new(HOOK_ARGV[1]).expect("argv[1] contains no NUL");
-            let hook_args: [&CStr; 2] = [arg0.as_c_str(), arg1.as_c_str()];
+            let arg2 = CString::new(HOOK_ARGV[2]).expect("argv[2] contains no NUL");
+            let hook_args: [&CStr; 3] = [arg0.as_c_str(), arg1.as_c_str(), arg2.as_c_str()];
 
             let _ = execvp(path.as_c_str(), &hook_args);
             // If execvp returns, it failed. Exit with a distinctive code the
@@ -629,6 +640,12 @@ mod tests {
     }
 
     #[test]
+    fn hook_invocation_carries_the_private_protocol_handshake() {
+        assert_eq!(HOOK_ARGV, &["oshioki", "check", HOOK_PROTOCOL_ARG]);
+        assert_eq!(HOOK_PROTOCOL_ARG, "--plugin-protocol-version=2");
+    }
+
+    #[test]
     fn open_identity_is_captured_for_exactly_one_check() {
         let _serial = identity_test();
         assert!(capture_test_identity(&[
@@ -720,6 +737,7 @@ mod tests {
                 "argv.2=hello\n",
                 "argv.3=world with spaces\n",
                 "argv.4=-n\n",
+                "meta.protocol_version=2\n",
                 "meta.env_complete=1\n",
                 "meta.env_count=0\n",
             )
@@ -751,6 +769,7 @@ mod tests {
         assert!(payload.contains("env.PERL5OPT=-M/tmp/attacker\n"));
         assert!(payload.contains("env.APP_MODE=unsafe\n"));
         assert!(payload.contains("env.HOME=/root\n"));
+        assert!(payload.contains("meta.protocol_version=2\n"));
         assert!(payload.contains("meta.env_complete=1\n"));
         assert!(payload.contains("meta.env_count=6\n"));
     }

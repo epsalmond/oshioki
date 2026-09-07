@@ -1192,10 +1192,10 @@ mod mac {
         fs::{self, OpenOptions},
         io::Write as _,
         os::unix::fs::OpenOptionsExt as _,
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use anyhow::{Context as _, Result, bail};
@@ -1208,6 +1208,15 @@ mod mac {
     use tracing::{error, info};
 
     use super::{approval_reason_for_raw, full_review_document, now};
+    use oshioki_agent::remaining_until;
+
+    /// The result of the review helper, before Touch ID is attempted.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ReviewOutcome {
+        Approved,
+        Canceled,
+        Expired,
+    }
 
     /// The request is shown in a transient, read-only `AppKit` view rather than
     /// in `LocalAuthentication`'s one-line reason. The JXA is constant and the
@@ -1288,20 +1297,41 @@ function run(argv) {
         opened: &OpenedRequest,
     ) -> Result<Option<DecisionV1>> {
         let request = &opened.request;
+        // The permit covers both the review window and the subsequent Touch
+        // ID sheet. A second native request fails closed immediately instead
+        // of stacking a review dialog and consuming an admission slot.
+        let Some(permit) = prompt.try_acquire() else {
+            info!(
+                request_id = %escape_for_terminal(&request.request_id),
+                "another native approval is already under review"
+            );
+            return Ok(None);
+        };
         // LocalAuthentication can truncate localized reasons, so the full
         // signed bytes must be inspected in the companion first. A launchd
         // agent has no terminal; failure to reach the GUI is therefore a
         // deliberate fail-closed result.
         let document = full_review_document(request, &opened.raw);
-        let reviewed = tokio::task::spawn_blocking(move || show_review(&document))
+        let expires_at = request.expires_at;
+        let reviewed = tokio::task::spawn_blocking(move || show_review(&document, expires_at))
             .await
             .context("the approval review thread panicked")??;
-        if !reviewed {
-            info!(
-                request_id = %escape_for_terminal(&request.request_id),
-                "approval review was canceled"
-            );
-            return Ok(None);
+        match reviewed {
+            ReviewOutcome::Approved => {}
+            ReviewOutcome::Canceled => {
+                info!(
+                    request_id = %escape_for_terminal(&request.request_id),
+                    "approval review was canceled"
+                );
+                return Ok(None);
+            }
+            ReviewOutcome::Expired => {
+                info!(
+                    request_id = %escape_for_terminal(&request.request_id),
+                    "request expired during approval review"
+                );
+                return Ok(None);
+            }
         }
         if request.expires_at <= now() {
             info!(
@@ -1320,7 +1350,7 @@ function run(argv) {
             move || identity.approve(&opened, &reason).map_err(classify)
         };
         match prompt
-            .ask(&request.request_id, request.expires_at, sign)
+            .ask_with_permit(permit, &request.request_id, request.expires_at, sign)
             .await
         {
             Ok(Outcome::Approved(decision)) => Ok(Some(decision)),
@@ -1354,9 +1384,29 @@ function run(argv) {
     /// for the operator to explicitly continue. The file is owner-only and
     /// is unlinked on every path; if either display or cleanup fails, approval
     /// is refused rather than leaving secrets behind or signing blindly.
-    fn show_review(document: &str) -> Result<bool> {
-        let (path, file) = create_review_file()?;
-        let display_result = (|| -> Result<bool> {
+    fn show_review(document: &str, expires_at: i64) -> Result<ReviewOutcome> {
+        let Some(remaining) = remaining_until(expires_at) else {
+            return Ok(ReviewOutcome::Expired);
+        };
+        show_review_with_deadline(
+            document,
+            Instant::now() + remaining,
+            Path::new("/usr/bin/osascript"),
+            &std::env::temp_dir(),
+        )
+    }
+
+    /// Runs a review helper while retaining a hard deadline. Killing the
+    /// child is required because aborting the blocking task would leave an
+    /// interactive osascript process and its dialog behind.
+    fn show_review_with_deadline(
+        document: &str,
+        deadline: Instant,
+        helper: &Path,
+        temp_dir: &Path,
+    ) -> Result<ReviewOutcome> {
+        let (path, file) = create_review_file_in(temp_dir)?;
+        let display_result = (|| -> Result<ReviewOutcome> {
             let mut file = file;
             file.write_all(document.as_bytes())?;
             file.sync_all()?;
@@ -1364,15 +1414,31 @@ function run(argv) {
             let path_string = path
                 .to_str()
                 .context("approval review path is not valid UTF-8")?;
-            let status = Command::new("/usr/bin/osascript")
+            let mut child = Command::new(helper)
                 .env_clear()
                 .args(["-l", "JavaScript", "-e", REVIEW_SCRIPT, path_string])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
+                .spawn()
                 .context("launch the approval review")?;
-            Ok(status.success())
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(if status.success() {
+                        ReviewOutcome::Approved
+                    } else {
+                        ReviewOutcome::Canceled
+                    });
+                }
+                if Instant::now() >= deadline {
+                    child
+                        .kill()
+                        .context("terminate the expired approval review")?;
+                    child.wait().context("reap the expired approval review")?;
+                    return Ok(ReviewOutcome::Expired);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         })();
         let cleanup_result = fs::remove_file(&path)
             .map_err(|error| anyhow::anyhow!("remove the temporary approval review: {error}"));
@@ -1380,13 +1446,13 @@ function run(argv) {
         display_result
     }
 
-    fn create_review_file() -> Result<(PathBuf, fs::File)> {
+    fn create_review_file_in(temp_dir: &Path) -> Result<(PathBuf, fs::File)> {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         for attempt in 0..100u8 {
-            let path = std::env::temp_dir().join(format!(
+            let path = temp_dir.join(format!(
                 "oshioki-review-{}-{stamp}-{attempt}.txt",
                 std::process::id()
             ));
@@ -1410,6 +1476,148 @@ function run(argv) {
             AttemptError::Canceled
         } else {
             AttemptError::Failed(error)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt as _,
+            path::{Path, PathBuf},
+            time::{Duration, Instant},
+        };
+
+        use super::{REVIEW_SCRIPT, ReviewOutcome, show_review_with_deadline};
+
+        fn test_dir(name: &str) -> PathBuf {
+            let path = std::env::temp_dir()
+                .join(format!("oshioki-review-test-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        fn helper(dir: &Path, name: &str, body: &str) -> PathBuf {
+            let path = dir.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions).unwrap();
+            path
+        }
+
+        fn review_files(dir: &Path) -> Vec<PathBuf> {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("oshioki-review-"))
+                })
+                .collect()
+        }
+
+        /// The real helper receives the review path as its final argument.
+        /// These non-interactive helpers inspect that file before returning,
+        /// which exercises its permissions, contents, and cleanup on each
+        /// exit-status path.
+        #[test]
+        fn review_file_lifecycle_is_fail_closed_and_owner_only() {
+            let dir = test_dir("lifecycle");
+            let ok = helper(
+                &dir,
+                "approve.sh",
+                "path=\"$5\"; cat \"$path\" > \"$path.capture\"; stat -f %Lp \"$path\" > \"$path.mode\"; exit 0",
+            );
+            let document = "signed request with a complete environment";
+            assert_eq!(
+                show_review_with_deadline(
+                    document,
+                    Instant::now() + Duration::from_secs(5),
+                    &ok,
+                    &dir,
+                )
+                .unwrap(),
+                ReviewOutcome::Approved
+            );
+            let capture = review_files(&dir)
+                .into_iter()
+                .find(|path| path.extension().is_some_and(|ext| ext == "capture"))
+                .unwrap();
+            assert_eq!(fs::read_to_string(&capture).unwrap(), document);
+            let mode = capture.with_extension("mode");
+            assert_eq!(fs::read_to_string(mode).unwrap().trim(), "600");
+            assert!(review_files(&dir).iter().all(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "capture" || extension == "mode")
+            }));
+
+            let cancel = helper(
+                &dir,
+                "cancel.sh",
+                "path=\"$5\"; cat \"$path\" > \"$path.capture\"; stat -f %Lp \"$path\" > \"$path.mode\"; exit 1",
+            );
+            assert_eq!(
+                show_review_with_deadline(
+                    document,
+                    Instant::now() + Duration::from_secs(5),
+                    &cancel,
+                    &dir,
+                )
+                .unwrap(),
+                ReviewOutcome::Canceled
+            );
+            assert!(review_files(&dir).iter().all(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "capture" || extension == "mode")
+            }));
+
+            let missing = dir.join("missing-helper");
+            assert!(
+                show_review_with_deadline(
+                    document,
+                    Instant::now() + Duration::from_secs(5),
+                    &missing,
+                    &dir,
+                )
+                .is_err()
+            );
+            assert!(review_files(&dir).iter().all(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "capture" || extension == "mode")
+            }));
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn review_expiry_kills_the_helper_before_cleanup() {
+            let dir = test_dir("expiry");
+            let started = dir.join("helper.started");
+            let helper = helper(
+                &dir,
+                "hang.sh",
+                &format!(": > '{}'; exec /bin/sleep 60", started.display()),
+            );
+            let outcome = show_review_with_deadline(
+                "expiring request",
+                Instant::now() + Duration::from_secs(1),
+                &helper,
+                &dir,
+            )
+            .unwrap();
+            assert_eq!(outcome, ReviewOutcome::Expired);
+            assert!(started.exists());
+            assert!(review_files(&dir).is_empty());
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn jxa_buttons_map_cancel_to_non_continue_and_continue_to_1001() {
+            assert!(REVIEW_SCRIPT.contains("alert.addButtonWithTitle('Cancel');"));
+            assert!(REVIEW_SCRIPT.contains("alert.addButtonWithTitle('Continue to Touch ID');"));
+            assert!(REVIEW_SCRIPT.contains("if (response != 1001)"));
         }
     }
 }

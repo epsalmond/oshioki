@@ -205,28 +205,37 @@ dropin_ok() {
 }
 backup=""; dropin_backup=""
 dropin_original_present=0
+rollback_armed=0
 # The enable/disable windows rewrite sudo.conf before sudo -V proves the
 # result, and the drop-in install between them can still fail (visudo
 # refusal, invalid user). Every failure path restores both files so the
 # managed block and the drop-in never outlive each other; the EXIT trap is
 # the backstop for die and set -e exits inside the window.
 restore_sudo_backups() {
-  [ -n "$backup" ] && [ -f "$backup" ] || return 0
-  cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"
+  [ "$rollback_armed" -eq 1 ] || return 0
+  if [ -n "$backup" ] && [ -f "$backup" ]; then
+    cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"
+  fi
   # rm first: the drop-in is 0440, so overwriting it in place fails.
   if [ -n "$dropin_backup" ] && [ -f "$dropin_backup" ]; then
     rm -f "$SUDOERS_FILE"; cp -p "$dropin_backup" "$SUDOERS_FILE"; rm -f "$dropin_backup"
+    # Keep repeated EXIT-trap cleanup idempotent: a second pass must not
+    # mistake this restored file for a newly-created drop-in.
+    dropin_original_present=1
   elif [ "$dropin_original_present" -eq 0 ] && owned_sudoers_dropin_user >/dev/null 2>&1; then
     rm -f "$SUDOERS_FILE"
   fi
-  backup=""; dropin_backup=""; dropin_original_present=0
+  backup=""; dropin_backup=""; rollback_armed=0
 }
 drop_sudo_backups() {
   [ -z "$backup" ] || rm -f "$backup"
   [ -z "$dropin_backup" ] || rm -f "$dropin_backup"
-  backup=""; dropin_backup=""; dropin_original_present=0
+  backup=""; dropin_backup=""; dropin_original_present=0; rollback_armed=0
 }
 capture_dropin_backup() {
+  # Arm rollback before any managed sudo state is changed. The EXIT trap is
+  # intentionally inert after drop_sudo_backups disarms a successful window.
+  rollback_armed=1
   dropin_backup=""
   if [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ]; then
     dropin_original_present=1
@@ -237,6 +246,54 @@ capture_dropin_backup() {
   else
     dropin_original_present=0
   fi
+}
+
+# Before replacing an installed hook or plugin, take the managed sudo
+# authorization out of service and prove ordinary sudo still parses the
+# resulting configuration. This ordering is important on an interrupted
+# upgrade: a half-installed pair must leave sudo using its normal policy, not
+# a plugin whose companion may have a different private protocol.
+has_managed_state() {
+  { [ -f "$SUDO_CONF" ] && {
+      grep -Fq "$BEGIN_MARK" "$SUDO_CONF" ||
+      grep -Fq "$END_MARK" "$SUDO_CONF" ||
+      has_our_plugin;
+    }; } ||
+    [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ];
+}
+
+prepare_upgrade() {
+  has_managed_state || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then
+    [ -f "$SUDO_CONF" ] && {
+      grep -Fq "$BEGIN_MARK" "$SUDO_CONF" ||
+      grep -Fq "$END_MARK" "$SUDO_CONF" ||
+      has_our_plugin;
+    } && echo "DRY: remove the managed Oshioki plugin block from $SUDO_CONF"
+    remove_sudoers_dropin
+    validate_sudo
+    return 0
+  fi
+
+  if [ -f "$SUDO_CONF" ]; then
+    backup="$(mktemp "${SUDO_CONF}.upgrade-rollback.XXXXXX")"
+    cp -p "$SUDO_CONF" "$backup"
+    capture_dropin_backup
+    rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
+  else
+    # A drop-in can survive after an administrator removed sudo.conf. Keep its
+    # verified backup while normal sudo is checked, then restore it on error.
+    capture_dropin_backup
+  fi
+  remove_sudoers_dropin
+  if ! validate_sudo; then
+    restore_sudo_backups
+    die "normal sudo validation failed before replacing the hook and plugin"
+  fi
+  # The disabled state is intentional from this point through both artifact
+  # installs. An EXIT trap must not restore the old authorization after a
+  # partial copy.
+  drop_sudo_backups
 }
 
 # True when the hook would refuse NATS_URL as plaintext past loopback. The
@@ -529,6 +586,7 @@ for artifact in "$HOOK_BIN" "$PLUGIN_BIN"; do
   [ "$(hash_file "$artifact")" = "$expected" ] || die "checksum mismatch for $name"
 done
 
+prepare_upgrade
 
 run install -d -m 0755 "$SBIN_DIR" "$PLUGIN_DIR"
 run install -m 0755 -o root -g "$ROOT_GROUP" "$HOOK_BIN" "$SBIN_DIR/oshioki"

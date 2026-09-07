@@ -23,10 +23,10 @@ use uuid::Uuid;
 
 use oshioki_protocol::{
     ActivationV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
-    EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1, RequestEnvelopeV1,
-    RequestV1, VERSION_V1, escape_for_terminal, verify_approval_v1, verify_deny_v1,
-    verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
-    verify_software_native_enrollment_v1,
+    EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1,
+    PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION, RequestEnvelopeV1, RequestV1, VERSION_V1,
+    escape_for_terminal, verify_approval_v1, verify_deny_v1, verify_enrollment_v1,
+    verify_native_approval_v1, verify_native_enrollment_v1, verify_software_native_enrollment_v1,
 };
 use oshioki_transport::{HookTransport, NatsTransport};
 
@@ -49,7 +49,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Verb {
-    Check,
+    Check {
+        /// Required private handshake from the matching root-owned plugin.
+        /// Hidden from normal operator help; a missing or mismatched value
+        /// fails closed before any request bytes are accepted.
+        #[arg(long, hide = true)]
+        plugin_protocol_version: Option<u8>,
+    },
     Enroll {
         #[arg(long, allow_hyphen_values = true)]
         resume: Option<String>,
@@ -85,10 +91,12 @@ struct EnrollmentStateV1 {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let checking = matches!(cli.verb, Verb::Check);
+    let checking = matches!(cli.verb, Verb::Check { .. });
     logging::init(checking);
     let result = match cli.verb {
-        Verb::Check => cmd_check().await,
+        Verb::Check {
+            plugin_protocol_version,
+        } => cmd_check(plugin_protocol_version).await,
         Verb::Enroll { resume } => cmd_enroll(resume.as_deref()).await,
         Verb::Revoke { fingerprint } => cmd_revoke(&fingerprint).await,
         Verb::Pin { fingerprint } => cmd_pin(&fingerprint).await,
@@ -535,7 +543,10 @@ mod logging {
     }
 }
 
-async fn cmd_check() -> Result<()> {
+async fn cmd_check(plugin_protocol_version: Option<u8>) -> Result<()> {
+    if plugin_protocol_version != Some(PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION) {
+        bail!("plugin/hook protocol handshake failed");
+    }
     let request = build_request(&parse_sudo_stdin()?)?;
     execute_request_at(request, APPROVAL_TIMEOUT, check_config_dir(), false).await
 }
@@ -1258,6 +1269,12 @@ fn build_request(values: &[(String, String)]) -> Result<RequestV1> {
     if last_value("meta.env_complete") != Some("1") {
         bail!("plugin payload does not attest to a complete environment");
     }
+    let protocol_version = last_value("meta.protocol_version")
+        .and_then(|value| value.parse::<u8>().ok())
+        .context("missing or invalid plugin/hook protocol version")?;
+    if protocol_version != PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION {
+        bail!("unsupported plugin/hook protocol version: {protocol_version}");
+    }
     let expected_env_count = last_value("meta.env_count")
         .and_then(|value| value.parse::<usize>().ok())
         .context("missing or invalid environment count")?;
@@ -1673,6 +1690,10 @@ mod tests {
             ("env.PATH".into(), "/second".into()),
             ("env.LD_PRELOAD".into(), "/tmp/evil.so".into()),
             ("env.HOME".into(), "/root".into()),
+            (
+                "meta.protocol_version".into(),
+                PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION.to_string(),
+            ),
             ("meta.env_complete".into(), "1".into()),
             ("meta.env_count".into(), "7".into()),
         ];
@@ -1716,10 +1737,35 @@ mod tests {
 
         let mut wrong_count = base.clone();
         wrong_count.extend([
+            (
+                "meta.protocol_version".into(),
+                PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION.to_string(),
+            ),
             ("meta.env_complete".into(), "1".into()),
             ("meta.env_count".into(), "2".into()),
         ]);
         assert!(build_request(&wrong_count).is_err());
+    }
+
+    /// An old plugin emits the environment markers without the private
+    /// protocol version, while an explicitly mixed version must also fail
+    /// closed before a request can be sealed.
+    #[test]
+    fn mixed_plugin_versions_fail_closed() {
+        let base = vec![
+            ("info.command".into(), "/usr/bin/true".into()),
+            ("argv.1".into(), "/usr/bin/true".into()),
+            ("env.APP_MODE".into(), "safe".into()),
+            ("meta.env_complete".into(), "1".into()),
+            ("meta.env_count".into(), "1".into()),
+        ];
+        assert!(build_request(&base).is_err(), "old plugin was accepted");
+        let mut mismatched = base;
+        mismatched.push(("meta.protocol_version".into(), "1".into()));
+        assert!(
+            build_request(&mismatched).is_err(),
+            "unsupported plugin version was accepted"
+        );
     }
     #[test]
     fn request_bytes_are_retained_in_every_sealed_body() {

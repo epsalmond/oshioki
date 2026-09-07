@@ -17,9 +17,17 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::{Error, native_v1::sec1_p256_verifying_key, webauthn_v1::cose_p256_verifying_key};
 
 pub const VERSION_V1: u8 = 1;
+/// Private framing version shared only by the root-owned sudo plugin and its
+/// hook child. It is deliberately separate from the public `RequestV1` wire
+/// version so an artifact mix cannot silently accept a partial context.
+pub const PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION: u8 = 2;
 pub const MAX_DEVICES: usize = 8;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 3 * 1024 * 1024;
+/// Maximum number of effective environment entries in one request. Ordinary
+/// shells can expose substantially more than the old 64-entry cap; the total
+/// request byte bound and per-entry bounds remain the limiting factors.
+pub const MAX_ENV_ENTRIES: usize = 4096;
 /// The longest a request may be valid after it was issued. This is a
 /// receiver policy rather than part of structural decoding, so old callers
 /// that only need to inspect a request can keep using [`RequestV1::validate`].
@@ -135,7 +143,7 @@ impl RequestV1 {
             || self.argv.len() > 4096
             || self.pid_chain.len() > 5
             || self.pid_chain.iter().any(|entry| entry.len() > 512)
-            || self.env.len() > 64
+            || self.env.len() > MAX_ENV_ENTRIES
             || self
                 .env
                 .iter()
@@ -979,7 +987,7 @@ mod tests {
                 name: "PATH".into(),
                 value: "/usr/bin".into(),
             };
-            65
+            MAX_ENV_ENTRIES + 1
         ];
         assert!(request.validate().is_err());
         request.env.truncate(1);
@@ -988,6 +996,21 @@ mod tests {
         request.env[0].name = "PATH".into();
         request.env[0].value = "x".repeat(32769);
         assert!(request.validate().is_err());
+    }
+
+    /// A normal process environment can exceed 64 entries. The protocol
+    /// accepts a large entry count while retaining the 256 KiB request cap.
+    #[test]
+    fn ordinary_large_environment_builds_successfully() {
+        let mut request = minimal_request();
+        request.env = (0..65)
+            .map(|index| EnvEntryV1 {
+                name: format!("APP_VAR_{index}"),
+                value: format!("value-{index}"),
+            })
+            .collect();
+        request.validate().unwrap();
+        assert!(!request.raw_json().unwrap().is_empty());
     }
 
     /// The approval signs the raw request bytes, so requests that differ only
