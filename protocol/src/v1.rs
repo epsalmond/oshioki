@@ -200,13 +200,19 @@ impl RequestEnvelopeV1 {
 
 /// How a device proves an approval.
 ///
-/// `webauthn` devices sign `WebAuthn` assertions from a browser. `secure-enclave`
-/// devices sign the challenge directly with a P-256 key (the native agent).
+/// `webauthn` devices sign `WebAuthn` assertions from a browser. Native
+/// devices sign the challenge directly with a P-256 key. `secure-enclave` is
+/// reserved for a key backed by the Mac Secure Enclave; `software` is the
+/// explicitly non-hardware-backed native signer used on Linux and in tests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceKindV1 {
     #[default]
     #[serde(rename = "webauthn")]
     Webauthn,
+    /// A native P-256 key held in software. This kind must never be used to
+    /// grant passwordless sudo: the enrolling account can read the key.
+    #[serde(rename = "software")]
+    Software,
     #[serde(rename = "secure-enclave")]
     SecureEnclave,
 }
@@ -217,6 +223,7 @@ impl DeviceKindV1 {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Webauthn => "webauthn",
+            Self::Software => "software",
             Self::SecureEnclave => "secure-enclave",
         }
     }
@@ -230,9 +237,9 @@ impl std::fmt::Display for DeviceKindV1 {
 
 /// A pinned approval device.
 ///
-/// For `secure-enclave` records `credential_public_key` is the 65-byte SEC1
-/// uncompressed P-256 point, `credential_id` is the SHA-256 of that point,
-/// and `sign_count` is always zero.
+/// For native records (`software` and `secure-enclave`) `credential_public_key`
+/// is the 65-byte SEC1 uncompressed P-256 point, `credential_id` is the
+/// SHA-256 of that point, and `sign_count` is always zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePublicRecordV1 {
     pub version: u8,
@@ -268,15 +275,13 @@ impl DevicePublicRecordV1 {
             DeviceKindV1::Webauthn => {
                 crate::webauthn_v1::cose_p256_verifying_key(&public_key)?;
             }
-            DeviceKindV1::SecureEnclave => {
+            DeviceKindV1::Software | DeviceKindV1::SecureEnclave => {
                 crate::native_v1::sec1_p256_verifying_key(&public_key)?;
                 if decode_base64url(&self.credential_id)?
                     != crate::native_v1::native_credential_id(&public_key)
                     || self.sign_count != 0
                 {
-                    return Err(Error::InvalidRequest(
-                        "invalid secure-enclave device record".into(),
-                    ));
+                    return Err(Error::InvalidRequest("invalid native device record".into()));
                 }
             }
         }
@@ -349,6 +354,11 @@ impl EnrollmentIntentV1 {
 pub enum EnrollmentSubmissionV1 {
     #[serde(rename = "webauthn")]
     Webauthn(WebauthnEnrollmentSubmissionV1),
+    /// Native software identities are carried separately from an enclave
+    /// submission so the host never upgrades a readable key to hardware
+    /// assurance based on a caller-provided label.
+    #[serde(rename = "software")]
+    Software(NativeEnrollmentSubmissionV1),
     #[serde(rename = "secure-enclave")]
     SecureEnclave(NativeEnrollmentSubmissionV1),
 }
@@ -373,6 +383,9 @@ impl<'de> Deserialize<'de> for EnrollmentSubmissionV1 {
             Some(serde_json::Value::String(tag)) if tag == DeviceKindV1::Webauthn.as_str() => {
                 DeviceKindV1::Webauthn
             }
+            Some(serde_json::Value::String(tag)) if tag == DeviceKindV1::Software.as_str() => {
+                DeviceKindV1::Software
+            }
             Some(serde_json::Value::String(tag)) if tag == DeviceKindV1::SecureEnclave.as_str() => {
                 DeviceKindV1::SecureEnclave
             }
@@ -392,6 +405,9 @@ impl<'de> Deserialize<'de> for EnrollmentSubmissionV1 {
             DeviceKindV1::Webauthn => serde_json::from_value(value)
                 .map(Self::Webauthn)
                 .map_err(D::Error::custom),
+            DeviceKindV1::Software => serde_json::from_value(value)
+                .map(Self::Software)
+                .map_err(D::Error::custom),
             DeviceKindV1::SecureEnclave => serde_json::from_value(value)
                 .map(Self::SecureEnclave)
                 .map_err(D::Error::custom),
@@ -403,19 +419,24 @@ impl EnrollmentSubmissionV1 {
     pub fn enrollment_id(&self) -> &str {
         match self {
             Self::Webauthn(submission) => &submission.enrollment_id,
-            Self::SecureEnclave(submission) => &submission.enrollment_id,
+            Self::Software(submission) | Self::SecureEnclave(submission) => {
+                &submission.enrollment_id
+            }
         }
     }
     pub fn kind(&self) -> DeviceKindV1 {
         match self {
             Self::Webauthn(_) => DeviceKindV1::Webauthn,
+            Self::Software(_) => DeviceKindV1::Software,
             Self::SecureEnclave(_) => DeviceKindV1::SecureEnclave,
         }
     }
     pub fn validate_shape(&self) -> Result<(), Error> {
         match self {
             Self::Webauthn(submission) => submission.validate_shape(),
-            Self::SecureEnclave(submission) => submission.validate_shape(),
+            Self::Software(submission) | Self::SecureEnclave(submission) => {
+                submission.validate_shape()
+            }
         }
     }
 }
@@ -640,8 +661,8 @@ pub fn deny_challenge(request_id: &str, device_fingerprint: &str) -> [u8; 32] {
 }
 
 /// Verifies a device-signed denial against its pinned record. The credential
-/// key parses according to the device kind; both `WebAuthn` and Secure Enclave
-/// devices speak DER ECDSA P-256.
+/// key parses according to the device kind; browser and native devices all
+/// ultimately verify a DER ECDSA P-256 signature.
 pub fn verify_deny_v1(denial: &DenyV1, device: &DevicePublicRecordV1) -> Result<(), Error> {
     device.validate()?;
     denial.validate_shape()?;
@@ -658,7 +679,7 @@ pub fn verify_deny_v1(denial: &DenyV1, device: &DevicePublicRecordV1) -> Result<
         DeviceKindV1::Webauthn => {
             cose_p256_verifying_key(&decode_base64url(&device.credential_public_key)?)?
         }
-        DeviceKindV1::SecureEnclave => {
+        DeviceKindV1::Software | DeviceKindV1::SecureEnclave => {
             sec1_p256_verifying_key(&decode_base64url(&device.credential_public_key)?)?
         }
     };
@@ -956,7 +977,11 @@ mod tests {
     /// both depend on the two staying the same string.
     #[test]
     fn kind_renders_as_its_serde_tag() {
-        for kind in [DeviceKindV1::Webauthn, DeviceKindV1::SecureEnclave] {
+        for kind in [
+            DeviceKindV1::Webauthn,
+            DeviceKindV1::Software,
+            DeviceKindV1::SecureEnclave,
+        ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{kind}\""));
             assert_eq!(kind.to_string(), kind.as_str());
         }
@@ -981,6 +1006,10 @@ mod tests {
         let native = r#"{"kind":"secure-enclave","version":1,"enrollment_id":"e1","credential_public_key":"AA","box_public_key":"AQ","api_token_hash":"Ag","label":"mac","proof_signature":"Aw","transcript_hmac":"BA"}"#;
         let native: EnrollmentSubmissionV1 = serde_json::from_str(native).unwrap();
         assert_eq!(native.kind(), DeviceKindV1::SecureEnclave);
+
+        let software = r#"{"kind":"software","version":1,"enrollment_id":"e1","credential_public_key":"AA","box_public_key":"AQ","api_token_hash":"Ag","label":"linux","proof_signature":"Aw","transcript_hmac":"BA"}"#;
+        let software: EnrollmentSubmissionV1 = serde_json::from_str(software).unwrap();
+        assert_eq!(software.kind(), DeviceKindV1::Software);
     }
 
     /// A malformed submission must say which field is wrong. An untagged
@@ -1096,7 +1125,7 @@ mod tests {
         let point = signing.verifying_key().to_encoded_point(false);
         let public = point.as_bytes().to_vec();
         let (credential_id, credential_public_key) = match kind {
-            DeviceKindV1::SecureEnclave => (
+            DeviceKindV1::Software | DeviceKindV1::SecureEnclave => (
                 encode_base64url(&crate::native_v1::native_credential_id(&public)),
                 encode_base64url(&public),
             ),
@@ -1147,7 +1176,11 @@ mod tests {
     /// credential encodings, and the challenge is input-sensitive.
     #[test]
     fn signed_denials_verify_per_device_kind() {
-        for kind in [DeviceKindV1::Webauthn, DeviceKindV1::SecureEnclave] {
+        for kind in [
+            DeviceKindV1::Webauthn,
+            DeviceKindV1::Software,
+            DeviceKindV1::SecureEnclave,
+        ] {
             let (device, signing) = deny_fixture(kind);
             let denial = signed_denial(&signing, "req-1", &device);
             denial.validate_shape().unwrap();

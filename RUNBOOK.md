@@ -37,8 +37,11 @@ the moment the agent is running. Run it as yourself, never under sudo. A root ru
 bundle loses its readable icon that way). Non-interactive with `--yes`
 plus values in the environment. Setup costs two Touch ID approvals, the
 elevation and the proof (plus the sudo password on a machine that has never
-run setup). Day-to-day sudo costs one approval, no password: the installer
-couples a `sudoers.d` NOPASSWD drop-in to the plugin block. The manual
+run setup). Day-to-day sudo with a hardware-backed device costs one approval,
+no password: the installer couples a `sudoers.d` NOPASSWD drop-in to the
+plugin block. A software native device keeps normal sudo password
+authentication because its signing key is readable by the enrolled account.
+The manual
 steps below remain for non-brew layouts.
 
 ## Prelaunch installer
@@ -216,7 +219,8 @@ so nothing pinned needs redoing.
 
 `enroll` prints an enrollment URL, and below it the `oshioki-agent pair`
 command a native device runs to consume the same URL. `status` prints each
-device's `kind` (`webauthn` or `secure-enclave`) next to its fingerprint.
+device's `kind` (`webauthn`, `software`, or `secure-enclave`) next to its
+fingerprint.
 
 `test` publishes a synthetic request and waits for approve or deny.
 

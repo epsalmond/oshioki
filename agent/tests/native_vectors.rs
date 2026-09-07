@@ -8,7 +8,7 @@
 use oshioki_agent::Identity;
 use oshioki_protocol::{
     DecisionV1, RequestV1, VERSION_V1, approve_challenge, encode_base64url,
-    native_enrollment_proof, verify_native_approval_v1, verify_native_enrollment_v1,
+    native_enrollment_proof, verify_native_approval_v1, verify_software_native_enrollment_v1,
 };
 use serde::{Deserialize, Serialize};
 
@@ -63,7 +63,7 @@ fn generate() -> Vectors {
     let submission = identity
         .enrollment_submission("vector-enrollment", &secret, "vector laptop")
         .unwrap();
-    let device = verify_native_enrollment_v1(&submission, &secret).unwrap();
+    let device = verify_software_native_enrollment_v1(&submission, &secret).unwrap();
     let raw = request().raw_json().unwrap();
     let DecisionV1::ApproveNative(approval) = identity
         .approve(

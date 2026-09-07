@@ -24,7 +24,7 @@ use oshioki_protocol::{
     ApproveNativeV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1,
     NativeEnrollmentSubmissionV1, RequestEnvelopeV1, RequestV1, VERSION_V1, approve_challenge,
     decode_base64url, deny_challenge, device_fingerprint, encode_base64url, native_credential_id,
-    native_enrollment_proof, native_v1::native_transcript_hmac, unseal_v1,
+    native_enrollment_proof, native_transcript_hmac_for_kind, unseal_v1,
 };
 
 /// What the enrollment proof signature approves, for a backend that asks.
@@ -417,10 +417,16 @@ impl Identity {
     }
 
     /// The record the host pins after a successful enrollment.
+    ///
+    /// The assurance kind is derived from the signer backend, rather than
+    /// being a caller-supplied label. A software key must never be serialized
+    /// as `secure-enclave`, because the host uses this distinction when
+    /// deciding whether passwordless sudo is safe.
     pub fn device_record(&self, label: &str) -> DevicePublicRecordV1 {
+        let kind = self.device_kind();
         DevicePublicRecordV1 {
             version: VERSION_V1,
-            kind: DeviceKindV1::SecureEnclave,
+            kind,
             fingerprint: self.fingerprint(),
             credential_id: encode_base64url(&self.credential_id()),
             credential_public_key: encode_base64url(&self.public_key_sec1()),
@@ -453,8 +459,10 @@ impl Identity {
             proof_signature: encode_base64url(&self.signer.sign_der(&proof, ENROLL_REASON)?),
             transcript_hmac: String::new(),
         };
-        submission.transcript_hmac =
-            encode_base64url(&native_transcript_hmac(secret, &submission).context("transcript")?);
+        submission.transcript_hmac = encode_base64url(
+            &native_transcript_hmac_for_kind(secret, &submission, self.device_kind())
+                .context("transcript")?,
+        );
         submission.validate_shape().context("submission shape")?;
         Ok(submission)
     }
@@ -515,6 +523,14 @@ impl Identity {
             device_fingerprint: self.fingerprint(),
             signature: Some(encode_base64url(&signature)),
         }))
+    }
+
+    /// The protocol assurance kind corresponding to this identity's signer.
+    pub fn device_kind(&self) -> DeviceKindV1 {
+        match self.signer_kind() {
+            SignerKind::Software => DeviceKindV1::Software,
+            SignerKind::Enclave => DeviceKindV1::SecureEnclave,
+        }
     }
 }
 
@@ -671,7 +687,7 @@ mod tests {
     use crate::secret_store::SecretStore as _;
     use oshioki_protocol::{
         DeviceRegistryV1, seal_v1, verify_deny_v1, verify_native_approval_v1,
-        verify_native_enrollment_v1,
+        verify_native_enrollment_v1, verify_software_native_enrollment_v1,
     };
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -729,7 +745,7 @@ mod tests {
         let submission = identity
             .enrollment_submission("enroll-1", &secret, "laptop")
             .unwrap();
-        let device = verify_native_enrollment_v1(&submission, &secret).unwrap();
+        let device = verify_software_native_enrollment_v1(&submission, &secret).unwrap();
         assert_eq!(device, identity.device_record("laptop"));
         DeviceRegistryV1 {
             version: VERSION_V1,
@@ -744,6 +760,7 @@ mod tests {
     fn opens_own_body_and_signs_a_verifiable_approval() {
         let identity = identity();
         let device = identity.device_record("laptop");
+        assert_eq!(device.kind, DeviceKindV1::Software);
         let request = request();
         let (envelope, raw) = envelope(&request, std::slice::from_ref(&device));
         let opened = identity.open_request(&envelope).unwrap().unwrap();

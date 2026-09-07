@@ -26,6 +26,7 @@ use oshioki_protocol::{
     EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1, RequestEnvelopeV1,
     RequestV1, VERSION_V1, escape_for_terminal, is_approval_env, verify_approval_v1,
     verify_deny_v1, verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
+    verify_software_native_enrollment_v1,
 };
 use oshioki_transport::{HookTransport, NatsTransport};
 
@@ -899,10 +900,12 @@ async fn apply_decision(
             let device = active
                 .iter()
                 .find(|device| {
-                    device.kind == DeviceKindV1::SecureEnclave
-                        && device.fingerprint == approval.device_fingerprint
+                    matches!(
+                        device.kind,
+                        DeviceKindV1::Software | DeviceKindV1::SecureEnclave
+                    ) && device.fingerprint == approval.device_fingerprint
                 })
-                .context("native approval does not name one pinned secure-enclave device")?;
+                .context("native approval does not name one pinned native device")?;
             verify_native_approval_v1(&approval, raw_request, device)
                 .context("native approval verification failed")?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
@@ -959,6 +962,10 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     let device = match &submission {
         EnrollmentSubmissionV1::Webauthn(submission) => {
             verify_enrollment_v1(submission, &secret_bytes, &config).context("verify enrollment")?
+        }
+        EnrollmentSubmissionV1::Software(submission) => {
+            verify_software_native_enrollment_v1(submission, &secret_bytes)
+                .context("verify software native enrollment")?
         }
         EnrollmentSubmissionV1::SecureEnclave(submission) => {
             verify_native_enrollment_v1(submission, &secret_bytes)
@@ -2177,6 +2184,113 @@ mod tests {
             }
         }
         serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process that owns the Linux agent state can replace the socket and
+    /// use the readable software identity to produce a valid signature. The
+    /// record remains explicitly software, so the installer must not pair it
+    /// with passwordless sudo; the separate installer regression checks that
+    /// policy while this test exercises the replacement-socket path itself.
+    #[tokio::test]
+    async fn replacement_socket_with_software_identity_is_not_hardware_assurance() {
+        use p256::ecdsa::{SigningKey, signature::Signer as _};
+
+        let dir = socket_test_dir("software-replacement");
+        // macOS caps AF_UNIX paths at 104 bytes; keep the socket outside the
+        // descriptive temp directory so this test also runs there.
+        let socket_path = PathBuf::from(format!("/tmp/oshioki-repl-{}.sock", Uuid::new_v4()));
+        socket_test_config_no_nats(&dir, Some(&socket_path));
+
+        let signing = SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let box_secret = x25519_dalek::StaticSecret::from([0x22; 32]);
+        let credential_public_key = signing
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let credential_id = oshioki_protocol::native_credential_id(&credential_public_key);
+        let device = DevicePublicRecordV1 {
+            version: VERSION_V1,
+            kind: DeviceKindV1::Software,
+            fingerprint: oshioki_protocol::device_fingerprint(
+                &credential_id,
+                &credential_public_key,
+                x25519_dalek::PublicKey::from(&box_secret).as_bytes(),
+            ),
+            credential_id: URL_SAFE_NO_PAD.encode(&credential_id),
+            credential_public_key: URL_SAFE_NO_PAD.encode(&credential_public_key),
+            box_public_key: URL_SAFE_NO_PAD
+                .encode(x25519_dalek::PublicKey::from(&box_secret).as_bytes()),
+            label: "linux".into(),
+            api_token_hash: URL_SAFE_NO_PAD.encode([0x33; 32]),
+            sign_count: 0,
+            active: true,
+        };
+        device.validate().unwrap();
+        let request = build_synthetic_request();
+        let raw = request.raw_json().unwrap();
+        let envelope = oshioki_protocol::RequestEnvelopeV1 {
+            version: VERSION_V1,
+            request_id: request.request_id.clone(),
+            host: request.host.clone(),
+            user: request.user.clone(),
+            issued_at: request.issued_at,
+            expires_at: request.expires_at,
+            sealed: vec![oshioki_protocol::seal_v1(&raw, &device).unwrap()],
+        };
+        let payload = serde_json::to_vec(&envelope).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let expected_fingerprint = device.fingerprint.clone();
+        let expected_raw = raw.clone();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            stream.read_exact(&mut prefix).await.unwrap();
+            let mut request_bytes = vec![0u8; u32::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut request_bytes).await.unwrap();
+            let received: RequestEnvelopeV1 = serde_json::from_slice(&request_bytes).unwrap();
+            let opened = oshioki_protocol::unseal_v1(&received.sealed[0], &box_secret).unwrap();
+            assert_eq!(opened, expected_raw);
+            let signature: p256::ecdsa::Signature =
+                signing.sign(&oshioki_protocol::approve_challenge(&opened));
+            let approval = oshioki_protocol::ApproveNativeV1 {
+                version: VERSION_V1,
+                request_id: received.request_id,
+                device_fingerprint: expected_fingerprint,
+                signature: URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+            };
+            let frame = oshioki_protocol::socket_v1::encode_frame(
+                &serde_json::to_vec(&DecisionV1::ApproveNative(approval)).unwrap(),
+            )
+            .unwrap();
+            stream.write_all(&frame).await.unwrap();
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let decision = match try_agent_socket(&dir, &payload, deadline).await.unwrap() {
+            SocketOutcome::Decision(decision) => decision,
+            SocketOutcome::Unconfigured | SocketOutcome::Silent(_) => {
+                panic!("replacement socket verdict was ignored")
+            }
+        };
+        let mut registry = DeviceRegistryV1 {
+            version: VERSION_V1,
+            devices: Vec::new(),
+        };
+        apply_decision(
+            decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            &dir,
+        )
+        .await
+        .unwrap();
+        assert_eq!(device.kind, DeviceKindV1::Software);
+        serve.await.unwrap();
+        let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

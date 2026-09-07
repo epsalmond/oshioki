@@ -19,8 +19,9 @@ pub mod webauthn_v1;
 pub use enrollment_v1::{enrollment_hmac, verify_enrollment_v1};
 pub use error::Error;
 pub use native_v1::{
-    native_credential_id, native_enrollment_proof, sec1_p256_verifying_key,
-    verify_native_approval_v1, verify_native_enrollment_v1,
+    native_credential_id, native_enrollment_proof, native_transcript_hmac_for_kind,
+    sec1_p256_verifying_key, verify_native_approval_v1, verify_native_enrollment_v1,
+    verify_software_native_enrollment_v1,
 };
 pub use nats_policy::{
     ALLOW_PLAINTEXT_NATS_ENV, allow_plaintext_nats, check_nats_url, nats_url_is_tls,

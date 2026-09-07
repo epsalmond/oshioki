@@ -29,14 +29,17 @@ The hook and the server route through `oshioki-transport`. The hook holds a `Hoo
 
 ## Device kinds
 
-A device record carries a `kind`: `webauthn` or `secure-enclave`.
+A device record carries a `kind`: `webauthn`, `software`, or
+`secure-enclave`. `software` identifies a native signer whose P-256 key is
+readable by the account running it; it is never eligible for passwordless
+sudo. `secure-enclave` is reserved for the macOS Secure Enclave backend.
 
 A `secure-enclave` record holds a 65-byte SEC1 uncompressed P-256 point as
 `credential_public_key`. `credential_id` is the SHA-256 hash of that point
 (32 bytes). `sign_count` is always 0. `api_token_hash` is still 32 random
 bytes, but the server does not use them for a native device; they exist only
 to keep the server's UNIQUE column honest. The fingerprint formula is
-unchanged for both kinds.
+unchanged for both native kinds.
 
 ## Decisions
 
@@ -53,7 +56,7 @@ as the message hash, over the same 32-byte challenge WebAuthn signs. It
 carries no authenticator data, client data, origin, or RP ID: the native
 agent signs the challenge directly.
 
-The hook applies the same rules to both kinds. The first decision it receives
+The hook applies the same signature rules to all device kinds. The first decision it receives
 wins. An explicit deny ends the request immediately. An invalid approval
 fails closed. The hook gives up after 90 seconds. A decision must name a
 device whose kind and fingerprint both match a pinned record.
@@ -71,11 +74,11 @@ A native enrollment submission carries `credential_public_key`,
 the domain `oshioki/enroll/native-proof/v1\0` and, in order, the credential ID
 (derived from the public key), the public key, the box key, the API token
 hash, and the label. The transcript HMAC covers the enrollment ID, the
-literal kind tag `secure-enclave`, and every submission field including the
-proof signature, in that same order. The native agent publishes its
-submission straight to `oshioki.enrollment.submission.<id>` and waits on
-`oshioki.enrollment.activation.<id>`. It never calls the server's HTTP
-submission route, which accepts the `webauthn` kind only.
+outer kind tag (`secure-enclave` or `software`), and every submission field
+including the proof signature, in that same order. The native agent publishes
+its submission straight to `oshioki.enrollment.submission.<id>` and waits on
+`oshioki.enrollment.activation.<id>`. Neither native variant calls the
+server's HTTP submission route, which accepts the `webauthn` kind only.
 
 The X25519 box key is always a software key, even on a secure-enclave device:
 the enclave only holds P-256. On macOS it will live in the Keychain (issue

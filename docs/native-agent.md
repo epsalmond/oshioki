@@ -20,7 +20,9 @@ oshioki-agent run
 submits the enrollment and waits for the host to activate it. On a Mac the
 signing key is created in the Secure Enclave; everywhere else it is a P-256
 key in that file. `pair --signer software` forces the software key on a Mac
-too, which is what the tests use. On a Mac the file holds only a keychain
+too, which is what the tests use. Software enrollments are recorded as
+`software`, never as `secure-enclave`; a host therefore keeps normal sudo
+password authentication for them. On a Mac the file holds only a keychain
 reference for the X25519 box secret, which lives in the login keychain;
 anywhere else the file carries the secret itself. Pre-move files migrate on
 first load, keeping the fingerprint.
@@ -39,6 +41,11 @@ confirmation as server pairing. The pinned device approves local sudo over
 the socket exactly like an enrolled one, and the agent still answers NATS
 requests whenever the network is up — one agent does both. Pairing with the
 server later keeps the fingerprint, so nothing pinned needs redoing.
+
+The software signer is suitable for Linux and test use, but its key is
+readable by the account running the agent. The installer never writes the
+passwordless sudoers rule for a software-only device; keep the normal sudo
+password prompt as the independent authorization action.
 
 `run` watches for sudo requests and prompts. A release build has no way
 to skip the prompt: `run --auto approve` and `run --auto deny`, which decide

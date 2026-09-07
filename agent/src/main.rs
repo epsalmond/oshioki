@@ -331,7 +331,11 @@ async fn cmd_pair(
 ) -> Result<()> {
     let (enrollment_id, secret) = parse_enrollment_url(url)?;
     let identity = load_or_create(identity_path, &pairing)?;
-    let submission = identity.enrollment_submission(&enrollment_id, &secret, label)?;
+    let native = identity.enrollment_submission(&enrollment_id, &secret, label)?;
+    let submission = match identity.signer_kind() {
+        SignerKind::Software => oshioki_protocol::EnrollmentSubmissionV1::Software(native),
+        SignerKind::Enclave => oshioki_protocol::EnrollmentSubmissionV1::SecureEnclave(native),
+    };
     let nats = connect_nats().await?;
     let mut activations = nats
         .subscribe(format!("oshioki.enrollment.activation.{enrollment_id}"))
@@ -340,10 +344,7 @@ async fn cmd_pair(
     nats.flush().await?;
     nats.publish(
         format!("oshioki.enrollment.submission.{enrollment_id}"),
-        serde_json::to_vec(&oshioki_protocol::EnrollmentSubmissionV1::SecureEnclave(
-            submission,
-        ))?
-        .into(),
+        serde_json::to_vec(&submission)?.into(),
     )
     .await
     .context("publish submission")?;
@@ -356,8 +357,9 @@ async fn cmd_pair(
         serde_json::from_slice(&message.payload).context("decode activation")?;
     if activation.enrollment_id != enrollment_id
         || activation.device.fingerprint != identity.fingerprint()
+        || activation.device.kind != identity.device_kind()
     {
-        bail!("activation names another device");
+        bail!("activation names another device or assurance kind");
     }
     activation.device.validate().context("activated record")?;
     println!(

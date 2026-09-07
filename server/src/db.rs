@@ -302,6 +302,7 @@ fn submission_binds_device(
 ) -> Result<bool> {
     let expected_kind = match submission {
         EnrollmentSubmissionV1::Webauthn(_) => DeviceKindV1::Webauthn,
+        EnrollmentSubmissionV1::Software(_) => DeviceKindV1::Software,
         EnrollmentSubmissionV1::SecureEnclave(_) => DeviceKindV1::SecureEnclave,
     };
     if device.kind != expected_kind {
@@ -316,7 +317,8 @@ fn submission_binds_device(
                 submission.api_token_hash.clone(),
                 submission.label.clone(),
             ),
-            EnrollmentSubmissionV1::SecureEnclave(submission) => {
+            EnrollmentSubmissionV1::Software(submission)
+            | EnrollmentSubmissionV1::SecureEnclave(submission) => {
                 let public_key =
                     oshioki_protocol::decode_base64url(&submission.credential_public_key)
                         .context("decode submitted credential key")?;

@@ -121,6 +121,15 @@ write_sudoers_dropin() {
 install_sudoers_dropin() {
   local user="$1"
   [ "$MODE" = prelaunch ] || return 0
+  if ! registry_has_active_passwordless_devices; then
+    # A software native key is readable by the account making the sudo
+    # request. Keep the plugin available for an additional approval, but
+    # remove any stale NOPASSWD rule so sudo still performs its normal
+    # authentication first.
+    echo "install-oshioki-hook: warning: active devices have no hardware-backed approval; sudo keeps asking for passwords" >&2
+    remove_sudoers_dropin
+    return 0
+  fi
   if [ -z "$user" ]; then
     echo "install-oshioki-hook: warning: no laptop user (set OSHIOKI_SUDO_USER); sudo keeps asking for passwords" >&2
     return 0
@@ -136,6 +145,11 @@ install_sudoers_dropin() {
 plan_sudoers_dropin() {
   local user="$1"
   [ "$MODE" = prelaunch ] || return 0
+  if ! registry_has_active_passwordless_devices; then
+    echo "DRY: keep password authentication (no hardware-backed approval device)"
+    remove_sudoers_dropin
+    return 0
+  fi
   if [ -z "$user" ]; then echo "DRY: skip $SUDOERS_FILE (no laptop user named)"; return 0; fi
   valid_sudoers_user "$user" || die "invalid sudoers user: $user"
   if ! sudoers_included; then echo "DRY: skip $SUDOERS_FILE ($MAIN_SUDOERS includes no sudoers.d directory)"; return 0; fi
@@ -244,6 +258,22 @@ load_config_file() {
   done < "$path"
 }
 
+# A software native device is explicitly not eligible for passwordless sudo:
+# the enrolled account can read its signing key and replace its socket. The
+# registry is machine-written by this installer and serde emits `kind` before
+# `active`; resetting at each record's version keeps legacy records (which
+# default to WebAuthn) eligible while recognizing a software record even when
+# each JSON field occupies its own line.
+registry_has_active_passwordless_devices() {
+  [ -f "$STATE_DIR/devices.json" ] || return 1
+  awk '
+    /"version"[[:space:]]*:/ { software=0 }
+    /"kind"[[:space:]]*:[[:space:]]*"software"/ { software=1 }
+    /"active"[[:space:]]*:[[:space:]]*true/ && !software { found=1 }
+    END { exit found ? 0 : 1 }
+  ' "$STATE_DIR/devices.json"
+}
+
 # Resolve caller-supplied paths (e.g. Homebrew prefix symlinks) to the real
 # files before the safety checks below. Checksum lookup uses the resolved
 # basename, so links must keep the artifact filename.
@@ -280,7 +310,15 @@ if [ "$MODE" = prelaunch-status ]; then
     # alone reports enabled; laptop-setup always names one, keeping the
     # coupling strict in the owned flow.
     dropin_user="$(sudoers_user)"
-    if [ -z "$dropin_user" ] || dropin_ok "$dropin_user"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
+    if [ -z "$dropin_user" ] || ! registry_has_active_passwordless_devices; then
+      if [ -n "$dropin_user" ] && { [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ]; }; then
+        echo "enabled with passwordless sudo but no hardware-backed approval device"
+        exit 1
+      fi
+      echo "enabled: $PLUGIN_DEST (sudo password required for software-only approvals)"
+      exit 0
+    fi
+    if dropin_ok "$dropin_user"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
     echo "enabled without passwordless sudo"
     exit 1
   fi

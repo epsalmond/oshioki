@@ -234,6 +234,21 @@ printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$ACTIV
 run_installer "$ACTIVE_REGISTRY" --prelaunch >"$ACTIVE_REGISTRY/log" 2>&1
 grep -Fq '# BEGIN oshioki' "$ACTIVE_REGISTRY/sudo.conf" || fail "active registry did not enable the plugin"
 
+# A software native identity may still use the approval plugin, but its
+# readable key cannot authorize passwordless sudo. The installer must leave
+# normal sudo authentication in place and remove any stale drop-in.
+SOFTWARE_REGISTRY="$TEST_ROOT/software-registry"; mkdir -p "$SOFTWARE_REGISTRY/state" "$SOFTWARE_REGISTRY/sudoers.d"
+printf '{"version":1,"devices":[{"version":1,"kind":"software","fingerprint":"23d5DG4zOMRbr6Q3dpIDZA","credential_id":"K60P1hDZnq5EPpMqJhQryh5fqZW0UYRSgn547x8xf_A","credential_public_key":"BAIX5hfwtkQ5KCePlpmeaaI6TywVK99tbN9m5bgCgtTtGUp968uXcS0t2jyoWqh2Wlb0X8dYWZZS8ol8ZTBuV5Q","box_public_key":"D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyA","label":"linux","api_token_hash":"MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM","sign_count":0,"active":true}]}\n' > "$SOFTWARE_REGISTRY/state/devices.json"
+printf 'old-user ALL=(ALL) NOPASSWD: ALL\n' > "$SOFTWARE_REGISTRY/sudoers.d/oshioki"
+printf '@includedir %s\n' "$SOFTWARE_REGISTRY/sudoers.d" > "$SOFTWARE_REGISTRY/sudoers"
+OSHIOKI_SUDO_USER=testuser run_installer "$SOFTWARE_REGISTRY" --prelaunch >"$SOFTWARE_REGISTRY/log" 2>&1
+grep -Fq '# BEGIN oshioki' "$SOFTWARE_REGISTRY/sudo.conf" || fail "software-only registry disabled approval plugin"
+[ ! -e "$SOFTWARE_REGISTRY/sudoers.d/oshioki" ] || fail "software-only registry left a passwordless drop-in"
+grep -Fq 'hardware-backed approval' "$SOFTWARE_REGISTRY/log" || fail "software-only warning missing"
+OSHIOKI_SUDO_USER=testuser run_installer "$SOFTWARE_REGISTRY" --prelaunch-status \
+  | grep -Fq 'sudo password required for software-only approvals' \
+  || fail "software-only status did not require the sudo password"
+
 # The passwordless drop-in installs next to the plugin block, visudo-gated,
 # and status couples the two.
 SUDOERS="$TEST_ROOT/with-dropin"; mkdir -p "$SUDOERS/state"
