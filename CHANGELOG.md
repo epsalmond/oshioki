@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-07
+
 ### Changed
 
 - The hook is quiet on an approved sudo. Approvals, denials, and a request
