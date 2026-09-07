@@ -28,9 +28,12 @@ applies the new bottle and restarts the agent. It writes
 `/etc/oshioki/install.env` (prompting for values on first run,
 `--reconfigure` to redo), dry-runs then applies the prelaunch install
 inside one sudo elevation, enrolls and pairs the agent when there is no
-identity, installs a LaunchAgent (Darwin) or user systemd unit (Linux) for
-`oshioki-agent run`, and finishes with a real `sudo true` as proof. Run it
-as yourself, never under sudo. A root run poisons user-owned files (the app
+identity, installs a LaunchAgent for `oshioki-agent run` on Darwin, and
+finishes with a real `sudo true` as proof. Linux has no autostart: the agent
+approves through a terminal prompt there, so setup writes
+`~/.config/oshioki/agent.env` and prints the one-liner that runs the agent on
+a terminal you keep open. It finishes without the proof, and sudo works from
+the moment the agent is running. Run it as yourself, never under sudo. A root run poisons user-owned files (the app
 bundle loses its readable icon that way). Non-interactive with `--yes`
 plus values in the environment. Setup costs two Touch ID approvals, the
 elevation and the proof (plus the sudo password on a machine that has never
@@ -180,6 +183,15 @@ and `--yes` skips the apply prompt.
 ```bash
 oshioki-laptop-setup --local
 ```
+
+On Linux this leaves the agent to you. Start it on a terminal you keep open:
+
+```bash
+set -a; . ~/.config/oshioki/agent.env; set +a; oshioki-agent run
+```
+
+Every sudo prompts there, and answering the prompt is what approves the
+request. Closing that terminal stops approvals.
 
 The steps, spelled out for when something needs a hand: the device exports
 its own record and the host pins it with the same fingerprint confirmation
