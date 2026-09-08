@@ -19,8 +19,9 @@ pub mod webauthn_v1;
 pub use enrollment_v1::{enrollment_hmac, verify_enrollment_v1};
 pub use error::Error;
 pub use native_v1::{
-    native_credential_id, native_enrollment_proof, sec1_p256_verifying_key,
-    verify_native_approval_v1, verify_native_enrollment_v1,
+    native_credential_id, native_enrollment_proof, native_transcript_hmac_for_kind,
+    sec1_p256_verifying_key, verify_native_approval_v1, verify_native_enrollment_v1,
+    verify_software_native_enrollment_v1,
 };
 pub use nats_policy::{
     ALLOW_PLAINTEXT_NATS_ENV, allow_plaintext_nats, check_nats_url, nats_url_is_tls,
@@ -30,7 +31,8 @@ pub use terminal::escape_for_terminal;
 pub use v1::{
     ActivationV1, ApproveNativeV1, ApproveV1, DecisionV1, DenyV1, DeviceKindV1,
     DevicePublicRecordV1, DeviceRegistryV1, EnrollmentIntentV1, EnrollmentStatusV1,
-    EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1, NativeEnrollmentSubmissionV1,
+    EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1, MAX_REQUEST_ISSUANCE_SKEW_SECS,
+    MAX_REQUEST_LIFETIME_SECS, NativeEnrollmentSubmissionV1, PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION,
     RequestEnvelopeV1, RequestV1, SealedDeviceBodyV1, VERSION_V1, WebauthnEnrollmentSubmissionV1,
     approve_challenge, decode_base64url, deny_challenge, device_fingerprint, encode_base64url,
     is_approval_env, seal_v1, unseal_v1, verify_deny_v1,

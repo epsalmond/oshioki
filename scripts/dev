@@ -37,6 +37,7 @@ local_checks() {
     echo "test-dev-acceptance: SKIP (Linux only)"
   fi
   "$REPO_ROOT/scripts/test-install-oshioki-hook"
+  "$REPO_ROOT/scripts/test-debian-package-scripts"
   "$REPO_ROOT/scripts/test-oshioki-laptop-setup"
 }
 

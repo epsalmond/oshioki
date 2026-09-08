@@ -37,8 +37,10 @@ the moment the agent is running. Run it as yourself, never under sudo. A root ru
 bundle loses its readable icon that way). Non-interactive with `--yes`
 plus values in the environment. Setup costs two Touch ID approvals, the
 elevation and the proof (plus the sudo password on a machine that has never
-run setup). Day-to-day sudo uses one device approval when the installer
-couples a `sudoers.d` `NOPASSWD` drop-in to the plugin block. On Linux, an
+run setup). Day-to-day sudo with a hardware-backed device costs one device
+approval: the installer couples a `sudoers.d` NOPASSWD drop-in to the plugin
+block. A software native device keeps normal sudo password authentication
+because its signing key is readable by the enrolled account. On Linux, an
 interactive request also races the invoking account password through the
 host's `sudo` PAM service. Press Enter to skip that fallback and wait for
 device approval. The manual steps below remain for non-brew layouts.
@@ -87,8 +89,9 @@ sudo scripts/install-oshioki-hook --prelaunch-status
 The installer rejects unknown config keys, symlinks, non-root ownership, and
 modes other than 0600. `--prelaunch` preserves an existing `devices.json`.
 With an active device it also writes `/etc/sudoers.d/oshioki`
-(`<user> ALL=(ALL) NOPASSWD: ALL`, visudo-checked), so sudo policy does not
-add a separate password prompt. The user comes from
+(`<user> ALL=(ALL) NOSETENV: NOPASSWD: ALL`, visudo-checked), so Touch ID is
+the only authorization step for a hardware-backed device and sudo stops asking
+for a password. The user comes from
 `OSHIOKI_SUDO_USER` (else `SUDO_USER`); without either, or without a
 `sudoers.d` include in the main sudoers file, the installer warns and keeps
 password authentication. The block and the drop-in go away together with
@@ -226,7 +229,8 @@ so nothing pinned needs redoing.
 
 `enroll` prints an enrollment URL, and below it the `oshioki-agent pair`
 command a native device runs to consume the same URL. `status` prints each
-device's `kind` (`webauthn` or `secure-enclave`) next to its fingerprint.
+device's `kind` (`webauthn`, `software`, or `secure-enclave`) next to its
+fingerprint.
 
 `test` publishes a synthetic request and waits for approve or deny.
 

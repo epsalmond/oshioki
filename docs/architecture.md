@@ -20,23 +20,38 @@ The browser token identifies one device. The request API returns only that
 device's sealed body. Plaintext commands never enter SQLite, logs,
 notifications, or metrics.
 
-The request also carries the curated execution environment — loader,
-resolution, shell, interpreter, pager, and trust variables. Approvals sign
-those bytes alongside the command, so a different environment is a different
-approval; the environment travels only inside the sealed bodies.
+The request also carries the complete effective execution environment in its
+original order, including duplicate names. Approvals sign those bytes
+alongside the command, so a different environment is a different approval;
+the environment travels only inside the sealed bodies. The finite list of
+well-known behavior-changing names is display emphasis only and never filters
+authentication coverage. Values that cannot be represented by the private
+line-framed plugin payload (invalid UTF-8, line delimiters, or an environment
+entry without `=`) cause the request to be denied. A NUL is the C-string
+terminator in sudo's `run_envp` ABI and therefore cannot be an environment
+byte; bytes after it are not part of the effective entry.
+
+The plugin adds an environment-complete marker and count to its private
+payload. The hook requires and checks both, preventing a new hook from
+silently accepting the partial environment emitted by an older plugin. This
+does not change the v1 JSON schema: `RequestV1.env` already defaults to empty
+and is omitted when empty, so old requests and signatures remain readable.
 
 The hook and the server route through `oshioki-transport`. The hook holds a `HookTransport`; the server holds a `ServerTransport`. `OSHIOKI_TRANSPORT=nats` is the default and the only transport this issue lands. The wire format (SMTP-style subjects and v1 JSON payloads) is identical to what shipped before the seam. The agent keeps talking to NATS directly until a device-side transport ships (#6/#7).
 
 ## Device kinds
 
-A device record carries a `kind`: `webauthn` or `secure-enclave`.
+A device record carries a `kind`: `webauthn`, `software`, or
+`secure-enclave`. `software` identifies a native signer whose P-256 key is
+readable by the account running it; it is never eligible for passwordless
+sudo. `secure-enclave` is reserved for the macOS Secure Enclave backend.
 
 A `secure-enclave` record holds a 65-byte SEC1 uncompressed P-256 point as
 `credential_public_key`. `credential_id` is the SHA-256 hash of that point
 (32 bytes). `sign_count` is always 0. `api_token_hash` is still 32 random
 bytes, but the server does not use them for a native device; they exist only
 to keep the server's UNIQUE column honest. The fingerprint formula is
-unchanged for both kinds.
+unchanged for both native kinds.
 
 ## Decisions
 
@@ -53,7 +68,7 @@ as the message hash, over the same 32-byte challenge WebAuthn signs. It
 carries no authenticator data, client data, origin, or RP ID: the native
 agent signs the challenge directly.
 
-The hook applies the same rules to both kinds. The first decision it receives
+The hook applies the same signature rules to all device kinds. The first decision it receives
 wins. An explicit deny ends the request immediately. An invalid approval
 fails closed. The hook gives up after 90 seconds. A decision must name a
 device whose kind and fingerprint both match a pinned record.
@@ -95,17 +110,23 @@ relays the HMAC-bound browser transcript. The hook verifies registration,
 the immediate proof assertion, origin, RP ID, UP, UV, and the ES256 key before
 atomically replacing its local registry.
 
+Attestation and COSE CBOR are decoded with `ciborium` in bounded strict mode:
+attestation objects are capped at 128 KiB, COSE keys at 4 KiB, nesting at 16
+levels, and total CBOR items at 256. Each input must contain exactly one value;
+duplicate map keys are rejected before the existing ES256 key, coordinate, and
+`none` attestation-format checks run.
+
 A native enrollment submission carries `credential_public_key`,
 `box_public_key`, `api_token_hash`, `label`, `proof_signature`, and
 `transcript_hmac`. The proof is a DER ECDSA P-256 signature over an HMAC of
 the domain `oshioki/enroll/native-proof/v1\0` and, in order, the credential ID
 (derived from the public key), the public key, the box key, the API token
 hash, and the label. The transcript HMAC covers the enrollment ID, the
-literal kind tag `secure-enclave`, and every submission field including the
-proof signature, in that same order. The native agent publishes its
-submission straight to `oshioki.enrollment.submission.<id>` and waits on
-`oshioki.enrollment.activation.<id>`. It never calls the server's HTTP
-submission route, which accepts the `webauthn` kind only.
+outer kind tag (`secure-enclave` or `software`), and every submission field
+including the proof signature, in that same order. The native agent publishes
+its submission straight to `oshioki.enrollment.submission.<id>` and waits on
+`oshioki.enrollment.activation.<id>`. Neither native variant calls the
+server's HTTP submission route, which accepts the `webauthn` kind only.
 
 The X25519 box key is always a software key, even on a secure-enclave device:
 the enclave only holds P-256. On macOS it will live in the Keychain (issue

@@ -26,6 +26,7 @@ case "$(uname -s)" in
   Linux) BUILD_PLUGIN=liboshioki_plugin.so ;;
   *) fail "unsupported test operating system" ;;
 esac
+PLUGIN_NAME="oshioki.${BUILD_PLUGIN##*.}"
 cp /usr/bin/true "$TEST_ROOT/service/target/release/oshioki"
 cp /usr/bin/true "$TEST_ROOT/service/target/release/$BUILD_PLUGIN"
 (
@@ -49,6 +50,8 @@ SH
 cat > "$TEST_ROOT/fake-bin/install" <<'SH'
 #!/usr/bin/env bash
 args=(); while [ "$#" -gt 0 ]; do case "$1" in -o|-g) shift 2;; *) args+=("$1"); shift;; esac; done
+last_arg="${args[${#args[@]}-1]}"
+[ -n "${FAIL_INSTALL_TARGET:-}" ] && [ "$(basename "$last_arg")" = "$FAIL_INSTALL_TARGET" ] && exit 1
 exec /usr/bin/install "${args[@]}"
 SH
 cat > "$TEST_ROOT/fake-bin/sudo" <<'SH'
@@ -91,16 +94,24 @@ chmod 0755 "$TEST_ROOT/fake-bin"/* "$TEST_ROOT/service/scripts/install-oshioki-h
 TEST_PATH="$TEST_ROOT/fake-bin:/usr/bin:/bin"
 
 run_installer() {
-  local root="$1"; shift
+  local sudo_user="" root
+  if [ "${1:-}" = --sudo-user ]; then
+    [ "$#" -ge 3 ] || fail "--sudo-user requires a value and a root"
+    sudo_user="$2"
+    shift 2
+  fi
+  root="$1"; shift
   mkdir -p "$root"
   PATH="$TEST_PATH" SUDO_CONF="$root/sudo.conf" SUDO_PLUGIN_DIR="$root/plugin" SBIN_DIR="$root/sbin" \
     SUDOERS_D="$root/sudoers.d" MAIN_SUDOERS="$root/sudoers" OSHIOKI_STATE_DIR="$root/state" \
     SUDO_USER="" VISUDO_CALLS="$root/visudo.calls" \
+    OSHIOKI_SUDO_USER="$sudo_user" \
     OSHIOKI_ORIGIN="${INSTALL_ORIGIN-https://sudo.test}" \
     OSHIOKI_RP_ID="${INSTALL_RP_ID-sudo.test}" \
     NATS_URL="${INSTALL_NATS_URL-nats://nats.test:4222}" \
     NATS_PASS="${INSTALL_NATS_PASS-${NATS_PASS:-test-only}}" \
     FAKE_STAT_OWNER="${FAKE_STAT_OWNER:-0}" FAKE_STAT_MODE="${FAKE_STAT_MODE:-600}" \
+    FAIL_INSTALL_TARGET="${FAIL_INSTALL_TARGET:-}" \
     "$TEST_ROOT/service/scripts/install-oshioki-hook" "$@"
 }
 
@@ -188,6 +199,29 @@ run_installer "$PRELAUNCH" --prelaunch
 [ "$(grep -c '^# BEGIN oshioki$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "rerun duplicated block"
 run_installer "$PRELAUNCH" --prelaunch-status | grep -Fq enabled || fail "status did not report enabled"
 
+# An upgrade first removes both privilege artifacts and validates ordinary
+# sudo. A validation failure restores the old state without replacing either
+# binary.
+UPGRADE_VALIDATE="$TEST_ROOT/upgrade-validate"; mkdir -p "$UPGRADE_VALIDATE/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$UPGRADE_VALIDATE/state/devices.json"
+printf '#includedir %s\n' "$UPGRADE_VALIDATE/sudoers.d" > "$UPGRADE_VALIDATE/sudoers"
+run_installer --sudo-user testuser "$UPGRADE_VALIDATE" --prelaunch >"$UPGRADE_VALIDATE/first.log" 2>&1
+upgrade_hook_hash="$(sha256_file "$UPGRADE_VALIDATE/sbin/oshioki")"
+if FAIL_SUDO=1 run_installer "$UPGRADE_VALIDATE" --prelaunch >"$UPGRADE_VALIDATE/fail.log" 2>&1; then fail "replaced artifacts before validating ordinary sudo"; fi
+[ "$(sha256_file "$UPGRADE_VALIDATE/sbin/oshioki")" = "$upgrade_hook_hash" ] || fail "sudo validation failure replaced the hook"
+grep -Fq '# BEGIN oshioki' "$UPGRADE_VALIDATE/sudo.conf" || fail "sudo validation failure did not restore the plugin block"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$UPGRADE_VALIDATE/sudoers.d/oshioki" || fail "sudo validation failure did not restore the drop-in"
+
+# If copying the plugin is interrupted after the hook copy, the disabled
+# state is retained: neither half of the old/new pair is re-enabled.
+UPGRADE_INTERRUPT="$TEST_ROOT/upgrade-interrupt"; mkdir -p "$UPGRADE_INTERRUPT/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$UPGRADE_INTERRUPT/state/devices.json"
+printf '#includedir %s\n' "$UPGRADE_INTERRUPT/sudoers.d" > "$UPGRADE_INTERRUPT/sudoers"
+run_installer --sudo-user testuser "$UPGRADE_INTERRUPT" --prelaunch >"$UPGRADE_INTERRUPT/first.log" 2>&1
+if FAIL_INSTALL_TARGET="$PLUGIN_NAME" run_installer "$UPGRADE_INTERRUPT" --prelaunch >"$UPGRADE_INTERRUPT/fail.log" 2>&1; then fail "accepted an interrupted plugin upgrade"; fi
+if grep -Fq '# BEGIN oshioki' "$UPGRADE_INTERRUPT/sudo.conf"; then fail "interrupted upgrade re-enabled the plugin"; fi
+[ ! -e "$UPGRADE_INTERRUPT/sudoers.d/oshioki" ] || fail "interrupted upgrade left passwordless sudo"
+
 UNMANAGED_PLUGIN_BLOCK="$TEST_ROOT/unmanaged-plugin-block"; mkdir -p "$UNMANAGED_PLUGIN_BLOCK"
 printf '%s\n' \
   'outside-before' \
@@ -234,24 +268,67 @@ printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$ACTIV
 run_installer "$ACTIVE_REGISTRY" --prelaunch >"$ACTIVE_REGISTRY/log" 2>&1
 grep -Fq '# BEGIN oshioki' "$ACTIVE_REGISTRY/sudo.conf" || fail "active registry did not enable the plugin"
 
+# A software native identity may still use the approval plugin, but its
+# readable key cannot authorize passwordless sudo. The installer must leave
+# normal sudo authentication in place and remove any stale drop-in.
+SOFTWARE_REGISTRY="$TEST_ROOT/software-registry"; mkdir -p "$SOFTWARE_REGISTRY/state" "$SOFTWARE_REGISTRY/sudoers.d"
+printf '{"version":1,"devices":[{"version":1,"kind":"software","fingerprint":"23d5DG4zOMRbr6Q3dpIDZA","credential_id":"K60P1hDZnq5EPpMqJhQryh5fqZW0UYRSgn547x8xf_A","credential_public_key":"BAIX5hfwtkQ5KCePlpmeaaI6TywVK99tbN9m5bgCgtTtGUp968uXcS0t2jyoWqh2Wlb0X8dYWZZS8ol8ZTBuV5Q","box_public_key":"D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyA","label":"linux","api_token_hash":"MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM","sign_count":0,"active":true}]}\n' > "$SOFTWARE_REGISTRY/state/devices.json"
+printf 'old-user ALL=(ALL) NOPASSWD: ALL\n' > "$SOFTWARE_REGISTRY/sudoers.d/oshioki"
+printf '@includedir %s\n' "$SOFTWARE_REGISTRY/sudoers.d" > "$SOFTWARE_REGISTRY/sudoers"
+run_installer --sudo-user testuser "$SOFTWARE_REGISTRY" --prelaunch >"$SOFTWARE_REGISTRY/log" 2>&1
+grep -Fq '# BEGIN oshioki' "$SOFTWARE_REGISTRY/sudo.conf" || fail "software-only registry disabled approval plugin"
+[ ! -e "$SOFTWARE_REGISTRY/sudoers.d/oshioki" ] || fail "software-only registry left a passwordless drop-in"
+grep -Fq 'hardware-backed approval' "$SOFTWARE_REGISTRY/log" || fail "software-only warning missing"
+run_installer --sudo-user testuser "$SOFTWARE_REGISTRY" --prelaunch-status \
+  | grep -Fq 'sudo password required for software-only approvals' \
+  || fail "software-only status did not require the sudo password"
+
 # The passwordless drop-in installs next to the plugin block, visudo-gated,
 # and status couples the two.
 SUDOERS="$TEST_ROOT/with-dropin"; mkdir -p "$SUDOERS/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SUDOERS/state/devices.json"
 printf '# sudoers test file\n@includedir %s\n' "$SUDOERS/sudoers.d" > "$SUDOERS/sudoers"
-OSHIOKI_SUDO_USER=testuser run_installer "$SUDOERS" --prelaunch >"$SUDOERS/log" 2>&1
-grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$SUDOERS/sudoers.d/oshioki" || fail "drop-in has the wrong content"
+run_installer --sudo-user testuser "$SUDOERS" --prelaunch >"$SUDOERS/log" 2>&1
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$SUDOERS/sudoers.d/oshioki" || fail "drop-in has the wrong content"
 [ "$(stat -c '%a' "$SUDOERS/sudoers.d/oshioki" 2>/dev/null || stat -f '%Lp' "$SUDOERS/sudoers.d/oshioki")" = 440 ] || fail "drop-in is not 0440"
 grep -Fq -- '-c -f' "$SUDOERS/visudo.calls" || fail "visudo gate never ran"
 grep -Fq 'sudoers.d/oshioki' "$SUDOERS/visudo.calls" || fail "visudo checked the wrong file"
-OSHIOKI_SUDO_USER=testuser run_installer "$SUDOERS" --prelaunch --dry-run >"$SUDOERS/dry.log" 2>&1
+run_installer --sudo-user testuser "$SUDOERS" --prelaunch --dry-run >"$SUDOERS/dry.log" 2>&1
 grep -Fq "DRY: write $SUDOERS/sudoers.d/oshioki for passwordless sudo by testuser" "$SUDOERS/dry.log" || fail "dry run omitted the drop-in plan"
-OSHIOKI_SUDO_USER=testuser run_installer "$SUDOERS" --prelaunch-status | grep -Fq enabled || fail "status rejected a good drop-in"
+run_installer --sudo-user testuser "$SUDOERS" --prelaunch-status | grep -Fq enabled || fail "status rejected a good drop-in"
 rm "$SUDOERS/sudoers.d/oshioki"
-if OSHIOKI_SUDO_USER=testuser run_installer "$SUDOERS" --prelaunch-status >/dev/null 2>&1; then fail "status accepted a missing drop-in"; fi
+if run_installer --sudo-user testuser "$SUDOERS" --prelaunch-status >/dev/null 2>&1; then fail "status accepted a missing drop-in"; fi
 run_installer "$SUDOERS" --disable-prelaunch
 if grep -Fq '# BEGIN oshioki' "$SUDOERS/sudo.conf"; then fail "disable left managed block"; fi
 [ ! -e "$SUDOERS/sudoers.d/oshioki" ] || fail "disable left the drop-in"
+
+# Package removal must clean the drop-in even when sudo.conf was removed or
+# its managed markers were damaged. The drop-in mode checks ownership, mode,
+# and the complete Oshioki rule without consulting sudo.conf.
+MISSING_CONF="$TEST_ROOT/missing-sudo-conf"; mkdir -p "$MISSING_CONF/state" "$MISSING_CONF/sudoers.d"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$MISSING_CONF/sudoers.d/oshioki"
+run_installer "$MISSING_CONF" --disable-prelaunch
+[ ! -e "$MISSING_CONF/sudoers.d/oshioki" ] || fail "missing sudo.conf left the Oshioki drop-in"
+
+MALFORMED_CONF="$TEST_ROOT/malformed-sudo-conf"; mkdir -p "$MALFORMED_CONF/state" "$MALFORMED_CONF/sudoers.d"
+printf '%s\n' '# BEGIN oshioki' "Plugin approval_exec $MALFORMED_CONF/plugin/$PLUGIN_NAME" > "$MALFORMED_CONF/sudo.conf"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$MALFORMED_CONF/sudoers.d/oshioki"
+run_installer "$MALFORMED_CONF" --disable-prelaunch
+if grep -Fq "Plugin approval_exec $MALFORMED_CONF/plugin/$PLUGIN_NAME" "$MALFORMED_CONF/sudo.conf"; then fail "malformed sudo.conf left the Oshioki plugin"; fi
+[ ! -e "$MALFORMED_CONF/sudoers.d/oshioki" ] || fail "malformed sudo.conf left the Oshioki drop-in"
+
+PARTIAL_CONF="$TEST_ROOT/partial-sudo-conf"; mkdir -p "$PARTIAL_CONF/state" "$PARTIAL_CONF/sudoers.d"
+printf '%s\n' '# END oshioki' 'outside' > "$PARTIAL_CONF/sudo.conf"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$PARTIAL_CONF/sudoers.d/oshioki"
+run_installer "$PARTIAL_CONF" --disable-prelaunch
+if grep -Fq '# END oshioki' "$PARTIAL_CONF/sudo.conf"; then fail "partial sudo.conf left the Oshioki marker"; fi
+[ ! -e "$PARTIAL_CONF/sudoers.d/oshioki" ] || fail "partial sudo.conf left the Oshioki drop-in"
+
+UNRELATED_DROPIN="$TEST_ROOT/unrelated-dropin"; mkdir -p "$UNRELATED_DROPIN/state" "$UNRELATED_DROPIN/sudoers.d"
+printf 'administrator ALL=(ALL) NOPASSWD: /usr/bin/id\n' > "$UNRELATED_DROPIN/sudoers.d/oshioki"
+if run_installer "$UNRELATED_DROPIN" --remove-sudoers-dropin >"$UNRELATED_DROPIN/log" 2>&1; then fail "drop-in cleanup accepted unrelated sudoers content"; fi
+grep -Fq 'unverified sudoers drop-in' "$UNRELATED_DROPIN/log" || fail "unrelated drop-in rejection was not explained"
+[ -e "$UNRELATED_DROPIN/sudoers.d/oshioki" ] || fail "unrelated sudoers content was deleted"
 
 # sudo accepts "# includedir" with space but requires @includedir contiguous,
 # so "@ includedir" includes nothing. Writing the drop-in on the strength of
@@ -259,7 +336,7 @@ if grep -Fq '# BEGIN oshioki' "$SUDOERS/sudo.conf"; then fail "disable left mana
 BADINC="$TEST_ROOT/bad-include"; mkdir -p "$BADINC/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$BADINC/state/devices.json"
 printf '# sudoers test file\n@ includedir %s\n' "$BADINC/sudoers.d" > "$BADINC/sudoers"
-OSHIOKI_SUDO_USER=testuser run_installer "$BADINC" --prelaunch >"$BADINC/log" 2>&1
+run_installer --sudo-user testuser "$BADINC" --prelaunch >"$BADINC/log" 2>&1
 [ ! -e "$BADINC/sudoers.d/oshioki" ] || fail "drop-in written despite a non-contiguous @ includedir"
 grep -Fq 'includes no sudoers.d directory' "$BADINC/log" || fail "no warning for a non-contiguous @ includedir"
 
@@ -267,14 +344,14 @@ grep -Fq 'includes no sudoers.d directory' "$BADINC/log" || fail "no warning for
 SPACEINC="$TEST_ROOT/space-include"; mkdir -p "$SPACEINC/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SPACEINC/state/devices.json"
 printf '# sudoers test file\n#  includedir %s\n' "$SPACEINC/sudoers.d" > "$SPACEINC/sudoers"
-OSHIOKI_SUDO_USER=testuser run_installer "$SPACEINC" --prelaunch >"$SPACEINC/log" 2>&1
-grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$SPACEINC/sudoers.d/oshioki" || fail "spaced # includedir was not honoured"
+run_installer --sudo-user testuser "$SPACEINC" --prelaunch >"$SPACEINC/log" 2>&1
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$SPACEINC/sudoers.d/oshioki" || fail "spaced # includedir was not honoured"
 
 # Dry runs plan without writing.
 DRYUSER="$TEST_ROOT/dry-user"; mkdir -p "$DRYUSER/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$DRYUSER/state/devices.json"
 printf '#includedir %s\n' "$DRYUSER/sudoers.d" > "$DRYUSER/sudoers"
-OSHIOKI_SUDO_USER=testuser run_installer "$DRYUSER" --prelaunch --dry-run >"$DRYUSER/dry.log" 2>&1
+run_installer --sudo-user testuser "$DRYUSER" --prelaunch --dry-run >"$DRYUSER/dry.log" 2>&1
 grep -Fq "DRY: write $DRYUSER/sudoers.d/oshioki" "$DRYUSER/dry.log" || fail "dry run omitted the drop-in plan"
 [ ! -e "$DRYUSER/sudoers.d" ] || fail "dry run wrote sudoers state"
 printf 'outside\n' > "$DRYUSER/sudo.conf"
@@ -296,7 +373,7 @@ grep -Fq '# BEGIN oshioki' "$NOUSER/sudo.conf" || fail "missing user blocked the
 NOINCLUDE="$TEST_ROOT/no-includedir"; mkdir -p "$NOINCLUDE/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$NOINCLUDE/state/devices.json"
 printf '# sudoers without any include\n' > "$NOINCLUDE/sudoers"
-OSHIOKI_SUDO_USER=testuser run_installer "$NOINCLUDE" --prelaunch >"$NOINCLUDE/log" 2>&1 || fail "missing includedir blocked the plugin"
+run_installer --sudo-user testuser "$NOINCLUDE" --prelaunch >"$NOINCLUDE/log" 2>&1 || fail "missing includedir blocked the plugin"
 grep -Fq 'includes no sudoers.d directory' "$NOINCLUDE/log" || fail "missing includedir skipped silently"
 grep -Fq '# BEGIN oshioki' "$NOINCLUDE/sudo.conf" || fail "missing includedir blocked the plugin"
 [ ! -e "$NOINCLUDE/sudoers.d/oshioki" ] || fail "missing includedir wrote a drop-in"
@@ -304,7 +381,7 @@ grep -Fq '# BEGIN oshioki' "$NOINCLUDE/sudo.conf" || fail "missing includedir bl
 # Explicit garbage fails closed.
 BADUSER="$TEST_ROOT/bad-sudo-user"; mkdir -p "$BADUSER/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$BADUSER/state/devices.json"
-if OSHIOKI_SUDO_USER='bad user' run_installer "$BADUSER" --prelaunch >"$BADUSER/log" 2>&1; then fail "accepted invalid sudoers user"; fi
+if run_installer --sudo-user 'bad user' "$BADUSER" --prelaunch >"$BADUSER/log" 2>&1; then fail "accepted invalid sudoers user"; fi
 grep -Fq 'invalid sudoers user' "$BADUSER/log" || fail "missing invalid user error"
 if grep -Fq '# BEGIN oshioki' "$BADUSER/sudo.conf"; then fail "invalid user left the plugin enabled"; fi
 
@@ -319,7 +396,7 @@ grep -Fq 'no active approval devices' "$STALE/log" || fail "stale drop-in enable
 VISUDOFAIL="$TEST_ROOT/visudo-fail"; mkdir -p "$VISUDOFAIL/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$VISUDOFAIL/state/devices.json"
 printf '#includedir %s\n' "$VISUDOFAIL/sudoers.d" > "$VISUDOFAIL/sudoers"
-if OSHIOKI_SUDO_USER=testuser FAIL_VISUDO=1 run_installer "$VISUDOFAIL" --prelaunch >"$VISUDOFAIL/log" 2>&1; then fail "accepted visudo failure"; fi
+if FAIL_VISUDO=1 run_installer --sudo-user testuser "$VISUDOFAIL" --prelaunch >"$VISUDOFAIL/log" 2>&1; then fail "accepted visudo failure"; fi
 grep -Fq 'visudo rejected' "$VISUDOFAIL/log" || fail "missing visudo error"
 [ ! -e "$VISUDOFAIL/sudoers.d/oshioki" ] || fail "visudo failure left a drop-in"
 if grep -Fq '# BEGIN oshioki' "$VISUDOFAIL/sudo.conf"; then fail "visudo failure left the plugin enabled"; fi
@@ -330,7 +407,7 @@ printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$RBDRO
 printf '#includedir %s\n' "$RBDROPIN/sudoers.d" > "$RBDROPIN/sudoers"
 printf 'olduser ALL=(ALL) NOPASSWD: ALL\n' > "$RBDROPIN/sudoers.d/oshioki"
 printf 'original\n' > "$RBDROPIN/sudo.conf"
-if OSHIOKI_SUDO_USER=testuser FAIL_SUDO=1 run_installer "$RBDROPIN" --prelaunch >"$RBDROPIN/log" 2>&1; then fail "accepted sudo validation failure with drop-in"; fi
+if FAIL_SUDO=1 run_installer --sudo-user testuser "$RBDROPIN" --prelaunch >"$RBDROPIN/log" 2>&1; then fail "accepted sudo validation failure with drop-in"; fi
 grep -Fxq 'olduser ALL=(ALL) NOPASSWD: ALL' "$RBDROPIN/sudoers.d/oshioki" || fail "rollback did not restore the drop-in"
 if grep -Fq '# BEGIN oshioki' "$RBDROPIN/sudo.conf"; then fail "rollback did not restore sudo.conf"; fi
 
@@ -339,28 +416,28 @@ if grep -Fq '# BEGIN oshioki' "$RBDROPIN/sudo.conf"; then fail "rollback did not
 STALEBLOCK="$TEST_ROOT/stale-block"; mkdir -p "$STALEBLOCK/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$STALEBLOCK/state/devices.json"
 printf '#includedir %s\n' "$STALEBLOCK/sudoers.d" > "$STALEBLOCK/sudoers"
-OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCK" --prelaunch >"$STALEBLOCK/first.log" 2>&1
+run_installer --sudo-user testuser "$STALEBLOCK" --prelaunch >"$STALEBLOCK/first.log" 2>&1
 grep -Fq '# BEGIN oshioki' "$STALEBLOCK/sudo.conf" || fail "setup did not enable the plugin"
-grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$STALEBLOCK/sudoers.d/oshioki" || fail "setup did not write the drop-in"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$STALEBLOCK/sudoers.d/oshioki" || fail "setup did not write the drop-in"
 printf '{"version":1,"devices":[]}\n' > "$STALEBLOCK/state/devices.json"
-OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCK" --prelaunch --dry-run >"$STALEBLOCK/dry.log" 2>&1
+run_installer --sudo-user testuser "$STALEBLOCK" --prelaunch --dry-run >"$STALEBLOCK/dry.log" 2>&1
 grep -Fq "DRY: remove exact managed block from $STALEBLOCK/sudo.conf" "$STALEBLOCK/dry.log" || fail "dry run did not predict the block removal"
 run_installer "$STALEBLOCK" --prelaunch >"$STALEBLOCK/second.log" 2>&1
 grep -Fq 'no active approval devices' "$STALEBLOCK/second.log" || fail "emptied registry re-enabled silently"
 if grep -Fq '# BEGIN oshioki' "$STALEBLOCK/sudo.conf"; then fail "emptied registry left the plugin enabled"; fi
 [ ! -e "$STALEBLOCK/sudoers.d/oshioki" ] || fail "emptied registry left the drop-in"
-if OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCK" --prelaunch-status >/dev/null 2>&1; then fail "status accepted a removed plugin"; fi
+if run_installer --sudo-user testuser "$STALEBLOCK" --prelaunch-status >/dev/null 2>&1; then fail "status accepted a removed plugin"; fi
 
 # A validation failure while removing the stale block restores the block
 # with the drop-in instead of leaving half a sudoers state.
 STALEBLOCKRB="$TEST_ROOT/stale-block-rollback"; mkdir -p "$STALEBLOCKRB/state"
 printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$STALEBLOCKRB/state/devices.json"
 printf '#includedir %s\n' "$STALEBLOCKRB/sudoers.d" > "$STALEBLOCKRB/sudoers"
-OSHIOKI_SUDO_USER=testuser run_installer "$STALEBLOCKRB" --prelaunch >"$STALEBLOCKRB/first.log" 2>&1
+run_installer --sudo-user testuser "$STALEBLOCKRB" --prelaunch >"$STALEBLOCKRB/first.log" 2>&1
 printf '{"version":1,"devices":[]}\n' > "$STALEBLOCKRB/state/devices.json"
 if FAIL_SUDO=1 run_installer "$STALEBLOCKRB" --prelaunch >"$STALEBLOCKRB/log" 2>&1; then fail "accepted sudo validation failure on stale removal"; fi
 grep -Fq '# BEGIN oshioki' "$STALEBLOCKRB/sudo.conf" || fail "rollback did not restore the stale block"
-grep -Fxq 'testuser ALL=(ALL) NOPASSWD: ALL' "$STALEBLOCKRB/sudoers.d/oshioki" || fail "rollback did not restore the stale drop-in"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$STALEBLOCKRB/sudoers.d/oshioki" || fail "rollback did not restore the stale drop-in"
 
 UNSAFE="$TEST_ROOT/unsafe"; mkdir -p "$UNSAFE"; ln -s "$TEST_ROOT/elsewhere" "$UNSAFE/sudo.conf"
 if run_installer "$UNSAFE" --prelaunch >"$UNSAFE/log" 2>&1; then fail "accepted symlink sudo.conf"; fi

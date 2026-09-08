@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.4] - 2026-09-07
+## [0.1.4] - 2026-09-08
 
 ### Added
 
@@ -30,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password attempt without calling PAM.
 - Upgrade the server, browser bundle, hook, and agent as one compatibility
   set. There is no rolling negotiation; mixed versions fail closed with an
-  upgrade diagnostic. The v1 request and decision formats and cryptography
-  are unchanged.
+  upgrade diagnostic. Existing request encryption and decision signatures
+  remain compatible while native enrollment records now distinguish software
+  keys from Secure Enclave keys.
 - A socket agent that disconnects after acknowledging a request causes that
   sudo to be denied, including during an agent restart or laptop suspend.
   The hook does not retry that request through NATS.
@@ -44,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Explicit approval denials and invalid approval results fail closed even
   while the password attempt is running. Whichever branch wins cancels and
   reaps the other process, and restores terminal echo and pending input.
+- The root-owned sudo plugin and hook now require a matching private framing
+  handshake, including the complete environment attestation.
 
 ## [0.1.3] - 2026-09-07
 

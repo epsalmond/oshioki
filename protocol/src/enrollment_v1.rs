@@ -1,8 +1,7 @@
 //! Resumable enrollment transcript verification.
 
-use std::io::Cursor;
-
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ciborium::Value;
 use hmac::{Hmac, Mac};
 use p256::ecdsa::{Signature, signature::Verifier as _};
 use serde::Deserialize;
@@ -14,7 +13,9 @@ use crate::{
         DeviceKindV1, DevicePublicRecordV1, HookConfigV1, VERSION_V1,
         WebauthnEnrollmentSubmissionV1, decode_base64url, device_fingerprint, encode_base64url,
     },
-    webauthn_v1::cose_p256_verifying_key,
+    webauthn_v1::{
+        MAX_ATTESTATION_CBOR_BYTES, MAX_COSE_CBOR_BYTES, cose_p256_verifying_key, decode_cbor_value,
+    },
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -159,21 +160,19 @@ fn parse_attestation(
     attestation_object: &[u8],
     rp_id: &str,
 ) -> Result<(Vec<u8>, Vec<u8>, u32), Error> {
-    let value: serde_cbor::Value = serde_cbor::from_slice(attestation_object)
-        .map_err(|_| Error::MalformedAuthenticatorData)?;
-    let serde_cbor::Value::Map(entries) = value else {
+    let value = decode_cbor_value(attestation_object, MAX_ATTESTATION_CBOR_BYTES)
+        .map_err(|()| Error::MalformedAuthenticatorData)?;
+    let Value::Map(entries) = value else {
         return Err(Error::MalformedAuthenticatorData);
     };
     let mut format = None;
     let mut auth_data = None;
     for (key, value) in entries {
         match (key, value) {
-            (serde_cbor::Value::Text(key), serde_cbor::Value::Text(value)) if key == "fmt" => {
+            (Value::Text(key), Value::Text(value)) if key == "fmt" => {
                 format = Some(value);
             }
-            (serde_cbor::Value::Text(key), serde_cbor::Value::Bytes(value))
-                if key == "authData" =>
-            {
+            (Value::Text(key), Value::Bytes(value)) if key == "authData" => {
                 auth_data = Some(value);
             }
             _ => {}
@@ -213,10 +212,11 @@ fn parse_attestation(
         return Err(Error::MalformedAuthenticatorData);
     }
     let credential_id = auth_data[55..credential_end].to_vec();
-    let mut cursor = Cursor::new(&auth_data[credential_end..]);
-    let cose: serde_cbor::Value =
-        serde_cbor::from_reader(&mut cursor).map_err(|_| Error::MalformedAuthenticatorData)?;
-    let cose = serde_cbor::to_vec(&cose).map_err(|_| Error::MalformedAuthenticatorData)?;
+    let cose_value = decode_cbor_value(&auth_data[credential_end..], MAX_COSE_CBOR_BYTES)
+        .map_err(|()| Error::MalformedAuthenticatorData)?;
+    let mut cose = Vec::new();
+    ciborium::ser::into_writer(&cose_value, &mut cose)
+        .map_err(|_| Error::MalformedAuthenticatorData)?;
     cose_p256_verifying_key(&cose)?;
     Ok((credential_id, cose, count))
 }
@@ -256,12 +256,11 @@ fn verify_assertion_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webauthn_v1::MAX_CBOR_DEPTH;
     use p256::{
         ecdsa::{Signature, SigningKey, signature::Signer as _},
         elliptic_curve::rand_core::OsRng,
     };
-    use serde_cbor::Value;
-    use std::collections::BTreeMap;
 
     fn fixture() -> (WebauthnEnrollmentSubmissionV1, [u8; 32], HookConfigV1) {
         let secret = [9; 32];
@@ -273,19 +272,21 @@ mod tests {
         };
         let signing = SigningKey::random(&mut OsRng);
         let point = signing.verifying_key().to_encoded_point(false);
-        let mut cose = BTreeMap::new();
-        cose.insert(Value::Integer(1), Value::Integer(2));
-        cose.insert(Value::Integer(3), Value::Integer(-7));
-        cose.insert(Value::Integer(-1), Value::Integer(1));
-        cose.insert(
-            Value::Integer(-2),
-            Value::Bytes(point.x().unwrap().to_vec()),
-        );
-        cose.insert(
-            Value::Integer(-3),
-            Value::Bytes(point.y().unwrap().to_vec()),
-        );
-        let cose = serde_cbor::to_vec(&Value::Map(cose)).unwrap();
+        let cose = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(3.into()), Value::Integer((-7).into())),
+            (Value::Integer((-1).into()), Value::Integer(1.into())),
+            (
+                Value::Integer((-2).into()),
+                Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                Value::Integer((-3).into()),
+                Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ]);
+        let mut cose_bytes = Vec::new();
+        ciborium::ser::into_writer(&cose, &mut cose_bytes).unwrap();
         let credential_id = vec![7; 24];
         let box_key = vec![8; 32];
         let token_hash = vec![6; 32];
@@ -303,15 +304,17 @@ mod tests {
         registration_auth
             .extend_from_slice(&u16::try_from(credential_id.len()).unwrap().to_be_bytes());
         registration_auth.extend_from_slice(&credential_id);
-        registration_auth.extend_from_slice(&cose);
-        let mut attestation = BTreeMap::new();
-        attestation.insert(Value::Text("fmt".into()), Value::Text("none".into()));
-        attestation.insert(
-            Value::Text("authData".into()),
-            Value::Bytes(registration_auth),
-        );
-        attestation.insert(Value::Text("attStmt".into()), Value::Map(BTreeMap::new()));
-        let attestation = serde_cbor::to_vec(&Value::Map(attestation)).unwrap();
+        registration_auth.extend_from_slice(&cose_bytes);
+        let attestation = Value::Map(vec![
+            (Value::Text("fmt".into()), Value::Text("none".into())),
+            (
+                Value::Text("authData".into()),
+                Value::Bytes(registration_auth),
+            ),
+            (Value::Text("attStmt".into()), Value::Map(Vec::new())),
+        ]);
+        let mut attestation_bytes = Vec::new();
+        ciborium::ser::into_writer(&attestation, &mut attestation_bytes).unwrap();
         let proof_challenge = enrollment_hmac(
             &secret,
             PROOF_DOMAIN,
@@ -333,7 +336,7 @@ mod tests {
         let fields = [
             b"enrollment-1".as_slice(),
             registration_client.as_slice(),
-            attestation.as_slice(),
+            attestation_bytes.as_slice(),
             proof_auth.as_slice(),
             proof_client.as_slice(),
             signature.as_slice(),
@@ -347,7 +350,7 @@ mod tests {
             version: 1,
             enrollment_id: "enrollment-1".into(),
             registration_client_data_json: encode_base64url(&registration_client),
-            attestation_object: encode_base64url(&attestation),
+            attestation_object: encode_base64url(&attestation_bytes),
             proof_authenticator_data: encode_base64url(&proof_auth),
             proof_client_data_json: encode_base64url(&proof_client),
             proof_signature: encode_base64url(&signature),
@@ -384,5 +387,85 @@ mod tests {
         let (submission, secret, mut config) = fixture();
         config.rp_id = "other.example".into();
         assert!(verify_enrollment_v1(&submission, &secret, &config).is_err());
+    }
+
+    fn fixture_attestation() -> (Vec<u8>, HookConfigV1) {
+        let (submission, _, config) = fixture();
+        (
+            decode_base64url(&submission.attestation_object).unwrap(),
+            config,
+        )
+    }
+
+    fn encode_value(value: &Value) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(value, &mut encoded).unwrap();
+        encoded
+    }
+
+    #[test]
+    fn rejects_malformed_attestation_cbor() {
+        assert!(parse_attestation(&[0xff], "sudo.example").is_err());
+    }
+
+    #[test]
+    fn rejects_deeply_nested_attestation_cbor() {
+        let (attestation, config) = fixture_attestation();
+        let Value::Map(mut entries) =
+            decode_cbor_value(&attestation, MAX_ATTESTATION_CBOR_BYTES).unwrap()
+        else {
+            unreachable!();
+        };
+        let mut nested = Value::Null;
+        for _ in 0..=MAX_CBOR_DEPTH {
+            nested = Value::Array(vec![nested]);
+        }
+        entries.push((Value::Text("nested".into()), nested));
+        assert!(parse_attestation(&encode_value(&Value::Map(entries)), &config.rp_id).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_attestation_cbor() {
+        let (_, config) = fixture_attestation();
+        assert!(
+            parse_attestation(&vec![0; MAX_ATTESTATION_CBOR_BYTES + 1], &config.rp_id).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_attestation_map_key() {
+        let (attestation, config) = fixture_attestation();
+        let Value::Map(mut entries) =
+            decode_cbor_value(&attestation, MAX_ATTESTATION_CBOR_BYTES).unwrap()
+        else {
+            unreachable!();
+        };
+        entries.push((Value::Text("fmt".into()), Value::Text("none".into())));
+        assert!(parse_attestation(&encode_value(&Value::Map(entries)), &config.rp_id).is_err());
+    }
+
+    #[test]
+    fn rejects_attestation_trailing_data() {
+        let (mut attestation, config) = fixture_attestation();
+        attestation.push(0);
+        assert!(parse_attestation(&attestation, &config.rp_id).is_err());
+    }
+
+    #[test]
+    fn rejects_trailing_data_after_attestation_cose_key() {
+        let (attestation, config) = fixture_attestation();
+        let Value::Map(mut entries) =
+            decode_cbor_value(&attestation, MAX_ATTESTATION_CBOR_BYTES).unwrap()
+        else {
+            unreachable!();
+        };
+        for (key, value) in &mut entries {
+            if *key == Value::Text("authData".into()) {
+                if let Value::Bytes(auth_data) = value {
+                    auth_data.push(0);
+                }
+            }
+        }
+        assert!(parse_attestation(&encode_value(&Value::Map(entries)), &config.rp_id).is_err());
     }
 }

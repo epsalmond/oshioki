@@ -24,9 +24,10 @@ use uuid::Uuid;
 
 use oshioki_protocol::{
     ActivationV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
-    EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1, RequestEnvelopeV1,
-    RequestV1, VERSION_V1, escape_for_terminal, is_approval_env, verify_approval_v1,
-    verify_deny_v1, verify_enrollment_v1, verify_native_approval_v1, verify_native_enrollment_v1,
+    EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1,
+    PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION, RequestEnvelopeV1, RequestV1, VERSION_V1,
+    escape_for_terminal, verify_approval_v1, verify_deny_v1, verify_enrollment_v1,
+    verify_native_approval_v1, verify_native_enrollment_v1, verify_software_native_enrollment_v1,
 };
 use oshioki_transport::{HookProgress, HookTransport, HookTransportFailure, NatsTransport};
 
@@ -67,7 +68,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Verb {
-    Check,
+    Check {
+        /// Required private handshake from the matching root-owned plugin.
+        /// Hidden from normal operator help; a missing or mismatched value
+        /// fails closed before any request bytes are accepted.
+        #[arg(long, hide = true)]
+        plugin_protocol_version: Option<u8>,
+    },
     Enroll {
         #[arg(long, allow_hyphen_values = true)]
         resume: Option<String>,
@@ -103,10 +110,12 @@ struct EnrollmentStateV1 {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let checking = matches!(cli.verb, Verb::Check);
+    let checking = matches!(cli.verb, Verb::Check { .. });
     logging::init(checking);
     let result = match cli.verb {
-        Verb::Check => cmd_check().await,
+        Verb::Check {
+            plugin_protocol_version,
+        } => cmd_check(plugin_protocol_version).await,
         Verb::Enroll { resume } => cmd_enroll(resume.as_deref()).await,
         Verb::Revoke { fingerprint } => cmd_revoke(&fingerprint).await,
         Verb::Pin { fingerprint } => cmd_pin(&fingerprint).await,
@@ -616,7 +625,10 @@ mod logging {
     }
 }
 
-async fn cmd_check() -> Result<()> {
+async fn cmd_check(plugin_protocol_version: Option<u8>) -> Result<()> {
+    if plugin_protocol_version != Some(PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION) {
+        bail!("plugin/hook protocol handshake failed");
+    }
     let request = build_request(&parse_sudo_stdin()?)?;
     execute_request_at(request, APPROVAL_TIMEOUT, check_config_dir(), false).await
 }
@@ -1230,10 +1242,12 @@ async fn apply_decision(
             let device = active
                 .iter()
                 .find(|device| {
-                    device.kind == DeviceKindV1::SecureEnclave
-                        && device.fingerprint == approval.device_fingerprint
+                    matches!(
+                        device.kind,
+                        DeviceKindV1::Software | DeviceKindV1::SecureEnclave
+                    ) && device.fingerprint == approval.device_fingerprint
                 })
-                .context("native approval does not name one pinned secure-enclave device")?;
+                .context("native approval does not name one pinned native device")?;
             verify_native_approval_v1(&approval, raw_request, device)
                 .context("native approval verification failed")?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
@@ -1290,6 +1304,10 @@ async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
     let device = match &submission {
         EnrollmentSubmissionV1::Webauthn(submission) => {
             verify_enrollment_v1(submission, &secret_bytes, &config).context("verify enrollment")?
+        }
+        EnrollmentSubmissionV1::Software(submission) => {
+            verify_software_native_enrollment_v1(submission, &secret_bytes)
+                .context("verify software native enrollment")?
         }
         EnrollmentSubmissionV1::SecureEnclave(submission) => {
             verify_native_enrollment_v1(submission, &secret_bytes)
@@ -1565,62 +1583,76 @@ fn opener_command(opener: &str, url: &str) -> Command {
     command
 }
 
-fn build_request(values: &HashMap<String, String>) -> Result<RequestV1> {
+fn build_request(values: &[(String, String)]) -> Result<RequestV1> {
     let issued_at = now();
     let mut nonce = [0_u8; 16];
     rand::thread_rng().fill_bytes(&mut nonce);
-    let command = values
-        .get("info.command")
-        .cloned()
+    let last_value = |key: &str| {
+        values
+            .iter()
+            .rev()
+            .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+    };
+    // A current plugin emits this marker and the exact environment count.
+    // Requiring it prevents a new hook from silently accepting the partial
+    // environment produced by an older plugin. This is private framing; the
+    // RequestV1 wire version remains unchanged.
+    if last_value("meta.env_complete") != Some("1") {
+        bail!("plugin payload does not attest to a complete environment");
+    }
+    let protocol_version = last_value("meta.protocol_version")
+        .and_then(|value| value.parse::<u8>().ok())
+        .context("missing or invalid plugin/hook protocol version")?;
+    if protocol_version != PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION {
+        bail!("unsupported plugin/hook protocol version: {protocol_version}");
+    }
+    let expected_env_count = last_value("meta.env_count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .context("missing or invalid environment count")?;
+    let command = last_value("info.command")
+        .map(str::to_owned)
         .context("missing info.command")?;
     let argv = values
-        .keys()
-        .filter_map(|key| key.strip_prefix("argv.")?.parse::<u32>().ok())
+        .iter()
+        .filter_map(|(key, _)| key.strip_prefix("argv.")?.parse::<u32>().ok())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
-        .filter_map(|index| values.get(&format!("argv.{index}")).cloned())
+        .filter_map(|index| last_value(&format!("argv.{index}")).map(str::to_owned))
         .collect();
-    // The plugin already filters to policy variables; re-filter here so a
-    // hand-built payload cannot smuggle extra environment into the signed
-    // request. Sorted for a stable payload.
-    let mut env: Vec<EnvEntryV1> = values
+    // Preserve every environment entry in the order supplied by sudo,
+    // including duplicate names. Ordering and duplicates are execution input;
+    // a map or a finite allowlist here would make distinct sudo requests share
+    // one approval.
+    let env: Vec<EnvEntryV1> = values
         .iter()
         .filter_map(|(key, value)| {
-            let name = key.strip_prefix("env.")?;
-            if !is_approval_env(name) {
-                return None;
-            }
             Some(EnvEntryV1 {
-                name: name.to_owned(),
+                name: key.strip_prefix("env.")?.to_owned(),
                 value: value.clone(),
             })
         })
         .collect();
-    env.sort_by(|a, b| a.name.cmp(&b.name));
+    if env.len() != expected_env_count {
+        bail!(
+            "environment count mismatch: payload says {expected_env_count}, received {}",
+            env.len()
+        );
+    }
     let request = RequestV1 {
         version: VERSION_V1,
         request_id: Uuid::new_v4().to_string(),
         nonce: URL_SAFE_NO_PAD.encode(nonce),
         host: hostname(),
-        user: values
-            .get("info.user")
-            .cloned()
-            .unwrap_or_else(|| "unknown".into()),
-        uid: values
-            .get("info.uid")
+        user: last_value("info.user").map_or_else(|| "unknown".into(), str::to_owned),
+        uid: last_value("info.uid")
             .and_then(|value| value.parse().ok())
             .unwrap_or(u32::MAX),
-        runas_uid: values
-            .get("info.runas_uid")
+        runas_uid: last_value("info.runas_uid")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
-        cwd: values
-            .get("info.cwd")
-            .cloned()
-            .unwrap_or_else(|| "/".into()),
-        tty: values
-            .get("info.tty")
-            .cloned()
+        cwd: last_value("info.cwd").map_or_else(|| "/".into(), str::to_owned),
+        tty: last_value("info.tty")
+            .map(str::to_owned)
             .filter(|value| !value.is_empty()),
         command,
         argv,
@@ -1683,13 +1715,14 @@ fn seal_request(
     Ok(envelope)
 }
 
-fn parse_sudo_stdin() -> Result<HashMap<String, String>> {
-    let mut values = HashMap::new();
+fn parse_sudo_stdin() -> Result<Vec<(String, String)>> {
+    let mut values = Vec::new();
     for line in io::stdin().lock().lines() {
         let line = line?;
-        if let Some((key, value)) = line.split_once('=') {
-            values.insert(key.to_owned(), value.to_owned());
-        }
+        let (key, value) = line
+            .split_once('=')
+            .context("malformed plugin payload line")?;
+        values.push((key.to_owned(), value.to_owned()));
     }
     if values.is_empty() {
         bail!("stdin empty; expected sudo plugin payload");
@@ -2001,7 +2034,6 @@ mod tests {
         }
     }
     use p256::ecdsa::SigningKey;
-    use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[test]
     fn fingerprint_arguments_may_start_with_a_hyphen() {
@@ -2015,31 +2047,97 @@ mod tests {
         let cli = Cli::try_parse_from(["oshioki", "enroll", "--resume", "-abc"]).unwrap();
         assert!(matches!(cli.verb, Verb::Enroll { resume: Some(ref r) } if r == "-abc"));
     }
-    /// Only policy variables reach the signed request, sorted by name, even
-    /// when the payload carries the whole environment: the hook re-filters
-    /// what the plugin sends.
+    /// The complete effective environment reaches the signed request in its
+    /// original order, including variables not in the finite display
+    /// classification and duplicate names.
     #[test]
-    fn build_request_binds_only_policy_environment() {
-        let values = HashMap::from([
+    fn build_request_binds_complete_environment() {
+        let values = vec![
             ("info.command".into(), "/usr/bin/python3".into()),
             ("argv.1".into(), "/usr/bin/python3".into()),
+            ("env.PYTHONINSPECT".into(), "1".into()),
+            ("env.PERL5OPT".into(), "-M/tmp/attacker".into()),
+            ("env.APP_MODE".into(), "unsafe".into()),
             ("env.PATH".into(), "/tmp/bin:/usr/bin".into()),
+            ("env.PATH".into(), "/second".into()),
             ("env.LD_PRELOAD".into(), "/tmp/evil.so".into()),
             ("env.HOME".into(), "/root".into()),
-            ("env.AWS_SECRET_ACCESS_KEY".into(), "hunter2".into()),
-        ]);
+            (
+                "meta.protocol_version".into(),
+                PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION.to_string(),
+            ),
+            ("meta.env_complete".into(), "1".into()),
+            ("meta.env_count".into(), "7".into()),
+        ];
         let request = build_request(&values).unwrap();
         let names: Vec<_> = request
             .env
             .iter()
             .map(|entry| entry.name.as_str())
             .collect();
-        assert_eq!(names, ["LD_PRELOAD", "PATH"]);
-        assert_eq!(request.env[0].value, "/tmp/evil.so");
-        assert_eq!(request.env[1].value, "/tmp/bin:/usr/bin");
-        // The environment is part of the signed bytes, not decoration.
+        assert_eq!(
+            names,
+            [
+                "PYTHONINSPECT",
+                "PERL5OPT",
+                "APP_MODE",
+                "PATH",
+                "PATH",
+                "LD_PRELOAD",
+                "HOME",
+            ]
+        );
+        assert_eq!(request.env[0].value, "1");
+        assert_eq!(request.env[1].value, "-M/tmp/attacker");
+        assert_eq!(request.env[4].value, "/second");
+        // The complete environment is part of the signed bytes, not
+        // decoration or a finite allowlist projection.
         let raw = String::from_utf8(request.raw_json().unwrap()).unwrap();
-        assert!(raw.contains("LD_PRELOAD"));
+        for name in ["PYTHONINSPECT", "PERL5OPT", "APP_MODE", "HOME"] {
+            assert!(raw.contains(name), "{name} missing from {raw}");
+        }
+    }
+
+    #[test]
+    fn build_request_rejects_missing_or_mismatched_environment_attestation() {
+        let base = vec![
+            ("info.command".into(), "/usr/bin/true".into()),
+            ("argv.1".into(), "/usr/bin/true".into()),
+            ("env.APP_MODE".into(), "safe".into()),
+        ];
+        assert!(build_request(&base).is_err());
+
+        let mut wrong_count = base.clone();
+        wrong_count.extend([
+            (
+                "meta.protocol_version".into(),
+                PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION.to_string(),
+            ),
+            ("meta.env_complete".into(), "1".into()),
+            ("meta.env_count".into(), "2".into()),
+        ]);
+        assert!(build_request(&wrong_count).is_err());
+    }
+
+    /// An old plugin emits the environment markers without the private
+    /// protocol version, while an explicitly mixed version must also fail
+    /// closed before a request can be sealed.
+    #[test]
+    fn mixed_plugin_versions_fail_closed() {
+        let base = vec![
+            ("info.command".into(), "/usr/bin/true".into()),
+            ("argv.1".into(), "/usr/bin/true".into()),
+            ("env.APP_MODE".into(), "safe".into()),
+            ("meta.env_complete".into(), "1".into()),
+            ("meta.env_count".into(), "1".into()),
+        ];
+        assert!(build_request(&base).is_err(), "old plugin was accepted");
+        let mut mismatched = base;
+        mismatched.push(("meta.protocol_version".into(), "1".into()));
+        assert!(
+            build_request(&mismatched).is_err(),
+            "unsupported plugin version was accepted"
+        );
     }
     #[test]
     fn request_bytes_are_retained_in_every_sealed_body() {
@@ -2048,25 +2146,30 @@ mod tests {
         let credential = vec![1; 8];
         let signing = SigningKey::from_bytes((&[2; 32]).into()).unwrap();
         let point = signing.verifying_key().to_encoded_point(false);
-        let mut cose = BTreeMap::new();
-        cose.insert(serde_cbor::Value::Integer(1), serde_cbor::Value::Integer(2));
-        cose.insert(
-            serde_cbor::Value::Integer(3),
-            serde_cbor::Value::Integer(-7),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-1),
-            serde_cbor::Value::Integer(1),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-2),
-            serde_cbor::Value::Bytes(point.x().unwrap().to_vec()),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-3),
-            serde_cbor::Value::Bytes(point.y().unwrap().to_vec()),
-        );
-        let public = serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap();
+        let cose = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Integer(1.into()),
+                ciborium::Value::Integer(2.into()),
+            ),
+            (
+                ciborium::Value::Integer(3.into()),
+                ciborium::Value::Integer((-7).into()),
+            ),
+            (
+                ciborium::Value::Integer((-1).into()),
+                ciborium::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::Value::Integer((-2).into()),
+                ciborium::Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                ciborium::Value::Integer((-3).into()),
+                ciborium::Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ]);
+        let mut public = Vec::new();
+        ciborium::ser::into_writer(&cose, &mut public).unwrap();
         let secret = x25519_dalek::StaticSecret::from([4; 32]);
         let box_public = x25519_dalek::PublicKey::from(&secret);
         let fingerprint =
@@ -2569,6 +2672,127 @@ mod tests {
             }
         }
         serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process that owns the Linux agent state can replace the socket and
+    /// use the readable software identity to produce a valid signature. The
+    /// record remains explicitly software, so the installer must not pair it
+    /// with passwordless sudo; the separate installer regression checks that
+    /// policy while this test exercises the replacement-socket path itself.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn replacement_socket_with_software_identity_is_not_hardware_assurance() {
+        use p256::ecdsa::{SigningKey, signature::Signer as _};
+
+        let dir = socket_test_dir("software-replacement");
+        // macOS caps AF_UNIX paths at 104 bytes; keep the socket outside the
+        // descriptive temp directory so this test also runs there.
+        let socket_path = PathBuf::from(format!("/tmp/oshioki-repl-{}.sock", Uuid::new_v4()));
+        socket_test_config_no_nats(&dir, Some(&socket_path));
+
+        let signing = SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let box_secret = x25519_dalek::StaticSecret::from([0x22; 32]);
+        let credential_public_key = signing
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let credential_id = oshioki_protocol::native_credential_id(&credential_public_key);
+        let device = DevicePublicRecordV1 {
+            version: VERSION_V1,
+            kind: DeviceKindV1::Software,
+            fingerprint: oshioki_protocol::device_fingerprint(
+                &credential_id,
+                &credential_public_key,
+                x25519_dalek::PublicKey::from(&box_secret).as_bytes(),
+            ),
+            credential_id: URL_SAFE_NO_PAD.encode(&credential_id),
+            credential_public_key: URL_SAFE_NO_PAD.encode(&credential_public_key),
+            box_public_key: URL_SAFE_NO_PAD
+                .encode(x25519_dalek::PublicKey::from(&box_secret).as_bytes()),
+            label: "linux".into(),
+            api_token_hash: URL_SAFE_NO_PAD.encode([0x33; 32]),
+            sign_count: 0,
+            active: true,
+        };
+        device.validate().unwrap();
+        let request = build_synthetic_request();
+        let raw = request.raw_json().unwrap();
+        let envelope = oshioki_protocol::RequestEnvelopeV1 {
+            version: VERSION_V1,
+            request_id: request.request_id.clone(),
+            host: request.host.clone(),
+            user: request.user.clone(),
+            issued_at: request.issued_at,
+            expires_at: request.expires_at,
+            sealed: vec![oshioki_protocol::seal_v1(&raw, &device).unwrap()],
+        };
+        let payload = serde_json::to_vec(&envelope).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let expected_fingerprint = device.fingerprint.clone();
+        let expected_raw = raw.clone();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            stream.read_exact(&mut prefix).await.unwrap();
+            let mut request_bytes = vec![0u8; u32::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut request_bytes).await.unwrap();
+            let received: RequestEnvelopeV1 = serde_json::from_slice(&request_bytes).unwrap();
+            let opened = oshioki_protocol::unseal_v1(&received.sealed[0], &box_secret).unwrap();
+            assert_eq!(opened, expected_raw);
+            let alive = oshioki_protocol::socket_v1::encode_frame(
+                &serde_json::to_vec(&oshioki_protocol::AliveV1::for_request(
+                    &received.request_id,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            stream.write_all(&alive).await.unwrap();
+            let signature: p256::ecdsa::Signature =
+                signing.sign(&oshioki_protocol::approve_challenge(&opened));
+            let approval = oshioki_protocol::ApproveNativeV1 {
+                version: VERSION_V1,
+                request_id: received.request_id,
+                device_fingerprint: expected_fingerprint,
+                signature: URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+            };
+            let frame = oshioki_protocol::socket_v1::encode_frame(
+                &serde_json::to_vec(&DecisionV1::ApproveNative(approval)).unwrap(),
+            )
+            .unwrap();
+            stream.write_all(&frame).await.unwrap();
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let progress = test_progress();
+        let decision =
+            match try_agent_socket(&dir, &request.request_id, &payload, deadline, &progress)
+                .await
+                .unwrap()
+            {
+                SocketOutcome::Decision(decision) => decision,
+                SocketOutcome::Unconfigured | SocketOutcome::Silent(_) => {
+                    panic!("replacement socket verdict was ignored")
+                }
+            };
+        let mut registry = DeviceRegistryV1 {
+            version: VERSION_V1,
+            devices: Vec::new(),
+        };
+        apply_decision(
+            decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            &dir,
+        )
+        .await
+        .unwrap();
+        assert_eq!(device.kind, DeviceKindV1::Software);
+        serve.await.unwrap();
+        let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

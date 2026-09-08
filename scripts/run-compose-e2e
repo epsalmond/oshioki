@@ -172,14 +172,14 @@ if [ "$deny_status" -eq 124 ]; then
   exit 1
 fi
 
-if ! "$HOOK_BIN" status | grep -Fq "$fingerprint  native-e2e  kind=secure-enclave  active=true"; then
-  echo "status does not show the native device as a secure-enclave record" >&2
+if ! "$HOOK_BIN" status | grep -Fq "$fingerprint  native-e2e  kind=software  active=true"; then
+  echo "status does not show the Linux native device as a software record" >&2
   "$HOOK_BIN" status >&2
   exit 1
 fi
 printf 'native agent approved and denied a request: %s\n' "$fingerprint"
 
-# `pin` must accept a secure-enclave record served by the server, starting
+# `pin` must accept a software native record served by the server, starting
 # from a config dir without the native device. The TLS proxy started for the
 # enrollment read-back still serves the origin.
 PIN_CONFIG_DIR="$STATE_ROOT/pin"
@@ -191,17 +191,17 @@ printf '{"version":1,"devices":[]}\n' >"$PIN_CONFIG_DIR/devices.json"
 chmod 0600 "$PIN_CONFIG_DIR"/*.json "$PIN_CONFIG_DIR/config.env"
 if ! printf '%s\n' "$fingerprint" \
   | OSHIOKI_CONFIG_DIR="$PIN_CONFIG_DIR" "$HOOK_BIN" pin "$fingerprint"; then
-  echo "pin rejected the secure-enclave record" >&2
+  echo "pin rejected the software native record" >&2
   cat "$PROXY_LOG" >&2
   exit 1
 fi
 if ! OSHIOKI_CONFIG_DIR="$PIN_CONFIG_DIR" "$HOOK_BIN" status \
-  | grep -Fq "$fingerprint  native-e2e  kind=secure-enclave  active=true"; then
-  echo "pinned secure-enclave record missing from status" >&2
+  | grep -Fq "$fingerprint  native-e2e  kind=software  active=true"; then
+  echo "pinned software native record missing from status" >&2
   exit 1
 fi
 stop_background
-printf 'pin accepted the secure-enclave record: %s\n' "$fingerprint"
+printf 'pin accepted the software native record: %s\n' "$fingerprint"
 unset OSHIOKI_CONFIG_DIR
 
 cd /work

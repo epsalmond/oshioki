@@ -77,7 +77,7 @@ chacha20poly1305 = { version = "0.10" }
 # Serde
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
-serde_cbor = { version = "0.11" }
+ciborium = { version = "0.2.2" }
 
 # HTTP
 axum = { version = "0.7", features = ["http1", "tokio", "json"] }

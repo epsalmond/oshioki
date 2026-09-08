@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+TEST_ROOT="$(mktemp -d -t oshioki-debian-package-test.XXXXXX)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+fail() { echo "test-debian-package-scripts: $*" >&2; exit 1; }
+
+mkdir -p "$TEST_ROOT/fake-bin"
+cat > "$TEST_ROOT/fake-bin/id" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = -u ] && { echo 0; exit 0; }
+exec /usr/bin/id "$@"
+SH
+cat > "$TEST_ROOT/fake-bin/deb-systemd-helper" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+cat > "$TEST_ROOT/fake-bin/stat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  '-c %u'|'-f %u') echo 0 ;;
+  '-c %a'|'-f %Lp') echo 440 ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+SH
+cat > "$TEST_ROOT/fake-bin/chown" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+cat > "$TEST_ROOT/fake-bin/uname" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = -s ] && { echo Linux; exit 0; }
+exec /usr/bin/uname "$@"
+SH
+cat > "$TEST_ROOT/fake-bin/rm" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in
+    /etc/oshioki|/var/lib/oshioki|/usr/local/sbin/oshioki|/usr/local/libexec/sudo/oshioki.so) exit 0 ;;
+  esac
+done
+exec /bin/rm "$@"
+SH
+chmod 0755 "$TEST_ROOT/fake-bin"/*
+cp "$SCRIPT_DIR/install-oshioki-hook" "$TEST_ROOT/installer"
+chmod 0755 "$TEST_ROOT/installer"
+
+new_case() {
+  local name="$1"
+  CASE_ROOT="$TEST_ROOT/$name"
+  mkdir -p "$CASE_ROOT/state" "$CASE_ROOT/sudoers.d"
+  export CASE_ROOT
+}
+run_prerm() {
+  PATH="$TEST_ROOT/fake-bin:/usr/bin:/bin" \
+    OSHIOKI_INSTALLER="$TEST_ROOT/installer" \
+    SUDO_CONF="$CASE_ROOT/sudo.conf" SUDOERS_D="$CASE_ROOT/sudoers.d" \
+    SUDO_PLUGIN_DIR=/usr/local/libexec/sudo SBIN_DIR="$CASE_ROOT/sbin" \
+    OSHIOKI_STATE_DIR="$CASE_ROOT/state" SKIP_NODEVER=1 \
+    bash "$SCRIPT_DIR/../packaging/debian/DEBIAN/prerm" remove
+}
+run_postrm_purge() {
+  PATH="$TEST_ROOT/fake-bin:/usr/bin:/bin" \
+    OSHIOKI_INSTALLER="$TEST_ROOT/installer" \
+    SUDOERS_D="$CASE_ROOT/sudoers.d" \
+    bash "$SCRIPT_DIR/../packaging/debian/DEBIAN/postrm" purge
+}
+
+# Missing sudo.conf must not prevent an exact Oshioki drop-in from being
+# removed by prerm.
+new_case missing-conf
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$CASE_ROOT/sudoers.d/oshioki"
+run_prerm
+[ ! -e "$CASE_ROOT/sudoers.d/oshioki" ] || fail "missing sudo.conf left the drop-in"
+
+# A malformed marker pair still gets independently cleaned up, including the
+# exact plugin directive and the drop-in.
+new_case malformed-conf
+printf '%s\n' '# BEGIN oshioki' 'Plugin approval_exec /usr/local/libexec/sudo/oshioki.so' > "$CASE_ROOT/sudo.conf"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$CASE_ROOT/sudoers.d/oshioki"
+run_prerm
+if grep -Fq 'Plugin approval_exec /usr/local/libexec/sudo/oshioki.so' "$CASE_ROOT/sudo.conf"; then fail "malformed sudo.conf left the plugin"; fi
+[ ! -e "$CASE_ROOT/sudoers.d/oshioki" ] || fail "malformed sudo.conf left the drop-in"
+
+# If only one marker survived, cleanup removes that marker while preserving
+# unrelated administrator text.
+new_case partial-conf
+printf '%s\n' 'outside' '# END oshioki' > "$CASE_ROOT/sudo.conf"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$CASE_ROOT/sudoers.d/oshioki"
+run_prerm
+grep -Fxq outside "$CASE_ROOT/sudo.conf" || fail "partial cleanup changed unrelated sudo.conf text"
+if grep -Fq '# END oshioki' "$CASE_ROOT/sudo.conf"; then fail "partial sudo.conf left the marker"; fi
+[ ! -e "$CASE_ROOT/sudoers.d/oshioki" ] || fail "partial sudo.conf left the drop-in"
+
+# The package scripts must refuse an unrelated administrator rule at the
+# reserved path rather than deleting it during removal.
+new_case unrelated-dropin
+printf 'administrator ALL=(ALL) NOPASSWD: /usr/bin/id\n' > "$CASE_ROOT/sudoers.d/oshioki"
+if run_prerm >"$CASE_ROOT/log" 2>&1; then fail "prerm accepted an unrelated drop-in"; fi
+[ -e "$CASE_ROOT/sudoers.d/oshioki" ] || fail "prerm deleted unrelated sudoers content"
+
+# postrm purge is the final defensive cleanup opportunity after the installer
+# has otherwise been removed from dpkg's file list.
+new_case postrm-fallback
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$CASE_ROOT/sudoers.d/oshioki"
+rm "$TEST_ROOT/installer"
+run_postrm_purge
+[ ! -e "$CASE_ROOT/sudoers.d/oshioki" ] || fail "postrm purge left the Oshioki drop-in"
+
+new_case postrm-legacy
+printf 'testuser ALL=(ALL) NOPASSWD: ALL\n' > "$CASE_ROOT/sudoers.d/oshioki"
+run_postrm_purge
+[ ! -e "$CASE_ROOT/sudoers.d/oshioki" ] || fail "postrm purge left the legacy Oshioki drop-in"
+
+echo "test-debian-package-scripts: PASS"

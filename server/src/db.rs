@@ -9,6 +9,11 @@ use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+/// The server keeps request state only briefly after its local receipt time.
+/// This bound is intentionally independent of timestamps supplied by a
+/// publisher, including timestamps in a conflicting redelivery.
+pub const SERVER_REQUEST_RETENTION_SECS: i64 = 5 * 60;
+
 pub struct Store {
     connection: Mutex<Connection>,
 }
@@ -302,6 +307,7 @@ fn submission_binds_device(
 ) -> Result<bool> {
     let expected_kind = match submission {
         EnrollmentSubmissionV1::Webauthn(_) => DeviceKindV1::Webauthn,
+        EnrollmentSubmissionV1::Software(_) => DeviceKindV1::Software,
         EnrollmentSubmissionV1::SecureEnclave(_) => DeviceKindV1::SecureEnclave,
     };
     if device.kind != expected_kind {
@@ -316,7 +322,8 @@ fn submission_binds_device(
                 submission.api_token_hash.clone(),
                 submission.label.clone(),
             ),
-            EnrollmentSubmissionV1::SecureEnclave(submission) => {
+            EnrollmentSubmissionV1::Software(submission)
+            | EnrollmentSubmissionV1::SecureEnclave(submission) => {
                 let public_key =
                     oshioki_protocol::decode_base64url(&submission.credential_public_key)
                         .context("decode submitted credential key")?;
@@ -382,10 +389,7 @@ impl Store {
         if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
             bail!("oversized request envelope");
         }
-        envelope.validate().context("validate envelope")?;
-        if envelope.expires_at <= now {
-            bail!("expired request");
-        }
+        envelope.validate_at(now).context("validate envelope")?;
         let hash = Sha256::digest(raw).to_vec();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -402,15 +406,30 @@ impl Store {
             }
             transaction.execute(
                 "INSERT OR IGNORE INTO tombstones(kind, object_id, payload_hash, expires_at) VALUES ('request_conflict', ?1, ?2, ?3)",
-                params![envelope.request_id, hash, envelope.expires_at],
+                params![
+                    envelope.request_id,
+                    hash,
+                    envelope
+                        .expires_at
+                        .min(now.saturating_add(SERVER_REQUEST_RETENTION_SECS))
+                ],
             )?;
             transaction.commit()?;
             return Ok(InsertResult::Conflict);
         }
         transaction.execute(
             "INSERT INTO requests(id, envelope_hash, envelope_json, host, user, issued_at, expires_at, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', unixepoch())",
-            params![envelope.request_id, hash, raw, envelope.host, envelope.user, envelope.issued_at, envelope.expires_at],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+            params![
+                envelope.request_id,
+                hash,
+                raw,
+                envelope.host,
+                envelope.user,
+                envelope.issued_at,
+                envelope.expires_at,
+                now,
+            ],
         )?;
         for body in &envelope.sealed {
             transaction.execute(
@@ -626,7 +645,10 @@ impl Store {
             "UPDATE enrollments SET status='expired' WHERE status='pending' AND expires_at<=?1",
             [now],
         )?;
-        connection.execute("DELETE FROM requests WHERE expires_at < ?1", [now - 3600])?;
+        connection.execute(
+            "DELETE FROM requests WHERE created_at < ?1",
+            [now.saturating_sub(SERVER_REQUEST_RETENTION_SECS)],
+        )?;
         connection.execute("DELETE FROM tombstones WHERE expires_at < ?1", [now])?;
         connection.execute(
             "DELETE FROM outbox WHERE sent_at IS NOT NULL AND sent_at < ?1",
@@ -676,6 +698,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   UNIQUE(kind, dedupe_key)
 );
 CREATE INDEX IF NOT EXISTS requests_expiry_idx ON requests(expires_at);
+CREATE INDEX IF NOT EXISTS requests_created_idx ON requests(created_at);
 CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox(sent_at, id);
 PRAGMA user_version = 1;
 COMMIT;
@@ -691,7 +714,6 @@ mod tests {
     };
     use p256::ecdsa::SigningKey;
     use std::{
-        collections::BTreeMap,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -717,25 +739,30 @@ mod tests {
         let credential_id = vec![1; 16];
         let signing = SigningKey::from_bytes((&[2; 32]).into()).unwrap();
         let point = signing.verifying_key().to_encoded_point(false);
-        let mut cose = BTreeMap::new();
-        cose.insert(serde_cbor::Value::Integer(1), serde_cbor::Value::Integer(2));
-        cose.insert(
-            serde_cbor::Value::Integer(3),
-            serde_cbor::Value::Integer(-7),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-1),
-            serde_cbor::Value::Integer(1),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-2),
-            serde_cbor::Value::Bytes(point.x().unwrap().to_vec()),
-        );
-        cose.insert(
-            serde_cbor::Value::Integer(-3),
-            serde_cbor::Value::Bytes(point.y().unwrap().to_vec()),
-        );
-        let credential_public_key = serde_cbor::to_vec(&serde_cbor::Value::Map(cose)).unwrap();
+        let cose = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Integer(1.into()),
+                ciborium::Value::Integer(2.into()),
+            ),
+            (
+                ciborium::Value::Integer(3.into()),
+                ciborium::Value::Integer((-7).into()),
+            ),
+            (
+                ciborium::Value::Integer((-1).into()),
+                ciborium::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::Value::Integer((-2).into()),
+                ciborium::Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                ciborium::Value::Integer((-3).into()),
+                ciborium::Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ]);
+        let mut credential_public_key = Vec::new();
+        ciborium::ser::into_writer(&cose, &mut credential_public_key).unwrap();
         let box_public_key = vec![3; 32];
         let fingerprint = oshioki_protocol::device_fingerprint(
             &credential_id,
@@ -762,8 +789,8 @@ mod tests {
             request_id: "request-1".into(),
             host: "nas".into(),
             user: "eric".into(),
-            issued_at: 10,
-            expires_at: 100,
+            issued_at: 20,
+            expires_at: 110,
             sealed: vec![SealedDeviceBodyV1 {
                 device_fingerprint: fingerprint.into(),
                 ephemeral_pub: encode_base64url(&[4; 32]),
@@ -828,8 +855,11 @@ mod tests {
         assert_eq!(pending[0].subject, "oshioki.delivery.request-1");
         let receipt: DeliveryV1 = serde_json::from_slice(&pending[0].payload).unwrap();
         receipt.validate("request-1").unwrap();
+        let mut invalid_receipt = receipt.clone();
+        invalid_receipt.request_id = "request-2".into();
+        assert!(invalid_receipt.validate("request-1").is_err());
 
-        let mut inactive = browser;
+        let mut inactive = browser.clone();
         inactive.active = false;
         store.put_device(&inactive).unwrap();
         let mut second = envelope(&inactive.fingerprint);
@@ -842,6 +872,101 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|item| item.subject != "oshioki.delivery.request-2")
+        );
+
+        let (_, native) = native_pair("native-receipt", 9, b"native-token", "native");
+        store.put_device(&native).unwrap();
+        let mut native_request = envelope(&native.fingerprint);
+        native_request.request_id = "request-native".into();
+        let native_raw = serde_json::to_vec(&native_request).unwrap();
+        store
+            .ingest_request(&native_raw, &native_request, 20)
+            .unwrap();
+        assert!(
+            store
+                .pending_verdicts(10)
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != "oshioki.delivery.request-native")
+        );
+
+        let legacy_json = serde_json::to_value(&browser).unwrap();
+        let mut legacy_object = legacy_json.as_object().unwrap().clone();
+        legacy_object.remove("kind");
+        let legacy_json = serde_json::to_string(&legacy_object).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE devices SET active=1, public_record_json=?1 WHERE fingerprint=?2",
+                rusqlite::params![legacy_json, browser.fingerprint.clone()],
+            )
+            .unwrap();
+        let mut legacy_request = envelope(&browser.fingerprint);
+        legacy_request.request_id = "request-legacy".into();
+        let legacy_raw = serde_json::to_vec(&legacy_request).unwrap();
+        store
+            .ingest_request(&legacy_raw, &legacy_request, 20)
+            .unwrap();
+        assert!(
+            store
+                .pending_verdicts(10)
+                .unwrap()
+                .iter()
+                .any(|item| item.subject == "oshioki.delivery.request-legacy")
+        );
+    }
+
+    #[test]
+    fn request_receiver_rejects_stale_future_skew_and_long_lived_envelopes() {
+        let store = Store::memory().unwrap();
+        let fingerprint = device(b"timing-token").fingerprint;
+        let now = 1_000;
+        let base = envelope(&fingerprint);
+
+        let mut future = base.clone();
+        future.issued_at = now + oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS + 1;
+        future.expires_at = future.issued_at + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS;
+        let future_raw = serde_json::to_vec(&future).unwrap();
+        assert!(store.ingest_request(&future_raw, &future, now).is_err());
+
+        let mut stale = base.clone();
+        stale.issued_at = now - oshioki_protocol::MAX_REQUEST_ISSUANCE_SKEW_SECS - 1;
+        stale.expires_at = now + 1;
+        let stale_raw = serde_json::to_vec(&stale).unwrap();
+        assert!(store.ingest_request(&stale_raw, &stale, now).is_err());
+
+        let mut long_lived = base;
+        long_lived.issued_at = now;
+        long_lived.expires_at = now + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS + 1;
+        let long_lived_raw = serde_json::to_vec(&long_lived).unwrap();
+        assert!(
+            store
+                .ingest_request(&long_lived_raw, &long_lived, now)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cleanup_uses_server_receipt_time_not_message_expiry() {
+        let store = Store::memory().unwrap();
+        let device = device(b"retention-token");
+        store.put_device(&device).unwrap();
+        let received_at = 1_000;
+        let mut request = envelope(&device.fingerprint);
+        request.issued_at = received_at;
+        request.expires_at = received_at + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS;
+        let raw = serde_json::to_vec(&request).unwrap();
+        store.ingest_request(&raw, &request, received_at).unwrap();
+
+        store
+            .cleanup(received_at + SERVER_REQUEST_RETENTION_SECS + 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .request_lifecycle("request-1", received_at + SERVER_REQUEST_RETENTION_SECS + 1)
+                .unwrap(),
+            None
         );
     }
 
@@ -898,7 +1023,11 @@ mod tests {
         );
         assert_eq!(store.recorded_verdict("request-9").unwrap(), None);
         let pending = store.pending_verdicts(10).unwrap();
-        store.mark_outbox_sent(pending[0].id).unwrap();
+        let verdict = pending
+            .iter()
+            .find(|item| item.subject == "oshioki.verdict.request-1")
+            .unwrap();
+        store.mark_outbox_sent(verdict.id).unwrap();
         assert_eq!(
             store.recorded_verdict("request-1").unwrap(),
             Some(serde_json::to_vec(&decision).unwrap())

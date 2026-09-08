@@ -17,9 +17,24 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::{Error, native_v1::sec1_p256_verifying_key, webauthn_v1::cose_p256_verifying_key};
 
 pub const VERSION_V1: u8 = 1;
+/// Private framing version shared only by the root-owned sudo plugin and its
+/// hook child. It is deliberately separate from the public `RequestV1` wire
+/// version so an artifact mix cannot silently accept a partial context.
+pub const PRIVATE_PLUGIN_HOOK_PROTOCOL_VERSION: u8 = 2;
 pub const MAX_DEVICES: usize = 8;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 3 * 1024 * 1024;
+/// Maximum number of effective environment entries in one request. Ordinary
+/// shells can expose substantially more than the old 64-entry cap; the total
+/// request byte bound and per-entry bounds remain the limiting factors.
+pub const MAX_ENV_ENTRIES: usize = 4096;
+/// The longest a request may be valid after it was issued. This is a
+/// receiver policy rather than part of structural decoding, so old callers
+/// that only need to inspect a request can keep using [`RequestV1::validate`].
+pub const MAX_REQUEST_LIFETIME_SECS: i64 = 90;
+/// The amount of clock skew receivers tolerate around their own wall clock
+/// when checking a request's issuance time.
+pub const MAX_REQUEST_ISSUANCE_SKEW_SECS: i64 = 30;
 const CHALLENGE_DOMAIN: &[u8] = b"oshioki/approve/v1\0";
 const DENY_DOMAIN: &[u8] = b"oshioki/deny/v1\0";
 const FINGERPRINT_DOMAIN: &[u8] = b"oshioki/fingerprint/v1\0";
@@ -30,12 +45,11 @@ pub struct EnvEntryV1 {
     pub value: String,
 }
 
-/// Environment variables that can change what a command does without
-/// changing its path or arguments: the dynamic loader, command resolution,
-/// shell startup files, interpreter search paths, pagers and editors, and
-/// trust configuration. The plugin sends only these, so secrets that happen
-/// to sit in the environment never enter the request at all — not the sealed
-/// body, not server storage, not logs.
+/// Environment variable names that deserve emphasis in an approval display.
+/// This is deliberately a finite classification, not an authentication
+/// allowlist: [`RequestV1::env`] carries every effective environment entry.
+/// A command-specific variable can change execution just as surely as one of
+/// these well-known names.
 pub fn is_approval_env(name: &str) -> bool {
     matches!(
         name,
@@ -96,11 +110,13 @@ pub struct RequestV1 {
     pub command: String,
     pub argv: Vec<String>,
     pub pid_chain: Vec<String>,
-    /// Curated execution environment (see [`is_approval_env`]). Signed as
-    /// part of the raw request bytes, so two different environments never
-    /// share an approval. Empty environments serialize to nothing, so
-    /// requests written before the field existed are byte-identical to new
-    /// ones without it — and old signatures keep verifying.
+    /// Complete effective execution environment, in the order supplied to
+    /// `execve`. Duplicate names are retained because their order can affect
+    /// which value a program observes. Every entry is signed as part of the
+    /// raw request bytes, so an omitted or reordered entry cannot share an
+    /// approval. Empty environments serialize to nothing, so requests written
+    /// before this field existed remain byte-identical to new ones without
+    /// it, and old signatures keep verifying.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvEntryV1>,
     pub issued_at: i64,
@@ -127,7 +143,7 @@ impl RequestV1 {
             || self.argv.len() > 4096
             || self.pid_chain.len() > 5
             || self.pid_chain.iter().any(|entry| entry.len() > 512)
-            || self.env.len() > 64
+            || self.env.len() > MAX_ENV_ENTRIES
             || self
                 .env
                 .iter()
@@ -136,6 +152,14 @@ impl RequestV1 {
             return Err(Error::InvalidRequest("invalid request field size".into()));
         }
         Ok(())
+    }
+
+    /// Validates the request's timestamps against a receiver-local clock.
+    /// Structural validation intentionally remains separate: timestamps are
+    /// meaningful only at a trust boundary that has a current clock.
+    pub fn validate_at(&self, now: i64) -> Result<(), Error> {
+        self.validate()?;
+        validate_request_timing(self.issued_at, self.expires_at, now)
     }
 
     pub fn raw_json(&self) -> Result<Vec<u8>, Error> {
@@ -196,17 +220,53 @@ impl RequestEnvelopeV1 {
         }
         Ok(())
     }
+
+    /// Validates the envelope's timestamps against a receiver-local clock.
+    /// The opened request is checked independently by the agent because the
+    /// envelope timestamps are not authenticated until its sealed body opens.
+    pub fn validate_at(&self, now: i64) -> Result<(), Error> {
+        self.validate()?;
+        validate_request_timing(self.issued_at, self.expires_at, now)
+    }
+}
+
+fn validate_request_timing(issued_at: i64, expires_at: i64, now: i64) -> Result<(), Error> {
+    let oldest_issued_at = now.saturating_sub(MAX_REQUEST_ISSUANCE_SKEW_SECS);
+    let newest_issued_at = now.saturating_add(MAX_REQUEST_ISSUANCE_SKEW_SECS);
+    if issued_at < oldest_issued_at || issued_at > newest_issued_at {
+        return Err(Error::InvalidRequest(
+            "request issuance time is outside clock skew".into(),
+        ));
+    }
+    if expires_at <= now {
+        return Err(Error::InvalidRequest("request has expired".into()));
+    }
+    let lifetime = expires_at
+        .checked_sub(issued_at)
+        .ok_or_else(|| Error::InvalidRequest("invalid request lifetime".into()))?;
+    if lifetime > MAX_REQUEST_LIFETIME_SECS {
+        return Err(Error::InvalidRequest(
+            "request lifetime exceeds maximum".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// How a device proves an approval.
 ///
-/// `webauthn` devices sign `WebAuthn` assertions from a browser. `secure-enclave`
-/// devices sign the challenge directly with a P-256 key (the native agent).
+/// `webauthn` devices sign `WebAuthn` assertions from a browser. Native
+/// devices sign the challenge directly with a P-256 key. `secure-enclave` is
+/// reserved for a key backed by the Mac Secure Enclave; `software` is the
+/// explicitly non-hardware-backed native signer used on Linux and in tests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceKindV1 {
     #[default]
     #[serde(rename = "webauthn")]
     Webauthn,
+    /// A native P-256 key held in software. This kind must never be used to
+    /// grant passwordless sudo: the enrolling account can read the key.
+    #[serde(rename = "software")]
+    Software,
     #[serde(rename = "secure-enclave")]
     SecureEnclave,
 }
@@ -217,6 +277,7 @@ impl DeviceKindV1 {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Webauthn => "webauthn",
+            Self::Software => "software",
             Self::SecureEnclave => "secure-enclave",
         }
     }
@@ -230,9 +291,9 @@ impl std::fmt::Display for DeviceKindV1 {
 
 /// A pinned approval device.
 ///
-/// For `secure-enclave` records `credential_public_key` is the 65-byte SEC1
-/// uncompressed P-256 point, `credential_id` is the SHA-256 of that point,
-/// and `sign_count` is always zero.
+/// For native records (`software` and `secure-enclave`) `credential_public_key`
+/// is the 65-byte SEC1 uncompressed P-256 point, `credential_id` is the
+/// SHA-256 of that point, and `sign_count` is always zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePublicRecordV1 {
     pub version: u8,
@@ -268,15 +329,13 @@ impl DevicePublicRecordV1 {
             DeviceKindV1::Webauthn => {
                 crate::webauthn_v1::cose_p256_verifying_key(&public_key)?;
             }
-            DeviceKindV1::SecureEnclave => {
+            DeviceKindV1::Software | DeviceKindV1::SecureEnclave => {
                 crate::native_v1::sec1_p256_verifying_key(&public_key)?;
                 if decode_base64url(&self.credential_id)?
                     != crate::native_v1::native_credential_id(&public_key)
                     || self.sign_count != 0
                 {
-                    return Err(Error::InvalidRequest(
-                        "invalid secure-enclave device record".into(),
-                    ));
+                    return Err(Error::InvalidRequest("invalid native device record".into()));
                 }
             }
         }
@@ -349,6 +408,11 @@ impl EnrollmentIntentV1 {
 pub enum EnrollmentSubmissionV1 {
     #[serde(rename = "webauthn")]
     Webauthn(WebauthnEnrollmentSubmissionV1),
+    /// Native software identities are carried separately from an enclave
+    /// submission so the host never upgrades a readable key to hardware
+    /// assurance based on a caller-provided label.
+    #[serde(rename = "software")]
+    Software(NativeEnrollmentSubmissionV1),
     #[serde(rename = "secure-enclave")]
     SecureEnclave(NativeEnrollmentSubmissionV1),
 }
@@ -373,6 +437,9 @@ impl<'de> Deserialize<'de> for EnrollmentSubmissionV1 {
             Some(serde_json::Value::String(tag)) if tag == DeviceKindV1::Webauthn.as_str() => {
                 DeviceKindV1::Webauthn
             }
+            Some(serde_json::Value::String(tag)) if tag == DeviceKindV1::Software.as_str() => {
+                DeviceKindV1::Software
+            }
             Some(serde_json::Value::String(tag)) if tag == DeviceKindV1::SecureEnclave.as_str() => {
                 DeviceKindV1::SecureEnclave
             }
@@ -392,6 +459,9 @@ impl<'de> Deserialize<'de> for EnrollmentSubmissionV1 {
             DeviceKindV1::Webauthn => serde_json::from_value(value)
                 .map(Self::Webauthn)
                 .map_err(D::Error::custom),
+            DeviceKindV1::Software => serde_json::from_value(value)
+                .map(Self::Software)
+                .map_err(D::Error::custom),
             DeviceKindV1::SecureEnclave => serde_json::from_value(value)
                 .map(Self::SecureEnclave)
                 .map_err(D::Error::custom),
@@ -403,19 +473,24 @@ impl EnrollmentSubmissionV1 {
     pub fn enrollment_id(&self) -> &str {
         match self {
             Self::Webauthn(submission) => &submission.enrollment_id,
-            Self::SecureEnclave(submission) => &submission.enrollment_id,
+            Self::Software(submission) | Self::SecureEnclave(submission) => {
+                &submission.enrollment_id
+            }
         }
     }
     pub fn kind(&self) -> DeviceKindV1 {
         match self {
             Self::Webauthn(_) => DeviceKindV1::Webauthn,
+            Self::Software(_) => DeviceKindV1::Software,
             Self::SecureEnclave(_) => DeviceKindV1::SecureEnclave,
         }
     }
     pub fn validate_shape(&self) -> Result<(), Error> {
         match self {
             Self::Webauthn(submission) => submission.validate_shape(),
-            Self::SecureEnclave(submission) => submission.validate_shape(),
+            Self::Software(submission) | Self::SecureEnclave(submission) => {
+                submission.validate_shape()
+            }
         }
     }
 }
@@ -640,8 +715,8 @@ pub fn deny_challenge(request_id: &str, device_fingerprint: &str) -> [u8; 32] {
 }
 
 /// Verifies a device-signed denial against its pinned record. The credential
-/// key parses according to the device kind; both `WebAuthn` and Secure Enclave
-/// devices speak DER ECDSA P-256.
+/// key parses according to the device kind; browser and native devices all
+/// ultimately verify a DER ECDSA P-256 signature.
 pub fn verify_deny_v1(denial: &DenyV1, device: &DevicePublicRecordV1) -> Result<(), Error> {
     device.validate()?;
     denial.validate_shape()?;
@@ -658,7 +733,7 @@ pub fn verify_deny_v1(denial: &DenyV1, device: &DevicePublicRecordV1) -> Result<
         DeviceKindV1::Webauthn => {
             cose_p256_verifying_key(&decode_base64url(&device.credential_public_key)?)?
         }
-        DeviceKindV1::SecureEnclave => {
+        DeviceKindV1::Software | DeviceKindV1::SecureEnclave => {
             sec1_p256_verifying_key(&decode_base64url(&device.credential_public_key)?)?
         }
     };
@@ -824,10 +899,35 @@ mod tests {
         }
     }
 
-    /// The allowlist pins behavior-shaping variables and nothing else:
-    /// loaders, resolution, shells, interpreters, pagers, trust config.
-    /// Anything carrying secrets or mere preferences stays out, so it never
-    /// enters the sealed request.
+    #[test]
+    fn receiver_timing_is_bounded_without_changing_structural_validation() {
+        let now = 1_000;
+        let mut request = minimal_request();
+        request.issued_at = now;
+        request.expires_at = now + MAX_REQUEST_LIFETIME_SECS;
+        request.validate().unwrap();
+        request.validate_at(now).unwrap();
+
+        request.expires_at += 1;
+        request.validate().unwrap();
+        assert!(request.validate_at(now).is_err());
+
+        request.expires_at = now + 90;
+        request.issued_at = now + MAX_REQUEST_ISSUANCE_SKEW_SECS + 1;
+        assert!(request.validate_at(now).is_err());
+
+        request.issued_at = now - MAX_REQUEST_ISSUANCE_SKEW_SECS - 1;
+        assert!(request.validate_at(now).is_err());
+
+        request.issued_at = now - 1;
+        request.expires_at = now;
+        assert!(request.validate_at(now).is_err());
+    }
+
+    /// The classification identifies behavior-shaping variables for display
+    /// emphasis. It does not determine authentication coverage: all effective
+    /// environment entries are retained in the request, including unknown
+    /// application-specific variables.
     #[test]
     fn approval_env_list_covers_the_dangerous_and_little_else() {
         for name in [
@@ -887,7 +987,7 @@ mod tests {
                 name: "PATH".into(),
                 value: "/usr/bin".into(),
             };
-            65
+            MAX_ENV_ENTRIES + 1
         ];
         assert!(request.validate().is_err());
         request.env.truncate(1);
@@ -898,9 +998,25 @@ mod tests {
         assert!(request.validate().is_err());
     }
 
-    /// The approval signs the raw request bytes, so requests that differ
-    /// only in environment hash — and sign — differently. Two materially
-    /// different environments can never share an approval payload.
+    /// A normal process environment can exceed 64 entries. The protocol
+    /// accepts a large entry count while retaining the 256 KiB request cap.
+    #[test]
+    fn ordinary_large_environment_builds_successfully() {
+        let mut request = minimal_request();
+        request.env = (0..65)
+            .map(|index| EnvEntryV1 {
+                name: format!("APP_VAR_{index}"),
+                value: format!("value-{index}"),
+            })
+            .collect();
+        request.validate().unwrap();
+        assert!(!request.raw_json().unwrap().is_empty());
+    }
+
+    /// The approval signs the raw request bytes, so requests that differ only
+    /// in an environment entry — including its order or duplicate placement —
+    /// sign differently. Two materially different environments can never
+    /// share an approval payload.
     #[test]
     fn different_environments_never_share_an_approval() {
         let bare = minimal_request();
@@ -956,7 +1072,11 @@ mod tests {
     /// both depend on the two staying the same string.
     #[test]
     fn kind_renders_as_its_serde_tag() {
-        for kind in [DeviceKindV1::Webauthn, DeviceKindV1::SecureEnclave] {
+        for kind in [
+            DeviceKindV1::Webauthn,
+            DeviceKindV1::Software,
+            DeviceKindV1::SecureEnclave,
+        ] {
             assert_eq!(serde_json::to_string(&kind).unwrap(), format!("\"{kind}\""));
             assert_eq!(kind.to_string(), kind.as_str());
         }
@@ -981,6 +1101,10 @@ mod tests {
         let native = r#"{"kind":"secure-enclave","version":1,"enrollment_id":"e1","credential_public_key":"AA","box_public_key":"AQ","api_token_hash":"Ag","label":"mac","proof_signature":"Aw","transcript_hmac":"BA"}"#;
         let native: EnrollmentSubmissionV1 = serde_json::from_str(native).unwrap();
         assert_eq!(native.kind(), DeviceKindV1::SecureEnclave);
+
+        let software = r#"{"kind":"software","version":1,"enrollment_id":"e1","credential_public_key":"AA","box_public_key":"AQ","api_token_hash":"Ag","label":"linux","proof_signature":"Aw","transcript_hmac":"BA"}"#;
+        let software: EnrollmentSubmissionV1 = serde_json::from_str(software).unwrap();
+        assert_eq!(software.kind(), DeviceKindV1::Software);
     }
 
     /// A malformed submission must say which field is wrong. An untagged
@@ -1096,7 +1220,7 @@ mod tests {
         let point = signing.verifying_key().to_encoded_point(false);
         let public = point.as_bytes().to_vec();
         let (credential_id, credential_public_key) = match kind {
-            DeviceKindV1::SecureEnclave => (
+            DeviceKindV1::Software | DeviceKindV1::SecureEnclave => (
                 encode_base64url(&crate::native_v1::native_credential_id(&public)),
                 encode_base64url(&public),
             ),
@@ -1147,7 +1271,11 @@ mod tests {
     /// credential encodings, and the challenge is input-sensitive.
     #[test]
     fn signed_denials_verify_per_device_kind() {
-        for kind in [DeviceKindV1::Webauthn, DeviceKindV1::SecureEnclave] {
+        for kind in [
+            DeviceKindV1::Webauthn,
+            DeviceKindV1::Software,
+            DeviceKindV1::SecureEnclave,
+        ] {
             let (device, signing) = deny_fixture(kind);
             let denial = signed_denial(&signing, "req-1", &device);
             denial.validate_shape().unwrap();

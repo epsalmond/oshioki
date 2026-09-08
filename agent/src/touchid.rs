@@ -23,7 +23,7 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::info;
 
 use crate::remaining_until;
@@ -75,6 +75,13 @@ pub struct TouchIdPrompt {
     sheet: Mutex<()>,
 }
 
+/// The native approval sequence's serialization token. macOS takes this token
+/// before showing the companion review and keeps it until Touch ID finishes,
+/// so review windows cannot stack ahead of the biometric sheet.
+pub struct PromptPermit<'a> {
+    _sheet: MutexGuard<'a, ()>,
+}
+
 impl TouchIdPrompt {
     pub fn new(screen: Box<dyn ScreenLock>, canceller: Arc<dyn PromptCancel>) -> Self {
         Self {
@@ -83,6 +90,16 @@ impl TouchIdPrompt {
             poll: LOCK_POLL,
             sheet: Mutex::new(()),
         }
+    }
+
+    /// Try to reserve the complete native review-and-Touch-ID sequence. A
+    /// second native request fails closed immediately instead of waiting for a
+    /// review window that the operator cannot safely correlate.
+    pub fn try_acquire(&self) -> Option<PromptPermit<'_>> {
+        self.sheet
+            .try_lock()
+            .ok()
+            .map(|sheet| PromptPermit { _sheet: sheet })
     }
 
     /// Shortens the lock poll interval. Tests only; a real agent waits seconds.
@@ -103,7 +120,27 @@ impl TouchIdPrompt {
         T: Send + 'static,
         F: FnOnce() -> Result<T, AttemptError> + Send + 'static,
     {
-        let _sheet = self.sheet.lock().await;
+        let permit = PromptPermit {
+            _sheet: self.sheet.lock().await,
+        };
+        self.ask_with_permit(permit, request_id, expires_at, sign)
+            .await
+    }
+
+    /// Runs the Touch ID portion while holding a permit acquired before the
+    /// companion review. The permit is consumed only after the biometric
+    /// interaction has completely returned.
+    pub async fn ask_with_permit<T, F>(
+        &self,
+        _permit: PromptPermit<'_>,
+        request_id: &str,
+        expires_at: i64,
+        sign: F,
+    ) -> Result<Outcome<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, AttemptError> + Send + 'static,
+    {
         let mut waited_for_the_screen = false;
         let remaining = loop {
             let Some(remaining) = remaining_until(expires_at) else {
@@ -413,5 +450,17 @@ mod tests {
             assert_eq!(sheet.await.unwrap(), Outcome::Approved(vec![0]));
         }
         assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// Native callers reserve the token before their review window. A second
+    /// caller is rejected immediately rather than stacking behind the first.
+    #[test]
+    fn native_sequence_token_is_nonblocking_and_exclusive() {
+        let (screen, canceller) = (Arc::new(Screen::default()), Arc::new(Canceller::default()));
+        let prompt = prompt(&screen, &canceller);
+        let first = prompt.try_acquire().expect("first sequence is admitted");
+        assert!(prompt.try_acquire().is_none());
+        drop(first);
+        assert!(prompt.try_acquire().is_some());
     }
 }
