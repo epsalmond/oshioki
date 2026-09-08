@@ -177,15 +177,22 @@ sudo env NATS_URL=tls://sudo.example.com:4222 NATS_USER=<hook-user> NATS_PASS=<s
 The fingerprint must still be pinned locally; the command removes it there
 once the server confirms.
 
-Each browser profile enrolls separately:
+For phone enrollment, first run `oshioki-phone-setup` as the logged-in
+user. It prefers a local server reached through Tailscale Serve; an existing
+HTTPS server is supported with `--server-url` and `--nats-config`.
+See [phone enrollment](docs/phone-enrollment.md). The phone needs to be on
+the same tailnet only when using the Tailscale option.
+
+Each browser profile enrolls separately. Run these host commands with sudo
+because they read or update the root-owned registry:
 
 ```bash
-oshioki enroll
-oshioki enroll --resume <enrollment-id>
-oshioki status
-oshioki revoke <fingerprint>
-oshioki pin <fingerprint>
-oshioki pin-record <path>
+sudo oshioki enroll
+sudo oshioki enroll --resume <enrollment-id>
+sudo oshioki status
+sudo oshioki revoke <fingerprint>
+sudo oshioki pin <fingerprint>
+sudo oshioki pin-record <path>
 ```
 
 A host the server never sees pairs offline with one command. It builds
@@ -306,7 +313,7 @@ fingerprint for the host to pin:
 ```bash
 rm ~/.config/oshioki/agent.json      # on the Mac
 scripts/dev-acceptance mac           # on the host, then paste on the Mac
-oshioki revoke <old-fingerprint>     # on the host
+sudo oshioki revoke <old-fingerprint>     # on the host
 ```
 
 Remove the `# BEGIN oshioki` … `# END oshioki` section the installer added

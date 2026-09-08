@@ -53,6 +53,7 @@ install -d "$TREE/usr/share/oshioki" "$TREE/usr/sbin"
 install -m 0755 "$STAGE_DIR/oshioki" "$TREE/usr/share/oshioki/"
 install -m 0644 "$STAGE_DIR/liboshioki_plugin.so" "$STAGE_DIR/SHA256SUMS" "$TREE/usr/share/oshioki/"
 install -m 0755 "$STAGE_DIR/oshioki-server" "$TREE/usr/sbin/oshioki-server"
+install -m 0755 "$ROOT/scripts/oshioki-phone-setup" "$TREE/usr/sbin/oshioki-phone-setup"
 install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$TREE/usr/share/oshioki/install-oshioki-hook"
 install -d -m 0750 "$TREE/etc/oshioki"
 

@@ -53,6 +53,7 @@ struct AppState {
     consumer_last_ok: Arc<AtomicI64>,
     outbox_last_ok: Arc<AtomicI64>,
     origin: Arc<String>,
+    rp_id: Arc<String>,
     ntfy_url: Option<Arc<String>>,
 }
 
@@ -103,6 +104,7 @@ async fn main() -> Result<()> {
         consumer_last_ok: Arc::new(AtomicI64::new(0)),
         outbox_last_ok: Arc::new(AtomicI64::new(now())),
         origin: Arc::new(runtime_config.origin),
+        rp_id: Arc::new(runtime_config.rp_id),
         ntfy_url: std::env::var("OSHIOKI_NTFY_URL").ok().map(Arc::new),
     };
     spawn_workers(&state);
@@ -634,9 +636,13 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
     if consumer_age > 30 || outbox_age > 30 {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE));
     }
-    Ok(Json(
-        json!({"status":"ok","consumer_age_seconds":consumer_age,"outbox_age_seconds":outbox_age}),
-    ))
+    Ok(Json(json!({
+        "status":"ok",
+        "consumer_age_seconds":consumer_age,
+        "outbox_age_seconds":outbox_age,
+        "origin":state.origin.as_str(),
+        "rp_id":state.rp_id.as_str(),
+    })))
 }
 async fn dist_file(
     State(state): State<AppState>,
@@ -818,6 +824,49 @@ mod tests {
 
     fn permits() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(MAX_CONCURRENT_ARTIFACTS))
+    }
+
+    fn health_state(name: &str, consumer_age: i64, outbox_age: i64) -> (PathBuf, AppState) {
+        let dir =
+            std::env::temp_dir().join(format!("oshioki-health-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("state.sqlite3")).unwrap());
+        store.ready().unwrap();
+        let transport = oshioki_transport::MockTransport::new();
+        let current = now();
+        (
+            dir,
+            AppState {
+                store,
+                transport: Arc::new(transport),
+                dist_root: Arc::new(PathBuf::from("/nonexistent")),
+                artifact_permits: Arc::new(Semaphore::new(1)),
+                consumer_last_ok: Arc::new(AtomicI64::new(current - consumer_age)),
+                outbox_last_ok: Arc::new(AtomicI64::new(current - outbox_age)),
+                origin: Arc::new("https://sudo.test:8443".into()),
+                rp_id: Arc::new("sudo.test".into()),
+                ntfy_url: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn health_reports_public_webauthn_configuration() {
+        let (dir, state) = health_state("metadata", 0, 0);
+        let Json(body) = health(State(state)).await.unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["origin"], "https://sudo.test:8443");
+        assert_eq!(body["rp_id"], "sudo.test");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn health_rejects_stale_workers() {
+        let (dir, state) = health_state("stale", 31, 0);
+        let error = health(State(state)).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     async fn status(root: &std::path::Path, path: &str, permits: &Arc<Semaphore>) -> StatusCode {
@@ -1062,6 +1111,7 @@ mod tests {
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
+            rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
         };
         let worker = tokio::spawn(verdict_worker(state));
@@ -1119,6 +1169,7 @@ mod tests {
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
+            rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
         };
         handle_revocation(
@@ -1225,6 +1276,7 @@ mod tests {
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
+            rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
         };
         let worker = tokio::spawn(request_consumer(state));

@@ -39,6 +39,7 @@ local_checks() {
   "$REPO_ROOT/scripts/test-install-oshioki-hook"
   "$REPO_ROOT/scripts/test-debian-package-scripts"
   "$REPO_ROOT/scripts/test-oshioki-laptop-setup"
+  "$REPO_ROOT/scripts/test-oshioki-phone-setup"
 }
 
 read_session() {

@@ -6,6 +6,7 @@ server/web/node_modules/
 .acceptance-session
 server/web/test-results/
 server/web/playwright-report/
+__pycache__/
 
 # Lockfile for binaries — commit this
 # Cargo.lock

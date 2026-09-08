@@ -146,7 +146,7 @@ server.
 
 A confirmation that times out is not a rejection. The device is pinned on the
 host and can approve sudo there; what is unknown is the server's copy. `enroll`
-says so and names the recovery, which is a fresh `oshioki enroll` for that
+says so and names the recovery, which is a fresh `sudo oshioki enroll` for that
 device once the server is healthy.
 
 ## Persistence
