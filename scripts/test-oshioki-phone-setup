@@ -200,6 +200,24 @@ class PhoneSetupTests(unittest.TestCase):
         self.assertEqual(hook.read_bytes(), hook_before)
         self.assertFalse((self.config / "config.env").exists())
 
+    def test_launchagent_reload_retries_bootstrap_without_kickstarting_old_definition(self) -> None:
+        self.state.mkdir(mode=0o700)
+        calls = []
+        attempts = 0
+
+        def launchctl(argv, **kwargs):
+            nonlocal attempts
+            calls.append(argv)
+            if argv[1] == "bootstrap":
+                attempts += 1
+                return phone.subprocess.CompletedProcess(argv, 37 if attempts == 1 else 0, b"", b"")
+            return phone.subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone, "_run", side_effect=launchctl), mock.patch.object(phone.time, "sleep"):
+            phone._ensure_services(self.state, {}, roles=("nats",))
+        self.assertEqual(attempts, 2)
+        self.assertEqual([call[1] for call in calls], ["bootout", "bootstrap", "bootstrap"])
+
     def test_service_arguments_are_parseable_and_do_not_contain_credentials(self) -> None:
         args = phone._service_args("server", self.state)
         parsed = phone._parser().parse_args(args[args.index("--run-service"):])

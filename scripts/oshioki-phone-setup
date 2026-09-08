@@ -686,7 +686,7 @@ def _service_args(role: str, state: Path) -> list[str]:
 
 
 def _service_identity(arguments: Any, role: str, state: Path) -> bool:
-    """Prove an old command belongs to this role and state directory."""
+    """Recognize the role/state marker in a private, user-owned definition."""
     if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
         return False
     marker = ["--run-service", "--role", role, "--state-dir", str(state)]
@@ -810,7 +810,15 @@ def _ensure_services(state: Path, runtime: dict[str, Any], roles: tuple[str, ...
             launchctl = os.environ.get("OSHIOKI_PHONE_SETUP_LAUNCHCTL", "launchctl")
             if changed[role]:
                 _run([launchctl, "bootout", f"{domain}/{label}"])
-            result = _run([launchctl, "bootstrap", domain, str(plist)])
+            # An unload can still be settling when bootout returns. Retry
+            # bootstrap itself so the new definition is loaded; kickstart
+            # could otherwise restart the old cached definition.
+            for attempt in range(5 if changed[role] else 1):
+                result = _run([launchctl, "bootstrap", domain, str(plist)])
+                if result.returncode == 0:
+                    break
+                if changed[role] and attempt < 4:
+                    time.sleep(0.2)
             if result.returncode != 0:
                 if changed[role]:
                     fail(f"could not reload owned LaunchAgent {label}")
