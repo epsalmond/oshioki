@@ -10,7 +10,6 @@ that mode is deliberately small and only edits the Oshioki config files.
 from __future__ import annotations
 
 import argparse
-import base64
 import http.client
 import ipaddress
 import json
@@ -43,6 +42,7 @@ NATS_ENV = "OSHIOKI_PHONE_SETUP_NATS_BIN"
 TAILSCALE_ENV = "OSHIOKI_PHONE_SETUP_TAILSCALE_BIN"
 SUDO_ENV = "OSHIOKI_PHONE_SETUP_SUDO_BIN"
 PLATFORM_ENV = "OSHIOKI_PHONE_SETUP_PLATFORM"
+SERVICE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 
 class SetupError(Exception):
@@ -188,21 +188,23 @@ def _binary(value: str | None, env_name: str, candidates: Iterable[Path], descri
             found = shutil.which(description)
             path = Path(found) if found else path
     # Package managers commonly install command shims as symlinks (notably
-    # Homebrew's opt prefix). Resolve those for execution; managed state and
-    # config paths remain strict about symlinks through _regular_or_absent.
+    # Homebrew's opt prefix). Validate the resolved target, but retain the
+    # lexical path so a later package upgrade follows the stable shim.
     try:
-        path = path.resolve(strict=True)
+        target = path.resolve(strict=True)
     except OSError:
-        pass
-    if not path.is_file() or not os.access(path, os.X_OK):
+        target = path
+    if not target.is_file() or not os.access(target, os.X_OK):
         if description == "nats-server":
             fail("nats-server is required; install it with `brew install nats-server` or your distro package manager")
         fail(f"{description} executable not found: {path}")
-    return path.resolve()
+    return Path(os.path.abspath(path))
 
 
 def _script_path() -> Path:
-    return Path(__file__).resolve()
+    # Keep /opt/homebrew/bin/oshioki-phone-setup (or another package shim)
+    # in service definitions instead of pinning the current Cellar version.
+    return Path(os.path.abspath(__file__))
 
 
 def _platform() -> str:
@@ -613,7 +615,7 @@ def _nats_config(state: Path, credentials: dict[str, str], port: int) -> Path:
     store = state / "nats" / "store"
     _owned_directory(store, "NATS store", 0o700)
     hook_publish = ["oshioki.request.>", "oshioki.enrollment.intent", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>"]
-    hook_subscribe = ["oshioki.verdict.>", "oshioki.enrollment.submission.>", "oshioki.device.revoked.>"]
+    hook_subscribe = ["oshioki.verdict.>", "oshioki.enrollment.submission.>", "oshioki.device.revoked.>", "oshioki.request.>"]
     server_publish = ["oshioki.verdict.>", "oshioki.enrollment.submission.>", "oshioki.device.revoked.>", "$JS.API.>", "$JS.ACK.>"]
     server_subscribe = ["oshioki.request.>", "oshioki.enrollment.intent", "oshioki.enrollment.submission.>", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>", "_INBOX.>"]
 
@@ -677,16 +679,32 @@ def _runtime(state: Path, *, nats_bin: Path, server_bin: Path, nats_port: int, s
 
 
 def _service_args(role: str, state: Path) -> list[str]:
-    return [sys.executable, str(_script_path()), "--run-service", "--role", role, "--state-dir", str(state)]
+    # /usr/bin/env and the package-managed python3 shim are stable across
+    # Homebrew Cellar upgrades.  The service PATH is explicit in both service
+    # manager definitions below.
+    return ["/usr/bin/env", "python3", str(_script_path()), "--run-service", "--role", role, "--state-dir", str(state)]
 
 
-def _plist(path: Path, label: str, role: str, state: Path, log: Path) -> None:
+def _service_identity(arguments: Any, role: str, state: Path) -> bool:
+    """Prove an old command belongs to this role and state directory."""
+    if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
+        return False
+    marker = ["--run-service", "--role", role, "--state-dir", str(state)]
+    try:
+        position = arguments.index("--run-service")
+    except ValueError:
+        return False
+    return arguments[position:] == marker
+
+
+def _plist(path: Path, label: str, role: str, state: Path, log: Path) -> bool:
     _private_file(path, "LaunchAgent plist")
     value = {
         "Label": label,
         "ProgramArguments": _service_args(role, state),
         "RunAtLoad": True,
         "KeepAlive": True,
+        "EnvironmentVariables": {"PATH": SERVICE_PATH},
         "StandardOutPath": str(log),
         "StandardErrorPath": str(log),
     }
@@ -695,13 +713,31 @@ def _plist(path: Path, label: str, role: str, state: Path, log: Path) -> None:
             old = plistlib.loads(path.read_bytes())
         except (OSError, plistlib.InvalidFileException) as exc:
             fail(f"invalid existing LaunchAgent plist {path}: {exc}")
-        if old != value:
-            fail(f"refusing to replace an unexpected owned LaunchAgent plist: {path}")
+        expected_keys = set(value)
+        old_environment = old.get("EnvironmentVariables", {}) if isinstance(old, dict) else None
+        if (
+            not isinstance(old, dict)
+            or not set(old).issubset(expected_keys)
+            or set(old) not in (expected_keys, expected_keys - {"EnvironmentVariables"})
+            or old.get("Label") != label
+            or old.get("StandardOutPath") != str(log)
+            or old.get("StandardErrorPath") != str(log)
+            or old.get("RunAtLoad") is not True
+            or old.get("KeepAlive") is not True
+            or old_environment not in ({}, {"PATH": SERVICE_PATH})
+            or not _service_identity(old.get("ProgramArguments"), role, state)
+        ):
+            fail(f"refusing to replace an unexpected LaunchAgent plist: {path}")
+        changed = old != value
+        if changed:
+            _atomic_write(path, plistlib.dumps(value, fmt=plistlib.FMT_XML), 0o600)
+        return changed
     else:
         _atomic_write(path, plistlib.dumps(value, fmt=plistlib.FMT_XML), 0o600)
+        return True
 
 
-def _systemd_unit(path: Path, description: str, role: str, state: Path, log: Path) -> None:
+def _systemd_unit(path: Path, description: str, role: str, state: Path, log: Path) -> bool:
     _private_file(path, "systemd user unit")
     command = " ".join(shlex.quote(item) for item in _service_args(role, state))
     text = "\n".join([
@@ -712,6 +748,7 @@ def _systemd_unit(path: Path, description: str, role: str, state: Path, log: Pat
         "[Service]",
         "Type=simple",
         f"ExecStart={command}",
+        f"Environment=PATH={SERVICE_PATH}",
         "Restart=on-failure",
         "RestartSec=2",
         f"StandardOutput=append:{log}",
@@ -721,10 +758,25 @@ def _systemd_unit(path: Path, description: str, role: str, state: Path, log: Pat
         "WantedBy=default.target",
         "",
     ])
-    if path.exists() and path.read_text(encoding="utf-8") != text:
-        fail(f"refusing to replace an unexpected owned systemd user unit: {path}")
-    if not path.exists():
+    if path.exists():
+        try:
+            old_lines = path.read_text(encoding="utf-8").splitlines()
+            old_exec = next(line.split("=", 1)[1] for line in old_lines if line.startswith("ExecStart="))
+            old_arguments = shlex.split(old_exec)
+        except (OSError, UnicodeError, ValueError, StopIteration) as exc:
+            fail(f"invalid existing systemd user unit {path}: {exc}")
+        expected_without_exec = [line for line in text.splitlines() if not line.startswith("ExecStart=")]
+        old_without_exec = [line for line in old_lines if not line.startswith("ExecStart=")]
+        legacy_without_environment = [line for line in expected_without_exec if not line.startswith("Environment=")]
+        if old_without_exec not in (expected_without_exec, legacy_without_environment) or not _service_identity(old_arguments, role, state):
+            fail(f"refusing to replace an unexpected systemd user unit: {path}")
+        changed = path.read_text(encoding="utf-8") != text
+        if changed:
+            _atomic_write(path, text.encode(), 0o600)
+        return changed
+    else:
         _atomic_write(path, text.encode(), 0o600)
+        return True
 
 
 def _ensure_services(state: Path, runtime: dict[str, Any], roles: tuple[str, ...] = ("nats", "server")) -> None:
@@ -740,8 +792,14 @@ def _ensure_services(state: Path, runtime: dict[str, Any], roles: tuple[str, ...
         directory = _owned_directory(Path.home() / "Library" / "LaunchAgents", "LaunchAgents", 0o700, tighten=False)
         nats_plist = directory / "com.oshioki.phone-server.nats.plist"
         server_plist = directory / "com.oshioki.phone-server.server.plist"
-        _plist(nats_plist, "com.oshioki.phone-server.nats", "nats", state, nats_log)
-        _plist(server_plist, "com.oshioki.phone-server.server", "server", state, server_log)
+        plist_paths = {
+            "nats": ("com.oshioki.phone-server.nats", nats_plist, nats_log),
+            "server": ("com.oshioki.phone-server.server", server_plist, server_log),
+        }
+        changed: dict[str, bool] = {}
+        for role in roles:
+            label, plist, log = plist_paths[role]
+            changed[role] = _plist(plist, label, role, state, log)
         domain = f"gui/{os.getuid()}"
         services = {
             "nats": ("com.oshioki.phone-server.nats", nats_plist),
@@ -750,8 +808,12 @@ def _ensure_services(state: Path, runtime: dict[str, Any], roles: tuple[str, ...
         for role in roles:
             label, plist = services[role]
             launchctl = os.environ.get("OSHIOKI_PHONE_SETUP_LAUNCHCTL", "launchctl")
+            if changed[role]:
+                _run([launchctl, "bootout", f"{domain}/{label}"])
             result = _run([launchctl, "bootstrap", domain, str(plist)])
             if result.returncode != 0:
+                if changed[role]:
+                    fail(f"could not reload owned LaunchAgent {label}")
                 retry = _run([launchctl, "kickstart", "-k", f"{domain}/{label}"])
                 if retry.returncode != 0:
                     fail(f"could not start owned LaunchAgent {label}")
@@ -759,8 +821,14 @@ def _ensure_services(state: Path, runtime: dict[str, Any], roles: tuple[str, ...
         directory = _owned_directory(Path.home() / ".config" / "systemd" / "user", "systemd user unit directory", 0o700, tighten=False)
         nats_unit = directory / "oshioki-phone-server-nats.service"
         server_unit = directory / "oshioki-phone-server.service"
-        _systemd_unit(nats_unit, "Oshioki phone setup NATS", "nats", state, nats_log)
-        _systemd_unit(server_unit, "Oshioki phone setup server", "server", state, server_log)
+        unit_paths = {
+            "nats": ("Oshioki phone setup NATS", nats_unit, nats_log),
+            "server": ("Oshioki phone setup server", server_unit, server_log),
+        }
+        changed: dict[str, bool] = {}
+        for role in roles:
+            description, unit, log = unit_paths[role]
+            changed[role] = _systemd_unit(unit, description, role, state, log)
         systemctl = os.environ.get("OSHIOKI_PHONE_SETUP_SYSTEMCTL", "systemctl")
         reload_result = _run([systemctl, "--user", "daemon-reload"])
         if reload_result.returncode != 0:
@@ -771,6 +839,10 @@ def _ensure_services(state: Path, runtime: dict[str, Any], roles: tuple[str, ...
             result = _run([systemctl, "--user", "enable", "--now", unit])
             if result.returncode != 0:
                 fail(f"could not start owned systemd user service {unit}")
+            if changed[role]:
+                restarted = _run([systemctl, "--user", "restart", unit])
+                if restarted.returncode != 0:
+                    fail(f"could not restart updated systemd user service {unit}")
 
 
 def _run_service(role: str, state: Path) -> int:
@@ -1016,7 +1088,8 @@ def _external_mode(args: argparse.Namespace, config_dir: Path) -> None:
 def _local_mode(args: argparse.Namespace, config_dir: Path) -> None:
     tailscale = _binary(args.tailscale_bin, TAILSCALE_ENV, [], "tailscale")
     nats_bin = _binary(args.nats_bin, NATS_ENV, [], "nats-server")
-    server_bin = _binary(args.server_bin, SERVER_ENV, [Path(__file__).resolve().parent / "oshioki-server", Path(__file__).resolve().parent.parent / "target" / "release" / "oshioki-server", Path(__file__).resolve().parent.parent / "target" / "debug" / "oshioki-server"], "oshioki-server")
+    script = _script_path()
+    server_bin = _binary(args.server_bin, SERVER_ENV, [script.parent / "oshioki-server", script.parent.parent / "target" / "release" / "oshioki-server", script.parent.parent / "target" / "debug" / "oshioki-server", Path("/usr/local/sbin/oshioki-server"), Path("/usr/sbin/oshioki-server")], "oshioki-server")
     dns, origin = _tailscale_status(tailscale)
     origin, rp_id, _ = _origin_parts(origin + (f":{args.https_port}" if args.https_port != 443 else ""))
     expected = _expected_serve(rp_id, args.https_port, args.server_port)
@@ -1108,6 +1181,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if os.geteuid() == 0 and not args.install_config and not args.run_service:
+            fail("run oshioki-phone-setup as your normal user; it invokes sudo only for the final hook configuration")
         if args.install_config:
             if not args.staging:
                 fail("--install-config requires --staging")

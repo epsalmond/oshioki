@@ -38,8 +38,10 @@ EOF
   cd "$OUTPUT"
   if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; fi
 )
-file "$OUTPUT/oshioki" "$OUTPUT/oshioki.dylib" "$OUTPUT/oshioki-agent" "$OUTPUT/oshioki-server" | grep -q 'arm64'
+for artifact in oshioki oshioki.dylib oshioki-agent oshioki-server; do
+  file "$OUTPUT/$artifact" | grep -q 'arm64'
+done
 nm -gU "$OUTPUT/oshioki.dylib" | grep -Eq '(_)?approval_exec$'
 # The agent is useless without the enclave; a build that dropped the framework
 # would still run and only fail at the first signature.
-otool -L "$OUTPUT/oshioki-agent" "$OUTPUT/oshioki-server" | grep -q 'LocalAuthentication'
+otool -L "$OUTPUT/oshioki-agent" | grep -q 'LocalAuthentication'

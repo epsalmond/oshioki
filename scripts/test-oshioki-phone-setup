@@ -13,7 +13,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import stat
+import plistlib
+import shlex
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -78,9 +80,15 @@ class PhoneSetupTests(unittest.TestCase):
         fake_binary = self.root / "fake"
         fake_binary.write_text("", encoding="utf-8")
         fake_binary.chmod(0o755)
-        with mock.patch.object(phone, "_binary", return_value=fake_binary), mock.patch.object(phone, "_tailscale_status", return_value=("phone.example", "https://phone.example")), mock.patch.object(phone, "_serve_config", return_value={}):
+        with mock.patch.object(phone.os, "geteuid", return_value=501), mock.patch.object(phone, "_binary", return_value=fake_binary), mock.patch.object(phone, "_tailscale_status", return_value=("phone.example", "https://phone.example")), mock.patch.object(phone, "_serve_config", return_value={}):
             result = phone.main(["--check", "--state-dir", str(self.state), "--config-dir", str(self.config)])
         self.assertEqual(result, 0)
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.config.exists())
+
+    def test_top_level_root_invocation_stops_before_state_mutation(self) -> None:
+        with mock.patch.object(phone.os, "geteuid", return_value=0), mock.patch.object(phone, "_local_mode", side_effect=AssertionError("normal setup must stop before mode selection")):
+            self.assertEqual(phone.main(["--state-dir", str(self.state), "--config-dir", str(self.config)]), 1)
         self.assertFalse(self.state.exists())
         self.assertFalse(self.config.exists())
 
@@ -194,10 +202,124 @@ class PhoneSetupTests(unittest.TestCase):
 
     def test_service_arguments_are_parseable_and_do_not_contain_credentials(self) -> None:
         args = phone._service_args("server", self.state)
-        parsed = phone._parser().parse_args(args[2:])
+        parsed = phone._parser().parse_args(args[args.index("--run-service"):])
         self.assertTrue(parsed.run_service)
         self.assertEqual(parsed.role, "server")
         self.assertNotIn("PASS", " ".join(args))
+
+    def test_local_nats_permissions_include_hook_request_watch(self) -> None:
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        credentials = {
+            "hook_user": "oshioki-hook",
+            "hook_pass": "hook-secret",
+            "server_user": "oshioki-server",
+            "server_pass": "server-secret",
+        }
+        config = phone._nats_config(state, credentials, 14222)
+        text = config.read_text(encoding="utf-8")
+        self.assertIn('"oshioki.request.>"', text)
+        self.assertIn('"$JS.ACK.>"', text)
+
+    def test_command_shims_and_script_path_remain_lexically_stable(self) -> None:
+        target = self.root / "Cellar" / "tool"
+        target.parent.mkdir(parents=True)
+        target.write_text("#!/bin/sh\n", encoding="utf-8")
+        target.chmod(0o755)
+        shim = self.root / "bin" / "tool"
+        shim.parent.mkdir()
+        shim.symlink_to(target)
+        resolved = phone._binary(str(shim), "UNUSED_BINARY_ENV", [], "tool")
+        self.assertEqual(resolved, Path(os.path.abspath(shim)))
+
+        script_target = self.root / "Cellar" / "oshioki-phone-setup"
+        script_target.write_text("", encoding="utf-8")
+        script_link = self.root / "bin" / "oshioki-phone-setup"
+        script_link.symlink_to(script_target)
+        with mock.patch.object(phone, "__file__", str(script_link)):
+            self.assertEqual(phone._script_path(), Path(os.path.abspath(script_link)))
+
+    def test_launchagent_upgrade_updates_only_a_proven_owned_plist(self) -> None:
+        log = self.root / "logs" / "nats.log"
+        plist = self.root / "LaunchAgents" / "nats.plist"
+        state = self.root / "state"
+        log.parent.mkdir(parents=True)
+        plist.parent.mkdir(parents=True)
+        changed = phone._plist(plist, "com.oshioki.phone-server.nats", "nats", state, log)
+        self.assertTrue(changed)
+        old = plistlib.loads(plist.read_bytes())
+        marker = old["ProgramArguments"].index("--run-service")
+        old["ProgramArguments"] = ["/old/homebrew/python3", "/old/Cellar/oshioki-phone-setup"] + old["ProgramArguments"][marker:]
+        plist.write_bytes(plistlib.dumps(old, fmt=plistlib.FMT_XML))
+        plist.chmod(0o600)
+        self.assertTrue(phone._plist(plist, "com.oshioki.phone-server.nats", "nats", state, log))
+        updated = plistlib.loads(plist.read_bytes())
+        self.assertEqual(updated["ProgramArguments"], phone._service_args("nats", state))
+
+        collision = dict(updated)
+        collision["ProgramArguments"] = phone._service_args("server", state)
+        plist.write_bytes(plistlib.dumps(collision, fmt=plistlib.FMT_XML))
+        plist.chmod(0o600)
+        self.assert_setup_error(phone._plist, plist, "com.oshioki.phone-server.nats", "nats", state, log)
+
+    def test_systemd_upgrade_reloads_owned_unit_and_refuses_role_collision(self) -> None:
+        log = self.root / "logs" / "server.log"
+        unit = self.root / "systemd" / "server.service"
+        state = self.root / "state"
+        log.parent.mkdir(parents=True)
+        unit.parent.mkdir(parents=True)
+        self.assertTrue(phone._systemd_unit(unit, "Oshioki phone setup server", "server", state, log))
+        old_lines = unit.read_text(encoding="utf-8").splitlines()
+        old_lines = [
+            "ExecStart=/old/homebrew/python3 /old/Cellar/oshioki-phone-setup --run-service --role server --state-dir " + shlex.quote(str(state))
+            if line.startswith("ExecStart=") else line
+            for line in old_lines
+        ]
+        unit.write_text("\n".join(old_lines) + "\n", encoding="utf-8")
+        unit.chmod(0o600)
+        self.assertTrue(phone._systemd_unit(unit, "Oshioki phone setup server", "server", state, log))
+        self.assertIn("/usr/bin/env python3", unit.read_text(encoding="utf-8"))
+
+        collision_lines = unit.read_text(encoding="utf-8").replace("--role server", "--role nats")
+        unit.write_text(collision_lines, encoding="utf-8")
+        unit.chmod(0o600)
+        self.assert_setup_error(phone._systemd_unit, unit, "Oshioki phone setup server", "server", state, log)
+
+    def test_linux_updated_unit_is_restarted_after_reload(self) -> None:
+        state = self.root / "state"
+        runtime = {"version": 1}
+        calls: list[list[str]] = []
+        completed = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.dict(os.environ, {phone.PLATFORM_ENV: "Linux"}), mock.patch.object(phone, "_run", side_effect=lambda argv, **kwargs: calls.append(argv) or completed):
+            phone._ensure_services(state, runtime, roles=("server",))
+        self.assertTrue(any(command[-2:] == ["--now", "oshioki-phone-server.service"] for command in calls))
+        self.assertTrue(any(command[-2:] == ["restart", "oshioki-phone-server.service"] for command in calls))
+
+    def test_nats_then_server_phases_preserve_and_then_reload_old_server_unit(self) -> None:
+        state = self.root / "state"
+        server_unit = self.root / "home" / ".config" / "systemd" / "user" / "oshioki-phone-server.service"
+        log = state / "logs" / "server.log"
+        state.mkdir(mode=0o700)
+        log.parent.mkdir(parents=True)
+        server_unit.parent.mkdir(parents=True)
+        self.assertTrue(phone._systemd_unit(server_unit, "Oshioki phone setup server", "server", state, log))
+        old_lines = server_unit.read_text(encoding="utf-8").splitlines()
+        old_lines = [
+            "ExecStart=/old/python3 /old/oshioki-phone-setup --run-service --role server --state-dir " + shlex.quote(str(state))
+            if line.startswith("ExecStart=") else line
+            for line in old_lines
+        ]
+        server_unit.write_text("\n".join(old_lines) + "\n", encoding="utf-8")
+        server_unit.chmod(0o600)
+        before = server_unit.read_bytes()
+        calls: list[list[str]] = []
+        completed = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.dict(os.environ, {phone.PLATFORM_ENV: "Linux"}), mock.patch.object(phone, "_run", side_effect=lambda argv, **kwargs: calls.append(argv) or completed):
+            phone._ensure_services(state, {"version": 1}, roles=("nats",))
+            self.assertEqual(before, server_unit.read_bytes())
+            phone._ensure_services(state, {"version": 1}, roles=("server",))
+        self.assertIn("/usr/bin/env python3", server_unit.read_text(encoding="utf-8"))
+        self.assertTrue(any(command[-2:] == ["restart", "oshioki-phone-server.service"] for command in calls))
 
     def test_serve_collision_is_refused_before_local_state_or_service_start(self) -> None:
         fake = self.root / "tailscale"
