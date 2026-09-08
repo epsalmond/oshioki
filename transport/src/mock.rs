@@ -12,8 +12,8 @@ use anyhow::{Result, anyhow};
 use oshioki_protocol::{ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1};
 
 use crate::{
-    Ack, AckFuture, BoxFuture, HookTransport, InboundMessage, InboundStream, JetStreamMessage,
-    RequestStream, ServerTransport,
+    Ack, AckFuture, BoxFuture, HookProgress, HookTransport, InboundMessage, InboundStream,
+    JetStreamMessage, RequestStream, ServerTransport,
 };
 
 /// The subject the hook's enrollment intent goes out on, mirrored from the
@@ -97,13 +97,18 @@ impl HookTransport for MockTransport {
         _request_id: &str,
         _payload: Vec<u8>,
         _timeout: std::time::Duration,
+        _has_browser_recipient: bool,
+        progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
     ) -> BoxFuture<'_, DecisionV1> {
         let outcome = self
             .lock()
             .hook_verdicts
             .pop_front()
             .unwrap_or_else(|| Err(anyhow!("mock transport timed out: no queued verdict")));
-        Box::pin(async move { outcome })
+        Box::pin(async move {
+            progress(HookProgress::WaitingForApproval);
+            outcome
+        })
     }
 
     fn publish_enrollment_intent(

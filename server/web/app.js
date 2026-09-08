@@ -156,6 +156,8 @@ async function approval() {
   if (shared.every(value => value === 0)) throw new Error("invalid shared secret");
   const raw = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, unb64(sealed.ciphertext), null, unb64(sealed.nonce), shared);
   const request = JSON.parse(dec.decode(raw)); if (request.version !== 1 || request.request_id !== id) throw new Error("request mismatch");
+  const acknowledgement = await fetch(`/api/v1/requests/${id}/ack`, { method: "POST", headers: { authorization: `Bearer ${selected.device.apiToken}`, "content-type": "application/json" }, body: JSON.stringify({ type: "alive", version: 1, request_id: id }) });
+  if (!acknowledgement.ok) throw new Error(`acknowledgement failed ${acknowledgement.status}`);
   text("host", request.host); text("user", `${request.user} / ${request.uid}`); text("runas", runAsLabel(request.runas_uid)); text("command", request.command);
   text("argv", request.argv.map(quoteArgument).join("\n")); text("cwd", request.cwd); text("process-chain", request.pid_chain.join("\n"));
   text("env", formatEnvironment(request.env ?? []));

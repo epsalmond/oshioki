@@ -71,8 +71,13 @@ oshioki-agent run
 ```
 
 From then on, hardware-backed approvals can replace the sudo password; a
-software native identity still requires normal sudo authentication. Details
-in [docs/native-agent.md](docs/native-agent.md) and
+software native identity still requires normal sudo authentication. On Linux,
+an interactive request also races the invoking account password through the
+host's `sudo` PAM service. Press Enter to skip that fallback and wait for
+device approval. `sudo -n` never opens the plugin password prompt. The
+device-only flow requires the installer's `sudoers.d` `NOPASSWD` rule, which
+is written only for a hardware-backed device. Details in
+[docs/native-agent.md](docs/native-agent.md) and
 [docs/mac-approvals.md](docs/mac-approvals.md).
 
 ```bash

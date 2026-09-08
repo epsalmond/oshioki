@@ -7,11 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-08
+
+### Added
+
+- Browser requests receive a durable server delivery receipt after routing.
+  The browser sends its authenticated opened receipt after decrypting and
+  checking the request. Native agents send `AliveV1` before asking for a
+  decision. Human browser opening time does not consume the short delivery
+  wait.
+
+### Changed
+
+- The hook reports immediate progress on stderr: the command it is trying,
+  transport failures, an unresponsive daemon, and the transition to waiting
+  for approval. Socket and NATS connection, delivery, and receipt waits are
+  bounded before the remaining approval deadline is used for the decision.
+- On Linux, the sudo plugin races the hook with an interactive PAM password
+  fallback. The installer’s `NOPASSWD` rule makes this fallback available
+  when approval transport is unavailable; `sudo -n` skips password
+  authentication and never reads a password terminal. Enter skips the
+  password attempt without calling PAM.
+- Upgrade the server, browser bundle, hook, and agent as one compatibility
+  set. There is no rolling negotiation; mixed versions fail closed with an
+  upgrade diagnostic. Existing request encryption and decision signatures
+  remain compatible while native enrollment records now distinguish software
+  keys from Secure Enclave keys.
+- A socket agent that disconnects after acknowledging a request causes that
+  sudo to be denied, including during an agent restart or laptop suspend.
+  The hook does not retry that request through NATS.
+
 ### Fixed
 
 - On macOS the audit trail reaches the unified log. The hook hands each
   record to logger(1); datagrams to the legacy syslog socket were accepted
   and then dropped, so nothing was kept.
+- Explicit approval denials and invalid approval results fail closed even
+  while the password attempt is running. Whichever branch wins cancels and
+  reaps the other process, and restores terminal echo and pending input.
 - The root-owned sudo plugin and hook now require a matching private framing
   handshake, including the complete environment attestation.
 

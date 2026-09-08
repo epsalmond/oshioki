@@ -12,6 +12,9 @@ Production must provide:
 - The durable `oshioki-server-v1` consumer permissions.
 - Publish and subscribe permissions for `oshioki.verdict.*` and
   `oshioki.enrollment.*`.
+- Publish and subscribe permissions for `oshioki.ack.*`. Native agents and
+  the authenticated browser acknowledgement endpoint publish liveness
+  messages before a human decision.
 - Publish and subscribe permissions for `oshioki.device.>` (revocations and
   their confirmations). These apply to the `nats` transport; other transports
   document their own.
@@ -37,5 +40,7 @@ the read-only watcher credential, LaunchAgent, the `sudoers.d` passwordless
 drop-in (coupled to the plugin block, never `pam_tid`: one Touch ID approval
 per sudo, no password), laptop activation, and rollback.
 
-Neither the runtime nor the Mac installer changes the v1 wire format. A protocol change requires a new
-version and a compatibility decision in this repository.
+Neither the runtime nor the Mac installer changes the v1 request or decision
+wire format. `AliveV1` is a versioned liveness message on its own subject and
+socket response frame. A protocol change requires a compatibility decision in
+this repository.

@@ -34,5 +34,6 @@ investigating.
   to produce an approval the hook accepts.
 - Release agent builds must offer no prompt bypass: `run --auto` exists only
   under the `unattended` cargo feature.
-- `unsafe` is confined to the `enclave` crate on macOS; new `unsafe`
-  elsewhere will be rejected.
+- `unsafe` is confined to the macOS `enclave` crate and the existing sudo
+  plugin's FFI, process, tty, and PAM boundary. New unsafe code elsewhere
+  will be rejected.

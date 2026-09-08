@@ -73,6 +73,36 @@ wins. An explicit deny ends the request immediately. An invalid approval
 fails closed. The hook gives up after 90 seconds. A decision must name a
 device whose kind and fingerprint both match a pinned record.
 
+Each approval path reports liveness before it waits for a human decision. A
+native socket agent sends an `AliveV1` frame first. A native NATS agent sends
+the same message on `oshioki.ack.<request-id>`. For a request that includes an
+active pinned WebAuthn recipient, the server records a `DeliveryV1` outbox row
+in the request ingestion transaction after joining the sealed body to the
+active device record, then publishes it on `oshioki.delivery.<request-id>`.
+That receipt proves durable relay routing and lets the hook wait for the
+browser beyond the native three-second liveness bound. The browser posts
+`AliveV1` only after it authenticates, decrypts, and checks the sealed request;
+the server relays that browser message only after the authenticated post, so
+request ingestion cannot impersonate a live browser. The acknowledgement and
+delivery receipt carry no authorization.
+
+The delivery control message has no rolling negotiation. Browser-capable
+deployments must update the server, its browser bundle, and the hook together;
+native socket deployments must update the hook and agent together. An older
+server or peer leaves the corresponding receipt unavailable and the hook
+reports the required upgrade while failing closed.
+
+The sudo plugin starts the hook and, for an interactive Linux invocation, a
+separate PAM password attempt at the same time. The installer normally adds a
+`NOPASSWD` sudoers entry, so this is the plugin's fallback path rather than a
+second sudo policy prompt. PAM authenticates the invoking user through the
+system `sudo` service and runs account management before it can approve.
+`sudo -n` skips the password child and never reads `/dev/tty`. An explicit
+denial or invalid hook result wins over a password. A transport failure or an
+unanswered request leaves password authentication available. Both children
+are canceled and reaped when one wins, and the plugin restores terminal echo
+and pending input. The race is bounded by the same 90-second deadline.
+
 ## Enrollment
 
 The hook owns the enrollment secret. The server stores its SHA-256 hash and

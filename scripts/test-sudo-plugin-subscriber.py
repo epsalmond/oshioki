@@ -186,6 +186,19 @@ if payload is None:
 envelope = json.loads(payload)
 print(f"subscriber: got envelope for host {envelope['host']}", file=sys.stderr)
 
+# The acknowledgement is a liveness signal, not a verdict. Send it as soon
+# as the request is received, before unsealing or constructing the approval.
+ack = json.dumps(
+    {"type": "alive", "version": 1, "request_id": envelope["request_id"]},
+    separators=(",", ":"),
+).encode()
+ack_subject = f"oshioki.ack.{envelope['request_id']}"
+sock.sendall(f"PUB {ack_subject} {len(ack)}\r\n".encode() + ack + b"\r\nPING\r\n")
+while True:
+    line = sock.recv(65535)
+    if b"PONG\r\n" in line:
+        break
+
 # Find the sealed body addressed to us.
 mine = None
 for body in envelope["sealed"]:

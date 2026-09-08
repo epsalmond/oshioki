@@ -24,8 +24,8 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, SignerKind, parse_enrollment_url, remaining_until};
 use oshioki_protocol::{
-    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, DecisionV1, RequestEnvelopeV1, allow_plaintext_nats,
-    check_nats_url, escape_for_terminal, nats_url_is_tls,
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, AliveV1, DecisionV1, RequestEnvelopeV1,
+    allow_plaintext_nats, check_nats_url, escape_for_terminal, nats_url_is_tls,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -563,6 +563,16 @@ fn dispatch_nats_request(
     let decider = Arc::clone(decider);
     tokio::spawn(async move {
         let _permit = permit;
+        if let Some(nats) = &nats
+            && let Err(error) = publish_alive(nats, &opened.request).await
+        {
+            warn!(
+                request_id = %escape_for_terminal(&opened.request.request_id),
+                error = %escape_for_terminal(&error.to_string()),
+                "native liveness acknowledgement failed; approval prompt suppressed"
+            );
+            return;
+        }
         let verdict = decide(&identity, &decider, &opened).await;
         let result = match verdict {
             Ok(Some(decision)) => {
@@ -746,6 +756,23 @@ async fn publish(
     Ok(())
 }
 
+/// Publishes a liveness acknowledgement before the decider is invoked. It
+/// carries no signature and cannot authorize a request; the hook uses it only
+/// to distinguish a live native agent from an unavailable transport.
+async fn publish_alive(
+    nats: &async_nats::Client,
+    request: &oshioki_protocol::RequestV1,
+) -> Result<()> {
+    nats.publish(
+        format!("oshioki.ack.{}", request.request_id),
+        serde_json::to_vec(&AliveV1::for_request(&request.request_id))?.into(),
+    )
+    .await
+    .context("publish daemon acknowledgement")?;
+    nats.flush().await.context("flush daemon acknowledgement")?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Local socket — the hook's network-free fast path
 // ---------------------------------------------------------------------------
@@ -888,6 +915,17 @@ async fn handle_socket(
         );
         return Ok(());
     }
+    let alive = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(
+        &AliveV1::for_request(&opened.request.request_id),
+    )?)?;
+    writer
+        .write_all(&alive)
+        .await
+        .context("write socket acknowledgement")?;
+    writer
+        .flush()
+        .await
+        .context("flush socket acknowledgement")?;
     let Some(decision) = decide(identity, decider, &opened).await? else {
         return Ok(());
     };
@@ -992,6 +1030,7 @@ fn request_digest(raw: &[u8]) -> String {
 /// `raw` is JSON produced by the requesting hook, so its string escapes are
 /// also the unambiguous representation of every command, argument, and
 /// environment value that the signature covers.
+#[cfg(any(target_os = "macos", test))]
 fn full_review_document(request: &oshioki_protocol::RequestV1, raw: &[u8]) -> String {
     format!(
         "Oshioki approval review\n\nRequest ID: {}\nExact signed request SHA-256: {}\n\nThe JSON below is the complete signed request. Review every field, including every argv and env entry, before continuing to Touch ID.\n\n{}\n",
@@ -2211,6 +2250,15 @@ mod tests {
         let frame = oshioki_protocol::socket_v1::encode_frame(envelope).unwrap();
         hook_side.write_all(&frame).await.unwrap();
         let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        hook_side.read_exact(&mut prefix).await.unwrap();
+        let len = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+        let mut acknowledgement = vec![0u8; len];
+        hook_side.read_exact(&mut acknowledgement).await.unwrap();
+        let acknowledgement: oshioki_protocol::AliveV1 =
+            serde_json::from_slice(&acknowledgement).unwrap();
+        let request: oshioki_protocol::RequestEnvelopeV1 =
+            serde_json::from_slice(envelope).unwrap();
+        acknowledgement.validate(&request.request_id).unwrap();
         hook_side.read_exact(&mut prefix).await.unwrap();
         let len = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
         let mut verdict = vec![0u8; len];
