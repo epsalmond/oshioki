@@ -1388,6 +1388,7 @@ mod tests {
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
+            rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
         };
         assert!(transport.published().is_empty());
