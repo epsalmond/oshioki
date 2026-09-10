@@ -15,6 +15,14 @@ cargo build --locked --release --target "$TARGET" -p oshioki-hook -p oshioki-plu
 mkdir -p "$OUTPUT"
 install -m 0755 "target/$TARGET/release/oshioki" "$OUTPUT/oshioki"
 install -m 0755 "target/$TARGET/release/liboshioki_plugin.dylib" "$OUTPUT/oshioki.dylib"
+# Homebrew relocates the Cellar path and re-signs the dylib when it pours a
+# bottle, which rewrites the absolute CI build path baked into LC_ID_DYLIB and
+# invalidates any checksum taken before that happens. Strip that path out now
+# by giving the dylib a path-free install name and an ad hoc signature, before
+# it gets hashed into SHA256SUMS/manifest.json. sudo dlopens this plugin by
+# absolute path, so the install name itself is never used at load time.
+install_name_tool -id oshioki.dylib "$OUTPUT/oshioki.dylib"
+codesign --force --sign - "$OUTPUT/oshioki.dylib"
 install -m 0755 "target/$TARGET/release/oshioki-agent" "$OUTPUT/oshioki-agent"
 install -m 0755 "target/$TARGET/release/oshioki-server" "$OUTPUT/oshioki-server"
 install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$OUTPUT/install-oshioki-hook"
