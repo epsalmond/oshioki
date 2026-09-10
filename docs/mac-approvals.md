@@ -2,20 +2,11 @@
 
 On a Mac the Touch ID sheet is the approval. The signing key lives in the
 Secure Enclave behind `biometryCurrentSet`, so the signature cannot exist
-without the fingerprint. Before that sheet appears, the LaunchAgent opens a
-transient native review window containing the exact signed request in a
-read-only, scrollable text view. It includes every command argument and every
-environment entry, with JSON escaping and a SHA-256 of the retained bytes.
-Only the explicit `Continue to Touch ID` button raises the biometric sheet;
-Cancel, an expired request, a missing GUI session, or any review failure
-publishes no verdict. The short Touch ID reason contains only the request ID
-and digest, so an operating-system length limit cannot hide executable input.
-
-The review text is passed through an owner-only temporary file to a constant
-JXA/AppKit helper and the file is unlinked on every path. No TextEdit document
-or other persistent user document is created. The helper runs as the same
-signed Oshioki bundle launched by the per-user LaunchAgent, so a headless
-launch session fails closed rather than falling back to an unreadable log.
+without the fingerprint. The agent raises that sheet directly on each
+request; dismissing it, an expired request, or a locked screen all publish
+no verdict. The short Touch ID reason contains only the request ID and a
+digest of the signed bytes, so an operating-system length limit cannot hide
+executable input.
 
 ```bash
 scripts/mac/bundle-agent

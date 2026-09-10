@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The macOS pre-approval review dialog. It added a click before every Touch
+  ID sheet, and the raw JSON it displayed was not useful to review in
+  practice. Approval goes straight to Touch ID again.
+
 ## [0.1.4] - 2026-09-09
 
 ### Added
