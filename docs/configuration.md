@@ -33,6 +33,12 @@ credentials supplied by that deployment.
 | `OSHIOKI_AGENT_SOCKET` (in `config.env`) | Optional path to the agent's Unix socket. When set, the hook tries the socket first, requires an `AliveV1` acknowledgement within three seconds, and falls back to NATS within the same approval deadline. Unset in dev, where the Compose NATS carries everything. |
 | `NATS_URL` (in `config.env`) | Optional: absent means socket-only. The hook then never touches NATS — a silent agent denies at once instead of waiting out the deadline, and an empty transport set (no socket either) fails before any request is built. Installers verify a staged NATS before writing it and write no `NATS_*` keys otherwise, never placeholders. |
 
+## Caller environment
+
+| Variable | Notes |
+|---|---|
+| `OSHIOKI_SESSION` | Set this yourself, e.g. `export OSHIOKI_SESSION=claude` in a shell or a Ghostty window's startup, to label that session. The plugin captures it like any other environment variable and signs it as part of the request. The Touch ID sheet's reason text (see [mac-approvals.md](mac-approvals.md)) uses it, when set, to show which session a sudo request came from, ahead of falling back to a named process in `pid_chain` or the tty. |
+
 ## Native agent (`oshioki-agent` binary)
 
 | Variable | Notes |

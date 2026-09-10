@@ -4,9 +4,16 @@ On a Mac the Touch ID sheet is the approval. The signing key lives in the
 Secure Enclave behind `biometryCurrentSet`, so the signature cannot exist
 without the fingerprint. The agent raises that sheet directly on each
 request; dismissing it, an expired request, or a locked screen all publish
-no verdict. The short Touch ID reason contains only the request ID and a
-digest of the signed bytes, so an operating-system length limit cannot hide
-executable input.
+no verdict. The sheet is the only thing an operator reads before approving,
+so its reason text shows the session, user, host, and command — e.g.
+`claude: eric@nas sudo systemctl restart oshioki-server` — truncated with
+"…" to fit, dropping the session prefix first when space is tight. The
+session name comes from an `OSHIOKI_SESSION` environment variable, a named
+process in the caller's `pid_chain` (`claude`, `codex`, `tmux`, and similar;
+shells and `sudo` itself are skipped), or the tty basename, in that order;
+see [configuration.md](configuration.md) for `OSHIOKI_SESSION`. Truncation
+only ever shortens the display text — the full request is still verified
+against the signed bytes independently of what the sheet shows.
 
 ```bash
 scripts/mac/bundle-agent
