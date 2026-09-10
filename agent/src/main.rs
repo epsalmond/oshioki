@@ -1294,7 +1294,6 @@ function run(argv) {
     scrollView.autohidesScrollers = false;
     scrollView.documentView = textView;
     alert.accessoryView = scrollView;
-    alert.layout();
 
     $.NSApplication.sharedApplication;
     $.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
