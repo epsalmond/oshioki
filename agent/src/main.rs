@@ -1295,9 +1295,13 @@ function run(argv) {
     scrollView.documentView = textView;
     alert.accessoryView = scrollView;
 
-    $.NSApplication.sharedApplication;
-    $.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
-    const response = alert.runModal();
+    // A helper launched by a LaunchAgent has no activation policy, so AppKit
+    // never shows its windows without one. JXA invokes zero-argument
+    // methods on property access; trailing parentheses call the result.
+    const app = $.NSApplication.sharedApplication;
+    app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+    app.activateIgnoringOtherApps(true);
+    const response = alert.runModal;
     if (response != 1001) throw new Error('approval review was canceled');
     return 0;
 }
