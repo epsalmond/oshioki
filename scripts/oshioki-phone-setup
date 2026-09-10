@@ -1,0 +1,1223 @@
+#!/usr/bin/env python3
+"""Set up a phone-reachable Oshioki server for browser enrollment.
+
+The normal command owns only files below ``~/.local/share/oshioki/phone-server``
+and a Tailscale Serve route whose shape is checked before it is changed.  The
+last step invokes this same file through sudo with a 0600 JSON staging file;
+that mode is deliberately small and only edits the Oshioki config files.
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import ipaddress
+import json
+import os
+from pathlib import Path
+import plistlib
+import secrets
+import shlex
+import shutil
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Iterable
+from urllib.parse import urlsplit
+
+
+VERSION = 1
+DEFAULT_NATS_PORT = 14222
+DEFAULT_SERVER_PORT = 18443
+DEFAULT_HTTPS_PORT = 443
+DEFAULT_TIMEOUT = 5.0
+MAX_HEALTH_BYTES = 128 * 1024
+STATE_ENV = "OSHIOKI_PHONE_SETUP_STATE"
+SERVER_ENV = "OSHIOKI_PHONE_SETUP_SERVER_BIN"
+NATS_ENV = "OSHIOKI_PHONE_SETUP_NATS_BIN"
+TAILSCALE_ENV = "OSHIOKI_PHONE_SETUP_TAILSCALE_BIN"
+SUDO_ENV = "OSHIOKI_PHONE_SETUP_SUDO_BIN"
+PLATFORM_ENV = "OSHIOKI_PHONE_SETUP_PLATFORM"
+SERVICE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+
+class SetupError(Exception):
+    """An actionable setup failure safe to show to the operator."""
+
+
+def fail(message: str) -> "NoReturn":
+    raise SetupError(message)
+
+
+def _no_symlink(path: Path, description: str) -> None:
+    try:
+        if path.is_symlink():
+            fail(f"refusing symlink {description}: {path}")
+    except OSError as exc:
+        fail(f"cannot inspect {description} {path}: {exc}")
+
+
+def _regular_or_absent(path: Path, description: str) -> None:
+    _no_symlink(path, description)
+    if path.exists() and not path.is_file():
+        fail(f"refusing non-regular {description}: {path}")
+
+
+def _owned_directory(path: Path, description: str, mode: int = 0o700, *, tighten: bool = True) -> Path:
+    _no_symlink(path, description)
+    if path.exists():
+        if not path.is_dir():
+            fail(f"refusing non-directory {description}: {path}")
+        try:
+            current_mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError as exc:
+            fail(f"cannot inspect {description} {path}: {exc}")
+        if tighten and current_mode & 0o077:
+            try:
+                path.chmod(mode)
+            except OSError as exc:
+                fail(f"{description} must be owner-only ({path}): {exc}")
+    else:
+        try:
+            path.mkdir(mode=mode, parents=True)
+        except OSError as exc:
+            fail(f"cannot create {description} {path}: {exc}")
+    return path
+
+
+def _private_file(path: Path, description: str) -> None:
+    _regular_or_absent(path, description)
+    if path.exists():
+        try:
+            if stat.S_IMODE(path.stat().st_mode) & 0o077:
+                fail(f"{description} must be owner-only (0600): {path}")
+            if path.stat().st_uid != os.getuid():
+                fail(f"{description} must be owned by this user: {path}")
+        except OSError as exc:
+            fail(f"cannot inspect {description} {path}: {exc}")
+
+
+def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    """Write a private file without exposing a partial or broad-mode file."""
+    _regular_or_absent(path, "managed file")
+    parent = path.parent
+    _no_symlink(parent, "managed directory")
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = -1
+    temporary: Path | None = None
+    try:
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(parent))
+        temporary = Path(name)
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        if fd >= 0:
+            os.close(fd)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        fail(f"could not atomically write {path}: {exc}")
+
+
+def _json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _load_json(path: Path, description: str, owner_only: bool = True) -> Any:
+    if owner_only:
+        _private_file(path, description)
+    else:
+        _regular_or_absent(path, description)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"invalid {description} {path}: {exc}")
+
+
+def _write_json(path: Path, value: Any, description: str) -> None:
+    _private_file(path, description)
+    _atomic_write(path, _json_bytes(value), 0o600)
+
+
+def _run(argv: list[str], *, timeout: float = DEFAULT_TIMEOUT, input_data: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
+    """Run a non-secret command with a bounded wait and captured output."""
+    try:
+        return subprocess.run(
+            argv,
+            input=input_data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        fail(f"missing prerequisite: {argv[0]}")
+    except subprocess.TimeoutExpired:
+        fail(f"command timed out: {Path(argv[0]).name}")
+    except OSError as exc:
+        fail(f"could not run {Path(argv[0]).name}: {exc}")
+
+
+def _binary(value: str | None, env_name: str, candidates: Iterable[Path], description: str) -> Path:
+    selected = value or os.environ.get(env_name)
+    if selected:
+        path = Path(selected)
+        if not path.is_absolute():
+            found = shutil.which(selected)
+            path = Path(found) if found else path
+    else:
+        path = next((candidate for candidate in candidates if candidate.exists()), Path(description))
+        if path == Path(description):
+            found = shutil.which(description)
+            path = Path(found) if found else path
+    # Package managers commonly install command shims as symlinks (notably
+    # Homebrew's opt prefix). Validate the resolved target, but retain the
+    # lexical path so a later package upgrade follows the stable shim.
+    try:
+        target = path.resolve(strict=True)
+    except OSError:
+        target = path
+    if not target.is_file() or not os.access(target, os.X_OK):
+        if description == "nats-server":
+            fail("nats-server is required; install it with `brew install nats-server` or your distro package manager")
+        fail(f"{description} executable not found: {path}")
+    return Path(os.path.abspath(path))
+
+
+def _script_path() -> Path:
+    # Keep /opt/homebrew/bin/oshioki-phone-setup (or another package shim)
+    # in service definitions instead of pinning the current Cellar version.
+    return Path(os.path.abspath(__file__))
+
+
+def _platform() -> str:
+    return os.environ.get(PLATFORM_ENV) or ("Darwin" if sys.platform == "darwin" else "Linux")
+
+
+def _port(value: int, name: str) -> int:
+    if value < 1 or value > 65535:
+        fail(f"invalid {name}: {value}")
+    return value
+
+
+def _origin_parts(value: str) -> tuple[str, str, int | None]:
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        fail("invalid server URL")
+    if (
+        parsed.scheme.lower() != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        fail("server URL must be an HTTPS origin without a path, query, fragment, or credentials")
+    if port is not None and not 1 <= port <= 65535:
+        fail("server URL has an invalid port")
+    host = host.rstrip(".").lower()
+    if not host or _local_host(host):
+        fail("server URL must be reachable by the phone; localhost and loopback are not valid")
+    origin = f"https://{host}" + (f":{port}" if port is not None else "")
+    return origin, host, port
+
+
+def _local_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback or ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False
+
+
+def _nats_parts(value: str) -> tuple[str, str, int]:
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port or 4222
+    except ValueError:
+        fail("invalid NATS URL")
+    scheme = parsed.scheme.lower()
+    if (
+        scheme not in ("nats", "tls")
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        fail("NATS_URL must be nats:// or tls:// with a host, port, and no embedded credentials")
+    if not 1 <= port <= 65535:
+        fail("NATS_URL has an invalid port")
+    host = host.rstrip(".")
+    if scheme == "nats" and not _local_host(host):
+        fail("refusing plaintext NATS outside loopback; use tls://")
+    return scheme, host, port
+
+
+def _parse_nats_env(path: Path) -> dict[str, str]:
+    _private_file(path, "NATS config")
+    allowed = {"NATS_URL", "NATS_USER", "NATS_PASS"}
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        fail(f"could not read NATS config {path}: {exc}")
+    for number, line in enumerate(lines, 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if "=" not in line:
+            fail(f"NATS config line {number} must be KEY=VALUE")
+        key, value = line.split("=", 1)
+        if key not in allowed:
+            fail(f"unknown NATS config key: {key}")
+        if key in values:
+            fail(f"duplicate NATS config key: {key}")
+        if not value or value != value.strip() or "\n" in value or "\r" in value:
+            fail(f"NATS config value for {key} is empty or has surrounding whitespace")
+        values[key] = value
+    if set(values) != allowed:
+        fail("NATS config must contain exactly NATS_URL, NATS_USER, and NATS_PASS")
+    _nats_parts(values["NATS_URL"])
+    return values
+
+
+def _health_request(base_url: str, *, expected_origin: str, expected_rp_id: str, tls: bool) -> dict[str, Any]:
+    """GET /healthz once, with certificate verification and no redirects."""
+    parsed = urlsplit(base_url)
+    host = parsed.hostname
+    if not host:
+        fail("health URL has no host")
+    port = parsed.port or (443 if tls else 80)
+    path = "/healthz"
+    connection: http.client.HTTPConnection | http.client.HTTPSConnection
+    try:
+        if tls:
+            context = ssl.create_default_context()
+            connection = http.client.HTTPSConnection(host, port, context=context, timeout=DEFAULT_TIMEOUT)
+        else:
+            connection = http.client.HTTPConnection(host, port, timeout=DEFAULT_TIMEOUT)
+        connection.request("GET", path, headers={"Accept": "application/json", "Connection": "close"})
+        response = connection.getresponse()
+        if 300 <= response.status < 400 or response.status != 200:
+            fail(f"Oshioki HTTPS health check returned HTTP {response.status}")
+        body = response.read(MAX_HEALTH_BYTES + 1)
+        if len(body) > MAX_HEALTH_BYTES:
+            fail("Oshioki health response is too large")
+    except SetupError:
+        raise
+    except (OSError, ValueError) as exc:
+        fail(f"Oshioki HTTPS health check failed: {exc}")
+    finally:
+        try:
+            connection.close()  # type: ignore[union-attr]
+        except (UnboundLocalError, AttributeError):
+            pass
+    try:
+        health = json.loads(body.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"Oshioki health response is not JSON: {exc}")
+    if not isinstance(health, dict) or health.get("status") != "ok":
+        fail("Oshioki server is not ready (health status is not ok)")
+    if health.get("origin") != expected_origin or health.get("rp_id") != expected_rp_id:
+        fail("Oshioki health response origin or RP ID does not match the setup")
+    return health
+
+
+def _nats_read_line(sock: socket.socket, buffer: bytearray, deadline: float) -> bytes:
+    while b"\r\n" not in buffer:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("NATS probe timed out")
+        sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(8192)
+        except OSError as exc:
+            fail(f"NATS probe failed: {exc}")
+        if not chunk:
+            fail("NATS server closed the probe connection")
+        buffer.extend(chunk)
+    line, _, rest = buffer.partition(b"\r\n")
+    buffer[:] = rest
+    return bytes(line)
+
+
+def _nats_frame(sock: socket.socket, buffer: bytearray, deadline: float) -> bytes:
+    line = _nats_read_line(sock, buffer, deadline)
+    if line.startswith(b"MSG "):
+        fields = line.split()
+        if len(fields) not in (4, 5):
+            fail("NATS returned an invalid message frame")
+        try:
+            size = int(fields[-1])
+        except ValueError:
+            fail("NATS returned an invalid message size")
+        while len(buffer) < size + 2:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("NATS probe timed out reading a reply")
+            sock.settimeout(remaining)
+            chunk = sock.recv(8192)
+            if not chunk:
+                fail("NATS server closed the probe connection")
+            buffer.extend(chunk)
+        payload = bytes(buffer[:size])
+        del buffer[: size + 2]
+        return payload
+    return line
+
+
+def _nats_connect(url: str, user: str, password: str) -> tuple[socket.socket, bytearray, float]:
+    scheme, host, port = _nats_parts(url)
+    deadline = time.monotonic() + DEFAULT_TIMEOUT
+    try:
+        sock = socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT)
+        buffer = bytearray()
+        info: dict[str, Any] = {}
+        while True:
+            line = _nats_read_line(sock, buffer, deadline)
+            if line.startswith(b"INFO "):
+                try:
+                    info = json.loads(line[5:].decode("utf-8"))
+                except (UnicodeError, json.JSONDecodeError):
+                    fail("NATS returned invalid INFO")
+                break
+            if line.startswith(b"-ERR"):
+                fail("NATS rejected the connection")
+        if info.get("tls_required") and scheme != "tls":
+            sock.close()
+            fail("NATS server requires TLS; use a tls:// URL")
+        if info.get("nonce"):
+            sock.close()
+            fail("NATS server requires NKey authentication, which phone setup does not configure")
+        if scheme == "tls":
+            # NATS sends INFO in cleartext and upgrades this same connection
+            # before CONNECT. Bytes after INFO belong to the cleartext phase;
+            # carrying them across the TLS handshake would corrupt framing.
+            if buffer:
+                sock.close()
+                fail("NATS sent unexpected data before its TLS handshake")
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+        connect = {
+            "verbose": False,
+            "pedantic": False,
+            "lang": "oshioki-phone-setup",
+            "version": "1",
+            "protocol": 1,
+            "user": user,
+            "pass": password,
+        }
+        sock.sendall(b"CONNECT " + json.dumps(connect, separators=(",", ":")).encode() + b"\r\nPING\r\n")
+        while True:
+            line = _nats_read_line(sock, buffer, deadline)
+            if line == b"PONG" or line == b"+OK":
+                if line == b"+OK":
+                    continue
+                return sock, buffer, deadline
+            if line.startswith(b"INFO "):
+                continue
+            if line.startswith(b"-ERR"):
+                sock.close()
+                fail("NATS rejected the supplied credentials")
+            if line == b"PING":
+                sock.sendall(b"PONG\r\n")
+            elif line == b"PONG":
+                return sock, buffer, deadline
+        _ = info
+    except SetupError:
+        raise
+    except (OSError, ssl.SSLError) as exc:
+        fail(f"NATS connection failed: {exc}")
+    raise AssertionError("unreachable")
+
+
+def _nats_probe(url: str, user: str, password: str, *, ensure_stream: bool = False) -> None:
+    sock, buffer, deadline = _nats_connect(url, user, password)
+    try:
+        if ensure_stream:
+            inbox = f"_INBOX.OSHIOKI.{secrets.token_hex(12)}"
+            sock.sendall(f"SUB {inbox} 1\r\n".encode())
+            sock.sendall(b"PING\r\n")
+            while True:
+                frame = _nats_frame(sock, buffer, deadline)
+                if frame == b"PONG":
+                    break
+                if frame == b"PING":
+                    sock.sendall(b"PONG\r\n")
+            payload = b"{}"
+            subject = b"$JS.API.STREAM.INFO.OSHIOKI"
+            sock.sendall(b"PUB " + subject + b" " + inbox.encode() + b" " + str(len(payload)).encode() + b"\r\n" + payload + b"\r\n")
+            response = _nats_frame(sock, buffer, deadline)
+            response_json: dict[str, Any] | None = None
+            if response.startswith(b"{"):
+                try:
+                    parsed_response = json.loads(response.decode("utf-8"))
+                    if isinstance(parsed_response, dict):
+                        response_json = parsed_response
+                except (UnicodeError, json.JSONDecodeError):
+                    fail("NATS returned an invalid JetStream response")
+            if response.startswith(b"-ERR") or (response_json is not None and "error" in response_json):
+                # A missing stream is the one expected response that needs creation.
+                error_text = response.lower()
+                missing = b"stream not found" in error_text or b"10059" in error_text or b"10058" in error_text
+                if not missing:
+                    fail("authenticated NATS connection cannot inspect the OSHIOKI stream")
+                stream = json.dumps({
+                    "name": "OSHIOKI",
+                    "subjects": ["oshioki.request.>"],
+                    "storage": "file",
+                    "retention": "limits",
+                    "discard": "old",
+                    "max_age": 600_000_000_000,
+                    "num_replicas": 1,
+                }, separators=(",", ":")).encode()
+                command = b"PUB $JS.API.STREAM.CREATE.OSHIOKI " + inbox.encode() + b" " + str(len(stream)).encode() + b"\r\n" + stream + b"\r\n"
+                sock.sendall(command)
+                created = _nats_frame(sock, buffer, deadline)
+                if created.startswith(b"-ERR"):
+                    fail("authenticated NATS connection cannot create the OSHIOKI JetStream stream")
+                try:
+                    created_json = json.loads(created.decode("utf-8"))
+                except (UnicodeError, json.JSONDecodeError):
+                    fail("NATS returned an invalid JetStream create response")
+                if not isinstance(created_json, dict) or "error" in created_json:
+                    fail("authenticated NATS connection cannot create the OSHIOKI JetStream stream")
+            else:
+                # The helper above returns payloads for MSG frames. It is a JSON
+                # status response, so receiving it proves the stream exists.
+                status = response_json
+                if status is None:
+                    fail("NATS returned an invalid OSHIOKI stream response")
+                stream_config = status.get("config")
+                if not isinstance(stream_config, dict) or stream_config.get("name") != "OSHIOKI" or "oshioki.request.>" not in stream_config.get("subjects", []):
+                    fail("NATS returned an invalid OSHIOKI stream response")
+        else:
+            sock.sendall(b"PING\r\n")
+            while True:
+                frame = _nats_frame(sock, buffer, deadline)
+                if frame == b"PONG":
+                    break
+                if frame == b"PING":
+                    sock.sendall(b"PONG\r\n")
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _canonical(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _canonical(v) for k, v in sorted(value.items()) if v is not None and v != {}}
+    if isinstance(value, list):
+        return [_canonical(v) for v in value]
+    return value
+
+
+def _serve_empty(value: Any) -> bool:
+    normalized = _canonical(value)
+    return normalized is None or normalized == {}
+
+
+def _expected_serve(rp_id: str, https_port: int, server_port: int) -> dict[str, Any]:
+    route = f"{rp_id}:{https_port}" if https_port != 443 else f"{rp_id}:443"
+    return {
+        "TCP": {str(https_port): {"HTTPS": True}},
+        "Web": {route: {"Handlers": {"/": {"Proxy": f"http://127.0.0.1:{server_port}"}}}},
+    }
+
+
+def _tailscale_status(binary: Path) -> tuple[str, str]:
+    result = _run([str(binary), "status", "--json"])
+    if result.returncode != 0:
+        fail("Tailscale is not running; install/start Tailscale or use --server-url with --nats-config")
+    try:
+        status = json.loads(result.stdout.decode("utf-8"))
+        self_info = status["Self"]
+        dns = str(self_info["DNSName"]).rstrip(".").lower()
+    except (UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        fail("Tailscale status did not contain Self.DNSName")
+    if self_info.get("Online") is not True or not dns or _local_host(dns) or "/" in dns:
+        fail("Tailscale is offline or has no phone-reachable DNS name")
+    _origin_parts(f"https://{dns}")
+    return dns, f"https://{dns}"
+
+
+def _serve_config(binary: Path) -> Any:
+    result = _run([str(binary), "serve", "status", "--json"])
+    if result.returncode != 0:
+        fail("could not inspect Tailscale Serve configuration")
+    try:
+        return json.loads(result.stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"Tailscale Serve returned invalid JSON: {exc}")
+
+
+def _check_serve_route(binary: Path, expected: dict[str, Any]) -> bool:
+    current = _serve_config(binary)
+    if _serve_empty(current):
+        return False
+    if _canonical(current) == _canonical(expected):
+        return True
+    fail("Tailscale Serve already has another route; refusing to replace it (remove it or choose an external server)")
+
+
+def _credentials(state: Path) -> dict[str, str]:
+    path = state / "credentials.json"
+    if path.exists() or path.is_symlink():
+        value = _load_json(path, "phone setup credentials")
+        if not isinstance(value, dict) or set(value) != {"version", "hook_user", "hook_pass", "server_user", "server_pass"} or value.get("version") != VERSION:
+            fail(f"invalid phone setup credentials: {path}")
+        result = {key: value[key] for key in ("hook_user", "hook_pass", "server_user", "server_pass")}
+        if any(not isinstance(item, str) or not item for item in result.values()) or result["hook_user"] != "oshioki-hook" or result["server_user"] != "oshioki-server":
+            fail(f"invalid phone setup credentials: {path}")
+        return result
+    result = {
+        "hook_user": "oshioki-hook",
+        "hook_pass": secrets.token_urlsafe(32),
+        "server_user": "oshioki-server",
+        "server_pass": secrets.token_urlsafe(32),
+    }
+    _write_json(path, {"version": VERSION, **result}, "phone setup credentials")
+    return result
+
+
+def _quote_nats(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _nats_config(state: Path, credentials: dict[str, str], port: int) -> Path:
+    path = state / "nats.conf"
+    store = state / "nats" / "store"
+    _owned_directory(store, "NATS store", 0o700)
+    hook_publish = ["oshioki.request.>", "oshioki.enrollment.intent", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>"]
+    hook_subscribe = ["oshioki.verdict.>", "oshioki.enrollment.submission.>", "oshioki.device.revoked.>", "oshioki.request.>"]
+    server_publish = ["oshioki.verdict.>", "oshioki.enrollment.submission.>", "oshioki.device.revoked.>", "$JS.API.>", "$JS.ACK.>"]
+    server_subscribe = ["oshioki.request.>", "oshioki.enrollment.intent", "oshioki.enrollment.submission.>", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>", "_INBOX.>"]
+
+    def items(values: list[str]) -> str:
+        return "[" + ", ".join(_quote_nats(item) for item in values) + "]"
+
+    text = "\n".join([
+        f'listen: "127.0.0.1:{port}"',
+        "jetstream: {",
+        f"  store_dir: {_quote_nats(str(store))}",
+        "}",
+        "authorization {",
+        "  users = [",
+        "    {",
+        f"      user: {_quote_nats(credentials['hook_user'])}",
+        f"      password: {_quote_nats(credentials['hook_pass'])}",
+        "      permissions: {",
+        f"        publish: {items(hook_publish)}",
+        f"        subscribe: {items(hook_subscribe)}",
+        "      }",
+        "    },",
+        "    {",
+        f"      user: {_quote_nats(credentials['server_user'])}",
+        f"      password: {_quote_nats(credentials['server_pass'])}",
+        "      permissions: {",
+        f"        publish: {items(server_publish)}",
+        f"        subscribe: {items(server_subscribe)}",
+        "      }",
+        "    }",
+        "  ]",
+        "}",
+        "",
+    ])
+    _private_file(path, "NATS config")
+    if not path.exists() or path.read_text(encoding="utf-8") != text:
+        _atomic_write(path, text.encode(), 0o600)
+    return path
+
+
+def _runtime(state: Path, *, nats_bin: Path, server_bin: Path, nats_port: int, server_port: int, origin: str, rp_id: str, credentials: dict[str, str]) -> dict[str, Any]:
+    runtime_path = state / "runtime.json"
+    value = {
+        "version": VERSION,
+        "nats_bin": str(nats_bin),
+        "server_bin": str(server_bin),
+        "nats_port": nats_port,
+        "server_port": server_port,
+        "origin": origin,
+        "rp_id": rp_id,
+        "script": str(_script_path()),
+    }
+    if runtime_path.exists() or runtime_path.is_symlink():
+        old = _load_json(runtime_path, "phone setup runtime")
+        if not isinstance(old, dict) or set(old) != set(value) or old.get("version") != VERSION:
+            fail(f"invalid phone setup runtime: {runtime_path}")
+        for key in ("nats_port", "server_port", "origin", "rp_id"):
+            if old.get(key) != value[key]:
+                fail(f"phone setup state uses different {key}; choose a new --state-dir")
+    _write_json(runtime_path, value, "phone setup runtime")
+    return value
+
+
+def _service_args(role: str, state: Path) -> list[str]:
+    # /usr/bin/env and the package-managed python3 shim are stable across
+    # Homebrew Cellar upgrades.  The service PATH is explicit in both service
+    # manager definitions below.
+    return ["/usr/bin/env", "python3", str(_script_path()), "--run-service", "--role", role, "--state-dir", str(state)]
+
+
+def _service_identity(arguments: Any, role: str, state: Path) -> bool:
+    """Recognize the role/state marker in a private, user-owned definition."""
+    if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
+        return False
+    marker = ["--run-service", "--role", role, "--state-dir", str(state)]
+    try:
+        position = arguments.index("--run-service")
+    except ValueError:
+        return False
+    return arguments[position:] == marker
+
+
+def _plist(path: Path, label: str, role: str, state: Path, log: Path) -> bool:
+    _private_file(path, "LaunchAgent plist")
+    value = {
+        "Label": label,
+        "ProgramArguments": _service_args(role, state),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "EnvironmentVariables": {"PATH": SERVICE_PATH},
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
+    }
+    if path.exists():
+        try:
+            old = plistlib.loads(path.read_bytes())
+        except (OSError, plistlib.InvalidFileException) as exc:
+            fail(f"invalid existing LaunchAgent plist {path}: {exc}")
+        expected_keys = set(value)
+        old_environment = old.get("EnvironmentVariables", {}) if isinstance(old, dict) else None
+        if (
+            not isinstance(old, dict)
+            or not set(old).issubset(expected_keys)
+            or set(old) not in (expected_keys, expected_keys - {"EnvironmentVariables"})
+            or old.get("Label") != label
+            or old.get("StandardOutPath") != str(log)
+            or old.get("StandardErrorPath") != str(log)
+            or old.get("RunAtLoad") is not True
+            or old.get("KeepAlive") is not True
+            or old_environment not in ({}, {"PATH": SERVICE_PATH})
+            or not _service_identity(old.get("ProgramArguments"), role, state)
+        ):
+            fail(f"refusing to replace an unexpected LaunchAgent plist: {path}")
+        changed = old != value
+        if changed:
+            _atomic_write(path, plistlib.dumps(value, fmt=plistlib.FMT_XML), 0o600)
+        return changed
+    else:
+        _atomic_write(path, plistlib.dumps(value, fmt=plistlib.FMT_XML), 0o600)
+        return True
+
+
+def _systemd_unit(path: Path, description: str, role: str, state: Path, log: Path) -> bool:
+    _private_file(path, "systemd user unit")
+    command = " ".join(shlex.quote(item) for item in _service_args(role, state))
+    text = "\n".join([
+        "[Unit]",
+        f"Description={description}",
+        "After=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        f"ExecStart={command}",
+        f"Environment=PATH={SERVICE_PATH}",
+        "Restart=on-failure",
+        "RestartSec=2",
+        f"StandardOutput=append:{log}",
+        f"StandardError=append:{log}",
+        "",
+        "[Install]",
+        "WantedBy=default.target",
+        "",
+    ])
+    if path.exists():
+        try:
+            old_lines = path.read_text(encoding="utf-8").splitlines()
+            old_exec = next(line.split("=", 1)[1] for line in old_lines if line.startswith("ExecStart="))
+            old_arguments = shlex.split(old_exec)
+        except (OSError, UnicodeError, ValueError, StopIteration) as exc:
+            fail(f"invalid existing systemd user unit {path}: {exc}")
+        expected_without_exec = [line for line in text.splitlines() if not line.startswith("ExecStart=")]
+        old_without_exec = [line for line in old_lines if not line.startswith("ExecStart=")]
+        legacy_without_environment = [line for line in expected_without_exec if not line.startswith("Environment=")]
+        if old_without_exec not in (expected_without_exec, legacy_without_environment) or not _service_identity(old_arguments, role, state):
+            fail(f"refusing to replace an unexpected systemd user unit: {path}")
+        changed = path.read_text(encoding="utf-8") != text
+        if changed:
+            _atomic_write(path, text.encode(), 0o600)
+        return changed
+    else:
+        _atomic_write(path, text.encode(), 0o600)
+        return True
+
+
+def _ensure_services(state: Path, runtime: dict[str, Any], roles: tuple[str, ...] = ("nats", "server")) -> None:
+    logs = _owned_directory(state / "logs", "phone setup logs", 0o700)
+    nats_log = logs / "nats.log"
+    server_log = logs / "server.log"
+    for path in (nats_log, server_log):
+        _private_file(path, "service log")
+        if not path.exists():
+            _atomic_write(path, b"", 0o600)
+
+    if _platform() == "Darwin":
+        directory = _owned_directory(Path.home() / "Library" / "LaunchAgents", "LaunchAgents", 0o700, tighten=False)
+        nats_plist = directory / "com.oshioki.phone-server.nats.plist"
+        server_plist = directory / "com.oshioki.phone-server.server.plist"
+        plist_paths = {
+            "nats": ("com.oshioki.phone-server.nats", nats_plist, nats_log),
+            "server": ("com.oshioki.phone-server.server", server_plist, server_log),
+        }
+        changed: dict[str, bool] = {}
+        for role in roles:
+            label, plist, log = plist_paths[role]
+            changed[role] = _plist(plist, label, role, state, log)
+        domain = f"gui/{os.getuid()}"
+        services = {
+            "nats": ("com.oshioki.phone-server.nats", nats_plist),
+            "server": ("com.oshioki.phone-server.server", server_plist),
+        }
+        for role in roles:
+            label, plist = services[role]
+            launchctl = os.environ.get("OSHIOKI_PHONE_SETUP_LAUNCHCTL", "launchctl")
+            if changed[role]:
+                _run([launchctl, "bootout", f"{domain}/{label}"])
+            # An unload can still be settling when bootout returns. Retry
+            # bootstrap itself so the new definition is loaded; kickstart
+            # could otherwise restart the old cached definition.
+            for attempt in range(5 if changed[role] else 1):
+                result = _run([launchctl, "bootstrap", domain, str(plist)])
+                if result.returncode == 0:
+                    break
+                if changed[role] and attempt < 4:
+                    time.sleep(0.2)
+            if result.returncode != 0:
+                if changed[role]:
+                    fail(f"could not reload owned LaunchAgent {label}")
+                retry = _run([launchctl, "kickstart", "-k", f"{domain}/{label}"])
+                if retry.returncode != 0:
+                    fail(f"could not start owned LaunchAgent {label}")
+    else:
+        directory = _owned_directory(Path.home() / ".config" / "systemd" / "user", "systemd user unit directory", 0o700, tighten=False)
+        nats_unit = directory / "oshioki-phone-server-nats.service"
+        server_unit = directory / "oshioki-phone-server.service"
+        unit_paths = {
+            "nats": ("Oshioki phone setup NATS", nats_unit, nats_log),
+            "server": ("Oshioki phone setup server", server_unit, server_log),
+        }
+        changed: dict[str, bool] = {}
+        for role in roles:
+            description, unit, log = unit_paths[role]
+            changed[role] = _systemd_unit(unit, description, role, state, log)
+        systemctl = os.environ.get("OSHIOKI_PHONE_SETUP_SYSTEMCTL", "systemctl")
+        reload_result = _run([systemctl, "--user", "daemon-reload"])
+        if reload_result.returncode != 0:
+            fail("could not reload the user systemd manager")
+        units = {"nats": nats_unit.name, "server": server_unit.name}
+        for role in roles:
+            unit = units[role]
+            result = _run([systemctl, "--user", "enable", "--now", unit])
+            if result.returncode != 0:
+                fail(f"could not start owned systemd user service {unit}")
+            if changed[role]:
+                restarted = _run([systemctl, "--user", "restart", unit])
+                if restarted.returncode != 0:
+                    fail(f"could not restart updated systemd user service {unit}")
+
+
+def _run_service(role: str, state: Path) -> int:
+    runtime = _load_json(state / "runtime.json", "phone setup runtime")
+    creds = _load_json(state / "credentials.json", "phone setup credentials")
+    runtime_keys = {"version", "nats_bin", "server_bin", "nats_port", "server_port", "origin", "rp_id", "script"}
+    credential_keys = {"version", "hook_user", "hook_pass", "server_user", "server_pass"}
+    if not isinstance(runtime, dict) or set(runtime) != runtime_keys or runtime.get("version") != VERSION or not isinstance(creds, dict) or set(creds) != credential_keys or creds.get("version") != VERSION:
+        fail("phone setup service state is invalid")
+    if role not in ("nats", "server"):
+        fail("service role must be nats or server")
+    credentials = {key: creds.get(key) for key in ("hook_user", "hook_pass", "server_user", "server_pass")}
+    if any(not isinstance(item, str) or not item for item in credentials.values()):
+        fail("phone setup service credentials are invalid")
+    if not all(isinstance(runtime.get(key), str) and runtime[key] for key in ("nats_bin", "server_bin", "origin", "rp_id", "script")) or not all(isinstance(runtime.get(key), int) and not isinstance(runtime[key], bool) and 1 <= runtime[key] <= 65535 for key in ("nats_port", "server_port")):
+        fail("phone setup service state is invalid")
+    if role == "nats":
+        argv = [runtime["nats_bin"], "-c", str(state / "nats.conf")]
+        env = {"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "HOME": str(Path.home())}
+    else:
+        argv = [runtime["server_bin"]]
+        env = {
+            "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            "HOME": str(Path.home()),
+            "NATS_URL": f"nats://127.0.0.1:{runtime['nats_port']}",
+            "NATS_USER": credentials["server_user"],
+            "NATS_PASS": credentials["server_pass"],
+            "OSHIOKI_STATE_PATH": str(state / "server" / "state.sqlite3"),
+            "OSHIOKI_LISTEN": f"127.0.0.1:{runtime['server_port']}",
+            "OSHIOKI_ORIGIN": runtime["origin"],
+            "OSHIOKI_RP_ID": runtime["rp_id"],
+            "RUST_LOG": "info",
+        }
+    os.execve(argv[0], argv, env)
+    return 0
+
+
+def _wait_nats(url: str, user: str, password: str, *, ensure_stream: bool) -> None:
+    last: str = "not attempted"
+    for _ in range(30):
+        try:
+            _nats_probe(url, user, password, ensure_stream=ensure_stream)
+            return
+        except SetupError as exc:
+            last = str(exc)
+            time.sleep(0.25)
+    fail(f"NATS did not become ready: {last}")
+
+
+def _wait_health(base_url: str, origin: str, rp_id: str, tls: bool) -> None:
+    last: str = "not attempted"
+    for _ in range(30):
+        try:
+            _health_request(base_url, expected_origin=origin, expected_rp_id=rp_id, tls=tls)
+            return
+        except SetupError as exc:
+            last = str(exc)
+            time.sleep(0.25)
+    fail(f"Oshioki server did not become ready: {last}")
+
+
+def _read_registry(path: Path) -> dict[str, Any] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    _regular_or_absent(path, "device registry")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"invalid device registry {path}: {exc}")
+    if not isinstance(value, dict) or not isinstance(value.get("devices"), list):
+        fail(f"invalid device registry shape: {path}")
+    if any(not isinstance(device, dict) for device in value["devices"]):
+        fail(f"invalid device record in registry: {path}")
+    return value
+
+
+def _update_env_bytes(original: bytes | None, updates: dict[str, str]) -> bytes:
+    try:
+        lines = original.decode("utf-8").splitlines() if original is not None else []
+    except UnicodeError as exc:
+        fail(f"configuration file is not valid UTF-8: {exc}")
+    seen: set[str] = set()
+    output: list[str] = []
+    for line in lines:
+        if "=" in line and not line.lstrip().startswith("#"):
+            key = line.split("=", 1)[0]
+            if key in updates:
+                if key in seen:
+                    continue
+                output.append(f"{key}={updates[key]}")
+                seen.add(key)
+                continue
+        output.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            output.append(f"{key}={value}")
+    return ("\n".join(output).rstrip("\n") + "\n").encode()
+
+
+def _install_config(staging: Path, config_dir: Path) -> None:
+    """Root-only narrow config mutation with byte rollback on failure."""
+    _regular_or_absent(staging, "configuration staging file")
+    if not staging.exists() or stat.S_IMODE(staging.stat().st_mode) & 0o077:
+        fail("configuration staging file must be a regular 0600 file")
+    try:
+        allowed_owners = {os.getuid()}
+        if os.environ.get("SUDO_UID", "").isdigit():
+            allowed_owners.add(int(os.environ["SUDO_UID"]))
+        if staging.stat().st_uid not in allowed_owners:
+            fail("configuration staging file must be owned by the invoking user")
+    except OSError as exc:
+        fail(f"cannot inspect configuration staging file: {exc}")
+    try:
+        value = json.loads(staging.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        fail(f"invalid configuration staging file {staging}: {exc}")
+    required = {"version", "origin", "rp_id", "nats_url", "nats_user", "nats_pass"}
+    if not isinstance(value, dict) or set(value) != required or value.get("version") != VERSION:
+        fail("configuration staging file has unknown or missing fields")
+    for key in ("origin", "rp_id", "nats_url", "nats_user", "nats_pass"):
+        if not isinstance(value[key], str) or not value[key] or "\n" in value[key] or "\r" in value[key]:
+            fail(f"configuration staging value is invalid: {key}")
+    origin, host, _ = _origin_parts(value["origin"])
+    if origin != value["origin"] or value["rp_id"] != host:
+        fail("configuration staging origin and RP ID do not match")
+    _nats_parts(value["nats_url"])
+    _no_symlink(config_dir, "Oshioki config directory")
+    if config_dir.exists() and not config_dir.is_dir():
+        fail(f"Oshioki config path is not a directory: {config_dir}")
+    config_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
+    if os.geteuid() == 0 and config_dir.stat().st_uid != 0:
+        fail(f"Oshioki config directory must be root-owned: {config_dir}")
+
+    registry_path = config_dir / "devices.json"
+    registry = _read_registry(registry_path)
+    old_hook: dict[str, Any] | None = None
+    hook_path = config_dir / "hook.json"
+    if hook_path.exists() or hook_path.is_symlink():
+        _regular_or_absent(hook_path, "hook configuration")
+        try:
+            parsed = json.loads(hook_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            fail(f"invalid hook configuration {hook_path}: {exc}")
+        if not isinstance(parsed, dict):
+            fail(f"invalid hook configuration shape: {hook_path}")
+        old_hook = parsed
+    old_origin = old_hook.get("origin") if old_hook else None
+    if old_hook is not None and (not isinstance(old_origin, str) or not old_origin):
+        fail(f"invalid hook configuration origin: {hook_path}")
+    if registry and isinstance(registry.get("devices"), list) and old_origin and old_origin != origin:
+        for device in registry["devices"]:
+            if not isinstance(device, dict) or device.get("active") is not True:
+                continue
+            kind = device.get("kind", "webauthn")
+            if kind in ("webauthn", "browser"):
+                fail("refusing to change the enrollment origin while an active browser device is present; migrate that device explicitly first")
+
+    paths = [hook_path, config_dir / "config.env", config_dir / "install.env"]
+    originals: dict[Path, bytes | None] = {}
+    for path in paths:
+        _regular_or_absent(path, "Oshioki configuration file")
+        originals[path] = path.read_bytes() if path.exists() else None
+        if os.geteuid() == 0 and path.exists() and path.stat().st_uid != 0:
+            fail(f"Oshioki configuration file must be root-owned: {path}")
+    hook_value = dict(old_hook or {})
+    hook_value.update({"version": VERSION, "origin": origin, "rp_id": host, "server_base_url": origin})
+    env_updates = {
+        "OSHIOKI_ORIGIN": origin,
+        "OSHIOKI_RP_ID": host,
+        "NATS_URL": value["nats_url"],
+        "NATS_USER": value["nats_user"],
+        "NATS_PASS": value["nats_pass"],
+    }
+    new_bytes = {
+        hook_path: _json_bytes(hook_value),
+        config_dir / "config.env": _update_env_bytes(originals[config_dir / "config.env"], env_updates),
+        config_dir / "install.env": _update_env_bytes(originals[config_dir / "install.env"], env_updates),
+    }
+    attempted: list[Path] = []
+    try:
+        for path in paths:
+            attempted.append(path)
+            _atomic_write(path, new_bytes[path], 0o600)
+    except SetupError as exc:
+        rollback_errors: list[str] = []
+        for path in reversed(attempted):
+            try:
+                if originals[path] is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _atomic_write(path, originals[path] or b"", 0o600)
+            except (OSError, SetupError) as rollback_error:
+                rollback_errors.append(f"{path}: {rollback_error}")
+        if rollback_errors:
+            raise SetupError(
+                "configuration update failed; rollback is incomplete for "
+                + ", ".join(rollback_errors)
+            )
+        raise SetupError(f"configuration update failed and was rolled back: {exc}")
+
+
+def _sudo_install(staging: Path, config_dir: Path, sudo_bin: str) -> None:
+    result = _run([sudo_bin, str(_script_path()), "--install-config", "--staging", str(staging), "--config-dir", str(config_dir)], timeout=30)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        if detail:
+            fail(f"sudo could not install the Oshioki configuration: {detail}")
+        fail("sudo could not install the Oshioki configuration; rerun the printed setup command and complete the administrator prompt")
+
+
+def _staging_file(state: Path, payload: dict[str, str]) -> Path:
+    _owned_directory(state, "phone setup state", 0o700)
+    path = state / ".config-staging.json"
+    _private_file(path, "configuration staging file")
+    _atomic_write(path, _json_bytes({"version": VERSION, **payload}), 0o600)
+    return path
+
+
+def _external_mode(args: argparse.Namespace, config_dir: Path) -> None:
+    if not args.server_url or not args.nats_config:
+        fail("external setup requires both --server-url and --nats-config")
+    origin, host, _ = _origin_parts(args.server_url)
+    nats = _parse_nats_env(Path(args.nats_config))
+    _health_request(origin, expected_origin=origin, expected_rp_id=host, tls=True)
+    _nats_probe(nats["NATS_URL"], nats["NATS_USER"], nats["NATS_PASS"])
+    if args.check:
+        print(f"External Oshioki server is ready at {origin} (RP ID {host})")
+        print("NATS credentials authenticated; no files were changed")
+        return
+    state = _owned_directory(Path(args.state_dir or os.environ.get(STATE_ENV, Path.home() / ".local" / "share" / "oshioki" / "phone-server")), "phone setup state", 0o700)
+    staging = _staging_file(state, {"origin": origin, "rp_id": host, "nats_url": nats["NATS_URL"], "nats_user": nats["NATS_USER"], "nats_pass": nats["NATS_PASS"]})
+    try:
+        _sudo_install(staging, config_dir, args.sudo_bin)
+    finally:
+        try:
+            staging.unlink()
+        except OSError:
+            pass
+    print(f"Phone setup complete for {origin} (RP ID {host}).")
+    print("Next: sudo oshioki enroll")
+
+
+def _local_mode(args: argparse.Namespace, config_dir: Path) -> None:
+    tailscale = _binary(args.tailscale_bin, TAILSCALE_ENV, [], "tailscale")
+    nats_bin = _binary(args.nats_bin, NATS_ENV, [], "nats-server")
+    script = _script_path()
+    server_bin = _binary(args.server_bin, SERVER_ENV, [script.parent / "oshioki-server", script.parent.parent / "target" / "release" / "oshioki-server", script.parent.parent / "target" / "debug" / "oshioki-server", Path("/usr/local/sbin/oshioki-server"), Path("/usr/sbin/oshioki-server")], "oshioki-server")
+    dns, origin = _tailscale_status(tailscale)
+    origin, rp_id, _ = _origin_parts(origin + (f":{args.https_port}" if args.https_port != 443 else ""))
+    expected = _expected_serve(rp_id, args.https_port, args.server_port)
+    existing_owned_route = _check_serve_route(tailscale, expected)
+    if args.check:
+        print(f"Would run local Oshioki server at {origin} through Tailscale Serve (RP ID {rp_id}).")
+        print("Tailscale Serve is already owned by this setup." if existing_owned_route else "Tailscale Serve is empty and can be configured.")
+        print(f"NATS: loopback port {args.nats_port}; server: loopback port {args.server_port}")
+        print("No files, services, or routes were changed")
+        return
+
+    state = _owned_directory(Path(args.state_dir or os.environ.get(STATE_ENV, Path.home() / ".local" / "share" / "oshioki" / "phone-server")), "phone setup state", 0o700)
+    credentials = _credentials(state)
+
+    nats_conf = _nats_config(state, credentials, args.nats_port)
+    _ = nats_conf
+    runtime = _runtime(state, nats_bin=nats_bin, server_bin=server_bin, nats_port=args.nats_port, server_port=args.server_port, origin=origin, rp_id=rp_id, credentials=credentials)
+    _owned_directory(state / "server", "server state", 0o700)
+    # The server expects the OSHIOKI stream and its durable consumer to exist
+    # when it connects. Start NATS alone, initialize JetStream, then launch
+    # the server service.
+    _ensure_services(state, runtime, roles=("nats",))
+    nats_url = f"nats://127.0.0.1:{args.nats_port}"
+    _wait_nats(nats_url, credentials["server_user"], credentials["server_pass"], ensure_stream=True)
+    _ensure_services(state, runtime, roles=("server",))
+    local_url = f"http://127.0.0.1:{args.server_port}"
+    _wait_health(local_url, origin, rp_id, tls=False)
+
+    route_added = False
+    try:
+        if not existing_owned_route:
+            # Re-check immediately before mutation so a route added by another
+            # operator while services started is never silently replaced.
+            if _check_serve_route(tailscale, expected):
+                existing_owned_route = True
+            else:
+                result = _run([str(tailscale), "serve", "--bg", f"--https={args.https_port}", local_url], timeout=30)
+                if result.returncode != 0:
+                    fail("could not configure Tailscale Serve; no hook configuration was changed")
+                route_added = True
+                if not _check_serve_route(tailscale, expected):
+                    fail("Tailscale Serve did not report the owned route after configuration; no hook configuration was changed")
+        _wait_health(origin, origin, rp_id, tls=True)
+        staging = _staging_file(state, {"origin": origin, "rp_id": rp_id, "nats_url": nats_url, "nats_user": credentials["hook_user"], "nats_pass": credentials["hook_pass"]})
+        try:
+            _sudo_install(staging, config_dir, args.sudo_bin)
+        finally:
+            try:
+                staging.unlink()
+            except OSError:
+                pass
+    except SetupError:
+        if route_added:
+            try:
+                current = _serve_config(tailscale)
+                if _canonical(current) == _canonical(expected):
+                    _run([str(tailscale), "serve", "reset"], timeout=30)
+            except SetupError:
+                pass
+        raise
+    print(f"Phone setup complete for {origin} (RP ID {rp_id}).")
+    print("The phone must be connected to this Tailscale tailnet.")
+    print("Next: sudo oshioki enroll")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Set up a phone-reachable Oshioki enrollment server")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--tailscale", action="store_true", help="use a local loopback server exposed through Tailscale Serve")
+    mode.add_argument("--server-url", help="existing HTTPS Oshioki origin")
+    parser.add_argument("--nats-config", help="0600 KEY=VALUE file with NATS_URL, NATS_USER, and NATS_PASS")
+    parser.add_argument("--check", action="store_true", help="verify prerequisites and print the plan without changing files or services")
+    parser.add_argument("--state-dir", help="owned state directory (default: ~/.local/share/oshioki/phone-server)")
+    parser.add_argument("--config-dir", default=os.environ.get("OSHIOKI_CONFIG_DIR", "/etc/oshioki"), help=argparse.SUPPRESS)
+    parser.add_argument("--nats-port", type=int, default=DEFAULT_NATS_PORT, help=f"owned loopback NATS port (default: {DEFAULT_NATS_PORT})")
+    parser.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT, help=f"owned loopback server port (default: {DEFAULT_SERVER_PORT})")
+    parser.add_argument("--https-port", type=int, default=DEFAULT_HTTPS_PORT, help=f"Tailscale HTTPS port (default: {DEFAULT_HTTPS_PORT})")
+    parser.add_argument("--tailscale-bin", help=argparse.SUPPRESS)
+    parser.add_argument("--nats-bin", help=argparse.SUPPRESS)
+    parser.add_argument("--server-bin", help=argparse.SUPPRESS)
+    parser.add_argument("--sudo-bin", default=os.environ.get(SUDO_ENV, "sudo"), help=argparse.SUPPRESS)
+    parser.add_argument("--install-config", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--run-service", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--staging", help=argparse.SUPPRESS)
+    parser.add_argument("--role", help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if os.geteuid() == 0 and not args.install_config and not args.run_service:
+            fail("run oshioki-phone-setup as your normal user; it invokes sudo only for the final hook configuration")
+        if args.install_config:
+            if not args.staging:
+                fail("--install-config requires --staging")
+            _install_config(Path(args.staging), Path(args.config_dir))
+            return 0
+        if args.run_service or args.role:
+            if not args.run_service:
+                fail("service mode requires --run-service")
+            if not args.state_dir:
+                fail("service mode requires --state-dir")
+            if not args.role:
+                fail("service mode requires --role")
+            return _run_service(args.role, Path(args.state_dir))
+        for value, name in ((args.nats_port, "NATS port"), (args.server_port, "server port"), (args.https_port, "HTTPS port")):
+            _port(value, name)
+        if bool(args.server_url) != bool(args.nats_config):
+            fail("--server-url and --nats-config must be supplied together")
+        config_dir = Path(args.config_dir)
+        if args.server_url:
+            _external_mode(args, config_dir)
+        else:
+            _local_mode(args, config_dir)
+        return 0
+    except SetupError as exc:
+        print(f"oshioki-phone-setup: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

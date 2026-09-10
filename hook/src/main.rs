@@ -20,6 +20,7 @@ use std::{
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
+use url::{Host, Url};
 use uuid::Uuid;
 
 use oshioki_protocol::{
@@ -78,6 +79,9 @@ enum Verb {
     Enroll {
         #[arg(long, allow_hyphen_values = true)]
         resume: Option<String>,
+        /// Permit a loopback enrollment origin for local development only.
+        #[arg(long)]
+        allow_localhost: bool,
     },
     Revoke {
         #[arg(allow_hyphen_values = true)]
@@ -107,6 +111,15 @@ struct EnrollmentStateV1 {
     expires_at: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct ServerHealthV1 {
+    status: String,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    rp_id: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -116,7 +129,10 @@ async fn main() -> Result<()> {
         Verb::Check {
             plugin_protocol_version,
         } => cmd_check(plugin_protocol_version).await,
-        Verb::Enroll { resume } => cmd_enroll(resume.as_deref()).await,
+        Verb::Enroll {
+            resume,
+            allow_localhost,
+        } => cmd_enroll(resume.as_deref(), allow_localhost).await,
         Verb::Revoke { fingerprint } => cmd_revoke(&fingerprint).await,
         Verb::Pin { fingerprint } => cmd_pin(&fingerprint).await,
         Verb::PinRecord { path } => cmd_pin_record(&path),
@@ -1260,8 +1276,106 @@ fn approval_url(server_base_url: &str, request_id: &str) -> String {
     format!("{server_base_url}/r/{request_id}")
 }
 
-async fn cmd_enroll(resume: Option<&str>) -> Result<()> {
-    let config = load_hook_config()?;
+/// The system configuration and its enrollment state are root-owned. A
+/// caller-supplied config directory is intentionally allowed for local
+/// development and tests, where the caller owns the state instead.
+fn require_enroll_privileges(directory: &Path) -> Result<()> {
+    if enroll_needs_root(directory, nix::unistd::geteuid().as_raw()) {
+        bail!(
+            "`oshioki enroll` needs the system configuration; run `sudo oshioki enroll` (or set OSHIOKI_CONFIG_DIR for a user-owned development configuration)"
+        );
+    }
+    Ok(())
+}
+
+fn enroll_needs_root(directory: &Path, effective_uid: u32) -> bool {
+    directory == Path::new(DEFAULT_CONFIG_DIR) && effective_uid != 0
+}
+
+/// Parses and checks the configured browser origin before creating any
+/// enrollment state. Local-only origins are useful for development, but a
+/// phone cannot use the Mac's loopback interface.
+fn enrollment_origin(config: &HookConfigV1, allow_localhost: bool) -> Result<Url> {
+    let origin = Url::parse(&config.server_base_url)
+        .map_err(|_| anyhow::anyhow!("invalid enrollment origin in hook configuration"))?;
+    let valid_shape = origin.scheme() == "https"
+        && origin.host_str().is_some()
+        && origin.username().is_empty()
+        && origin.password().is_none()
+        && (origin.path().is_empty() || origin.path() == "/")
+        && origin.query().is_none()
+        && origin.fragment().is_none();
+    if !valid_shape {
+        bail!("invalid enrollment origin in hook configuration");
+    }
+    if !allow_localhost
+        && origin
+            .host()
+            .as_ref()
+            .is_some_and(is_local_only_enrollment_host)
+    {
+        bail!(
+            "the enrollment origin is reachable only from this computer; run `oshioki-phone-setup` as your normal user to configure a phone-reachable HTTPS origin (Tailscale is preferred), or pass `--allow-localhost` for local development"
+        );
+    }
+    Ok(origin)
+}
+
+fn is_local_only_enrollment_host(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.');
+            let suffix = ".localhost";
+            domain.eq_ignore_ascii_case("localhost")
+                || (domain.len() > suffix.len()
+                    && domain[domain.len() - suffix.len()..].eq_ignore_ascii_case(suffix))
+        }
+        Host::Ipv4(address) => address.is_loopback() || address.is_unspecified(),
+        Host::Ipv6(address) => {
+            address.is_loopback()
+                || address.is_unspecified()
+                || address
+                    .to_ipv4()
+                    .is_some_and(|address| address.is_loopback() || address.is_unspecified())
+        }
+    }
+}
+
+/// Checks that the public server is reachable over HTTPS and serves the same
+/// `WebAuthn` configuration as the hook. Older servers may omit the metadata,
+/// but a partial or conflicting pair is rejected.
+async fn preflight_enrollment_server(config: &HookConfigV1, origin: &Url) -> Result<()> {
+    let health_url = origin
+        .join("/healthz")
+        .map_err(|_| anyhow::anyhow!("invalid enrollment health URL"))?;
+    let body = http_get(health_url.as_str())
+        .await
+        .context("enrollment server health check failed")?;
+    let health: ServerHealthV1 = serde_json::from_slice(&body)
+        .context("enrollment server returned an invalid health response")?;
+    validate_server_health(config, &health)
+}
+
+fn validate_server_health(config: &HookConfigV1, health: &ServerHealthV1) -> Result<()> {
+    if health.status != "ok" {
+        bail!("enrollment server is not ready");
+    }
+    match (health.origin.as_deref(), health.rp_id.as_deref()) {
+        (None, None) => Ok(()),
+        (Some(origin), Some(rp_id)) if origin == config.origin && rp_id == config.rp_id => Ok(()),
+        (Some(_), Some(_)) => {
+            bail!("enrollment server WebAuthn configuration does not match the hook")
+        }
+        _ => bail!("enrollment server returned incomplete WebAuthn configuration"),
+    }
+}
+
+async fn cmd_enroll(resume: Option<&str>, allow_localhost: bool) -> Result<()> {
+    let directory = config_dir();
+    require_enroll_privileges(&directory)?;
+    let config = load_hook_config_from(&directory)?;
+    let origin = enrollment_origin(&config, allow_localhost)?;
+    preflight_enrollment_server(&config, &origin).await?;
     let state = if let Some(id) = resume {
         load_enrollment_state(id)?
     } else {
@@ -1889,15 +2003,19 @@ fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
 }
 
 async fn http_get(url: &str) -> Result<Vec<u8>> {
+    let mut args = if config_dir() == Path::new(DEFAULT_CONFIG_DIR) {
+        vec!["-q"]
+    } else {
+        Vec::new()
+    };
+    args.extend(["--fail", "--silent", "--show-error"]);
+    // The system installation must not inherit a caller-controlled curl
+    // configuration (which could enable redirects or disable TLS checks).
+    // User-owned development configurations intentionally retain CURL_HOME;
+    // the local E2E harness uses it to resolve its throwaway test hostname.
+    args.extend(["--proto", "=https", "--max-time", "15", url]);
     let output = tokio::process::Command::new("/usr/bin/curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "15",
-            url,
-        ])
+        .args(args)
         .output()
         .await?;
     if !output.status.success() {
@@ -2045,7 +2163,21 @@ mod tests {
             assert_eq!(fingerprint, "-8lGYGvNFgwWqSSFS3yv1Q");
         }
         let cli = Cli::try_parse_from(["oshioki", "enroll", "--resume", "-abc"]).unwrap();
-        assert!(matches!(cli.verb, Verb::Enroll { resume: Some(ref r) } if r == "-abc"));
+        assert!(matches!(
+            cli.verb,
+            Verb::Enroll {
+                resume: Some(ref r),
+                ..
+            } if r == "-abc"
+        ));
+        let cli = Cli::try_parse_from(["oshioki", "enroll", "--allow-localhost"]).unwrap();
+        assert!(matches!(
+            cli.verb,
+            Verb::Enroll {
+                allow_localhost: true,
+                resume: None,
+            }
+        ));
     }
     /// The complete effective environment reaches the signed request in its
     /// original order, including variables not in the finite display
@@ -2199,6 +2331,94 @@ mod tests {
             ),
             "https://host.example.ts.net:8443/r/67767d61-bcea-4e2d-8f28-32270c34eb6d"
         );
+    }
+
+    fn enrollment_config(origin: &str) -> HookConfigV1 {
+        HookConfigV1 {
+            version: VERSION_V1,
+            origin: origin.into(),
+            rp_id: "sudo.example".into(),
+            server_base_url: origin.into(),
+        }
+    }
+
+    #[test]
+    fn enrollment_origin_rejects_local_only_hosts() {
+        for origin in [
+            "https://localhost",
+            "https://localhost.",
+            "https://sudo.localhost",
+            "https://127.0.0.1",
+            "https://0.0.0.0",
+            "https://[::1]",
+            "https://[::]",
+            "https://[::ffff:127.0.0.1]",
+        ] {
+            let error = enrollment_origin(&enrollment_config(origin), false).unwrap_err();
+            assert!(
+                error.to_string().contains("oshioki-phone-setup"),
+                "{origin}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn enrollment_origin_allows_a_phone_reachable_host_and_local_opt_in() {
+        let config = enrollment_config("https://sudo.example.com:8443");
+        assert_eq!(enrollment_origin(&config, false).unwrap().scheme(), "https");
+        let local = enrollment_config("https://127.0.0.1:8443");
+        assert_eq!(
+            enrollment_origin(&local, true).unwrap().host_str(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn enrollment_origin_rejects_non_origin_url_shapes() {
+        for origin in [
+            "http://sudo.example",
+            "https://user@sudo.example",
+            "https://user:pass@sudo.example",
+            "https://sudo.example/path",
+            "https://sudo.example?query",
+            "https://sudo.example#fragment",
+        ] {
+            let error = enrollment_origin(&enrollment_config(origin), true).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid enrollment origin in hook configuration"),
+                "{origin}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn enroll_root_requirement_only_applies_to_the_system_configuration() {
+        assert!(enroll_needs_root(Path::new(DEFAULT_CONFIG_DIR), 501));
+        assert!(!enroll_needs_root(Path::new(DEFAULT_CONFIG_DIR), 0));
+        assert!(!enroll_needs_root(Path::new("/tmp/oshioki"), 501));
+    }
+
+    #[test]
+    fn enrollment_health_requires_matching_configuration_when_present() {
+        let config = enrollment_config("https://sudo.example");
+        for body in [
+            br#"{"status":"ok"}"#.as_slice(),
+            br#"{"status":"ok","origin":"https://sudo.example","rp_id":"sudo.example"}"#.as_slice(),
+        ] {
+            let health: ServerHealthV1 = serde_json::from_slice(body).unwrap();
+            assert!(validate_server_health(&config, &health).is_ok());
+        }
+        for body in [
+            br#"{"status":"ok","origin":"https://other.example","rp_id":"sudo.example"}"#
+                .as_slice(),
+            br#"{"status":"ok","origin":"https://sudo.example"}"#.as_slice(),
+            br#"{"status":"starting"}"#.as_slice(),
+        ] {
+            let health: ServerHealthV1 = serde_json::from_slice(body).unwrap();
+            assert!(validate_server_health(&config, &health).is_err());
+        }
     }
     #[test]
     fn atomic_registry_round_trip() {

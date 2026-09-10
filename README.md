@@ -43,6 +43,35 @@ then wire up the hook with `scripts/install-oshioki-hook` — see the
 
 ## Configure
 
+### Phone enrollment
+
+On a host with the hook installed, run setup as your normal user:
+
+```bash
+oshioki-phone-setup
+sudo oshioki enroll
+```
+
+Setup prefers Tailscale. It runs a local Oshioki server and NATS with
+JetStream, then uses Tailscale Serve for HTTPS. Open the enrollment URL in
+your phone's browser while the phone is connected to the same tailnet.
+The existing local Touch ID device and socket remain configured.
+
+Tailscale is optional. To use an existing HTTPS Oshioki server:
+
+```bash
+oshioki-phone-setup --server-url https://sudo.example.com --nats-config /path/to/hook-nats.env
+sudo oshioki enroll
+```
+
+The configuration file supplies that server's NATS connection settings.
+Setup verifies the HTTPS endpoint before changing the hook configuration.
+See [phone setup](docs/phone-enrollment.md) for prerequisites and service
+management. A `localhost` enrollment URL only works on the host itself;
+`enroll` now explains how to configure phone access instead of printing one.
+
+### Transport
+
 You need a reachable NATS server with JetStream alongside the Oshioki server. `OSHIOKI_TRANSPORT` selects the transport; the default is `nats`. Others are planned (#6, #7).
 
 NATS connections past your own machine require TLS: use `tls://` URLs, with
@@ -59,7 +88,7 @@ the whole control plane.
 Enroll a device from the host:
 
 ```bash
-oshioki enroll
+sudo oshioki enroll
 ```
 
 That prints an enrollment URL. Open it in a browser to enroll WebAuthn, or run
@@ -81,8 +110,8 @@ is written only for a hardware-backed device. Details in
 [docs/mac-approvals.md](docs/mac-approvals.md).
 
 ```bash
-oshioki status               # enrolled devices
-oshioki revoke <fingerprint> # remove one
+sudo oshioki status               # enrolled devices
+sudo oshioki revoke <fingerprint> # remove one
 ```
 
 Installing the hook and running acceptance sessions is covered in the

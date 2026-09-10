@@ -8,6 +8,12 @@
 - Node.js for the browser UI tests (`server/web`, Playwright + libsodium).
 - Tailscale only for the Safari/Mac acceptance loops.
 
+Phone setup has a hermetic Python test suite:
+`scripts/test-oshioki-phone-setup`. It substitutes the service and privilege
+boundaries, so it does not change the host's Tailscale, services, or sudo
+configuration. A real phone enrollment still needs a reachable HTTPS server
+and a browser WebAuthn ceremony.
+
 ## Development loop
 
 All entry points go through `scripts/dev`:

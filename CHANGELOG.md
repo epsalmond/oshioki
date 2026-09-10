@@ -7,10 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.4] - 2026-09-08
+## [0.1.4] - 2026-09-09
 
 ### Added
 
+- `oshioki-phone-setup` configures phone enrollment. Tailscale Serve is the
+  default for a local, supervised Oshioki server and NATS broker; users
+  without Tailscale can point at an existing HTTPS server with host-role NATS
+  credentials. Setup verifies readiness before touching host configuration
+  and preserves existing devices and the local agent socket.
+- macOS artifacts include the server and the phone setup helper; Debian
+  packages include the helper.
 - Browser requests receive a durable server delivery receipt after routing.
   The browser sends its authenticated opened receipt after decrypting and
   checking the request. Native agents send `AliveV1` before asking for a
@@ -19,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `oshioki enroll` explains that it must run as root and checks its HTTPS
+  endpoint before creating enrollment state. Localhost URLs give an
+  actionable setup message; `--allow-localhost` permits local development.
+- Phone services keep working across package upgrades, and macOS service
+  bootstrap retries while a previous unload settles.
 - The hook reports immediate progress on stderr: the command it is trying,
   transport failures, an unresponsive daemon, and the transition to waiting
   for approval. Socket and NATS connection, delivery, and receipt waits are

@@ -30,6 +30,7 @@ sha2 = { workspace = true }
 time = { workspace = true }
 nix = { workspace = true }
 futures = { version = "0.3" }
+url = "2.5"
 
 [dev-dependencies]
 p256 = { workspace = true }

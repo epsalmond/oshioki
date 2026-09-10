@@ -4,7 +4,7 @@ A native device signs approvals directly with a P-256 key instead of using a
 browser and WebAuthn. Enroll one from the host:
 
 ```bash
-oshioki enroll
+sudo oshioki enroll
 ```
 
 `enroll` prints an enrollment URL and, below it, the `oshioki-agent` command
@@ -89,7 +89,7 @@ missing GUI session or canceled review fails closed.
 reading `GET /api/v1/devices/<fingerprint>` back over HTTPS for up to fifteen
 seconds. If that confirmation times out, the device is still pinned and can
 approve sudo on the host; only the server's copy is unknown. The error says
-so, and the fix is another `oshioki enroll` for that device once the server
+so, and the fix is another `sudo oshioki enroll` for that device once the server
 is reachable.
 
 The agent needs the same `NATS_URL` as the hook, plus `NATS_USER` and

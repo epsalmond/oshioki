@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Hermetic tests for scripts/oshioki-phone-setup.
+
+No service manager, NATS daemon, Tailscale client, HTTPS endpoint, sudo, or
+system configuration is used.  The tests still drive the helper's validation,
+state, route, staging, and rollback paths rather than reimplementing them.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import plistlib
+import shlex
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parent.parent
+SOURCE = ROOT / "scripts" / "oshioki-phone-setup"
+LOADER = importlib.machinery.SourceFileLoader("oshioki_phone_setup", str(SOURCE))
+SPEC = importlib.util.spec_from_loader("oshioki_phone_setup", LOADER)
+assert SPEC and SPEC.loader
+phone = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(phone)
+
+
+class PhoneSetupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="oshioki-phone-setup-test-")
+        self.root = Path(self.temp.name)
+        self.home_patcher = mock.patch.object(phone.Path, "home", return_value=self.root / "home")
+        self.home_patcher.start()
+        self.state = self.root / "state"
+        self.config = self.root / "etc" / "oshioki"
+        self.nats_env = self.root / "nats.env"
+        self.nats_env.write_text("NATS_URL=nats://127.0.0.1:4222\nNATS_USER=u\nNATS_PASS=p\n", encoding="utf-8")
+        self.nats_env.chmod(0o600)
+
+    def tearDown(self) -> None:
+        self.home_patcher.stop()
+        self.temp.cleanup()
+
+    def assert_setup_error(self, function, *args, **kwargs) -> None:
+        with self.assertRaises(phone.SetupError):
+            function(*args, **kwargs)
+
+    def test_rejects_loopback_http_and_malformed_nats(self) -> None:
+        for value in ("http://phone.example", "https://localhost", "https://127.0.0.1", "https://phone.example/path"):
+            self.assert_setup_error(phone._origin_parts, value)
+        for value in ("http://nats.example:4222", "nats://nats.example:4222", "nats://u:p@127.0.0.1:4222", "nats://127.0.0.1/path"):
+            self.assert_setup_error(phone._nats_parts, value)
+
+    def test_external_mode_never_queries_tailscale_and_stages_real_values(self) -> None:
+        sudo_calls: list[tuple[Path, Path]] = []
+
+        def fake_sudo(staging: Path, config_dir: Path, sudo_bin: str) -> None:
+            sudo_calls.append((staging, config_dir))
+            staged = json.loads(staging.read_text(encoding="utf-8"))
+            self.assertEqual(staged["nats_pass"], "p")
+
+        args = phone._parser().parse_args([
+            "--server-url", "https://phone.example",
+            "--nats-config", str(self.nats_env),
+            "--state-dir", str(self.state),
+            "--config-dir", str(self.config),
+        ])
+        with mock.patch.object(phone, "_health_request"), mock.patch.object(phone, "_nats_probe"), mock.patch.object(phone, "_sudo_install", side_effect=fake_sudo), mock.patch.object(phone, "_tailscale_status", side_effect=AssertionError("Tailscale must not be queried")):
+            phone._external_mode(args, self.config)
+        self.assertEqual(len(sudo_calls), 1)
+        self.assertEqual(sudo_calls[0][0].parent, self.state)
+        self.assertFalse((self.state / ".config-staging.json").exists())
+
+    def test_check_is_read_only_and_does_not_create_credentials(self) -> None:
+        fake_binary = self.root / "fake"
+        fake_binary.write_text("", encoding="utf-8")
+        fake_binary.chmod(0o755)
+        with mock.patch.object(phone.os, "geteuid", return_value=501), mock.patch.object(phone, "_binary", return_value=fake_binary), mock.patch.object(phone, "_tailscale_status", return_value=("phone.example", "https://phone.example")), mock.patch.object(phone, "_serve_config", return_value={}):
+            result = phone.main(["--check", "--state-dir", str(self.state), "--config-dir", str(self.config)])
+        self.assertEqual(result, 0)
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.config.exists())
+
+    def test_top_level_root_invocation_stops_before_state_mutation(self) -> None:
+        with mock.patch.object(phone.os, "geteuid", return_value=0), mock.patch.object(phone, "_local_mode", side_effect=AssertionError("normal setup must stop before mode selection")):
+            self.assertEqual(phone.main(["--state-dir", str(self.state), "--config-dir", str(self.config)]), 1)
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.config.exists())
+
+    def test_local_mode_reuses_secret_state_and_preserves_route_check(self) -> None:
+        self.state.mkdir(mode=0o700)
+        creds = {
+            "version": 1,
+            "hook_user": "oshioki-hook",
+            "hook_pass": "hook-secret",
+            "server_user": "oshioki-server",
+            "server_pass": "server-secret",
+        }
+        (self.state / "credentials.json").write_text(json.dumps(creds), encoding="utf-8")
+        (self.state / "credentials.json").chmod(0o600)
+        fake_binary = self.root / "fake"
+        fake_binary.write_text("", encoding="utf-8")
+        fake_binary.chmod(0o755)
+        captured: dict[str, object] = {}
+
+        def fake_nats_config(state, credentials, port):
+            captured["credentials"] = credentials.copy()
+            return state / "nats.conf"
+
+        def fake_runtime(state, **kwargs):
+            captured["runtime"] = kwargs
+            return {"version": 1}
+
+        args = phone._parser().parse_args(["--state-dir", str(self.state), "--config-dir", str(self.config)])
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        expected = phone._expected_serve("phone.example", 443, 18443)
+        with mock.patch.object(phone, "_binary", return_value=fake_binary), mock.patch.object(phone, "_tailscale_status", return_value=("phone.example", "https://phone.example")), mock.patch.object(phone, "_serve_config", side_effect=[{}, expected]), mock.patch.object(phone, "_run", return_value=completed), mock.patch.object(phone, "_nats_config", side_effect=fake_nats_config), mock.patch.object(phone, "_runtime", side_effect=fake_runtime), mock.patch.object(phone, "_ensure_services"), mock.patch.object(phone, "_wait_nats"), mock.patch.object(phone, "_wait_health"), mock.patch.object(phone, "_staging_file", return_value=self.state / "stage"), mock.patch.object(phone, "_sudo_install"):
+            # The final staging file is mocked because this test focuses on
+            # idempotent secret reuse and the local service path.
+            phone._local_mode(args, self.config)
+        self.assertEqual(captured["credentials"]["hook_pass"], "hook-secret")
+        self.assertEqual(captured["credentials"]["server_pass"], "server-secret")
+
+    def test_install_config_preserves_socket_local_and_registry(self) -> None:
+        self.config.mkdir(parents=True)
+        hook = self.config / "hook.json"
+        hook.write_text(json.dumps({"version": 1, "origin": "https://old.example", "rp_id": "old.example", "server_base_url": "https://old.example", "future": "keep"}), encoding="utf-8")
+        hook.chmod(0o600)
+        config_env = self.config / "config.env"
+        config_env.write_text("OSHIOKI_AGENT_SOCKET=/tmp/agent.sock\nOSHIOKI_LOCAL=1\nCUSTOM=keep\n", encoding="utf-8")
+        config_env.chmod(0o600)
+        install_env = self.config / "install.env"
+        install_env.write_text("OSHIOKI_AGENT_SOCKET=/tmp/agent.sock\nOSHIOKI_LOCAL=1\n", encoding="utf-8")
+        install_env.chmod(0o600)
+        devices = self.config / "devices.json"
+        devices.write_text('{"version":1,"devices":[]}', encoding="utf-8")
+        devices.chmod(0o600)
+        devices_before = devices.read_bytes()
+        staging = self.root / "staging.json"
+        staging.write_text(json.dumps({"version": 1, "origin": "https://phone.example", "rp_id": "phone.example", "nats_url": "nats://127.0.0.1:4222", "nats_user": "hook", "nats_pass": "secret"}), encoding="utf-8")
+        staging.chmod(0o600)
+        phone._install_config(staging, self.config)
+        self.assertIn(b"OSHIOKI_AGENT_SOCKET=/tmp/agent.sock", config_env.read_bytes())
+        self.assertIn(b"OSHIOKI_LOCAL=1", install_env.read_bytes())
+        self.assertIn(b"CUSTOM=keep", config_env.read_bytes())
+        self.assertEqual(devices_before, devices.read_bytes())
+        self.assertEqual(json.loads(hook.read_text())["future"], "keep")
+        self.assertEqual(json.loads(hook.read_text())["origin"], "https://phone.example")
+
+    def test_install_config_refuses_active_browser_origin_migration(self) -> None:
+        self.config.mkdir(parents=True)
+        hook = self.config / "hook.json"
+        hook.write_text('{"version":1,"origin":"https://old.example","rp_id":"old.example","server_base_url":"https://old.example"}', encoding="utf-8")
+        hook.chmod(0o600)
+        devices = self.config / "devices.json"
+        devices.write_text('{"version":1,"devices":[{"kind":"webauthn","active":true}]}', encoding="utf-8")
+        devices.chmod(0o600)
+        staging = self.root / "staging.json"
+        staging.write_text(json.dumps({"version": 1, "origin": "https://phone.example", "rp_id": "phone.example", "nats_url": "nats://127.0.0.1:4222", "nats_user": "hook", "nats_pass": "secret"}), encoding="utf-8")
+        staging.chmod(0o600)
+        self.assert_setup_error(phone._install_config, staging, self.config)
+
+    def test_symlink_and_unknown_staging_are_refused(self) -> None:
+        self.config.mkdir(parents=True)
+        real = self.root / "real-staging.json"
+        real.write_text("{}", encoding="utf-8")
+        real.chmod(0o600)
+        staging = self.root / "staging.json"
+        staging.symlink_to(real)
+        self.assert_setup_error(phone._install_config, staging, self.config)
+        real.write_text(json.dumps({"version": 1, "origin": "https://phone.example", "rp_id": "phone.example", "nats_url": "nats://127.0.0.1:4222", "nats_user": "u", "nats_pass": "p", "unexpected": 1}), encoding="utf-8")
+        self.assert_setup_error(phone._install_config, real, self.config)
+
+    def test_config_write_failure_restores_original_bytes(self) -> None:
+        self.config.mkdir(parents=True)
+        hook = self.config / "hook.json"
+        hook_before = b'{"version":1,"origin":"https://old.example"}\n'
+        hook.write_bytes(hook_before)
+        hook.chmod(0o600)
+        staging = self.root / "staging.json"
+        staging.write_text(json.dumps({"version": 1, "origin": "https://phone.example", "rp_id": "phone.example", "nats_url": "nats://127.0.0.1:4222", "nats_user": "u", "nats_pass": "p"}), encoding="utf-8")
+        staging.chmod(0o600)
+        original_atomic = phone._atomic_write
+        calls = 0
+
+        def fail_second(path, data, mode=0o600):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise phone.SetupError("synthetic write failure")
+            return original_atomic(path, data, mode)
+
+        with mock.patch.object(phone, "_atomic_write", side_effect=fail_second):
+            self.assert_setup_error(phone._install_config, staging, self.config)
+        self.assertEqual(hook.read_bytes(), hook_before)
+        self.assertFalse((self.config / "config.env").exists())
+
+    def test_launchagent_reload_retries_bootstrap_without_kickstarting_old_definition(self) -> None:
+        self.state.mkdir(mode=0o700)
+        calls = []
+        attempts = 0
+
+        def launchctl(argv, **kwargs):
+            nonlocal attempts
+            calls.append(argv)
+            if argv[1] == "bootstrap":
+                attempts += 1
+                return phone.subprocess.CompletedProcess(argv, 37 if attempts == 1 else 0, b"", b"")
+            return phone.subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone, "_run", side_effect=launchctl), mock.patch.object(phone.time, "sleep"):
+            phone._ensure_services(self.state, {}, roles=("nats",))
+        self.assertEqual(attempts, 2)
+        self.assertEqual([call[1] for call in calls], ["bootout", "bootstrap", "bootstrap"])
+
+    def test_service_arguments_are_parseable_and_do_not_contain_credentials(self) -> None:
+        args = phone._service_args("server", self.state)
+        parsed = phone._parser().parse_args(args[args.index("--run-service"):])
+        self.assertTrue(parsed.run_service)
+        self.assertEqual(parsed.role, "server")
+        self.assertNotIn("PASS", " ".join(args))
+
+    def test_local_nats_permissions_include_hook_request_watch(self) -> None:
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        credentials = {
+            "hook_user": "oshioki-hook",
+            "hook_pass": "hook-secret",
+            "server_user": "oshioki-server",
+            "server_pass": "server-secret",
+        }
+        config = phone._nats_config(state, credentials, 14222)
+        text = config.read_text(encoding="utf-8")
+        self.assertIn('"oshioki.request.>"', text)
+        self.assertIn('"$JS.ACK.>"', text)
+
+    def test_command_shims_and_script_path_remain_lexically_stable(self) -> None:
+        target = self.root / "Cellar" / "tool"
+        target.parent.mkdir(parents=True)
+        target.write_text("#!/bin/sh\n", encoding="utf-8")
+        target.chmod(0o755)
+        shim = self.root / "bin" / "tool"
+        shim.parent.mkdir()
+        shim.symlink_to(target)
+        resolved = phone._binary(str(shim), "UNUSED_BINARY_ENV", [], "tool")
+        self.assertEqual(resolved, Path(os.path.abspath(shim)))
+
+        script_target = self.root / "Cellar" / "oshioki-phone-setup"
+        script_target.write_text("", encoding="utf-8")
+        script_link = self.root / "bin" / "oshioki-phone-setup"
+        script_link.symlink_to(script_target)
+        with mock.patch.object(phone, "__file__", str(script_link)):
+            self.assertEqual(phone._script_path(), Path(os.path.abspath(script_link)))
+
+    def test_launchagent_upgrade_updates_only_a_proven_owned_plist(self) -> None:
+        log = self.root / "logs" / "nats.log"
+        plist = self.root / "LaunchAgents" / "nats.plist"
+        state = self.root / "state"
+        log.parent.mkdir(parents=True)
+        plist.parent.mkdir(parents=True)
+        changed = phone._plist(plist, "com.oshioki.phone-server.nats", "nats", state, log)
+        self.assertTrue(changed)
+        old = plistlib.loads(plist.read_bytes())
+        marker = old["ProgramArguments"].index("--run-service")
+        old["ProgramArguments"] = ["/old/homebrew/python3", "/old/Cellar/oshioki-phone-setup"] + old["ProgramArguments"][marker:]
+        plist.write_bytes(plistlib.dumps(old, fmt=plistlib.FMT_XML))
+        plist.chmod(0o600)
+        self.assertTrue(phone._plist(plist, "com.oshioki.phone-server.nats", "nats", state, log))
+        updated = plistlib.loads(plist.read_bytes())
+        self.assertEqual(updated["ProgramArguments"], phone._service_args("nats", state))
+
+        collision = dict(updated)
+        collision["ProgramArguments"] = phone._service_args("server", state)
+        plist.write_bytes(plistlib.dumps(collision, fmt=plistlib.FMT_XML))
+        plist.chmod(0o600)
+        self.assert_setup_error(phone._plist, plist, "com.oshioki.phone-server.nats", "nats", state, log)
+
+    def test_systemd_upgrade_reloads_owned_unit_and_refuses_role_collision(self) -> None:
+        log = self.root / "logs" / "server.log"
+        unit = self.root / "systemd" / "server.service"
+        state = self.root / "state"
+        log.parent.mkdir(parents=True)
+        unit.parent.mkdir(parents=True)
+        self.assertTrue(phone._systemd_unit(unit, "Oshioki phone setup server", "server", state, log))
+        old_lines = unit.read_text(encoding="utf-8").splitlines()
+        old_lines = [
+            "ExecStart=/old/homebrew/python3 /old/Cellar/oshioki-phone-setup --run-service --role server --state-dir " + shlex.quote(str(state))
+            if line.startswith("ExecStart=") else line
+            for line in old_lines
+        ]
+        unit.write_text("\n".join(old_lines) + "\n", encoding="utf-8")
+        unit.chmod(0o600)
+        self.assertTrue(phone._systemd_unit(unit, "Oshioki phone setup server", "server", state, log))
+        self.assertIn("/usr/bin/env python3", unit.read_text(encoding="utf-8"))
+
+        collision_lines = unit.read_text(encoding="utf-8").replace("--role server", "--role nats")
+        unit.write_text(collision_lines, encoding="utf-8")
+        unit.chmod(0o600)
+        self.assert_setup_error(phone._systemd_unit, unit, "Oshioki phone setup server", "server", state, log)
+
+    def test_linux_updated_unit_is_restarted_after_reload(self) -> None:
+        state = self.root / "state"
+        runtime = {"version": 1}
+        calls: list[list[str]] = []
+        completed = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.dict(os.environ, {phone.PLATFORM_ENV: "Linux"}), mock.patch.object(phone, "_run", side_effect=lambda argv, **kwargs: calls.append(argv) or completed):
+            phone._ensure_services(state, runtime, roles=("server",))
+        self.assertTrue(any(command[-2:] == ["--now", "oshioki-phone-server.service"] for command in calls))
+        self.assertTrue(any(command[-2:] == ["restart", "oshioki-phone-server.service"] for command in calls))
+
+    def test_nats_then_server_phases_preserve_and_then_reload_old_server_unit(self) -> None:
+        state = self.root / "state"
+        server_unit = self.root / "home" / ".config" / "systemd" / "user" / "oshioki-phone-server.service"
+        log = state / "logs" / "server.log"
+        state.mkdir(mode=0o700)
+        log.parent.mkdir(parents=True)
+        server_unit.parent.mkdir(parents=True)
+        self.assertTrue(phone._systemd_unit(server_unit, "Oshioki phone setup server", "server", state, log))
+        old_lines = server_unit.read_text(encoding="utf-8").splitlines()
+        old_lines = [
+            "ExecStart=/old/python3 /old/oshioki-phone-setup --run-service --role server --state-dir " + shlex.quote(str(state))
+            if line.startswith("ExecStart=") else line
+            for line in old_lines
+        ]
+        server_unit.write_text("\n".join(old_lines) + "\n", encoding="utf-8")
+        server_unit.chmod(0o600)
+        before = server_unit.read_bytes()
+        calls: list[list[str]] = []
+        completed = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.dict(os.environ, {phone.PLATFORM_ENV: "Linux"}), mock.patch.object(phone, "_run", side_effect=lambda argv, **kwargs: calls.append(argv) or completed):
+            phone._ensure_services(state, {"version": 1}, roles=("nats",))
+            self.assertEqual(before, server_unit.read_bytes())
+            phone._ensure_services(state, {"version": 1}, roles=("server",))
+        self.assertIn("/usr/bin/env python3", server_unit.read_text(encoding="utf-8"))
+        self.assertTrue(any(command[-2:] == ["restart", "oshioki-phone-server.service"] for command in calls))
+
+    def test_serve_collision_is_refused_before_local_state_or_service_start(self) -> None:
+        fake = self.root / "tailscale"
+        fake.write_text("", encoding="utf-8")
+        fake.chmod(0o755)
+        with mock.patch.object(phone, "_serve_config", return_value={"Web": {"other.example:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}}}}}):
+            self.assert_setup_error(phone._check_serve_route, fake, phone._expected_serve("phone.example", 443, 18443))
+
+    def test_local_readiness_failure_never_invokes_root_config_update(self) -> None:
+        fake = self.root / "fake"
+        fake.write_text("", encoding="utf-8")
+        fake.chmod(0o755)
+        args = phone._parser().parse_args(["--state-dir", str(self.state), "--config-dir", str(self.config)])
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with mock.patch.object(phone, "_binary", return_value=fake), mock.patch.object(phone, "_tailscale_status", return_value=("phone.example", "https://phone.example")), mock.patch.object(phone, "_serve_config", return_value={}), mock.patch.object(phone, "_run", return_value=completed), mock.patch.object(phone, "_nats_config", return_value=self.state / "nats.conf"), mock.patch.object(phone, "_runtime", return_value={"version": 1}), mock.patch.object(phone, "_ensure_services"), mock.patch.object(phone, "_wait_nats"), mock.patch.object(phone, "_wait_health", side_effect=phone.SetupError("synthetic readiness failure")), mock.patch.object(phone, "_sudo_install") as sudo_install:
+            self.assert_setup_error(phone._local_mode, args, self.config)
+        sudo_install.assert_not_called()
+        self.assertFalse(self.config.exists())
+
+    def test_nats_tls_requires_upgrade_after_clear_info(self) -> None:
+        # This is a regression guard for the protocol ordering. The actual
+        # socket/TLS integration is intentionally left to the NATS acceptance
+        # lane; this test verifies the helper's explicit contract branch.
+        with mock.patch.object(phone, "_nats_parts", return_value=("nats", "nats.example", 4222)):
+            class FakeSocket:
+                def close(self):
+                    pass
+
+            with mock.patch.object(phone.socket, "create_connection", return_value=FakeSocket()), mock.patch.object(phone, "_nats_read_line", return_value=b'INFO {"tls_required":true}'):
+                self.assert_setup_error(phone._nats_connect, "nats://nats.example:4222", "u", "p")
+
+
+if __name__ == "__main__":
+    raise SystemExit(unittest.main(verbosity=2))

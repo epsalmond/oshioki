@@ -20,6 +20,12 @@ values are for production to choose; see [requirements.md](requirements.md).
 
 ## Hook (`oshioki` binary)
 
+For browser enrollment from a phone, use
+[`oshioki-phone-setup`](phone-enrollment.md). Its Tailscale option configures
+separate hook and server users with subject restrictions on an owned
+loopback NATS broker. The external HTTPS option uses the host-role
+credentials supplied by that deployment.
+
 | Variable | Notes |
 |---|---|
 | `OSHIOKI_CONFIG_DIR` | Local hook state; defaults to `/etc/oshioki`. `config.env` accepts `OSHIOKI_TRANSPORT=nats` (default; the only value today). The hook reads NATS settings from `config.env` there (sudo scrubs its environment): `NATS_URL` follows the server's TLS rule, `NATS_USER` should be the host role's own user (e.g. `oshioki-hook`), and `OSHIOKI_ALLOW_PLAINTEXT_NATS` is the testing opt-out in file form. |

@@ -11,13 +11,15 @@ TARGET="aarch64-apple-darwin"
 cd "$ROOT"
 # The agent links Security.framework and LocalAuthentication through
 # oshioki-enclave, so it builds here and nowhere else.
-cargo build --locked --release --target "$TARGET" -p oshioki-hook -p oshioki-plugin -p oshioki-agent
+cargo build --locked --release --target "$TARGET" -p oshioki-hook -p oshioki-plugin -p oshioki-agent -p oshioki-server
 mkdir -p "$OUTPUT"
 install -m 0755 "target/$TARGET/release/oshioki" "$OUTPUT/oshioki"
 install -m 0755 "target/$TARGET/release/liboshioki_plugin.dylib" "$OUTPUT/oshioki.dylib"
 install -m 0755 "target/$TARGET/release/oshioki-agent" "$OUTPUT/oshioki-agent"
+install -m 0755 "target/$TARGET/release/oshioki-server" "$OUTPUT/oshioki-server"
 install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$OUTPUT/install-oshioki-hook"
 install -m 0755 "$ROOT/scripts/oshioki-laptop-setup" "$OUTPUT/oshioki-laptop-setup"
+install -m 0755 "$ROOT/scripts/oshioki-phone-setup" "$OUTPUT/oshioki-phone-setup"
 
 mode_of() { if stat -f '%Lp' "$1" >/dev/null 2>&1; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi; }
 hash_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
@@ -26,15 +28,19 @@ plugin_hash="$(hash_of "$OUTPUT/oshioki.dylib")"
 agent_hash="$(hash_of "$OUTPUT/oshioki-agent")"
 installer_hash="$(hash_of "$OUTPUT/install-oshioki-hook")"
 setup_hash="$(hash_of "$OUTPUT/oshioki-laptop-setup")"
+server_hash="$(hash_of "$OUTPUT/oshioki-server")"
+phone_setup_hash="$(hash_of "$OUTPUT/oshioki-phone-setup")"
 toolchain="$(rustc --version --verbose | tr '\n' ';')"
 cat > "$OUTPUT/manifest.json" <<EOF
-{"schema_version":1,"target":"$TARGET","revision":"$REVISION","toolchain":"$toolchain","files":[{"name":"oshioki","mode":"$(mode_of "$OUTPUT/oshioki")","sha256":"$hook_hash","media_type":"application/vnd.oshioki.hook.v1"},{"name":"oshioki.dylib","mode":"$(mode_of "$OUTPUT/oshioki.dylib")","sha256":"$plugin_hash","media_type":"application/vnd.oshioki.plugin.v1"},{"name":"oshioki-agent","mode":"$(mode_of "$OUTPUT/oshioki-agent")","sha256":"$agent_hash","media_type":"application/vnd.oshioki.agent.v1"},{"name":"install-oshioki-hook","mode":"$(mode_of "$OUTPUT/install-oshioki-hook")","sha256":"$installer_hash","media_type":"application/vnd.oshioki.installer.v1"},{"name":"oshioki-laptop-setup","mode":"$(mode_of "$OUTPUT/oshioki-laptop-setup")","sha256":"$setup_hash","media_type":"application/vnd.oshioki.setup.v1"}]}
+{"schema_version":1,"target":"$TARGET","revision":"$REVISION","toolchain":"$toolchain","files":[{"name":"oshioki","mode":"$(mode_of "$OUTPUT/oshioki")","sha256":"$hook_hash","media_type":"application/vnd.oshioki.hook.v1"},{"name":"oshioki.dylib","mode":"$(mode_of "$OUTPUT/oshioki.dylib")","sha256":"$plugin_hash","media_type":"application/vnd.oshioki.plugin.v1"},{"name":"oshioki-agent","mode":"$(mode_of "$OUTPUT/oshioki-agent")","sha256":"$agent_hash","media_type":"application/vnd.oshioki.agent.v1"},{"name":"install-oshioki-hook","mode":"$(mode_of "$OUTPUT/install-oshioki-hook")","sha256":"$installer_hash","media_type":"application/vnd.oshioki.installer.v1"},{"name":"oshioki-laptop-setup","mode":"$(mode_of "$OUTPUT/oshioki-laptop-setup")","sha256":"$setup_hash","media_type":"application/vnd.oshioki.setup.v1"},{"name":"oshioki-server","mode":"$(mode_of "$OUTPUT/oshioki-server")","sha256":"$server_hash","media_type":"application/vnd.oshioki.server.v1"},{"name":"oshioki-phone-setup","mode":"$(mode_of "$OUTPUT/oshioki-phone-setup")","sha256":"$phone_setup_hash","media_type":"application/vnd.oshioki.phone-setup.v1"}]}
 EOF
 (
   cd "$OUTPUT"
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib oshioki-agent install-oshioki-hook oshioki-laptop-setup manifest.json > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib oshioki-agent install-oshioki-hook oshioki-laptop-setup manifest.json > SHA256SUMS; fi
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; fi
 )
-file "$OUTPUT/oshioki" "$OUTPUT/oshioki.dylib" "$OUTPUT/oshioki-agent" | grep -q 'arm64'
+for artifact in oshioki oshioki.dylib oshioki-agent oshioki-server; do
+  file "$OUTPUT/$artifact" | grep -q 'arm64'
+done
 nm -gU "$OUTPUT/oshioki.dylib" | grep -Eq '(_)?approval_exec$'
 # The agent is useless without the enclave; a build that dropped the framework
 # would still run and only fail at the first signature.
