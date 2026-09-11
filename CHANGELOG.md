@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/oshioki-phone-setup` generates NATS permission lists that now
+  include `oshioki.ack.*` and `oshioki.delivery.*` for both the hook and
+  server users. PR #57 (0.1.4) added the `oshioki.delivery.<request_id>`
+  delivery receipt and its `oshioki.ack.<request_id>` companion, but this
+  script's `_nats_config` still wrote the pre-#57 permission lists, so every
+  phone/browser approval routed through a phone-setup NATS instance failed
+  with `Permissions Violation for Publish to "oshioki.delivery.<id>"` on the
+  server and a daemon delivery-receipt timeout on the hook. The server's
+  publish permissions also dropped a stray, unused
+  `oshioki.enrollment.submission.>` grant (the server only subscribes to
+  that subject). `docs/requirements.md`'s hand-written permission checklist
+  is updated to match.
+
 ## [0.1.6] - 2026-09-10
 
 ### Added
