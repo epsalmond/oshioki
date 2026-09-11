@@ -154,9 +154,27 @@ mod tests {
 
     #[test]
     fn a_file_that_is_not_a_shared_object_fails_at_dlopen() {
-        // /etc/hostname is a regular file on every platform this builds for
-        // and is definitively not a loadable object.
-        let error = run(Path::new("/etc/hostname")).unwrap_err();
+        // A file the test writes itself, rather than a host path: /etc/hostname
+        // exists on Linux but not on macOS, and any host file could in
+        // principle be absent. The bytes are deliberately not a valid ELF or
+        // Mach-O header, so every platform's loader rejects the file.
+        let directory = std::env::temp_dir().join(format!(
+            "oshioki-pam-selftest-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create the test directory");
+        let file = directory.join("not-a-shared-object");
+        std::fs::write(&file, b"this is not a shared object\n").expect("write the test file");
+
+        // Clean up before asserting anything, so neither a success nor an
+        // unexpected message leaves the directory behind.
+        let result = run(&file);
+        let _ = std::fs::remove_dir_all(&directory);
+        let error = match result {
+            Ok(()) => panic!("a file that is not a shared object was loaded"),
+            Err(error) => error,
+        };
         assert!(
             format!("{error}").contains("dlopen failed"),
             "unexpected error: {error}"

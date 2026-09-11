@@ -209,28 +209,83 @@ per iteration.
 
 The module cannot be signalled directly. The helper is in its own process
 group, so the terminal delivers `SIGINT` only to sudo. What sudo does with it
-was measured, not assumed: while the module is waiting,
-`/proc/<sudo>/status` reports
+was measured on Linux and read out of upstream source for macOS; the two are
+labelled separately below. sudo's `verify_user()`
+(`plugins/sudoers/auth/sudo_auth.c`) blocks `SIGINT` and `SIGQUIT` for the
+whole authentication phase — "we treat authentication as a critical section".
+It unblocks them only inside `auth_getpass()`, and **the PAM method never
+reaches that call**: PAM is a `FLAG_STANDALONE` method, so `verify_user` hands
+the prompt straight to `sudo_pam_verify` and `auth_getpass` is skipped. Both
+signals therefore stay blocked for the entire PAM conversation, this module's
+wait included. That code has no platform conditionals, so it is the same on
+Linux and macOS. The *disposition* under that block depends on what sudo
+inherited:
 
-```text
-SigBlk: ...1006     SIGINT, SIGQUIT (and this module's own SIGPIPE) blocked
-SigIgn: ...1006     SIGINT, SIGQUIT ignored
-SigCgt: ...096a01   neither of them caught
-```
+* **A terminal sudo catches both.** `init_signals()` (`src/signal.c`) installs
+  `sudo_handler` for `SIGINT` and `SIGQUIT`. *Measured* on sudo 1.9.15p5,
+  Ubuntu, with sudo started from a foreground pty:
 
-sudo blocks *and* ignores both signals for the whole authentication phase and
-installs catching handlers only inside `tgetpass`, around its own password
-prompt. That is why a stock stack ends at `Ctrl-C` and why this module's wait
-did not. Two consequences follow, and together they decide the design:
+  ```text
+  SigIgn: ...1001000   SIGINT, SIGQUIT not ignored
+  SigCgt: ...00016a07  both caught (bits 1 and 3)
+  ```
+
+* **A sudo started as a shell's background job inherits `SIG_IGN`**, and
+  `init_signals()` deliberately does not overwrite an inherited `SIG_IGN`. The
+  same binary then reports
+
+  ```text
+  SigIgn: ...0001006   SIGINT, SIGQUIT (and sudo's own SIGPIPE) ignored
+  SigCgt: ...0016a01   neither of them caught
+  ```
+
+Both masks are Linux readings: macOS has no `/proc`, so the corresponding
+macOS statement is *inferred* from upstream sudo source (1.9.13p2, the version
+`sudo --version` reports on macOS 15.7.5) on the assumption that Apple's build
+does not patch `init_signals()` or `verify_user()`. The signal *behaviour* on
+macOS — what follows — is measured with a C probe, not inferred.
+
+Two consequences follow, and together they decide the design:
 
 * **`EINTR` never happens.** A blocked signal interrupts no syscall, so a rule
   that only watched for interrupted syscalls would observe nothing at all
   while the operator typed `Ctrl-C`.
-* **`sigpending` sees everything.** Linux deliberately does not discard a
-  *blocked* signal even when its disposition is `SIG_IGN`, because the handler
-  may change before it is unblocked. A typed `Ctrl-C` therefore sits in the
-  process-pending set for exactly as long as sudo holds it blocked — the whole
-  of this wait.
+* **`sigpending` sees it.** A blocked signal with a catching disposition is
+  left pending by both Linux and XNU, so a typed `Ctrl-C` sits in the pending
+  set for exactly as long as sudo holds it blocked — the whole of this wait.
+  sudo's own `user_interrupted()` is the same `sigpending` read, on both
+  platforms.
+
+### The one case macOS cannot see
+
+Linux keeps a blocked signal pending even when its disposition is `SIG_IGN`,
+because the handler may change before the unblock. **XNU does not**: it
+discards the signal at generation instead. Measured on macOS 15.7.5 with a C
+probe — block `SIGINT`, set `SIG_IGN`, then `pthread_kill`, `raise` and
+`kill(getpid())` — `sigpending` reports nothing in all three cases, while the
+same probe with a catching or default disposition reports the signal pending.
+
+So on macOS, cancellation is observable in the case that matters: a terminal
+sudo catches `SIGINT`, the keystroke is left pending, and the module sees it
+within one poll interval.
+
+The blind spot is narrower than "macOS". It is exactly one combination:
+a `Ctrl-C` **during this module's own wait**, in a sudo that **inherited
+`SIG_IGN`** for `SIGINT` — a sudo started as a shell's background job, or from
+a script that ignores `SIGINT`. It does not extend to the password prompt that
+follows, because `tgetpass()` installs a catching handler for `SIGINT` and
+`SIGQUIT` unconditionally, whatever sudo inherited, so a `Ctrl-C` there is
+pending on XNU too and sudo's own `user_interrupted()` sees it on the next
+loop. Within that one combination the loss is the kernel's, not this module's:
+no module-side mechanism can observe a signal the kernel never recorded, and
+sudo's `user_interrupted()` — the same `sigpending` read — is blind to it for
+the same reason. It is also the combination with no interactive `Ctrl-C` to
+miss. On Linux every case is covered.
+
+The blocked-and-caught test therefore runs on both platforms; the
+blocked-and-ignored cancellation test is `cfg(target_os = "linux")`, and a
+macOS-only test asserts the discard directly, so a future XNU that stopped
+discarding would fail the suite rather than pass unnoticed.
 
 So the module samples its own pending set once per poll interval and treats a
 pending `SIGINT` or `SIGQUIT` as cancellation: it aborts the helper process
@@ -249,9 +304,11 @@ Cancelling on a signal someone else left pending costs one password prompt,
 which is precisely the error budget this module already declares for
 unavailability; missing a real `Ctrl-C` costs the operator their terminal.
 
-A second, weaker rule covers the signals sudo *does* catch in this phase.
-Measured on the same stack, `SigCgt` covers `SIGHUP`, `SIGUSR1`, `SIGUSR2`,
-`SIGALRM`, `SIGTERM`, `SIGCHLD` and `SIGTSTP`; for those, **every interrupted
+A second, weaker rule covers the signals sudo catches in this phase *and does
+not block*. Measured on the same stack, `SigCgt` (`...16a07`) covers `SIGHUP`,
+`SIGUSR1`, `SIGUSR2`, `SIGALRM`, `SIGTERM` and `SIGCHLD` — as well as `SIGINT`
+and `SIGQUIT`, which are blocked and so handled by the pending-set rule above;
+for those, **every interrupted
 syscall in the helper pump loop is also cancellation**. `poll`, the bounded
 request write, the output reads, and the `waitid` that asks whether the leader
 has exited all report `EINTR` upward rather than retrying or answering "not
@@ -262,14 +319,17 @@ Before cancelling, the module re-checks whether the leader has exited, and if
 it has, the loop continues and reads the exit status normally, so a successful
 helper is never turned into a cancellation by its own death.
 
-Everything else in that list means this sudo is going away, being suspended,
-or timing out. `SIGTSTP` is worth stating plainly: **`Ctrl-Z` during a device
-wait cancels rather than suspends**, so the operator gets a password prompt
-instead of a stopped sudo holding a device prompt and a live helper tree. That
-is the intended outcome, and it is a consequence of the rule rather than
-something the container suite exercises. `SIGWINCH` is *not* in the list —
-sudo leaves it at its default in this phase, so a terminal resize cannot
-cancel. Being wrong in this direction costs one password prompt, never a
+Everything else in that list means this sudo is going away or timing out.
+`SIGTSTP` is *not* in the list, and the omission is deliberate: `verify_user()`
+sets `SIGTSTP` back to `SIG_DFL` for the authentication phase ("enable suspend
+during password entry"), and neither measured mask has bit 19. So **`Ctrl-Z`
+during a device wait stops sudo normally** — the process, and this module's
+thread with it, is suspended by the kernel rather than cancelled, and nothing
+here ever sees it as an interrupted syscall. A stopped sudo resumes on `fg`;
+its helper deadline, which is wall-clock, keeps running while it is stopped and
+will classify the wait as unavailable if the operator takes long enough.
+`SIGWINCH` is *not* in the list either — sudo leaves it at its default in this
+phase, so a terminal resize cannot cancel. Being wrong in this direction costs one password prompt, never a
 success and never a hard failure.
 
 A leader that has been *stopped* rather than exited is not a special case:
@@ -284,9 +344,11 @@ unblock, or caught outright), but a PAM module loaded into someone else's
 process should not be taking over the host's signals and then handing them
 back; `sigpending` answers the same question by reading state that already
 exists. **Leaving the helper in sudo's foreground process group** so the signal
-reaches it directly would not even deliver: sudo blocks and ignores `SIGINT`
-here, and both the blocked mask and an ignored disposition survive `fork` and
-`execve`, so the helper would inherit the same deafness. It would also give up
+reaches it directly would not even deliver: sudo *blocks* `SIGINT` here, and
+the blocked mask survives both `fork` and `execve` whatever the disposition is,
+so the helper would inherit the same deafness unless it reset its own mask.
+(Dispositions are the weaker half of that inheritance: a caught handler resets
+to `SIG_DFL` across `execve`, and only `SIG_IGN` survives it.) It would also give up
 the guaranteed `kill(-pgid)` of grandchildren the module never learned about
 (the only portable mechanism on macOS, which has no `PR_SET_PDEATHSIG`), hand
 the helper every other terminal signal including a `SIGTSTP` that could suspend

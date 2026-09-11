@@ -18,11 +18,14 @@
 //! Cancellation includes the terminal's own `Ctrl-C`.  The helper runs in its
 //! own process group, so a terminal `SIGINT` is delivered to sudo and never to
 //! the helper — and sudo *blocks* `SIGINT` and `SIGQUIT` for the whole
-//! authentication phase, catching them only inside its own password prompt, so
-//! a blocked signal interrupts nothing and simply becomes pending.  The module
-//! therefore watches its own pending set, which costs one `sigpending` read
-//! per poll interval and changes nothing about sudo's signal state.  See
-//! `terminal_cancel_requested`.  Any *other* interrupted syscall in the pump loop is
+//! authentication phase.  The PAM method is `FLAG_STANDALONE`, so
+//! `verify_user` never reaches the `auth_getpass` unblock window: they stay
+//! blocked for the entire PAM conversation, and a blocked signal interrupts
+//! nothing and simply becomes pending.  The
+//! module therefore watches its own pending set, which costs one `sigpending`
+//! read per poll interval and changes nothing about sudo's signal state.  See
+//! `terminal_cancel_requested`, and `pam/README.md` for the one case XNU
+//! cannot record.  Any *other* interrupted syscall in the pump loop is
 //! cancellation too, after re-checking whether the helper's own exit
 //! (`SIGCHLD`) caused the wakeup; see `interrupt_is_cancellation`.
 //!
@@ -953,12 +956,14 @@ fn spawn_and_pump_helper(path: &str, request: &[u8], timeout: Duration) -> Helpe
         // killing the helper directly.  terminal_cancel_requested closes
         // that gap in the parent instead.  Leaving the helper in sudo's foreground
         // group would not have delivered SIGINT for free anyway: sudo
-        // blocks and ignores it during authentication, and both the
-        // blocked mask and an ignored disposition survive fork and
-        // execve, so the helper would inherit the same deafness unless it
-        // were reset here.  It would also give up the
+        // *blocks* it for the whole authentication phase, and the blocked
+        // mask survives both fork and execve whatever the disposition is,
+        // so the helper would inherit the same deafness unless it reset
+        // the mask itself.  (Dispositions are the weaker half of that: a
+        // caught handler resets to SIG_DFL across execve, and only SIG_IGN
+        // survives it.)  It would also give up the
         // guaranteed group kill above, hand the helper every other
-        // terminal signal (SIGTSTP could suspend it mid-authentication),
+        // terminal signal (SIGTSTP would suspend it mid-authentication),
         // turn cancellation into a signal-killed helper (a hard
         // PAM_AUTH_ERR under the existing exit rules), and still depend
         // on the helper choosing to die.
@@ -1219,15 +1224,21 @@ fn spawn_and_pump_helper(path: &str, request: &[u8], timeout: Duration) -> Helpe
 /// a `waitid` that is itself interrupted answers `true` (cancel) rather than
 /// looping.
 ///
-/// Anything else is treated as cancellation.  Measured on a stock Ubuntu sudo,
-/// the signals it catches during authentication are `SIGHUP`, `SIGUSR1`,
-/// `SIGUSR2`, `SIGALRM`, `SIGTERM`, `SIGCHLD` and `SIGTSTP`; all but
-/// `SIGCHLD`, which is handled above, mean this sudo is going away, being
-/// suspended, or timing out, and none of them is a reason to keep holding the
-/// terminal on a device prompt.  `SIGWINCH` is not among them — it is left at
-/// its default and never interrupts anything — so a terminal resize cannot
-/// cancel.  Being wrong in this direction costs one password prompt, never a
-/// success and never a hard failure.
+/// Anything else is treated as cancellation.  Measured on a stock Ubuntu sudo
+/// (`SigCgt: ...16a07`), the signals it catches during authentication and
+/// leaves unblocked are `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGALRM`, `SIGTERM`
+/// and `SIGCHLD`; all but `SIGCHLD`, which is handled above, mean this sudo is
+/// going away or timing out, and none of them is a reason to keep holding the
+/// terminal on a device prompt.  `SIGINT` and `SIGQUIT` are caught too but
+/// blocked, so they arrive through the pending-set rule rather than as
+/// `EINTR`.  `SIGTSTP` is *not* in the caught set: `verify_user` sets it back
+/// to `SIG_DFL` for the authentication phase (neither measured mask has bit
+/// 19), so `Ctrl-Z` stops sudo — and this thread with it — the way it stops
+/// any other process, and is never seen here as an interrupted syscall.
+/// `SIGWINCH` is not among them either — it is left at its default and never
+/// interrupts anything — so a terminal resize cannot cancel.  Being wrong in
+/// this direction costs one password prompt, never a success and never a hard
+/// failure.
 ///
 /// A `waitid` that fails outright is cancellation too: a module that can no
 /// longer supervise its helper must not keep holding the terminal.
@@ -1484,28 +1495,29 @@ const CANCEL_SIGNALS: [c_int; 2] = [libc::SIGINT, libc::SIGQUIT];
 /// Has the terminal asked to cancel this authentication?
 ///
 /// The mechanism is `sigpending`, and the reason is what sudo actually does in
-/// its authentication phase, which was measured rather than assumed. While the
-/// module waits, `/proc/<sudo>/status` reports:
-///
-/// ```text
-/// SigBlk: 0000000000000006   <- SIGINT and SIGQUIT blocked
-/// SigIgn: 0000000000000006   <- and ignored
-/// SigCgt: ...a01             <- and not caught
-/// ```
-///
-/// sudo blocks and ignores both signals for the whole phase and installs
-/// catching handlers only inside `tgetpass`, around its own password prompt —
-/// which is why a stock stack ends at `Ctrl-C` but this module's wait did not.
-/// Two consequences follow, and together they decide the design:
+/// its authentication phase, which was measured rather than assumed. sudo's
+/// `verify_user()` blocks `SIGINT` and `SIGQUIT` for the whole phase and
+/// unblocks them only inside `auth_getpass()`, around its own password prompt
+/// — which is why a stock stack ends at `Ctrl-C` but this module's wait did
+/// not. The code has no platform conditionals, so this holds on Linux and
+/// macOS alike. Two consequences follow, and together they decide the design:
 ///
 /// * **`EINTR` never happens.** A blocked signal interrupts nothing, so a rule
 ///   that only watched for interrupted syscalls would see nothing at all while
 ///   the operator typed `Ctrl-C`. That is the defect this replaces.
-/// * **`sigpending` sees everything.** Linux deliberately does not discard a
-///   *blocked* signal even when its disposition is `SIG_IGN`, because the
-///   handler may change before it is unblocked, so a typed `Ctrl-C` sits in
-///   the process-pending set for exactly as long as sudo holds it blocked —
-///   which is the whole of this wait.
+/// * **`sigpending` sees it.** A terminal sudo *catches* both signals
+///   (`init_signals` installs `sudo_handler`; measured on sudo 1.9.15p5 as
+///   `SigCgt: ...16a07`), and a blocked signal with a catching disposition is
+///   left pending by Linux and XNU alike, so a typed `Ctrl-C` sits in the
+///   pending set for exactly as long as sudo holds it blocked — the whole of
+///   this wait. sudo's own `user_interrupted()` is this same read.
+///
+/// One case is invisible on macOS and only on macOS: a sudo that *inherited*
+/// `SIG_IGN` for `SIGINT`, which `init_signals` deliberately does not
+/// overwrite. Linux keeps such a signal pending anyway; XNU discards it at
+/// generation. That is a sudo started as a shell's background job, with no
+/// interactive `Ctrl-C` to miss, and sudo's own `user_interrupted()` is
+/// equally blind there. See `pam/README.md`.
 ///
 /// `sigpending` is a read. Nothing is installed, nothing is consumed, and
 /// nothing about sudo's own signal state changes: the signal is still pending
@@ -2078,14 +2090,24 @@ mod tests {
             ),
         );
 
+        // The clock starts *after* the spawn permit is held. Tests that take
+        // the exclusive side of `SPAWN` run for as long as their own wait
+        // budget, and a timer started before the lock would be measuring that
+        // queue rather than this timeout.
+        let permit = spawn_permit();
         let started = Instant::now();
-        let result = locked_run_helper_at(
+        let result = run_helper_at(
             path.to_str().unwrap(),
             &request(),
             Duration::from_millis(1500),
         );
+        let elapsed = started.elapsed();
+        drop(permit);
         assert_eq!(result, HelperOutcome::Unavailable);
-        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the timed-out wait took {elapsed:?}"
+        );
 
         let recorded = fs::read_to_string(&pidfile).expect("grandchild recorded its pid");
         let pid: libc::pid_t = recorded.trim().parse().expect("numeric pid");
@@ -2103,8 +2125,9 @@ mod tests {
         cleanup(&directory);
     }
 
-    /// Applies sudo's measured authentication-phase signal state for one
-    /// signal — ignored process-wide and blocked on this thread — and puts
+    /// Applies sudo's authentication-phase signal state for one signal —
+    /// blocked on this thread, with a process-wide disposition of either
+    /// `SIG_IGN` or a no-op catching handler, per [`Disposition`] — and puts
     /// everything back on drop, consuming a pending instance first so the
     /// mask can be released safely.
     ///
@@ -2112,28 +2135,49 @@ mod tests {
     /// middle of a test must not leave the rest of the suite, or the test
     /// runner, with a changed disposition, a changed mask, or an
     /// undeliverable signal parked in the pending set.
-    struct BlockedAndIgnored {
+    struct BlockedSignal {
         signal: c_int,
         previous_action: libc::sigaction,
         previous_mask: libc::sigset_t,
         blocked: libc::sigset_t,
     }
 
-    impl BlockedAndIgnored {
-        fn apply(signal: c_int) -> Self {
+    /// The disposition the surrounding process has installed while it blocks
+    /// the signal.  Which one applies is not a detail: it decides whether the
+    /// signal is left *pending* on Darwin.
+    ///
+    /// `sudo` installs `sudo_handler` for `SIGINT` and `SIGQUIT` in
+    /// `init_signals`, so [`Disposition::Caught`] is what a terminal sudo
+    /// actually has while this module waits.  It falls back to
+    /// [`Disposition::Ignored`] only when sudo *inherited* `SIG_IGN` — the
+    /// case for a sudo started as a shell's background job — because
+    /// `init_signals` deliberately does not overwrite an inherited `SIG_IGN`.
+    #[derive(Clone, Copy)]
+    enum Disposition {
+        Ignored,
+        Caught,
+    }
+
+    extern "C" fn absorb_signal(_signal: c_int) {}
+
+    impl BlockedSignal {
+        fn apply(signal: c_int, disposition: Disposition) -> Self {
             // SAFETY: every value is stack-local and initialized before use;
             // the mask change is thread-local.
             unsafe {
                 let mut previous_action = MaybeUninit::<libc::sigaction>::zeroed();
                 let mut action = MaybeUninit::<libc::sigaction>::zeroed();
                 let action_ptr = action.as_mut_ptr();
-                (*action_ptr).sa_sigaction = libc::SIG_IGN;
+                (*action_ptr).sa_sigaction = match disposition {
+                    Disposition::Ignored => libc::SIG_IGN,
+                    Disposition::Caught => absorb_signal as *const () as usize,
+                };
                 libc::sigemptyset(&raw mut (*action_ptr).sa_mask);
                 (*action_ptr).sa_flags = 0;
                 assert_eq!(
                     libc::sigaction(signal, action_ptr, previous_action.as_mut_ptr()),
                     0,
-                    "ignore the signal for the duration of this test"
+                    "set the test disposition for the signal"
                 );
                 let mut blocked = MaybeUninit::<libc::sigset_t>::zeroed().assume_init();
                 libc::sigemptyset(&raw mut blocked);
@@ -2178,7 +2222,7 @@ mod tests {
         }
     }
 
-    impl Drop for BlockedAndIgnored {
+    impl Drop for BlockedSignal {
         fn drop(&mut self) {
             // SAFETY: the pending instance is consumed before the mask is
             // released, then the saved disposition and mask are restored
@@ -2280,21 +2324,20 @@ mod tests {
         assert!(!alive, "descendant {pid} survived {what}");
     }
 
-    /// The real sudo case: `SIGINT` is *blocked* (and ignored) by the
-    /// surrounding process, so nothing is delivered and no syscall returns
-    /// `EINTR` — the keystroke only becomes pending. The wait must still end
-    /// as `Unavailable`, promptly, with the helper tree dead.
+    /// The body shared by the two blocked-`SIGINT` tests: the surrounding
+    /// process *blocks* the signal, so nothing is delivered and no syscall
+    /// returns `EINTR` — the keystroke only becomes pending. The wait must
+    /// still end as `Unavailable`, promptly, with the helper tree dead.
     ///
     /// `pthread_kill` targets the pumping thread so the signal cannot be taken
     /// by another test thread. Signal state is process-wide, so this runs
     /// under the exclusive spawn lock.
-    #[test]
-    fn a_blocked_and_ignored_sigint_still_cancels_the_helper_wait() {
+    fn blocked_sigint_cancels_the_helper_wait(disposition: Disposition) {
         let directory = test_dir();
         let (path, pidfile) = sleeping_helper_with_grandchild(&directory);
 
         let exclusive = SPAWN.write().unwrap_or_else(PoisonError::into_inner);
-        let signals = BlockedAndIgnored::apply(libc::SIGINT);
+        let signals = BlockedSignal::apply(libc::SIGINT, disposition);
 
         // SAFETY: pthread_self has no pointer arguments; the handle is used
         // only while this thread is inside the wait below.
@@ -2322,6 +2365,72 @@ mod tests {
         );
         assert_descendant_died(&pidfile, "a cancelled helper wait");
         cleanup(&directory);
+    }
+
+    /// The production case on both platforms: sudo's `init_signals` installs
+    /// `sudo_handler` for `SIGINT`, and `verify_user` blocks it for the whole
+    /// authentication phase. A blocked signal with a *catching* disposition is
+    /// left pending by both Linux and XNU, so `sigpending` sees the keystroke
+    /// on macOS exactly as it does on Linux.
+    #[test]
+    fn a_blocked_and_caught_sigint_still_cancels_the_helper_wait() {
+        blocked_sigint_cancels_the_helper_wait(Disposition::Caught);
+    }
+
+    /// The narrower case: sudo *inherited* `SIG_IGN` for `SIGINT` — a sudo
+    /// started as a shell's background job — so `init_signals` left the
+    /// disposition alone and the blocked signal is both ignored and blocked.
+    ///
+    /// Linux-only, and the restriction is a kernel difference rather than a
+    /// test artefact. Linux keeps a blocked signal pending even when its
+    /// disposition is `SIG_IGN`, because the handler may change before the
+    /// unblock. XNU discards it at generation instead: measured on macOS
+    /// 15.7.5, `sigpending` reports nothing after `pthread_kill`, `raise`, or
+    /// `kill(getpid())` for a signal that is blocked *and* `SIG_IGN`, while
+    /// the same probe with a catching or default disposition reports it
+    /// pending. No amount of module-side work can observe a signal the kernel
+    /// never recorded, and sudo's own `user_interrupted()` — which is the same
+    /// `sigpending` read — has exactly the same blind spot there. See
+    /// `pam/README.md`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_blocked_and_ignored_sigint_still_cancels_the_helper_wait() {
+        blocked_sigint_cancels_the_helper_wait(Disposition::Ignored);
+    }
+
+    /// The other half of that kernel difference, asserted rather than assumed:
+    /// on XNU a `SIGINT` that is blocked *and* `SIG_IGN` is discarded at
+    /// generation, so it never reaches the pending set and
+    /// `terminal_cancel_requested` cannot see it. This test exists to fail
+    /// loudly if a future macOS starts behaving like Linux — at which point
+    /// the Linux-only test above can become cross-platform.
+    ///
+    /// The signal never becomes pending, so nothing is delivered when the
+    /// guard restores the mask. Signal state is process-wide, so this runs
+    /// under the exclusive spawn lock.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_blocked_and_ignored_sigint_is_discarded_by_xnu() {
+        let exclusive = SPAWN.write().unwrap_or_else(PoisonError::into_inner);
+        let signals = BlockedSignal::apply(libc::SIGINT, Disposition::Ignored);
+        signals.raise_on_this_thread();
+        // The claim is about the kernel, so read the pending set directly
+        // rather than through terminal_cancel_requested, whose answer also
+        // depends on CANCEL_SIGNALS and on SIGQUIT.
+        // SAFETY: sigpending writes only into the zeroed set, which is then
+        // read by sigismember.
+        let pending_sigint = unsafe {
+            let mut pending = MaybeUninit::<libc::sigset_t>::zeroed();
+            assert_eq!(libc::sigpending(pending.as_mut_ptr()), 0, "sigpending");
+            let pending = pending.assume_init();
+            libc::sigismember(&raw const pending, libc::SIGINT)
+        };
+        drop(signals);
+        drop(exclusive);
+        assert_eq!(
+            pending_sigint, 0,
+            "XNU kept a blocked-and-ignored SIGINT pending; see pam/README.md"
+        );
     }
 
     /// A signal that lands in the *drain* window must not turn a successful
@@ -2451,7 +2560,10 @@ mod tests {
         let (path, directory) = script("sleep 300");
 
         let exclusive = SPAWN.write().unwrap_or_else(PoisonError::into_inner);
-        let signals = BlockedAndIgnored::apply(libc::SIGINT);
+        // The catching disposition is sudo's own (`init_signals` installs
+        // `sudo_handler`), and it is the one XNU also leaves pending; see
+        // `a_blocked_and_caught_sigint_still_cancels_the_helper_wait`.
+        let signals = BlockedSignal::apply(libc::SIGINT, Disposition::Caught);
         // Pending before the wait begins, exactly as a keystroke during an
         // earlier phase of the same PAM call would be.
         signals.raise_on_this_thread();
