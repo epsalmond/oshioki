@@ -4,9 +4,10 @@
 #   packaging/build-deb STAGE_DIR VERSION OUTPUT_DEB
 #
 # STAGE_DIR holds the release artifacts built for the target architecture:
-# oshioki, liboshioki_plugin.so, oshioki-server, and a SHA256SUMS whose
-# entries are named exactly oshioki and liboshioki_plugin.so (what
-# scripts/install-oshioki-hook verifies). VERSION is the Debian version,
+# oshioki, liboshioki_plugin.so, liboshioki_pam.so, oshioki-server, and a
+# SHA256SUMS whose entries are named exactly oshioki, liboshioki_plugin.so
+# and liboshioki_pam.so (what scripts/install-oshioki-hook verifies).
+# VERSION is the Debian version,
 # e.g. 0.1.0 for tag v0.1.0. DEB_ARCH overrides the target architecture
 # (default amd64) for local validation; the staged binaries must match it.
 set -euo pipefail
@@ -21,10 +22,10 @@ case "$OUTPUT_DEB" in /*) ;; *) OUTPUT_DEB="$(pwd -P)/$OUTPUT_DEB" ;; esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 ARCH="${DEB_ARCH:-amd64}"
 
-for artifact in oshioki liboshioki_plugin.so oshioki-server SHA256SUMS; do
+for artifact in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-server SHA256SUMS; do
   [ -f "$STAGE_DIR/$artifact" ] || { echo "build-deb: missing $STAGE_DIR/$artifact" >&2; exit 1; }
 done
-for name in oshioki liboshioki_plugin.so; do
+for name in oshioki liboshioki_plugin.so liboshioki_pam.so; do
   awk -v name="$name" '$2 == name {found=1} END {exit !found}' "$STAGE_DIR/SHA256SUMS" \
     || { echo "build-deb: SHA256SUMS has no entry for $name" >&2; exit 1; }
 done
@@ -37,7 +38,7 @@ case "$ARCH" in
   *) echo "build-deb: unsupported DEB_ARCH $ARCH" >&2; exit 1 ;;
 esac
 command -v file >/dev/null || { echo "build-deb: need the file command" >&2; exit 1; }
-for artifact in oshioki liboshioki_plugin.so oshioki-server; do
+for artifact in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-server; do
   file -b "$STAGE_DIR/$artifact" | grep -Eq "$arch_probe" \
     || { echo "build-deb: $artifact does not match DEB_ARCH=$ARCH" >&2; exit 1; }
 done
@@ -51,11 +52,23 @@ sed -i "s/@VERSION@/$VERSION/g; s/^Architecture: .*/Architecture: $ARCH/" "$TREE
 
 install -d "$TREE/usr/share/oshioki" "$TREE/usr/sbin"
 install -m 0755 "$STAGE_DIR/oshioki" "$TREE/usr/share/oshioki/"
-install -m 0644 "$STAGE_DIR/liboshioki_plugin.so" "$STAGE_DIR/SHA256SUMS" "$TREE/usr/share/oshioki/"
+install -m 0644 "$STAGE_DIR/liboshioki_plugin.so" "$STAGE_DIR/liboshioki_pam.so" \
+  "$STAGE_DIR/SHA256SUMS" "$TREE/usr/share/oshioki/"
 install -m 0755 "$STAGE_DIR/oshioki-server" "$TREE/usr/sbin/oshioki-server"
 install -m 0755 "$ROOT/scripts/oshioki-phone-setup" "$TREE/usr/sbin/oshioki-phone-setup"
 install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$TREE/usr/share/oshioki/install-oshioki-hook"
 install -d -m 0750 "$TREE/etc/oshioki"
+
+# The multiarch triplet this package was built for. The installer refuses to
+# drop the PAM module into a security directory that disagrees with it: a
+# module in the wrong directory is a module PAM silently never loads, which
+# `module_unknown=ignore` turns into a password-only host rather than an
+# error. An empty value would disable that check, so it fails the build.
+command -v dpkg-architecture >/dev/null || { echo "build-deb: need dpkg-architecture (dpkg-dev)" >&2; exit 1; }
+MULTIARCH="$(dpkg-architecture -a"$ARCH" -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
+[ -n "$MULTIARCH" ] || { echo "build-deb: dpkg-architecture reported no DEB_HOST_MULTIARCH for $ARCH" >&2; exit 1; }
+printf '%s\n' "$MULTIARCH" > "$TREE/usr/share/oshioki/pam-multiarch"
+chmod 0644 "$TREE/usr/share/oshioki/pam-multiarch"
 
 # Versioned libc dependency from the actual binaries. Rust links libc, and a
 # deb that installs on an older distro than the build host must say so.
@@ -66,9 +79,20 @@ mkdir -p "$WORK/scan/debian"
 printf 'Source: oshioki\nMaintainer: Oshioki contributors\n\nPackage: oshioki\nArchitecture: any\n' > "$WORK/scan/debian/control"
 shlib_log="$WORK/shlib-errors.log"
 shlib_depends="$(
-  cd "$WORK/scan" && dpkg-shlibdeps -O "$TREE/usr/sbin/oshioki-server" "$TREE/usr/share/oshioki/oshioki" 2>"$shlib_log" | sed 's/^shlibs:Depends=//'
+  cd "$WORK/scan" && dpkg-shlibdeps -O "$TREE/usr/sbin/oshioki-server" "$TREE/usr/share/oshioki/oshioki" \
+    "$TREE/usr/share/oshioki/liboshioki_pam.so" 2>"$shlib_log" | sed 's/^shlibs:Depends=//'
 )" || { cat "$shlib_log" >&2; echo "build-deb: dpkg-shlibdeps failed" >&2; exit 1; }
 [ -n "$shlib_depends" ] || { cat "$shlib_log" >&2; echo "build-deb: dpkg-shlibdeps produced no Depends" >&2; exit 1; }
+# The PAM module links libpam; if the scan above did not name it (a dpkg-dev
+# that resolved it through a different package name, or a stripped module),
+# say so explicitly rather than shipping a package that installs a module the
+# host cannot load.
+# Match the package name, not a substring: libpam0g-dev and libpam0go would
+# both satisfy a bare *libpam0g* and neither is the runtime library. The
+# version floor is the one Debian's own shlibs file carries for pam_sm_*.
+if ! printf '%s' "$shlib_depends" | grep -Eq '(^|, )libpam0g( |,|$)'; then
+  shlib_depends="$shlib_depends, libpam0g (>= 0.99.7.1)"
+fi
 sed -i "s/^Depends: \(.*\)/Depends: \1, $shlib_depends/" "$TREE/DEBIAN/control"
 
 # So dpkg -V and debsums can verify the installed files.

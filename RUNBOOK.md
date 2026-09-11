@@ -78,6 +78,60 @@ For socket mode (below), also add:
 OSHIOKI_AGENT_SOCKET=/Users/<you>/.config/oshioki/agent.sock
 ```
 
+To have the `.deb` migrate this host to the contextual PAM lane instead of
+leaving it on the approval plugin, add:
+
+```text
+OSHIOKI_CONTEXTUAL_PAM=1
+```
+
+Only the exact value `1` opts in; any other value, or no key at all, leaves
+the host on the plugin lane. The key is safe to pre-seed before any device
+exists: each `configure` runs `--prelaunch` first (it writes the hook binary,
+its configuration and the device registry that the migration needs) and
+`--contextual-pam` last, and the migration exits 0 with a "no active
+hardware-backed approval device yet" note until a hardware-backed device is
+pinned. The migration then happens at the first `configure` after that —
+`apt install --reinstall oshioki`, the next upgrade, or by hand:
+
+```bash
+sudo /usr/share/oshioki/install-oshioki-hook --contextual-pam \
+  --config-file /etc/oshioki/install.env
+```
+
+A migration that cannot complete never fails the package configuration; it
+prints the command to re-run. Once a host is on the PAM lane it stays there:
+`configure` reads the lane from the host (any PAM service file naming the
+module), so a later `--prelaunch` refreshes the hook and the module without
+re-enabling the approval plugin or the blanket `NOPASSWD` rule, even if the
+key is later removed from `install.env`. An upgrade that ships a new module
+swaps it in place — staged beside the live file, self-tested, then renamed —
+leaving the PAM entries untouched.
+
+On macOS the same opt-in is `oshioki-laptop-setup --contextual-pam` (or
+`OSHIOKI_CONTEXTUAL_PAM=1` in its environment), which runs the migration
+after the normal install and pairing.
+
+Never run the migration without a recovery path already open: a second root
+shell (`sudo -i`) held for the whole run, and a verified console or `pkexec`
+fallback, both established *before* the first `--contextual-pam`. Inspect and
+roll back with:
+
+```bash
+sudo /usr/share/oshioki/install-oshioki-hook --contextual-pam-status
+sudo /usr/share/oshioki/install-oshioki-hook --disable-contextual-pam
+```
+
+`--contextual-pam-status` exits non-zero unless every line reads `OK`.
+`--disable-contextual-pam` removes the PAM entries, re-proves `sudo -V`, and
+only then unlinks the module; it refuses to unlink a module any file under
+`/etc/pam.d` still names. `prerm` runs the same command during package
+removal — before it touches the plugin block or the sudoers drop-in, and it
+stops the removal if that command fails, so a host whose module is still live
+keeps the legacy artifacts it may need to reach `sudo`. `prerm` decides by
+looking for the marker or an `auth` line naming the module in any PAM service
+file under `/etc/pam.d`, so a hand-damaged entry is still cleaned up.
+
 Run the dry run and install against that file:
 
 ```bash

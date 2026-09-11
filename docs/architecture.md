@@ -92,10 +92,17 @@ native socket deployments must update the hook and agent together. An older
 server or peer leaves the corresponding receipt unavailable and the hook
 reports the required upgrade while failing closed.
 
+This describes the approval-plugin lane, which is what `--prelaunch` installs
+and what every deployment used before the contextual PAM lane
+(`install-oshioki-hook --contextual-pam`, opt-in) existed. On the PAM lane
+sudo has no Oshioki plugin and no `NOPASSWD` rule at all: one `auth` entry in
+the sudo PAM stack asks the device, and sudo's own password prompt is the
+fallback. See RUNBOOK.md and pam/README.md.
+
 The sudo plugin starts the hook and, for an interactive Linux invocation, a
-separate PAM password attempt at the same time. The installer normally adds a
-`NOPASSWD` sudoers entry, so this is the plugin's fallback path rather than a
-second sudo policy prompt. PAM authenticates the invoking user through the
+separate PAM password attempt at the same time. On this lane the installer
+normally adds a `NOPASSWD` sudoers entry, so this is the plugin's fallback
+path rather than a second sudo policy prompt. PAM authenticates the invoking user through the
 system `sudo` service and runs account management before it can approve.
 `sudo -n` skips the password child and never reads `/dev/tty`. An explicit
 denial or invalid hook result wins over a password. A transport failure or an

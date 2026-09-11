@@ -8,7 +8,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 RUN cargo build --locked --release --workspace \
  && cd target/release \
- && sha256sum oshioki oshioki-agent oshioki-server liboshioki_plugin.so > SHA256SUMS
+ && sha256sum oshioki oshioki-agent oshioki-server liboshioki_plugin.so liboshioki_pam.so > SHA256SUMS
 # The E2E drives the agent with `run --auto`, which only exists behind the
 # `unattended` feature. Build that agent apart so the release binary and its
 # checksum above stay feature-free.
@@ -39,6 +39,10 @@ WORKDIR /work
 COPY --from=builder /build/target/release/oshioki /work/target/release/
 COPY --from=builder /build/target/unattended/release/oshioki-agent /work/target/unattended/
 COPY --from=builder /build/target/release/liboshioki_plugin.so /work/target/release/
+# Copied, not loaded: nothing in scripts/run-compose-e2e dlopens the PAM
+# module, so the e2e image needs no libpam0g runtime. It is here so the
+# checksum manifest beside it describes every file it lists.
+COPY --from=builder /build/target/release/liboshioki_pam.so /work/target/release/
 COPY --from=builder /build/target/release/SHA256SUMS /work/target/release/
 COPY scripts/ /work/scripts/
 COPY server/web/package.json server/web/package-lock.json /work/server/web/

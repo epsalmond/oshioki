@@ -415,6 +415,7 @@ load_config_file() {
       OSHIOKI_ALLOW_PLAINTEXT_NATS) ALLOW_PLAINTEXT="$value" ;;
       OSHIOKI_AGENT_SOCKET) AGENT_SOCKET="$value" ;;
       OSHIOKI_LOCAL) : ;; # local-setup marker; inert, kept so the mode is visible in the file
+      OSHIOKI_CONTEXTUAL_PAM) : ;; # read by the Debian postinst to opt into --contextual-pam; inert here
       *) die "unknown config key in $path: $key" ;;
     esac
   done < "$path"
@@ -426,6 +427,24 @@ load_config_file() {
 # `active`; resetting at each record's version keeps legacy records (which
 # default to WebAuthn) eligible while recognizing a software record even when
 # each JSON field occupies its own line.
+# One of: absent (no registry yet), empty (registry, no active device),
+# software-only (active devices, none hardware-backed), eligible, or corrupt
+# (something is there but it is not a device registry). Only the last is a
+# reason to stop: the migration's "not yet" path needs to tell an operator
+# which of the first three they are looking at.
+registry_device_state() {
+  local file="$STATE_DIR/devices.json"
+  [ -e "$file" ] || { printf 'absent\n'; return 0; }
+  { [ -f "$file" ] && [ -r "$file" ]; } || { printf 'corrupt\n'; return 0; }
+  grep -Fq '"devices"' "$file" 2>/dev/null || { printf 'corrupt\n'; return 0; }
+  if registry_has_active_passwordless_devices; then printf 'eligible\n'; return 0; fi
+  if grep -Eq '"active":[[:space:]]*true' "$file" 2>/dev/null; then
+    printf 'software-only\n'
+    return 0
+  fi
+  printf 'empty\n'
+}
+
 registry_has_active_passwordless_devices() {
   [ -f "$STATE_DIR/devices.json" ] || return 1
   awk '
@@ -520,6 +539,26 @@ pam_auth_line() {
   else
     printf 'auth [success=done authinfo_unavail=ignore module_unknown=ignore ignore=ignore default=die] %s\n' "$PAM_MODULE_NAME"
   fi
+}
+
+# True when this host is already on the contextual PAM lane: some sudo
+# service file carries our marker, or names our module on an auth line. The
+# second test is deliberately looser than the exact line the installer
+# writes -- a half-edited or hand-modified entry still means the module is
+# live, and every caller of this predicate uses it to withhold or undo
+# something, never to grant.
+# Only the service names PAM actually reads: a `sudo.XXXXXX` left behind by
+# a crashed edit is litter, not a live lane, and treating it as one would
+# withhold the plugin lane from that host forever.
+pam_lane_active() {
+  local service file
+  for service in $PAM_SERVICES; do
+    file="$PAM_D/$service"
+    [ -f "$file" ] || continue
+    if grep -Fq "$PAM_BEGIN_MARK" "$file" 2>/dev/null; then return 0; fi
+    if grep -Eq '^[[:space:]]*auth[[:space:]].*liboshioki_pam' "$file" 2>/dev/null; then return 0; fi
+  done
+  return 1
 }
 
 stat_owner() { stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null; }
@@ -1052,6 +1091,11 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$MODE" != contextual-pam-status ]; then
     # artifacts come back.
     restore_pam_backups || true
     restore_sudo_backups || true
+    # The refresh path's staging files. Neither is ever referenced by a PAM
+    # file, so removing them is always safe; leaving them would strand a
+    # copy of the module beside the live one.
+    [ -z "${pam_staged:-}" ] || rm -f "$pam_staged"
+    [ -z "${pam_previous:-}" ] || rm -f "$pam_previous"
     rmdir "$LOCK_DIR" 2>/dev/null || true
   }
   handle_signal() {
@@ -1122,14 +1166,21 @@ pam_rollback_all() {
 # Where the module could be, for a removal that must work even when discovery
 # fails (libpam-modules purged, a damaged multiarch file).
 pam_module_removal_targets() {
-  local dir candidate
+  local dir candidate suffix
   dir="$(discover_security_dir 2>/dev/null)" || dir=""
-  [ -z "$dir" ] || printf '%s\n' "$(pam_module_dest "$dir")"
+  # The refresh path's staging names go too: nothing ever references them,
+  # and one left behind by an interrupted refresh is a stray copy of the
+  # module in the security directory.
+  for suffix in "" .oshioki-new .oshioki-previous; do
+    [ -z "$dir" ] || printf '%s%s\n' "$(pam_module_dest "$dir")" "$suffix"
+  done
   if [ "$(uname -s)" != Darwin ]; then
     for candidate in "/usr/lib/$(uname -m)-linux-gnu/security" /lib/security /usr/lib/security; do
       [ "$candidate" != "$dir" ] || continue
-      [ -f "$candidate/$PAM_MODULE_NAME" ] || continue
-      printf '%s/%s\n' "$candidate" "$PAM_MODULE_NAME"
+      for suffix in "" .oshioki-new .oshioki-previous; do
+        [ -f "$candidate/$PAM_MODULE_NAME$suffix" ] || continue
+        printf '%s/%s%s\n' "$candidate" "$PAM_MODULE_NAME" "$suffix"
+      done
     done
   fi
 }
@@ -1277,11 +1328,101 @@ if [ "$MODE" = contextual-pam ]; then
   classify_pam_services "$security_dir"
   helper_path_secure ||
     die "helper $SBIN_DIR/oshioki is missing or on an unsafe path; install the hook before migrating"
-  registry_has_active_passwordless_devices ||
-    die "no active hardware-backed approval device; pin one before migrating"
   assert_common_auth_clean ||
     die "$PAM_D/common-auth already references liboshioki_pam; refusing to touch this host"
   pam_trace "pam:prereq-ok"
+
+  # --- Upgrade path: the lane is already live and only the module file is
+  # out of date. A package upgrade must refresh it, and must do so without
+  # going through the migration again: the PAM block stays exactly as it is,
+  # the replacement is proven to load before anything references it, and the
+  # swap is a single rename. A host with the block but no module falls
+  # through to the full migration below, which reinstalls and re-edits.
+  if pam_lane_active && [ -f "$module_dest" ]; then
+    if pam_module_checksum_ok "$module_dest" "$PAM_CHECKSUMS"; then
+      pam_trace "pam:refresh:current"
+      echo "install-oshioki-hook: contextual PAM already current at $module_dest"
+      exit 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf 'DRY: stage %s beside %s, self-test it, then rename it into place\n' \
+        "$PAM_MODULE_BIN" "$module_dest"
+      printf 'DRY: %s pam-selftest --module %s.oshioki-new\n' "$SBIN_DIR/oshioki" "$module_dest"
+      validate_sudo
+      exit 0
+    fi
+    pam_staged="$module_dest.oshioki-new"
+    pam_previous="$module_dest.oshioki-previous"
+    rm -f "$pam_staged" "$pam_previous"
+    if [ "$FAIL_PAM_MODULE_INSTALL" = 1 ] ||
+       ! install -m 0644 -o root -g "$ROOT_GROUP" "$PAM_MODULE_BIN" "$pam_staged"; then
+      rm -f "$pam_staged"
+      die "could not stage the replacement PAM module at $pam_staged; $module_dest is unchanged"
+    fi
+    if [ "$FAIL_PAM_SELFTEST" = 1 ] ||
+       ! "$SBIN_DIR/oshioki" pam-selftest --module "$pam_staged"; then
+      rm -f "$pam_staged"
+      die "PAM module self-test failed for $pam_staged; $module_dest is unchanged"
+    fi
+    pam_trace "pam:refresh:selftest-ok"
+    cp -p "$module_dest" "$pam_previous" || {
+      rm -f "$pam_staged" "$pam_previous"
+      die "could not back up $module_dest; nothing was changed"
+    }
+    mv -f "$pam_staged" "$module_dest" || {
+      rm -f "$pam_staged" "$pam_previous"
+      die "could not replace $module_dest; the previous module is still in place"
+    }
+    pam_trace "pam:refresh:module-swapped:$module_dest"
+    if ! validate_sudo; then
+      mv -f "$pam_previous" "$module_dest" ||
+        die "sudo -V failed after refreshing the module, and the previous module could not be restored from $pam_previous; restore it by hand or run --disable-contextual-pam"
+      die "sudo -V failed after refreshing the module; restored the previous one"
+    fi
+    rm -f "$pam_previous"
+    pam_previous=""
+    pam_trace "pam:refresh:committed"
+    echo "install-oshioki-hook: contextual PAM module refreshed at $module_dest"
+    exit 0
+  fi
+
+  # --- The lane is configured but its module is gone: an interrupted
+  # refresh, a purge that swept too far, or a hand-edited host. Linux
+  # survives it (module_unknown=ignore turns the missing module into a
+  # password prompt) but macOS does not, so it is never passed over quietly.
+  pam_lane_missing_module=0
+  if pam_lane_active; then
+    pam_lane_missing_module=1
+    echo "install-oshioki-hook: WARNING: the contextual PAM lane is configured but the module file is missing: $module_dest" >&2
+    echo "install-oshioki-hook: reinstalling it; sudo authenticates by password until this finishes" >&2
+  fi
+
+  # --- Not yet, rather than a failure: the .deb's opt-in key can be
+  # pre-seeded before any device is paired, and every postinst until then
+  # would otherwise abort the migration as an error. Prerequisite problems
+  # above still die; this one only means "come back after pinning a device",
+  # and nothing on the host has been touched.
+  pam_registry_state="$(registry_device_state)"
+  case "$pam_registry_state" in
+    corrupt)
+      die "$STATE_DIR/devices.json is unreadable or is not a device registry; refusing to migrate" ;;
+    eligible) ;;
+    *)
+      # A host whose PAM stack already names a module that is not there is
+      # the one case this may not shrug off: leaving it as it is means macOS
+      # sudo is answering PAM_ABORT on every request.
+      [ "$pam_lane_missing_module" -eq 0 ] ||
+        die "the contextual PAM lane is configured but $module_dest is missing, and no hardware-backed device can prove a replacement; pin a device and re-run, or run --disable-contextual-pam"
+      pam_trace "pam:not-yet"
+      case "$pam_registry_state" in
+        absent|empty)
+          echo "install-oshioki-hook: no approval device pinned yet; skipping the contextual PAM migration" >&2 ;;
+        software-only)
+          echo "install-oshioki-hook: only software approval devices are active; a hardware-backed device is required, so the contextual PAM migration was skipped" >&2 ;;
+      esac
+      echo "install-oshioki-hook: no active hardware-backed approval device yet; pin one, then re-run: $0 --contextual-pam" >&2
+      exit 0 ;;
+  esac
 
   if [ "$DRY_RUN" -eq 1 ]; then
     # The plan mirrors the real order exactly, including the two removals
@@ -1606,6 +1747,37 @@ fi
 registry_has_active_devices() {
   grep -Eq '"active":[[:space:]]*true' "$STATE_DIR/devices.json" 2>/dev/null
 }
+
+# A host already migrated to the contextual PAM lane must not be pulled back
+# onto the plugin lane by an upgrade. `apt upgrade` re-runs postinst, which
+# re-runs --prelaunch; re-enabling the approval plugin and the blanket
+# NOPASSWD rule here would silently give such a host two authorization paths,
+# and a half-finished opt-in migration would leave both live. The hook
+# binary, the plugin file and the config above are still refreshed -- only
+# the enablement is withheld -- and any stale legacy artifact is removed
+# rather than left behind.
+if pam_lane_active; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    remove_sudoers_dropin
+    echo "DRY: skip enabling $SUDO_CONF (this host is on the contextual PAM lane)"
+    validate_sudo
+    exit 0
+  fi
+  echo "install-oshioki-hook: this host is on the contextual PAM lane; not enabling the approval plugin or the blanket sudoers rule" >&2
+  capture_dropin_backup
+  [ ! -f "$SUDO_CONF" ] || capture_sudo_conf_backup
+  remove_sudoers_dropin
+  if [ -f "$SUDO_CONF" ] && { grep -Fq "$BEGIN_MARK" "$SUDO_CONF" || has_our_plugin; }; then
+    rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
+  fi
+  if ! validate_sudo; then
+    restore_sudo_backups
+    die "sudo -V failed; restored prior configuration"
+  fi
+  drop_sudo_backups
+  echo "install-oshioki-hook: $MODE installed; the contextual PAM lane is unchanged"
+  exit 0
+fi
 if [ "$DRY_RUN" -eq 1 ]; then
   if registry_has_active_devices; then
     echo "DRY: enable exact managed block in $SUDO_CONF"

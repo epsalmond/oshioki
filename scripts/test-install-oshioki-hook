@@ -877,15 +877,21 @@ fi
 grep -Fq 'does not match the discovered' "$MULTIARCH/log" || fail "missing multiarch mismatch refusal"
 pam_unchanged "$MULTIARCH" || fail "the multiarch refusal modified a PAM file"
 
-# No hardware-backed device means nothing can answer an authentication.
+# No hardware-backed device is "not yet", not a failure: the .deb's opt-in
+# key is pre-seeded before any device is paired, so every postinst until
+# then would otherwise report an error. Nothing on the host is touched, and
+# the exit status has to be 0 for the package script to carry on.
 NODEVICE="$TEST_ROOT/pam-no-device"
 setup_legacy_host "$NODEVICE" ubuntu-24.04
 printf '{"version":1,"devices":[{"version":1,"kind":"software","active":true}]}\n' > "$NODEVICE/state/devices.json"
-if run_installer --sudo-user testuser "$NODEVICE" --contextual-pam >"$NODEVICE/log" 2>&1; then
-  fail "accepted a software-only registry"
-fi
-grep -Fq 'no active hardware-backed approval device' "$NODEVICE/log" || fail "missing device refusal"
-pam_unchanged "$NODEVICE" || fail "the device refusal modified a PAM file"
+run_installer --sudo-user testuser "$NODEVICE" --contextual-pam >"$NODEVICE/log" 2>&1 ||
+  fail "a software-only registry was an error rather than a skip"
+grep -Fq 'no active hardware-backed approval device yet' "$NODEVICE/log" || fail "missing device skip message"
+grep -Fq -- '--contextual-pam' "$NODEVICE/log" || fail "the skip does not name the command to re-run"
+pam_unchanged "$NODEVICE" || fail "the device skip modified a PAM file"
+[ ! -e "$NODEVICE/security/liboshioki_pam.so" ] || fail "the device skip installed the module"
+grep -Fq '# BEGIN oshioki' "$NODEVICE/sudo.conf" || fail "the device skip removed the legacy plugin"
+[ -e "$NODEVICE/sudoers.d/oshioki" ] || fail "the device skip removed the blanket rule"
 
 # A checksum that does not match the manifest never reaches the host.
 BADSUM="$TEST_ROOT/pam-bad-checksum"
@@ -1118,6 +1124,154 @@ grep -Fq "DRY: remove $DRY_DISABLE/security/liboshioki_pam.so" "$DRY_DISABLE/log
   fail "disable dry run did not plan the module removal"
 grep -Fxq "$PAM_AUTH_LINE" "$DRY_DISABLE/pam.d/sudo" || fail "the disable dry run edited a PAM file"
 [ -f "$DRY_DISABLE/security/liboshioki_pam.so" ] || fail "the disable dry run removed the module"
+
+# --- upgrade paths on an already-migrated host ---------------------------
+# `apt upgrade` re-runs postinst, which re-runs --prelaunch. On a migrated
+# host that must refresh the hook without putting the approval plugin or the
+# blanket NOPASSWD rule back: two authorization paths where the
+# administrator chose one is exactly what the migration removed.
+REPRELAUNCH="$TEST_ROOT/pam-prelaunch-on-migrated"
+setup_legacy_host "$REPRELAUNCH" ubuntu-24.04
+run_installer --sudo-user testuser "$REPRELAUNCH" --contextual-pam >"$REPRELAUNCH/install.log" 2>&1 ||
+  { sed -n '1,40p' "$REPRELAUNCH/install.log" >&2; fail "could not migrate the prelaunch-upgrade host"; }
+mkdir -p "$REPRELAUNCH/migrated"
+cp "$REPRELAUNCH/pam.d/"* "$REPRELAUNCH/migrated/"
+# Proof that the artifacts really are reinstalled rather than skipped.
+rm -f "$REPRELAUNCH/sbin/oshioki" "$REPRELAUNCH/state/config.env"
+run_installer --sudo-user testuser "$REPRELAUNCH" --prelaunch >"$REPRELAUNCH/log" 2>&1 ||
+  { sed -n '1,40p' "$REPRELAUNCH/log" >&2; fail "prelaunch failed on a migrated host"; }
+grep -Fq 'this host is on the contextual PAM lane' "$REPRELAUNCH/log" ||
+  fail "prelaunch on a migrated host did not say why it withheld the plugin lane"
+[ -x "$REPRELAUNCH/sbin/oshioki" ] || fail "prelaunch on a migrated host did not reinstall the hook"
+[ -f "$REPRELAUNCH/state/config.env" ] || fail "prelaunch on a migrated host did not rewrite config.env"
+if grep -Fq '# BEGIN oshioki' "$REPRELAUNCH/sudo.conf"; then
+  fail "prelaunch on a migrated host re-enabled the approval plugin"
+fi
+[ ! -e "$REPRELAUNCH/sudoers.d/oshioki" ] ||
+  fail "prelaunch on a migrated host re-installed the blanket NOPASSWD rule"
+for service in sudo sudo-i; do
+  cmp -s "$REPRELAUNCH/migrated/$service" "$REPRELAUNCH/pam.d/$service" ||
+    fail "prelaunch on a migrated host changed $service"
+done
+[ -f "$REPRELAUNCH/security/liboshioki_pam.so" ] || fail "prelaunch on a migrated host removed the module"
+# The dry run says the same thing and writes nothing.
+run_installer --sudo-user testuser "$REPRELAUNCH" --prelaunch --dry-run >"$REPRELAUNCH/dry.log" 2>&1 ||
+  fail "the prelaunch dry run failed on a migrated host"
+grep -Fq 'DRY: skip enabling' "$REPRELAUNCH/dry.log" ||
+  fail "the prelaunch dry run did not plan to skip the plugin lane"
+[ ! -e "$REPRELAUNCH/sudoers.d/oshioki" ] || fail "the prelaunch dry run wrote the blanket rule"
+
+# Crash litter is not a lane. A `sudo.XXXXXX` left behind by an interrupted
+# edit carries the whole block, and counting it would withhold the plugin
+# lane from that host forever.
+LITTER="$TEST_ROOT/pam-litter-not-a-lane"
+setup_legacy_host "$LITTER" ubuntu-24.04
+printf '%s\n' '# BEGIN oshioki pam' "$PAM_AUTH_LINE" '# END oshioki pam' > "$LITTER/pam.d/sudo.AbCdEf"
+run_installer --sudo-user testuser "$LITTER" --prelaunch >"$LITTER/log" 2>&1 ||
+  { sed -n '1,40p' "$LITTER/log" >&2; fail "prelaunch failed on a host with PAM edit litter"; }
+if grep -Fq 'this host is on the contextual PAM lane' "$LITTER/log"; then
+  fail "a leftover sudo.XXXXXX file was counted as a live PAM lane"
+fi
+grep -Fq '# BEGIN oshioki' "$LITTER/sudo.conf" || fail "litter host: the plugin block was not enabled"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$LITTER/sudoers.d/oshioki" ||
+  fail "litter host: the blanket rule was not installed"
+
+# The registry's three "not yet" shapes are distinguished, and a corrupt one
+# is a refusal rather than a skip.
+NOTYET="$TEST_ROOT/pam-registry-states"
+setup_legacy_host "$NOTYET" ubuntu-24.04
+printf '{"version":1,"devices":[]}\n' > "$NOTYET/state/devices.json"
+run_installer --sudo-user testuser "$NOTYET" --contextual-pam >"$NOTYET/empty.log" 2>&1 ||
+  fail "an empty registry was an error rather than a skip"
+grep -Fq 'no approval device pinned yet' "$NOTYET/empty.log" ||
+  fail "an empty registry was not reported as such"
+rm -f "$NOTYET/state/devices.json"
+run_installer --sudo-user testuser "$NOTYET" --contextual-pam >"$NOTYET/absent.log" 2>&1 ||
+  fail "an absent registry was an error rather than a skip"
+grep -Fq 'no approval device pinned yet' "$NOTYET/absent.log" ||
+  fail "an absent registry was not reported as such"
+printf 'not a registry\n' > "$NOTYET/state/devices.json"
+if run_installer --sudo-user testuser "$NOTYET" --contextual-pam >"$NOTYET/corrupt.log" 2>&1; then
+  fail "a corrupt registry was treated as a skip"
+fi
+grep -Fq 'is not a device registry' "$NOTYET/corrupt.log" || fail "missing corrupt-registry refusal"
+pam_unchanged "$NOTYET" || fail "a registry-state case modified a PAM file"
+
+# A configured lane whose module has gone missing is loud, and with no
+# device to prove a replacement it is a refusal, not a quiet skip: on macOS
+# that state makes every sudo answer PAM_ABORT.
+GONE="$TEST_ROOT/pam-module-missing"
+setup_legacy_host "$GONE" ubuntu-24.04
+run_installer --sudo-user testuser "$GONE" --contextual-pam >"$GONE/install.log" 2>&1 ||
+  { sed -n '1,40p' "$GONE/install.log" >&2; fail "could not migrate the missing-module host"; }
+rm -f "$GONE/security/$PAM_MODULE_ARTIFACT"
+run_installer --sudo-user testuser "$GONE" --contextual-pam >"$GONE/reinstall.log" 2>&1 ||
+  { sed -n '1,40p' "$GONE/reinstall.log" >&2; fail "a missing module was not reinstalled"; }
+grep -Fq 'the contextual PAM lane is configured but the module file is missing' "$GONE/reinstall.log" ||
+  fail "the missing module was not reported loudly"
+[ -f "$GONE/security/$PAM_MODULE_ARTIFACT" ] || fail "the missing module was not reinstalled"
+rm -f "$GONE/security/$PAM_MODULE_ARTIFACT"
+printf '{"version":1,"devices":[]}\n' > "$GONE/state/devices.json"
+if run_installer --sudo-user testuser "$GONE" --contextual-pam >"$GONE/notyet.log" 2>&1; then
+  fail "a configured lane with no module reported success on the not-yet path"
+fi
+grep -Fq 'run --disable-contextual-pam' "$GONE/notyet.log" ||
+  fail "the missing-module refusal does not name the way out"
+
+# A package upgrade ships a new module. It is staged beside the live one,
+# proven to load, and only then renamed into place; the PAM block never
+# moves, and a self-test failure leaves the old module running.
+REFRESH="$TEST_ROOT/pam-module-refresh"
+setup_legacy_host "$REFRESH" ubuntu-24.04
+run_installer --sudo-user testuser "$REFRESH" --contextual-pam >"$REFRESH/install.log" 2>&1 ||
+  { sed -n '1,40p' "$REFRESH/install.log" >&2; fail "could not migrate the refresh host"; }
+mkdir -p "$REFRESH/migrated" "$REFRESH/v2" "$REFRESH/v3"
+cp "$REFRESH/pam.d/"* "$REFRESH/migrated/"
+printf 'fake pam module v2\n' > "$REFRESH/v2/$PAM_MODULE_ARTIFACT"
+printf '%s  %s\n' "$(sha256_file "$REFRESH/v2/$PAM_MODULE_ARTIFACT")" "$PAM_MODULE_ARTIFACT" > "$REFRESH/v2/SHA256SUMS"
+printf 'fake pam module v3\n' > "$REFRESH/v3/$PAM_MODULE_ARTIFACT"
+printf '%s  %s\n' "$(sha256_file "$REFRESH/v3/$PAM_MODULE_ARTIFACT")" "$PAM_MODULE_ARTIFACT" > "$REFRESH/v3/SHA256SUMS"
+refresh_module="$REFRESH/security/$PAM_MODULE_ARTIFACT"
+
+OSHIOKI_CHECKSUMS="$REFRESH/v2/SHA256SUMS" PAM_MODULE_BIN="$REFRESH/v2/$PAM_MODULE_ARTIFACT" \
+  run_installer --sudo-user testuser "$REFRESH" --contextual-pam >"$REFRESH/refresh.log" 2>&1 ||
+  { sed -n '1,40p' "$REFRESH/refresh.log" >&2; fail "the module refresh failed"; }
+grep -Fq 'contextual PAM module refreshed' "$REFRESH/refresh.log" || fail "the refresh did not report itself"
+cmp -s "$REFRESH/v2/$PAM_MODULE_ARTIFACT" "$refresh_module" || fail "the refresh did not replace the module"
+for service in sudo sudo-i; do
+  cmp -s "$REFRESH/migrated/$service" "$REFRESH/pam.d/$service" || fail "the refresh changed $service"
+done
+[ ! -e "$refresh_module.oshioki-new" ] || fail "the refresh left its staged module behind"
+[ ! -e "$refresh_module.oshioki-previous" ] || fail "the refresh left its backup behind"
+
+# Re-running with the same module is a no-op that still exits 0.
+OSHIOKI_CHECKSUMS="$REFRESH/v2/SHA256SUMS" PAM_MODULE_BIN="$REFRESH/v2/$PAM_MODULE_ARTIFACT" \
+  run_installer --sudo-user testuser "$REFRESH" --contextual-pam >"$REFRESH/again.log" 2>&1 ||
+  fail "a second refresh with an unchanged module failed"
+grep -Fq 'already current' "$REFRESH/again.log" || fail "an unchanged module was not reported as current"
+
+# A staged module that does not load never reaches the live path.
+if OSHIOKI_CHECKSUMS="$REFRESH/v3/SHA256SUMS" PAM_MODULE_BIN="$REFRESH/v3/$PAM_MODULE_ARTIFACT" \
+   FAIL_PAM_SELFTEST=1 \
+   run_installer --sudo-user testuser "$REFRESH" --contextual-pam >"$REFRESH/selftest.log" 2>&1; then
+  fail "a refresh whose self-test failed reported success"
+fi
+grep -Fq 'is unchanged' "$REFRESH/selftest.log" || fail "the failed refresh did not say the module is unchanged"
+cmp -s "$REFRESH/v2/$PAM_MODULE_ARTIFACT" "$refresh_module" || fail "the failed refresh replaced the module"
+[ ! -e "$refresh_module.oshioki-new" ] || fail "the failed refresh left its staged module behind"
+for service in sudo sudo-i; do
+  cmp -s "$REFRESH/migrated/$service" "$REFRESH/pam.d/$service" || fail "the failed refresh changed $service"
+done
+
+# Disable sweeps the refresh staging names too: nothing ever references
+# them, and one left by an interrupted refresh is a stray copy of the module.
+printf 'stray\n' > "$refresh_module.oshioki-new"
+printf 'stray\n' > "$refresh_module.oshioki-previous"
+run_installer "$REFRESH" --disable-contextual-pam >"$REFRESH/disable.log" 2>&1 ||
+  { sed -n '1,40p' "$REFRESH/disable.log" >&2; fail "disable failed on the refresh host"; }
+[ ! -e "$refresh_module" ] || fail "disable left the module"
+[ ! -e "$refresh_module.oshioki-new" ] || fail "disable left a staged module"
+[ ! -e "$refresh_module.oshioki-previous" ] || fail "disable left a module backup"
 
 # Two modes at once is still rejected.
 if run_installer "$TEST_ROOT/pam-two-modes" --contextual-pam --prelaunch >"$TEST_ROOT/pam-two-modes.log" 2>&1; then
