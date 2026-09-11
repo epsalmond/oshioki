@@ -144,7 +144,30 @@ The helper exit status is the decision channel:
 | --- | --- | --- |
 | exit `0` | `PAM_SUCCESS` | Device authentication accepted. |
 | exit `2` | `PAM_AUTHINFO_UNAVAIL` | Device authentication is unavailable; the surrounding PAM stack may continue its normal password path. |
-| any other exit, signal, malformed output, or security failure | `PAM_AUTH_ERR` | Authentication did not succeed. |
+| any other exit, signal, malformed output, or security failure | `PAM_AUTH_ERR` (Linux) / `PAM_ABORT` (macOS) | Authentication did not succeed. |
+
+The hard-failure status is platform-dependent because the two PAM
+implementations express "stop here, fail closed" differently. On Linux the
+installer writes a bracket control
+(`auth [success=done authinfo_unavail=ignore module_unknown=ignore ignore=ignore default=die]`),
+so `PAM_AUTH_ERR` falls under `default=die` and denies the command. OpenPAM
+has no bracket controls: the macOS entry is
+`auth sufficient /usr/local/lib/pam/liboshioki_pam.dylib` in
+`/etc/pam.d/sudo_local`, and under `sufficient` a `PAM_AUTH_ERR` is merely
+recorded and ignored — evaluation would continue into `pam_opendirectory` and
+a typed password would authorise the command, silently erasing the refusal.
+`PAM_ABORT` (26 in both implementations) is the one status OpenPAM honours as
+an immediate abort of the whole chain, so macOS returns it for exactly the
+cases Linux dies on: a refused helper path, malformed helper output, and a
+repeat call on a handle that already has a result. The unavailable path is
+unchanged on both platforms.
+
+**This macOS mapping is unvalidated on hardware.** It is covered only by
+`a_hard_fault_maps_to_the_platform_fail_closed_status` in `pam/src/lib.rs`,
+which asserts the constant, not OpenPAM's reaction to it. If supervised Mac
+validation shows that `PAM_ABORT` under `sufficient` does not abort the
+chain, the fallback is to keep plain `PAM_AUTH_ERR` and document the
+asymmetry rather than to change the control word.
 
 Any failure to start the helper, and the bounded 90-second helper deadline,
 are classified as unavailable, never as a hard authentication failure. That
@@ -382,7 +405,11 @@ The following acceptance work remains open:
 - native sudo timestamps, `sudo -k`/`-K`, `sudo -v`, `sudo -n`, alternate
   principals, and administrator-selected `noninteractive_auth`;
 - known stock sudo-only service layouts, refusal of customized layouts,
-  staged module/config installation, upgrade, uninstall, and rollback;
+  staged module/config installation, upgrade, uninstall, and rollback. The
+  Linux half of this is now driven by `scripts/install-oshioki-hook
+  --contextual-pam` and covered by `scripts/test-install-oshioki-hook` and
+  `scripts/test-pam-acceptance`; the macOS half (`sudo_local`, `pam_tid`
+  coexistence, `PAM_ABORT`, code signing) is not;
 - diagnostic and progress forwarding. The current helper stderr channel is
   bounded and discarded, so no approval link or progress display should be
   inferred from this crate;

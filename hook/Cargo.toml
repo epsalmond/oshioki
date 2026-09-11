@@ -29,6 +29,10 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
 nix = { workspace = true }
+# Only for the dlopen/dlsym self-test of the built PAM module
+# (src/pam_selftest.rs). Already in Cargo.lock via nix and the plugin crate;
+# this adds no new package to the dependency graph.
+libc = { workspace = true }
 futures = { version = "0.3" }
 url = "2.5"
 

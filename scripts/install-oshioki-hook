@@ -4,10 +4,12 @@ set -euo pipefail
 
 MODE=""
 DRY_RUN=0
+SUPERVISED=0
 CONFIG_FILE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --prelaunch|--disable-prelaunch|--remove-sudoers-dropin|--prelaunch-status|--standalone-e2e)
+    --prelaunch|--disable-prelaunch|--remove-sudoers-dropin|--prelaunch-status|--standalone-e2e|\
+    --contextual-pam|--disable-contextual-pam|--contextual-pam-status)
       [ -z "$MODE" ] || { echo "install-oshioki-hook: choose exactly one mode" >&2; exit 2; }
       MODE="${1#--}"
       ;;
@@ -17,6 +19,9 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --dry-run) DRY_RUN=1 ;;
+    # Only --contextual-pam step 7 uses this: a live `sudo true` as the named
+    # account, with an administrator present to approve the device prompt.
+    --supervised) SUPERVISED=1 ;;
     *) echo "install-oshioki-hook: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -165,7 +170,10 @@ plan_sudoers_dropin() {
   printf 'DRY: write %s for passwordless sudo by %s\n' "$SUDOERS_FILE" "$user"
 }
 remove_sudoers_dropin() {
-  [ "$MODE" = prelaunch ] || [ "$MODE" = disable-prelaunch ] || [ "$MODE" = remove-sudoers-dropin ] || return 0
+  case "$MODE" in
+    prelaunch|disable-prelaunch|remove-sudoers-dropin|contextual-pam) ;;
+    *) return 0 ;;
+  esac
   [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ] || return 0
   dropin_user=""
   dropin_user="$(owned_sudoers_dropin_user)" || die "refusing to remove unverified sudoers drop-in: $SUDOERS_FILE"
@@ -225,6 +233,7 @@ restore_sudo_backups() {
       echo "install-oshioki-hook: rollback could not remove its sudo.conf backup; leaving the sudoers rule absent" >&2
       return 1
     fi
+    pam_trace "pam:rollback:plugin-restored:$SUDO_CONF"
   fi
   # rm first: the drop-in is 0440, so overwriting it in place fails.
   if [ -n "$dropin_backup" ] && [ -f "$dropin_backup" ]; then
@@ -240,6 +249,7 @@ restore_sudo_backups() {
       echo "install-oshioki-hook: rollback could not remove its sudoers backup" >&2
       return 1
     fi
+    pam_trace "pam:rollback:dropin-restored:$SUDOERS_FILE"
     # Keep repeated EXIT-trap cleanup idempotent: a second pass must not
     # mistake this restored file for a newly-created drop-in.
     dropin_original_present=1
@@ -458,6 +468,529 @@ validate_block() {
   validate_marker_pair "$source" "$BEGIN_MARK" "$END_MARK"
 }
 
+# ---------------------------------------------------------------------------
+# Contextual PAM authentication (issue #73)
+#
+# The legacy lane is a sudo plugin plus a blanket NOPASSWD rule in
+# sudoers.d. The contextual lane is a PAM auth module referenced from the
+# `sudo` service stack, with no sudoers rule at all: sudo keeps asking for
+# authentication and the module answers it from a hardware device, falling
+# back to the ordinary password when it cannot.
+#
+# Everything below owns exactly two artifacts per host: the module file in
+# the platform security directory, and one marker-delimited block per PAM
+# service file. `common-auth` is never touched and `pam-auth-update` is never
+# invoked: a mistake there would reach every service on the host, not just
+# sudo.
+# ---------------------------------------------------------------------------
+PAM_BEGIN_MARK='# BEGIN oshioki pam'
+PAM_END_MARK='# END oshioki pam'
+PAM_D="${PAM_D:-/etc/pam.d}"
+PAM_MODULE_BIN="${PAM_MODULE_BIN:-}"
+PAM_MULTIARCH_FILE="${OSHIOKI_PAM_MULTIARCH:-/usr/share/oshioki/pam-multiarch}"
+case "$(uname -s)" in
+  Darwin)
+    PAM_MODULE_NAME=liboshioki_pam.dylib
+    PAM_SERVICES="sudo_local"
+    ;;
+  *)
+    PAM_MODULE_NAME=liboshioki_pam.so
+    PAM_SERVICES="sudo sudo-i"
+    ;;
+esac
+# A packaging/test override in the same class as SUDO_PLUGIN_DIR and SBIN_DIR.
+# When it is empty the directory is discovered, never assumed.
+PAM_SECURITY_DIR="${PAM_SECURITY_DIR:-}"
+
+# One line per migration step, for the tests that assert the rollback chain
+# order. Inert unless INSTALL_TRACE names a file; the existing fake `cp` and
+# `rm` wrappers write to the same log, so step lines and file operations
+# interleave in real execution order.
+pam_trace() { [ -z "${INSTALL_TRACE:-}" ] || printf '%s\n' "$1" >> "$INSTALL_TRACE"; }
+
+pam_module_dest() { printf '%s/%s\n' "$1" "$PAM_MODULE_NAME"; }
+# The exact auth line, byte for byte. Linux gets a bracket control because
+# Linux-PAM has one; see pam/README.md for why each token is there, and in
+# particular why `module_unknown=ignore` is the difference between a degraded
+# install and a host where no sudo can ever succeed. macOS has no bracket
+# controls, so the module returns PAM_ABORT for the cases Linux dies on.
+pam_auth_line() {
+  if [ "$(uname -s)" = Darwin ]; then
+    printf 'auth       sufficient     %s\n' "$(pam_module_dest "$1")"
+  else
+    printf 'auth [success=done authinfo_unavail=ignore module_unknown=ignore ignore=ignore default=die] %s\n' "$PAM_MODULE_NAME"
+  fi
+}
+
+stat_owner() { stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null; }
+stat_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+
+# The mode as exactly four octal digits: special, user, group, other.
+padded_mode() {
+  local mode
+  mode="$(stat_mode "$1")" || return 1
+  case "$mode" in
+    ''|*[!0-7]*) return 1 ;;
+  esac
+  while [ "${#mode}" -lt 4 ]; do mode="0$mode"; done
+  [ "${#mode}" -eq 4 ] || return 1
+  printf '%s\n' "$mode"
+}
+
+# Root-owned and not writable by anyone else. Used for the helper the module
+# execs and for every parent directory on its path: a writable parent is a
+# writable helper one rename later.
+path_is_root_owned_and_tight() {
+  local target="$1" owner mode
+  owner="$(stat_owner "$target")" || return 1
+  [ "$owner" = 0 ] || return 1
+  mode="$(padded_mode "$target")" || return 1
+  # Group- and world-writable both lose: 2, 3, 6 and 7 all carry the write
+  # bit. A writable parent directory is a writable helper one rename later.
+  case "${mode:2:1}" in 2|3|6|7) return 1 ;; esac
+  case "${mode:3:1}" in 2|3|6|7) return 1 ;; esac
+  return 0
+}
+
+helper_path_secure() {
+  local helper="$SBIN_DIR/oshioki" directory mode
+  [ -f "$helper" ] && [ ! -L "$helper" ] || return 1
+  path_is_root_owned_and_tight "$helper" || return 1
+  mode="$(padded_mode "$helper")" || return 1
+  # No setuid and no setgid: the module runs the helper from sudo's already
+  # privileged PAM process and must never grant it privilege of its own.
+  case "${mode:0:1}" in 2|3|4|5|6|7) return 1 ;; esac
+  directory="$(dirname "$helper")"
+  while :; do
+    path_is_root_owned_and_tight "$directory" || return 1
+    [ "$directory" != / ] || break
+    directory="$(dirname "$directory")"
+  done
+  return 0
+}
+
+# Where this platform keeps PAM modules. Discovered from the packaging
+# database first, because a hard-coded multiarch triplet is wrong on every
+# architecture but one, and a module written to the wrong directory is a
+# module PAM cannot find -- which `module_unknown=ignore` turns into a silent
+# password-only host rather than a visible error.
+discover_security_dir() {
+  local dir="" candidate listed triplet
+  if [ -n "$PAM_SECURITY_DIR" ]; then
+    dir="$PAM_SECURITY_DIR"
+    # An explicit override is still checked, just against a weaker shape than
+    # a discovered path: it must be absolute and end in the directory name
+    # PAM module directories actually use. A packager pointing at a staging
+    # root or a distribution with a different prefix is legitimate; a typo
+    # that lands on /tmp or a home directory is not. The strong system-path
+    # regex below cannot be applied here because it would reject every
+    # staging root by construction.
+    printf '%s\n' "$dir" | grep -Eq '^/([A-Za-z0-9._+-]+/)*(security|pam)$' ||
+      die "refusing an implausible PAM security directory override: $dir"
+  elif [ "$(uname -s)" = Darwin ]; then
+    # /usr/lib/pam is SIP-protected. The module goes beside it in /usr/local
+    # and is referenced by absolute path, so OpenPAM's search path and its
+    # `.so.N` version probing never come into it.
+    dir=/usr/local/lib/pam
+  else
+    if command -v dpkg-query >/dev/null 2>&1; then
+      listed="$(dpkg-query -L libpam-modules 2>/dev/null | grep -E '/pam_unix\.so$' | head -1 || true)"
+      [ -z "$listed" ] || dir="$(dirname "$listed")"
+    fi
+    if [ -z "$dir" ]; then
+      for candidate in "/usr/lib/$(uname -m)-linux-gnu/security" /lib/security /usr/lib/security; do
+        [ -d "$candidate" ] || continue
+        dir="$candidate"
+        break
+      done
+    fi
+    [ -n "$dir" ] || die "could not locate the PAM security directory"
+    printf '%s\n' "$dir" | grep -Eq '^((/usr)?/lib/[a-z0-9_]+-linux-[a-z]+/security|/(usr/)?lib/security)$' ||
+      die "refusing an unexpected PAM security directory: $dir"
+  fi
+  safe_directory "$dir"
+  [ -d "$dir" ] || die "PAM security directory does not exist: $dir"
+  # This directory holds code libpam loads into every privileged sudo. On
+  # macOS its absolute path is written into sudo_local, so a directory
+  # anybody can write to is a standing offer to replace root-loaded code.
+  # Same predicate as the helper path, and applied to an explicit
+  # PAM_SECURITY_DIR override too -- which on Darwin has no pam_unix.so or
+  # multiarch cross-check behind it and would otherwise be unchecked.
+  path_is_root_owned_and_tight "$dir" ||
+    die "refusing a PAM security directory that is not root-owned and not writable by others: $dir"
+  if [ "$(uname -s)" != Darwin ]; then
+    # If pam_unix.so is not here, this is not the directory PAM loads from,
+    # whatever the path looks like.
+    [ -f "$dir/pam_unix.so" ] || die "no pam_unix.so in $dir; refusing to install a PAM module there"
+    # On a .deb install the build recorded the multiarch triplet it was built
+    # for. A mismatch means the package and the host disagree about the
+    # architecture; that is a hard refusal, never a warning.
+    if [ -f "$PAM_MULTIARCH_FILE" ]; then
+      triplet="$(head -1 "$PAM_MULTIARCH_FILE" | tr -d '[:space:]')"
+      if [ -n "$triplet" ]; then
+        case "$dir" in
+          "/usr/lib/$triplet/security"|"/lib/$triplet/security") ;;
+          *) die "packaged multiarch $triplet does not match the discovered $dir" ;;
+        esac
+      fi
+    fi
+  fi
+  printf '%s\n' "$dir"
+}
+
+# The file as an administrator's stock content: our owned block removed, then
+# comments and blank lines dropped. Fingerprinting this rather than the raw
+# file is what makes a re-run see the same stack the first run saw.
+pam_stock_view() {
+  local file="$1" line
+  line="$(pam_auth_line "${2:-}")"
+  [ -f "$file" ] || return 0
+  awk -v begin="$PAM_BEGIN_MARK" -v end="$PAM_END_MARK" -v authline="${line%$'\n'}" '
+    $0 == begin { inside=1; next }
+    $0 == end { inside=0; next }
+    inside { next }
+    $0 == authline { next }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    { print }
+  ' "$file"
+}
+
+# 0 = stock and editable, 1 = refuse, 2 = inherits the edit from another
+# service and must be skipped. Every refusal leaves the file untouched.
+pam_fingerprint_ok() {
+  local service="$1" dir="${2:-}" file view
+  file="$PAM_D/$service"
+  [ ! -L "$file" ] || return 1
+  if [ "$(uname -s)" = Darwin ]; then
+    pam_fingerprint_ok_darwin "$service" "$dir"
+    return
+  fi
+  # 3 = the service file does not exist on this host. Not every distribution
+  # ships sudo-i, and a service we were never asked to edit is not the same
+  # thing as one whose contents we refuse.
+  [ -f "$file" ] || return 3
+  # A line continued with a trailing backslash joins the next one, so the
+  # comment- and block-stripped view is not a faithful reading of what PAM
+  # parses -- a continued comment can swallow an auth line, or an auth line
+  # can be spelled across two. Refuse rather than guess.
+  if grep -q '\\$' "$file"; then
+    return 1
+  fi
+  view="$(pam_stock_view "$file" "$dir")"
+  # `sudo-i` is often just `@include sudo`, in which case editing `sudo` has
+  # already covered it and a second block would run the module twice.
+  # Every match here is case-insensitive: Linux-PAM compares the type and
+  # the @include directive with strcasecmp, so `AUTH` and `@Include` are the
+  # same words to it and must be the same words to us.
+  if printf '%s\n' "$view" | grep -Eqi '^[[:space:]]*@include[[:space:]]+sudo$'; then
+    return 2
+  fi
+  # An administrator with their own auth policy in this service is not a
+  # stack we understand well enough to edit.
+  #
+  # Every pattern here tolerates leading whitespace because Linux-PAM does:
+  # it strips it before parsing, so `  auth required pam_faillock.so preauth`
+  # is a live second factor. A column-0 anchor would call that file stock and
+  # land our `success=done` block after it, silently disabling the factor.
+  if printf '%s\n' "$view" | grep -Eqi '^[[:space:]]*auth[[:space:]]'; then
+    return 1
+  fi
+  [ "$(printf '%s\n' "$view" | grep -Eci '^[[:space:]]*@include[[:space:]]+common-auth$')" = 1 ] || return 1
+  # A liboshioki_pam reference outside our marker pair belongs to someone
+  # else; we never adopt it and never write a second one next to it.
+  if printf '%s\n' "$view" | grep -Fq liboshioki_pam; then
+    return 1
+  fi
+  return 0
+}
+
+# macOS: the module goes in sudo_local, but only if /etc/pam.d/sudo is the
+# stock stack that includes sudo_local as its first auth line. sudo_local
+# itself may hold comments, a pam_tid line, and our block -- nothing else.
+pam_fingerprint_ok_darwin() {
+  local dir="${2:-}" sudo_view local_view
+  [ -f "$PAM_D/sudo" ] && [ ! -L "$PAM_D/sudo" ] || return 1
+  if grep -q '\\$' "$PAM_D/sudo"; then
+    return 1
+  fi
+  if [ -f "$PAM_D/sudo_local" ] && grep -q '\\$' "$PAM_D/sudo_local"; then
+    return 1
+  fi
+  # Leading whitespace is tolerated for the same reason as on Linux: OpenPAM
+  # strips it, so an indented auth line is a live one.
+  sudo_view="$(pam_stock_view "$PAM_D/sudo" "$dir" | grep -Ei '^[[:space:]]*auth[[:space:]]' || true)"
+  [ "$(printf '%s\n' "$sudo_view" | sed -n '1p')" != "" ] || return 1
+  printf '%s\n' "$sudo_view" | sed -n '1p' | grep -Eqi '^[[:space:]]*auth[[:space:]]+include[[:space:]]+sudo_local$' || return 1
+  printf '%s\n' "$sudo_view" | sed -n '2p' | grep -Fq pam_smartcard.so || return 1
+  printf '%s\n' "$sudo_view" | sed -n '3p' | grep -Fq pam_opendirectory.so || return 1
+  [ "$(printf '%s\n' "$sudo_view" | grep -c .)" = 3 ] || return 1
+  if [ -e "$PAM_D/sudo_local" ]; then
+    [ -f "$PAM_D/sudo_local" ] && [ ! -L "$PAM_D/sudo_local" ] || return 1
+    local_view="$(pam_stock_view "$PAM_D/sudo_local" "$dir")"
+    # Comments and blanks are already gone from the view. What may remain is
+    # an administrator's pam_tid line and nothing else.
+    if printf '%s\n' "$local_view" | grep -q .; then
+      if printf '%s\n' "$local_view" | grep -q . && \
+         printf '%s\n' "$local_view" | grep -vEqi '^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_tid\.so$'; then
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+pam_block_present() {
+  local file="$1" dir="${2:-}" line
+  line="$(pam_auth_line "$dir")"
+  [ -f "$file" ] || return 1
+  grep -Fxq "$PAM_BEGIN_MARK" "$file" 2>/dev/null || return 1
+  grep -Fxq "${line%$'\n'}" "$file" 2>/dev/null
+}
+
+# Known and accepted, reviewed with the rest of this block:
+#
+# * No fsync before the rename. The temp file is renamed into place, which is
+#   atomic against a concurrent reader, but a power loss immediately after can
+#   leave a zero-length PAM file. This matches rewrite_block above and the
+#   sudoers drop-in writer; fixing it here alone would buy nothing, and
+#   `module_unknown=ignore` plus `@include common-auth` means a truncated
+#   sudo service still reaches pam_unix.
+# * A SIGKILL (which no trap can catch) leaves this function's mktemp file,
+#   and capture_pam_backups' snapshot, on disk. Both carry a dot in their
+#   names so PAM's own service lookup never matches them, and the next run
+#   overwrites the live file regardless; they are litter, not a hazard.
+#
+# awk's `print` always terminates a line, so a rewrite would silently add a
+# trailing newline to a file that had none. Match the source exactly: a
+# round trip through write + remove must be byte-identical.
+pam_match_trailing_newline() {
+  local source="$1" staged="$2" size
+  [ -f "$source" ] && [ -s "$source" ] || return 0
+  [ "$(tail -c 1 "$source" | od -An -t x1 | tr -d '[:space:]')" != 0a ] || return 0
+  [ -s "$staged" ] || return 0
+  size="$(wc -c < "$staged" | tr -d '[:space:]')"
+  head -c "$((size - 1))" "$staged" > "$staged.notrail" || return 1
+  mv -f "$staged.notrail" "$staged"
+}
+
+# Insert (or re-insert) the owned block. Idempotent by construction: an
+# existing owned block is dropped in the same pass that writes the new one, so
+# a second run produces byte-identical output. Every other line is preserved
+# in order.
+write_pam_block() {
+  local file="$1" dir="$2" tmp line
+  line="$(pam_auth_line "$dir")"; line="${line%$'\n'}"
+  regular_or_absent "$file"
+  # A file that does not exist yet (macOS sudo_local) has no markers to
+  # validate; validate_marker_pair counts grep hits and needs a real file.
+  [ ! -f "$file" ] || validate_marker_pair "$file" "$PAM_BEGIN_MARK" "$PAM_END_MARK" ||
+    die "malformed managed PAM block in $file"
+  tmp="$(mktemp "${file}.XXXXXX")" || die "could not stage an edit of $file"
+  if [ "$(uname -s)" = Darwin ]; then
+    # Appended after any pam_tid line: Touch ID first, local device second.
+    # Apple's own line is never rewritten or reordered.
+    if [ -f "$file" ]; then
+      awk -v begin="$PAM_BEGIN_MARK" -v end="$PAM_END_MARK" -v authline="$line" '
+        $0 == begin { inside=1; next }
+        $0 == end { inside=0; next }
+        inside { next }
+        $0 == authline { next }
+        # Only a live auth line counts. The stock sudo_local ships pam_tid
+        # commented out; appending after that comment would put our block
+        # above an administrator who later uncomments it.
+        { buf[n++]=$0; if (tolower($0) ~ /^[[:space:]]*auth[[:space:]]+.*pam_tid/) last=n }
+        END {
+          for (i = 0; i < n; i++) {
+            print buf[i]
+            if (i + 1 == last) { print begin; print authline; print end; done=1 }
+          }
+          if (!done) { print begin; print authline; print end }
+        }
+      ' "$file" > "$tmp" || { rm -f "$tmp"; die "could not rewrite $file"; }
+    else
+      printf '# sudo_local: created by install-oshioki-hook --contextual-pam\n%s\n%s\n%s\n' \
+        "$PAM_BEGIN_MARK" "$line" "$PAM_END_MARK" > "$tmp"
+    fi
+  else
+    [ -f "$file" ] || { rm -f "$tmp"; die "missing PAM service file: $file"; }
+    awk -v begin="$PAM_BEGIN_MARK" -v end="$PAM_END_MARK" -v authline="$line" '
+      $0 == begin { inside=1; next }
+      $0 == end { inside=0; next }
+      inside { next }
+      $0 == authline { next }
+      !done && tolower($0) ~ /^[[:space:]]*@include[[:space:]]+common-auth$/ {
+        print begin; print authline; print end; done=1
+      }
+      { print }
+      END { if (!done) exit 3 }
+    ' "$file" > "$tmp" || { rm -f "$tmp"; die "no @include common-auth anchor in $file"; }
+  fi
+  pam_match_trailing_newline "$file" "$tmp" || { rm -f "$tmp" "$tmp.notrail"; die "could not rewrite $file"; }
+  chmod 0644 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$file"
+}
+
+# Remove exactly our marker comments and our exact auth line, preserving
+# every other byte in order. A damaged marker pair is not a licence to delete
+# arbitrary text, and it must still not block removal of the auth line -- that
+# line is the live artifact.
+remove_pam_block() {
+  local file="$1" dir="$2" tmp line
+  line="$(pam_auth_line "$dir")"; line="${line%$'\n'}"
+  [ -f "$file" ] || return 0
+  regular_or_absent "$file"
+  tmp="$(mktemp "${file}.XXXXXX")" || die "could not stage an edit of $file"
+  # The dylib pattern is the one place this is not an exact-string match.
+  # The macOS auth line embeds the absolute module path, and that path is
+  # only known if the security directory can still be discovered -- which it
+  # cannot once someone has removed /usr/local/lib/pam. Matching our own
+  # module filename with any prefix removes the live line instead of leaving
+  # sudo pointing at a deleted dylib. It still names our module, so this is
+  # not a licence to delete arbitrary text.
+  awk -v begin="$PAM_BEGIN_MARK" -v end="$PAM_END_MARK" -v authline="$line" '
+    $0 == begin || $0 == end || $0 == authline { next }
+    tolower($0) ~ /^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+([^[:space:]]*\/)?liboshioki_pam\.dylib$/ { next }
+    { print }
+  ' "$file" > "$tmp" ||
+    { rm -f "$tmp"; die "could not rewrite $file"; }
+  pam_match_trailing_newline "$file" "$tmp" || { rm -f "$tmp" "$tmp.notrail"; die "could not rewrite $file"; }
+  chmod 0644 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$file"
+}
+
+pam_backups=""
+pam_rollback_armed=0
+
+# Snapshot every file the migration may edit, before anything is edited. An
+# absent file is recorded as absent, so rollback deletes what we created
+# rather than leaving an empty one behind.
+capture_pam_backups() {
+  local file tmp
+  pam_backups=""
+  pam_rollback_armed=1
+  for file in "$@"; do
+    if [ -e "$file" ]; then
+      regular_or_absent "$file"
+      tmp="$(mktemp "${file}.oshioki-backup.XXXXXX")" ||
+        die "could not create a PAM rollback backup for $file"
+      if ! cp -p "$file" "$tmp"; then
+        rm -f "$tmp"
+        die "could not back up $file"
+      fi
+      pam_backups="${pam_backups}${file}|${tmp}
+"
+    else
+      pam_backups="${pam_backups}${file}|-
+"
+    fi
+  done
+}
+
+# Rollback steps 1 and 2 of the four in the plan: PAM entries first (so the
+# module stops being referenced before it stops existing), then the module
+# file. Chained ahead of restore_sudo_backups, which does steps 3 and 4.
+# A second EXIT pass must be a no-op, so the armed flag and the entry list are
+# cleared before any work.
+restore_pam_backups() {
+  [ "$pam_rollback_armed" -eq 1 ] || return 0
+  local entries="$pam_backups" file tmp status=0
+  pam_backups=""
+  pam_rollback_armed=0
+  while IFS='|' read -r file tmp; do
+    [ -n "$file" ] || continue
+    if [ "$tmp" = "-" ]; then
+      rm -f "$file" || status=1
+    else
+      if cp -p "$tmp" "$file"; then rm -f "$tmp" || status=1; else status=1; fi
+    fi
+    pam_trace "pam:rollback:restored:$file"
+  done <<EOF
+$entries
+EOF
+  if [ "$status" -ne 0 ]; then
+    echo "install-oshioki-hook: rollback could not fully restore the PAM configuration" >&2
+  fi
+  return "$status"
+}
+
+# Disarm before deleting the snapshots, matching drop_sudo_backups: a signal
+# between the two must never restore half of a committed migration.
+drop_pam_backups() {
+  local entries="$pam_backups" file tmp status=0
+  pam_backups=""
+  pam_rollback_armed=0
+  while IFS='|' read -r file tmp; do
+    [ -n "$tmp" ] || continue
+    [ "$tmp" = "-" ] && continue
+    rm -f "$tmp" || status=1
+  done <<EOF
+$entries
+EOF
+  return "$status"
+}
+
+# The named services that this host will actually get a block in, with the
+# ones that inherit it recorded separately for status to report.
+pam_services_to_edit=""
+pam_services_inherited=""
+pam_services_absent=""
+classify_pam_services() {
+  local dir="$1" service status
+  pam_services_to_edit=""
+  pam_services_inherited=""
+  pam_services_absent=""
+  for service in $PAM_SERVICES; do
+    status=0
+    pam_fingerprint_ok "$service" "$dir" || status=$?
+    case "$status" in
+      0) pam_services_to_edit="${pam_services_to_edit}${service} " ;;
+      2) pam_services_inherited="${pam_services_inherited}${service} " ;;
+      3) pam_services_absent="${pam_services_absent}${service} " ;;
+      *) die "refusing a customised PAM stack: $PAM_D/$service is not a stock sudo layout" ;;
+    esac
+  done
+  [ -n "$pam_services_to_edit" ] || die "no editable PAM service found under $PAM_D"
+}
+
+# The checksum manifest, wherever this installation flow put it. A git
+# checkout builds it into target/release; a package ships it next to the
+# installer. Status must not pass a module it never verified, so callers
+# treat "not found" as a failure rather than a waiver.
+default_checksums() {
+  local candidate
+  for candidate in "$SERVICE_DIR/target/release/SHA256SUMS" "$SCRIPT_DIR/SHA256SUMS"; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+pam_module_checksum_ok() {
+  local module="$1" manifest="$2" name expected
+  name="$(basename "$module")"
+  expected="$(awk -v name="$name" '$2 == name {print $1}' "$manifest")"
+  [ "${#expected}" -eq 64 ] || return 1
+  [ "$(hash_file "$module")" = "$expected" ]
+}
+
+# `common-auth` is shared by every service on the host. If our module ever
+# appeared there it would run for ssh, login, polkit and cron, not just sudo.
+# Asserted after every edit rather than trusted.
+assert_common_auth_clean() {
+  [ -f "$PAM_D/common-auth" ] || return 0
+  if grep -F liboshioki_pam "$PAM_D/common-auth" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+validate_visudo() {
+  local checker
+  if [ "$DRY_RUN" -eq 1 ]; then printf 'DRY: visudo -c\n'; return 0; fi
+  checker="$(find_visudo)" || return 0
+  "$checker" -c >/dev/null 2>&1
+}
+
 if [ "$MODE" = prelaunch-status ]; then
   [ -f "$SUDO_CONF" ] || { echo "disabled"; exit 1; }
   validate_block "$SUDO_CONF"
@@ -497,20 +1030,27 @@ fi
 # Installation still rejects a malformed sudo.conf before touching any
 # binaries. Disablement is the one exception: its cleanup path must inspect
 # the independent drop-in even when this file cannot be parsed.
-if [ "$MODE" != disable-prelaunch ]; then
-  [ ! -f "$SUDO_CONF" ] || validate_block "$SUDO_CONF"
-fi
+case "$MODE" in
+  # Disablement and status must work on a host whose sudo.conf an
+  # administrator already deleted or damaged; installation still refuses one.
+  disable-prelaunch|disable-contextual-pam|contextual-pam-status) ;;
+  *) [ ! -f "$SUDO_CONF" ] || validate_block "$SUDO_CONF" ;;
+esac
 
 [ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || die "must run as root"
 safe_directory "$(dirname "$STATE_DIR")"; safe_directory "$STATE_DIR"; regular_or_absent "$SUDO_CONF"
 safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/oshioki"; regular_or_absent "$PLUGIN_DEST"
 regular_or_absent "$STATE_DIR/config.env"; regular_or_absent "$STATE_DIR/hook.json"; regular_or_absent "$STATE_DIR/devices.json"
 
-if [ "$DRY_RUN" -eq 0 ]; then
+if [ "$DRY_RUN" -eq 0 ] && [ "$MODE" != contextual-pam-status ]; then
   mkdir "$LOCK_DIR" 2>/dev/null || die "another installer holds $LOCK_DIR"
   cleanup_install() {
     # Do not allow a signal during rollback to re-enter this cleanup.
     trap - HUP INT TERM
+    # PAM entries and the module first, then sudo.conf and the sudoers rule:
+    # the module must stop being referenced before the legacy privilege
+    # artifacts come back.
+    restore_pam_backups || true
     restore_sudo_backups || true
     rmdir "$LOCK_DIR" 2>/dev/null || true
   }
@@ -567,6 +1107,388 @@ validate_sudo() {
   if [ "$DRY_RUN" -eq 1 ]; then printf 'DRY: sudo -V  # validate %s\n' "$SUDO_CONF"; return 0; fi
   sudo -V >/dev/null 2>&1
 }
+
+
+# Rollback for the contextual migration, in the plan's order: PAM entries and
+# the module first (restore_pam_backups), then sudo.conf and the sudoers rule
+# (restore_sudo_backups). Never the reverse: restoring the blanket NOPASSWD
+# rule while the module is still referenced would leave a host with two
+# authorization paths and no proof that either works.
+pam_rollback_all() {
+  restore_pam_backups || true
+  restore_sudo_backups || true
+}
+
+# Where the module could be, for a removal that must work even when discovery
+# fails (libpam-modules purged, a damaged multiarch file).
+pam_module_removal_targets() {
+  local dir candidate
+  dir="$(discover_security_dir 2>/dev/null)" || dir=""
+  [ -z "$dir" ] || printf '%s\n' "$(pam_module_dest "$dir")"
+  if [ "$(uname -s)" != Darwin ]; then
+    for candidate in "/usr/lib/$(uname -m)-linux-gnu/security" /lib/security /usr/lib/security; do
+      [ "$candidate" != "$dir" ] || continue
+      [ -f "$candidate/$PAM_MODULE_NAME" ] || continue
+      printf '%s/%s\n' "$candidate" "$PAM_MODULE_NAME"
+    done
+  fi
+}
+
+if [ "$MODE" = contextual-pam-status ]; then
+  # Eight lines, one per property the lane depends on. Exit 0 only if every
+  # one is OK: a status that reports a problem and still succeeds is a status
+  # nothing can be scripted against.
+  pam_status_rc=0
+  pam_status_ok() { printf 'OK    %s\n' "$1"; }
+  pam_status_bad() { printf 'FAIL  %s\n' "$1"; pam_status_rc=1; }
+
+  status_dir="$(discover_security_dir 2>/dev/null)" || status_dir=""
+  status_module=""
+  [ -z "$status_dir" ] || status_module="$(pam_module_dest "$status_dir")"
+
+  # 1. module present, and matching the manifest when one is available.
+  if [ -z "$status_module" ] || [ ! -f "$status_module" ]; then
+    pam_status_bad "module: not installed${status_dir:+ in $status_dir}"
+  else
+    status_manifest="${OSHIOKI_CHECKSUMS:-$(default_checksums || true)}"
+    if [ -z "$status_manifest" ] || [ ! -f "$status_manifest" ] || [ -L "$status_manifest" ]; then
+      # An unverified module is not an OK status line. Reporting success here
+      # would mean `--contextual-pam-status` exits 0 on a host where the file
+      # in the PAM search path was never checked against anything.
+      pam_status_bad "module: $status_module present but no SHA256SUMS manifest was found to verify it against"
+    elif pam_module_checksum_ok "$status_module" "$status_manifest"; then
+      pam_status_ok "module: $status_module (sha256 matches $status_manifest)"
+    else
+      pam_status_bad "module: $status_module does not match $status_manifest"
+    fi
+  fi
+
+  # 2. the owned entry, per service, with inheritance called out rather than
+  #    silently counted as present.
+  status_entries=""
+  status_entry_rc=0
+  for status_service in $PAM_SERVICES; do
+    status_fp=0
+    pam_fingerprint_ok "$status_service" "$status_dir" || status_fp=$?
+    if [ "$status_fp" = 3 ]; then
+      status_entries="${status_entries}${status_service}=no-such-service "
+    elif [ "$status_fp" = 2 ]; then
+      status_entries="${status_entries}${status_service}=inherited-via-include "
+    elif pam_block_present "$PAM_D/$status_service" "$status_dir"; then
+      status_entries="${status_entries}${status_service}=present "
+    else
+      status_entries="${status_entries}${status_service}=absent "
+      status_entry_rc=1
+    fi
+  done
+  if [ "$status_entry_rc" -eq 0 ]; then
+    pam_status_ok "pam entries: ${status_entries% }"
+  else
+    pam_status_bad "pam entries: ${status_entries% }"
+  fi
+
+  # 3. the stack we edited still looks like the stack we fingerprinted. An
+  #    administrator change under us is loud, not silent.
+  status_fingerprint_rc=0
+  status_fingerprints=""
+  for status_service in $PAM_SERVICES; do
+    status_fp=0
+    pam_fingerprint_ok "$status_service" "$status_dir" || status_fp=$?
+    case "$status_fp" in
+      0) status_fingerprints="${status_fingerprints}${status_service}=stock " ;;
+      2) status_fingerprints="${status_fingerprints}${status_service}=inherited " ;;
+      3) status_fingerprints="${status_fingerprints}${status_service}=no-such-service " ;;
+      *) status_fingerprints="${status_fingerprints}${status_service}=CHANGED "; status_fingerprint_rc=1 ;;
+    esac
+  done
+  if [ "$status_fingerprint_rc" -eq 0 ]; then
+    pam_status_ok "stock fingerprint: ${status_fingerprints% }"
+  else
+    pam_status_bad "stock fingerprint: ${status_fingerprints% } (an administrator changed the sudo stack under us)"
+  fi
+
+  # 4. common-auth, which we must never have touched.
+  if assert_common_auth_clean; then
+    pam_status_ok "common-auth: clean (no liboshioki_pam reference)"
+  else
+    pam_status_bad "common-auth: references liboshioki_pam; the module reaches every service on this host"
+  fi
+
+  # 5. the helper the module execs, and every parent on its path.
+  if helper_path_secure; then
+    pam_status_ok "helper: $SBIN_DIR/oshioki root-owned, not writable by others, not setuid"
+  else
+    pam_status_bad "helper: $SBIN_DIR/oshioki is missing, not root-owned, writable by others, or setuid"
+  fi
+
+  # 6. something that can actually answer an authentication.
+  if registry_has_active_passwordless_devices; then
+    pam_status_ok "devices: an active hardware-backed device is enrolled"
+  else
+    pam_status_bad "devices: no active hardware-backed device; every sudo falls back to a password"
+  fi
+
+  # 7. the legacy lane must be gone, not merely inactive.
+  status_legacy=""
+  if [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ]; then status_legacy="blanket-rule "; fi
+  if [ -f "$SUDO_CONF" ] && grep -q '^Plugin approval_exec ' "$SUDO_CONF" 2>/dev/null; then
+    status_legacy="${status_legacy}approval-plugin "
+  fi
+  if [ -z "$status_legacy" ]; then
+    pam_status_ok "legacy artifacts: none (no blanket sudoers rule, no approval plugin)"
+  else
+    pam_status_bad "legacy artifacts: ${status_legacy% } still present"
+  fi
+
+  # 8. sudo itself parses the result.
+  if validate_sudo; then
+    pam_status_ok "sudo -V: exits 0"
+  else
+    pam_status_bad "sudo -V: non-zero"
+  fi
+  exit "$pam_status_rc"
+fi
+
+if [ "$MODE" = contextual-pam ]; then
+  # Test-only fault injection, in the same class as SKIP_NODEVER above. Each
+  # name marks one step of the migration so the rollback chain can be
+  # asserted from the outside; none of them is a supported operator control.
+  FAIL_PAM_MODULE_INSTALL="${FAIL_PAM_MODULE_INSTALL:-0}"
+  FAIL_PAM_SELFTEST="${FAIL_PAM_SELFTEST:-0}"
+  FAIL_PAM_EDIT="${FAIL_PAM_EDIT:-}"
+  SIGNAL_AFTER_PAM_EDIT="${SIGNAL_AFTER_PAM_EDIT:-0}"
+
+  # --- Step 1: prerequisites. Nothing on this host has changed yet, so a
+  # refusal here is total and costs the administrator nothing.
+  [ -n "$PAM_MODULE_BIN" ] || die "PAM_MODULE_BIN is required for --contextual-pam"
+  PAM_MODULE_BIN="$(canonicalize "$PAM_MODULE_BIN")"
+  { [ -f "$PAM_MODULE_BIN" ] && [ ! -L "$PAM_MODULE_BIN" ]; } ||
+    die "missing or unsafe PAM module artifact: $PAM_MODULE_BIN"
+  PAM_CHECKSUMS="${OSHIOKI_CHECKSUMS:-$(default_checksums || true)}"
+  [ -n "$PAM_CHECKSUMS" ] || die "no artifact checksum manifest found"
+  PAM_CHECKSUMS="$(canonicalize "$PAM_CHECKSUMS")"
+  { [ -f "$PAM_CHECKSUMS" ] && [ ! -L "$PAM_CHECKSUMS" ]; } ||
+    die "missing artifact checksum manifest: $PAM_CHECKSUMS"
+  pam_module_checksum_ok "$PAM_MODULE_BIN" "$PAM_CHECKSUMS" ||
+    die "checksum mismatch for $(basename "$PAM_MODULE_BIN")"
+  security_dir="$(discover_security_dir)"
+  module_dest="$(pam_module_dest "$security_dir")"
+  safe_directory "$PAM_D"
+  classify_pam_services "$security_dir"
+  helper_path_secure ||
+    die "helper $SBIN_DIR/oshioki is missing or on an unsafe path; install the hook before migrating"
+  registry_has_active_passwordless_devices ||
+    die "no active hardware-backed approval device; pin one before migrating"
+  assert_common_auth_clean ||
+    die "$PAM_D/common-auth already references liboshioki_pam; refusing to touch this host"
+  pam_trace "pam:prereq-ok"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    # The plan mirrors the real order exactly, including the two removals
+    # that precede anything being installed.
+    remove_sudoers_dropin
+    if [ -f "$SUDO_CONF" ] && { grep -Fq "$BEGIN_MARK" "$SUDO_CONF" || has_our_plugin; }; then
+      echo "DRY: remove the managed Oshioki plugin block from $SUDO_CONF"
+    fi
+    validate_sudo
+    printf 'DRY: install %s to %s\n' "$PAM_MODULE_BIN" "$module_dest"
+    printf 'DRY: %s pam-selftest --module %s\n' "$SBIN_DIR/oshioki" "$module_dest"
+    for service in $pam_services_to_edit; do
+      printf 'DRY: insert the exact oshioki pam block into %s/%s\n' "$PAM_D" "$service"
+    done
+    for service in $pam_services_inherited; do
+      printf 'DRY: skip %s/%s (inherits the edit via @include sudo)\n' "$PAM_D" "$service"
+    done
+    for service in $pam_services_absent; do
+      printf 'DRY: skip %s/%s (no such service file on this host)\n' "$PAM_D" "$service"
+    done
+    printf 'DRY: assert %s/common-auth has no liboshioki_pam reference\n' "$PAM_D"
+    validate_visudo
+    validate_sudo
+    exit 0
+  fi
+
+  # --- Step 0 invariant: nothing has changed. Arm every rollback input
+  # before the first mutation, and snapshot the module destination alongside
+  # the PAM files so rollback treats it as one ordered set.
+  capture_dropin_backup
+  [ ! -f "$SUDO_CONF" ] || capture_sudo_conf_backup contextual-pam-rollback
+  pam_snapshot_targets=""
+  for service in $pam_services_to_edit; do
+    pam_snapshot_targets="$pam_snapshot_targets $PAM_D/$service"
+  done
+  # shellcheck disable=SC2086
+  capture_pam_backups $pam_snapshot_targets "$module_dest"
+
+  # --- Step 2: the blanket rule goes first, while the legacy plugin is still
+  # there to guard it. The reverse order would leave passwordless sudo with
+  # nothing approving it, even momentarily.
+  remove_sudoers_dropin
+  pam_trace "pam:dropin-removed"
+
+  # --- Step 3: the legacy plugin goes. From here until step 6 this host is
+  # on ordinary password sudo -- which is why there is no double-auth window
+  # and no intermediate state that grants more than stock sudo does.
+  if [ -f "$SUDO_CONF" ]; then
+    rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
+  fi
+  if ! validate_sudo; then
+    pam_rollback_all
+    die "sudo -V failed after removing the legacy plugin; restored the prior configuration"
+  fi
+  pam_trace "pam:plugin-removed"
+
+  # --- Step 4: the module lands but nothing references it yet: inert.
+  if [ "$FAIL_PAM_MODULE_INSTALL" = 1 ] ||
+     ! install -m 0644 -o root -g "$ROOT_GROUP" "$PAM_MODULE_BIN" "$module_dest"; then
+    pam_rollback_all
+    die "could not install the PAM module to $module_dest; this host is on password sudo"
+  fi
+  pam_trace "pam:module-installed:$module_dest"
+
+  # --- Step 5: prove the file actually loads and exports the auth entry
+  # points, while a failure still means no PAM file has been touched.
+  if [ "$FAIL_PAM_SELFTEST" = 1 ] ||
+     ! "$SBIN_DIR/oshioki" pam-selftest --module "$module_dest"; then
+    pam_rollback_all
+    die "PAM module self-test failed for $module_dest; no PAM configuration was changed"
+  fi
+  pam_trace "pam:selftest-ok"
+
+  # --- Step 6: the module goes live.
+  for service in $pam_services_to_edit; do
+    if [ "$FAIL_PAM_EDIT" = "$service" ]; then
+      pam_rollback_all
+      die "could not edit $PAM_D/$service; restored the prior configuration"
+    fi
+    write_pam_block "$PAM_D/$service" "$security_dir"
+    pam_trace "pam:edit:$service"
+    if [ "$SIGNAL_AFTER_PAM_EDIT" = 1 ]; then
+      kill -TERM $$
+      sleep 5
+    fi
+  done
+  if ! assert_common_auth_clean; then
+    pam_rollback_all
+    die "the module leaked into $PAM_D/common-auth; restored the prior configuration"
+  fi
+  pam_trace "pam:common-auth-clean"
+  if ! validate_visudo; then
+    pam_rollback_all
+    die "visudo -c failed after the PAM edit; restored the prior configuration"
+  fi
+  if ! validate_sudo; then
+    pam_rollback_all
+    die "sudo -V failed after the PAM edit; restored the prior configuration"
+  fi
+  pam_trace "pam:sudo-validated"
+
+  # --- Step 7: a live proof, only when an administrator is watching. This is
+  # the only step that needs a human, and the only one that can observe the
+  # module end to end on the real stack.
+  if [ "$SUPERVISED" -eq 1 ]; then
+    if [ ! -t 0 ]; then
+      echo "install-oshioki-hook: warning: --supervised needs a TTY on stdin; skipping the live proof" >&2
+    else
+      proof_user="$(sudoers_user)"
+      if [ -z "$proof_user" ]; then
+        pam_rollback_all
+        die "--supervised needs OSHIOKI_SUDO_USER to name the account that proves the stack"
+      fi
+      if ! valid_sudoers_user "$proof_user"; then
+        pam_rollback_all
+        die "invalid sudoers user: $proof_user"
+      fi
+      echo "install-oshioki-hook: approve the device prompt for $proof_user to finish the migration" >&2
+      if ! su -l "$proof_user" -c 'sudo -k && sudo true'; then
+        pam_rollback_all
+        die "the supervised sudo proof failed for $proof_user; restored the legacy configuration"
+      fi
+      pam_trace "pam:supervised-proof-ok"
+    fi
+  fi
+
+  # --- Step 8: commit. Both disarms come before the deletions, so a signal
+  # in this window cannot restore half a migration.
+  drop_pam_backups ||
+    echo "install-oshioki-hook: could not remove its PAM rollback backups" >&2
+  drop_sudo_backups
+  pam_trace "pam:committed"
+  echo "install-oshioki-hook: contextual PAM installed ($module_dest; services ${pam_services_to_edit% })"
+  [ -z "$pam_services_inherited" ] ||
+    echo "install-oshioki-hook: ${pam_services_inherited% } inherits the edit via @include sudo"
+  [ -z "$pam_services_absent" ] ||
+    echo "install-oshioki-hook: ${pam_services_absent% } does not exist on this host and was skipped"
+  exit 0
+fi
+
+if [ "$MODE" = disable-contextual-pam ]; then
+  # Strict order, and the only order that is safe: PAM entries out, sudo
+  # proven, and only then the file itself. Removing the module first would
+  # leave every /etc/pam.d/sudo pointing at a missing object; the installed
+  # control line survives that (module_unknown=ignore), but an older or
+  # hand-edited line would not, and the window is avoidable.
+  disable_dir="$(discover_security_dir 2>/dev/null)" || disable_dir=""
+  # On macOS the auth line embeds the module's absolute path, so a failed
+  # discovery would otherwise build the wrong line and leave the real one in
+  # place, pointing at a file this very run is about to delete. Fall back to
+  # the canonical location the installer owns; remove_pam_block's dylib
+  # pattern covers the rest.
+  if [ -z "$disable_dir" ] && [ "$(uname -s)" = Darwin ]; then
+    disable_dir=/usr/local/lib/pam
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    for service in $PAM_SERVICES; do
+      [ -f "$PAM_D/$service" ] || continue
+      printf 'DRY: remove the exact oshioki pam block from %s/%s\n' "$PAM_D" "$service"
+    done
+    validate_sudo
+    while IFS= read -r target; do
+      [ -n "$target" ] || continue
+      printf 'DRY: remove %s\n' "$target"
+    done <<EOF
+$(pam_module_removal_targets)
+EOF
+    exit 0
+  fi
+  for service in $PAM_SERVICES; do
+    [ -f "$PAM_D/$service" ] || continue
+    remove_pam_block "$PAM_D/$service" "$disable_dir"
+    pam_trace "pam:disable:edit:$service"
+  done
+  # A failure here exits non-zero with the module still installed, never the
+  # other way round.
+  validate_sudo || die "sudo -V failed after removing the PAM entries; the module is still installed"
+  pam_trace "pam:disable:sudo-validated"
+  # Someone else's reference to our module is not ours to strand. Unlinking
+  # the file while any service still names it is exactly the
+  # referenced-but-missing state this ordering exists to prevent.
+  # Our own litter is not a referrer: a crashed earlier run can leave a
+  # mktemp stage file, a rollback snapshot, or a .notrail intermediate next
+  # to the service it was editing, and every one of them contains the auth
+  # line. They are all "<service>.<something>"; a PAM service name is the
+  # bare name, so excluding that shape excludes exactly our own files.
+  disable_excludes=()
+  for service in $PAM_SERVICES; do
+    disable_excludes+=(--exclude="${service}.*")
+  done
+  disable_referrers="$(grep -rl "${disable_excludes[@]}" liboshioki_pam "$PAM_D" 2>/dev/null || true)"
+  if [ -n "$disable_referrers" ]; then
+    echo "install-oshioki-hook: $PAM_D still references the module; leaving it installed:" >&2
+    printf '%s\n' "$disable_referrers" | sed 's/^/  /' >&2
+    exit 1
+  fi
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    [ -e "$target" ] || continue
+    rm -f "$target" || die "could not remove $target"
+    pam_trace "pam:disable:module-removed:$target"
+  done <<EOF
+$(pam_module_removal_targets)
+EOF
+  echo "install-oshioki-hook: contextual PAM disabled and sudo validated"
+  exit 0
+fi
 
 if [ "$MODE" = disable-prelaunch ]; then
   # A package can be removed after an administrator has already deleted

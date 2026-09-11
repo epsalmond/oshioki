@@ -86,6 +86,12 @@ const PAM_AUTHINFO_UNAVAIL: c_int = 12;
 #[cfg(target_os = "macos")]
 const PAM_NO_MODULE_DATA: c_int = 24;
 
+/// Linux-PAM and `OpenPAM` both assign 26 to `PAM_ABORT`.  Verified against
+/// `security/_pam_types.h` on Linux-PAM; the macOS value is taken from
+/// `OpenPAM`'s `security/pam_constants.h` and is **not** validated on hardware
+/// (see `pam/README.md`).
+const PAM_ABORT: c_int = 26;
+
 const PAM_SERVICE: c_int = 1;
 const PAM_USER: c_int = 2;
 const PAM_TTY: c_int = 3;
@@ -251,6 +257,30 @@ enum HelperPathStatus {
     Insecure,
 }
 
+/// The status returned for a hard fault: a refused helper path
+/// (`HelperPathStatus::Insecure`), a malformed helper answer, or a repeat
+/// call on a handle that already has a result.  Never a transport problem,
+/// a cancellation, or a deadline — those stay `PAM_AUTHINFO_UNAVAIL`.
+///
+/// Linux stacks spell fail-closed with a bracket control: the installer
+/// writes `auth [... default=die] liboshioki_pam.so`, so `PAM_AUTH_ERR` ends
+/// the chain with a denial.  `OpenPAM` has no bracket controls, so the macOS
+/// entry is `auth sufficient /usr/local/lib/pam/liboshioki_pam.dylib`, and
+/// under `sufficient` a `PAM_AUTH_ERR` is merely recorded and ignored —
+/// evaluation continues into `pam_opendirectory` and a password authorises
+/// the command anyway.  `PAM_ABORT` is the one status `OpenPAM` honours as
+/// "abort the whole chain now", so macOS returns it to reach the same
+/// fail-closed outcome Linux gets from `default=die`.
+///
+/// This is unvalidated on Mac hardware; see `pam/README.md`.
+const fn hard_failure_status() -> c_int {
+    if cfg!(target_os = "macos") {
+        PAM_ABORT
+    } else {
+        PAM_AUTH_ERR
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PAM entry point and per-handle bookkeeping
 // ---------------------------------------------------------------------------
@@ -372,7 +402,7 @@ where
     match outcome {
         HelperOutcome::Success => PAM_SUCCESS,
         HelperOutcome::Unavailable => PAM_AUTHINFO_UNAVAIL,
-        HelperOutcome::Failure => PAM_AUTH_ERR,
+        HelperOutcome::Failure => hard_failure_status(),
     }
 }
 
@@ -390,7 +420,7 @@ fn decide_attempt(state: &mut AttemptState, key: &ContextKey) -> StateDecision {
         return StateDecision::Reuse(match state.outcome {
             AttemptOutcome::Unavailable => PAM_AUTHINFO_UNAVAIL,
             AttemptOutcome::Success | AttemptOutcome::Failure | AttemptOutcome::InProgress => {
-                PAM_AUTH_ERR
+                hard_failure_status()
             }
         });
     }
@@ -2888,12 +2918,12 @@ mod tests {
         let mut handle = FakeHandle::new();
         assert_eq!(
             attempt(&mut handle, &calls, HelperOutcome::Failure),
-            PAM_AUTH_ERR
+            hard_failure_status()
         );
         assert_eq!(calls.get(), 1);
         assert_eq!(
             attempt(&mut handle, &calls, HelperOutcome::Success),
-            PAM_AUTH_ERR
+            hard_failure_status()
         );
         assert_eq!(calls.get(), 1);
     }
@@ -2928,13 +2958,46 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(
             attempt(&mut handle, &calls, HelperOutcome::Success),
-            PAM_AUTH_ERR
+            hard_failure_status()
         );
         assert_eq!(calls.get(), 1);
         assert_eq!(
             handle.state.as_ref().unwrap().outcome,
             AttemptOutcome::Success
         );
+    }
+
+    /// Linux keeps the hard fault as `PAM_AUTH_ERR`, which the installer's
+    /// `default=die` control turns into a denial.  macOS has no bracket
+    /// controls, so the same fault must be `PAM_ABORT` for `OpenPAM` to abort
+    /// the chain under `auth sufficient`.  Unvalidated on hardware.
+    #[test]
+    fn a_hard_fault_maps_to_the_platform_fail_closed_status() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(hard_failure_status(), PAM_ABORT);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(hard_failure_status(), PAM_AUTH_ERR);
+        // Both PAM implementations number PAM_ABORT 26, and neither numbers
+        // it the same as its own PAM_AUTHINFO_UNAVAIL: a hard fault can never
+        // be mistaken for the fall-through-to-password status.
+        assert_eq!(PAM_ABORT, 26);
+        assert_ne!(hard_failure_status(), PAM_AUTHINFO_UNAVAIL);
+        assert_ne!(hard_failure_status(), PAM_SUCCESS);
+    }
+
+    /// The insecure-helper-path refusal reaches the same mapping, through
+    /// `HelperPathStatus::Insecure` -> `HelperOutcome::Failure`.
+    #[test]
+    fn an_insecure_helper_path_returns_the_fail_closed_status() {
+        let calls = Cell::new(0);
+        let mut handle = FakeHandle::new();
+        let status = match HelperPathStatus::Insecure {
+            HelperPathStatus::Valid => unreachable!(),
+            HelperPathStatus::Unavailable => HelperOutcome::Unavailable,
+            HelperPathStatus::Insecure => HelperOutcome::Failure,
+        };
+        assert_eq!(attempt(&mut handle, &calls, status), hard_failure_status());
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

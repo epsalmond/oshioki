@@ -117,6 +117,16 @@ enum Verb {
     Status,
     Watch,
     Test,
+    /// Private installer verb. `scripts/install-oshioki-hook --contextual-pam`
+    /// runs it after staging the PAM module and before any /etc/pam.d file
+    /// references it: dlopen the file, dlsym the two auth entry points,
+    /// dlclose, exit 0 or non-zero. Hidden for the same reason `check` and
+    /// `authenticate` are — it is not an operator command.
+    #[command(hide = true)]
+    PamSelftest {
+        #[arg(long)]
+        module: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +171,7 @@ async fn main() -> Result<()> {
         Verb::Status => cmd_status(),
         Verb::Watch => cmd_watch().await,
         Verb::Test => cmd_test().await,
+        Verb::PamSelftest { module } => pam_selftest::run(&module),
     };
     if let Err(error) = result {
         let exit_code = checking.then(|| check_error_exit_code(&error));
@@ -244,6 +255,8 @@ fn check_error_exit_code(error: &anyhow::Error) -> i32 {
 /// Audit records carry the `audit` target: approvals, denials, and a local
 /// agent leaving a request to NATS. The terminal layer drops that target and
 /// the syslog layer is the only place it lands.
+mod pam_selftest;
+
 mod logging {
     use std::fmt::Write as _;
     use std::os::unix::net::UnixDatagram;
@@ -2574,7 +2587,155 @@ fn pin_device_record(
     Ok(())
 }
 
+/// Where PAM service files live. Fixed, never configurable: this is a
+/// report about the host's real sudo stack, and a redirectable path would
+/// make it a report about nothing.
+const PAM_D_DIR: &str = "/etc/pam.d";
+const SUDO_CONF_PATH: &str = "/etc/sudo.conf";
+/// The marker comment `scripts/install-oshioki-hook` writes around its owned
+/// PAM entry. Kept identical to `PAM_BEGIN_MARK` there.
+const PAM_BEGIN_MARK: &str = "# BEGIN oshioki pam";
+#[cfg(target_os = "macos")]
+const PAM_MODULE_FILE: &str = "liboshioki_pam.dylib";
+#[cfg(not(target_os = "macos"))]
+const PAM_MODULE_FILE: &str = "liboshioki_pam.so";
+
+/// PAM service files the installer is allowed to own, in report order.
+#[cfg(target_os = "macos")]
+const PAM_SERVICES: [&str; 1] = ["sudo_local"];
+#[cfg(not(target_os = "macos"))]
+const PAM_SERVICES: [&str; 2] = ["sudo", "sudo-i"];
+
+/// Directories the module may have been installed into. The installer
+/// discovers exactly one of these from the packaging database; status only
+/// needs to find the file, so it checks all of them and reports the first
+/// hit.
+///
+/// The multiarch directories are enumerated, not derived. `std::env::consts::ARCH`
+/// is the Rust architecture name, which is not the Debian multiarch triplet
+/// component on every port (`powerpc64le` vs `powerpc64le-linux-gnu`,
+/// `arm` vs `arm-linux-gnueabihf`, …), so deriving the path would silently
+/// report "no module" on exactly the ports where it was hardest to install.
+/// Listing `/usr/lib/*/security` and `/lib/*/security` finds it whatever the
+/// triplet is called.
+fn pam_module_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![PathBuf::from("/usr/local/lib/pam")]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut candidates = vec![
+            PathBuf::from("/usr/lib/security"),
+            PathBuf::from("/lib/security"),
+        ];
+        for parent in ["/usr/lib", "/lib"] {
+            let Ok(entries) = fs::read_dir(parent) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let security = entry.path().join("security");
+                if security.is_dir() {
+                    candidates.push(security);
+                }
+            }
+        }
+        candidates
+    }
+}
+
+/// Read a file for the status report, distinguishing "this file says no"
+/// from "this process was not allowed to look".
+///
+/// `oshioki status` runs unprivileged as often as not, and `/etc/pam.d` or
+/// `/etc/sudo.conf` can be unreadable. Treating that as absence would print
+/// `sudo authentication: none` on a host that is in fact fully configured —
+/// the most misleading answer available.
+enum Readable {
+    Text(String),
+    Denied,
+    Absent,
+}
+
+fn read_for_status(path: &Path) -> Readable {
+    match fs::read_to_string(path) {
+        Ok(text) => Readable::Text(text),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Readable::Denied,
+        Err(_) => Readable::Absent,
+    }
+}
+
+/// One line describing how sudo currently authenticates on this host.
+///
+/// Derived from the filesystem, not from any state this tool writes: which
+/// `/etc/pam.d` services carry the installer's marker, whether the module
+/// file is actually present, and whether the legacy `approval_exec` plugin is
+/// still configured in `sudo.conf`. Contextual PAM is reported only when both
+/// an owned PAM entry and the module file exist — a marker with no module is
+/// the `module_unknown=ignore` degraded state and must not read as enabled.
+fn describe_sudo_authentication(pam_d: &Path, sudo_conf: &Path, module_dirs: &[PathBuf]) -> String {
+    let mut services: Vec<&str> = Vec::new();
+    let mut denied: Vec<String> = Vec::new();
+    for service in PAM_SERVICES {
+        match read_for_status(&pam_d.join(service)) {
+            Readable::Text(text) => {
+                if text.lines().any(|line| line.trim_end() == PAM_BEGIN_MARK) {
+                    services.push(service);
+                }
+            }
+            Readable::Denied => denied.push(pam_d.join(service).display().to_string()),
+            Readable::Absent => {}
+        }
+    }
+    let module = module_dirs
+        .iter()
+        .map(|directory| directory.join(PAM_MODULE_FILE))
+        .find(|candidate| candidate.is_file());
+    let legacy = match read_for_status(sudo_conf) {
+        Readable::Text(text) => text
+            .lines()
+            .any(|line| line.trim_start().starts_with("Plugin approval_exec ")),
+        Readable::Denied => {
+            denied.push(sudo_conf.display().to_string());
+            false
+        }
+        Readable::Absent => false,
+    };
+
+    // A file we could not read could have said anything. Only claim "none"
+    // when every input was actually inspected.
+    if services.is_empty() && !legacy && !denied.is_empty() {
+        return format!("unknown (cannot read {})", denied.join(", "));
+    }
+
+    match (services.is_empty(), module) {
+        (false, Some(path)) => format!(
+            "contextual PAM (module {}; services {})",
+            path.display(),
+            services.join(", ")
+        ),
+        (false, None) => format!(
+            "contextual PAM entry present in {} but the module file is missing (sudo falls back to a password)",
+            services.join(", ")
+        ),
+        (true, _) if legacy => "legacy approval plugin".to_owned(),
+        (true, Some(path)) => format!(
+            "none (module staged at {} but no PAM service references it)",
+            path.display()
+        ),
+        (true, None) => "none".to_owned(),
+    }
+}
+
 fn cmd_status() -> Result<()> {
+    println!(
+        "sudo authentication: {}",
+        describe_sudo_authentication(
+            Path::new(PAM_D_DIR),
+            Path::new(SUDO_CONF_PATH),
+            &pam_module_candidates(),
+        )
+    );
     let registry = load_registry()?;
     println!("Enrolled devices ({}):", registry.devices.len());
     for device in registry.devices {
@@ -3077,6 +3238,136 @@ fn pid_chain_darwin() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a throwaway /etc/pam.d + sudo.conf + security dir triple and
+    /// returns what `oshioki status` would print for it.
+    fn sudo_authentication_line(
+        services: &[(&str, bool)],
+        module_present: bool,
+        legacy_plugin: bool,
+    ) -> (String, PathBuf) {
+        let root = std::env::temp_dir().join(format!("oshioki-sudo-auth-{}", Uuid::new_v4()));
+        let pam_d = root.join("pam.d");
+        let security = root.join("security");
+        fs::create_dir_all(&pam_d).unwrap();
+        fs::create_dir_all(&security).unwrap();
+        for (service, owned) in services {
+            let body = if *owned {
+                format!(
+                    "session required pam_limits.so\n{PAM_BEGIN_MARK}\nauth [success=done] {PAM_MODULE_FILE}\n# END oshioki pam\n@include common-auth\n"
+                )
+            } else {
+                "session required pam_limits.so\n@include common-auth\n".to_owned()
+            };
+            fs::write(pam_d.join(service), body).unwrap();
+        }
+        if module_present {
+            fs::write(security.join(PAM_MODULE_FILE), b"not really a module").unwrap();
+        }
+        let sudo_conf = root.join("sudo.conf");
+        if legacy_plugin {
+            fs::write(
+                &sudo_conf,
+                "Plugin approval_exec /usr/local/libexec/sudo/oshioki.so\n",
+            )
+            .unwrap();
+        }
+        let line = describe_sudo_authentication(&pam_d, &sudo_conf, &[security]);
+        (line, root)
+    }
+
+    #[test]
+    fn status_reports_contextual_pam_only_when_entry_and_module_both_exist() {
+        let owned: Vec<(&str, bool)> = PAM_SERVICES.iter().map(|name| (*name, true)).collect();
+        let (line, root) = sudo_authentication_line(&owned, true, false);
+        fs::remove_dir_all(&root).ok();
+        assert!(line.starts_with("contextual PAM (module "), "{line}");
+        for service in PAM_SERVICES {
+            assert!(line.contains(service), "{line}");
+        }
+        assert!(line.contains(PAM_MODULE_FILE), "{line}");
+    }
+
+    #[test]
+    fn status_calls_out_an_entry_whose_module_file_is_gone() {
+        let owned: Vec<(&str, bool)> = PAM_SERVICES.iter().map(|name| (*name, true)).collect();
+        let (line, root) = sudo_authentication_line(&owned, false, false);
+        fs::remove_dir_all(&root).ok();
+        assert!(line.contains("module file is missing"), "{line}");
+    }
+
+    #[test]
+    fn status_reports_the_legacy_plugin_when_no_pam_entry_is_owned() {
+        let bare: Vec<(&str, bool)> = PAM_SERVICES.iter().map(|name| (*name, false)).collect();
+        let (line, root) = sudo_authentication_line(&bare, false, true);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(line, "legacy approval plugin");
+    }
+
+    #[test]
+    fn status_reports_none_on_an_untouched_host() {
+        let bare: Vec<(&str, bool)> = PAM_SERVICES.iter().map(|name| (*name, false)).collect();
+        let (line, root) = sudo_authentication_line(&bare, false, false);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(line, "none");
+    }
+
+    /// A module staged into the security directory but referenced by nothing
+    /// is inert -- the state the installer leaves behind between its staging
+    /// step and its PAM edit. It must not read as enabled.
+    #[test]
+    fn status_reports_none_for_a_staged_but_unreferenced_module() {
+        let bare: Vec<(&str, bool)> = PAM_SERVICES.iter().map(|name| (*name, false)).collect();
+        let (line, root) = sudo_authentication_line(&bare, true, false);
+        fs::remove_dir_all(&root).ok();
+        assert!(line.starts_with("none (module staged at "), "{line}");
+    }
+
+    /// An unreadable /etc/pam.d must never read as "nothing is configured".
+    #[test]
+    fn status_reports_unknown_when_it_cannot_read_the_pam_files() {
+        let root =
+            std::env::temp_dir().join(format!("oshioki-sudo-auth-denied-{}", Uuid::new_v4()));
+        let pam_d = root.join("pam.d");
+        fs::create_dir_all(&pam_d).unwrap();
+        for service in PAM_SERVICES {
+            let path = pam_d.join(service);
+            fs::write(&path, "@include common-auth\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let line = describe_sudo_authentication(&pam_d, &root.join("sudo.conf"), &[]);
+        // Determined empirically rather than by uid: root (and anything with
+        // CAP_DAC_OVERRIDE) reads a 0000 file anyway, and then "none" is the
+        // correct answer.
+        let mode_is_enforced = fs::read_to_string(pam_d.join(PAM_SERVICES[0])).is_err();
+        for service in PAM_SERVICES {
+            fs::set_permissions(pam_d.join(service), fs::Permissions::from_mode(0o600)).ok();
+        }
+        fs::remove_dir_all(&root).ok();
+        if mode_is_enforced {
+            assert!(line.starts_with("unknown (cannot read "), "{line}");
+        } else {
+            assert_eq!(line, "none");
+        }
+    }
+
+    /// The multiarch security directories are enumerated from the filesystem
+    /// rather than derived from the Rust architecture name.
+    #[test]
+    fn pam_module_candidates_include_the_fixed_paths_and_do_not_panic() {
+        let candidates = pam_module_candidates();
+        assert!(!candidates.is_empty());
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(candidates.contains(&PathBuf::from("/usr/lib/security")));
+            assert!(candidates.iter().all(|path| path.is_absolute()));
+            // Every globbed entry is a real directory named "security".
+            for candidate in candidates.iter().skip(2) {
+                assert_eq!(candidate.file_name().unwrap(), "security");
+                assert!(candidate.is_dir(), "{}", candidate.display());
+            }
+        }
+    }
 
     #[test]
     fn check_exit_codes_keep_password_fallback_only_for_unavailable_approval() {

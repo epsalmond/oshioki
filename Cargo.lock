@@ -1312,6 +1312,7 @@ dependencies = [
  "ciborium",
  "clap",
  "futures",
+ "libc",
  "nix",
  "oshioki-protocol",
  "oshioki-transport",

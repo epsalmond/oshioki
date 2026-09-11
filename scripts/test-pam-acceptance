@@ -39,6 +39,14 @@
 #     ignored, and a typed password still authorises the command (scenario
 #     11). Under this stack's `default=die` an exit 1 there would deny sudo
 #     with no password prompt at all.
+#   * The shipped installer produces this stack from a legacy host, retiring
+#     the approval plugin and the blanket NOPASSWD rule in the same run, and
+#     writing the exact control line with `module_unknown=ignore` -- which
+#     scenario 12 then proves is what keeps a missing module from locking the
+#     host out of sudo entirely.
+#   * `--disable-contextual-pam` restores byte-identical stock PAM files and
+#     removes the module, entries first (scenario 13), and a customised sudo
+#     stack is refused with nothing modified (scenario 14).
 #
 # WHAT THIS DOES NOT PROVE
 #   * A hardware-backed authentication SUCCESS. Secure Enclave needs a
@@ -46,9 +54,13 @@
 #     container, so no scenario here returns PAM_SUCCESS from the module. The
 #     success arm of the exit-0 contract is covered only by pam/ unit tests.
 #   * macOS / OpenPAM behaviour of any kind.
-#   * Any installer, packaging, upgrade, or rollback workflow: this script
-#     installs the module by hand and never runs pam-auth-update. The module
-#     is placed in /etc/pam.d/sudo ONLY, never common-auth.
+#   * Debian packaging, or any macOS workflow. The Linux installer IS
+#     exercised -- the stack under test is produced by
+#     `install-oshioki-hook --contextual-pam` migrating off a legacy plugin +
+#     blanket-NOPASSWD host -- but `pam-auth-update` is never run and the
+#     module is placed in /etc/pam.d/sudo and sudo-i ONLY, never common-auth.
+#   * Rollback of a failed migration. The fault-injection cases for that live
+#     in scripts/test-install-oshioki-hook, against a fake root.
 #   * Server, browser, or NATS delivery of an authentication envelope. Only
 #     the local agent socket transport is exercised.
 #   * Any hardware device answering. Scenario 5's registry relabels the test
@@ -153,6 +165,9 @@ PY
 
 cp "$FIXTURES/pty_sudo.py" "$SHARE/pty_sudo.py"
 cp "$FIXTURES/stall_agent.py" "$SHARE/stall_agent.py"
+# The stack under test is installed by the real installer, not by hand: the
+# whole point of scenarios 12-14 is that the shipped installer produces it.
+cp "$SCRIPT_DIR/install-oshioki-hook" "$SHARE/install-oshioki-hook"
 
 # --- container bootstrap -------------------------------------------------
 echo "* container: $CONTAINER ($IMAGE)"
@@ -170,21 +185,9 @@ in_container '
     apt-get install -y -qq sudo passwd libpam-runtime libpam-modules python3 \
         procps >/dev/null
 
-    # The module goes where this distribution actually keeps PAM modules for
-    # this architecture. The directory is discovered from the dpkg file list
-    # for libpam-modules rather than assumed, and then cross-checked against
-    # the multiarch layout /usr/lib/<triplet>/security. (dpkg-architecture
-    # would name the triplet directly but lives in dpkg-dev, which drags in a
-    # whole toolchain for one string.)
-    security_dir="$(dirname "$(dpkg-query -L libpam-modules | grep -E "/pam_unix[.]so$" | head -1)")"
-    [ -d "$security_dir" ] || { echo "could not locate the PAM module directory" >&2; exit 1; }
-    case "$security_dir" in
-        /usr/lib/*-linux-*/security) ;;
-        *) echo "unexpected PAM module directory $security_dir" >&2; exit 1 ;;
-    esac
-    printf "%s\n" "$security_dir" >/run/oshioki-test/security-dir
-    install -o root -g root -m 0644 \
-        /run/oshioki-release/liboshioki_pam.so "$security_dir/liboshioki_pam.so"
+    # The module directory is NOT chosen here. install-oshioki-hook discovers
+    # it, and the test records what the installer decided so the scenarios can
+    # find the file.
 
     # Observation store. Root-only: the request JSON is captured here and the
     # fixture account must not be able to read or forge it.
@@ -230,29 +233,12 @@ WRAP
 JSON
     chmod 0644 /etc/oshioki/hook.json
 
-    # PAM stack. Both stock services keep their own account and session
-    # includes; only the auth line changes, and common-auth is never touched.
+    # Byte-exact "before" copies. Scenario 13 asserts that
+    # --disable-contextual-pam restores exactly these.
     for service in sudo sudo-i; do
         cp "/etc/pam.d/$service" "/run/oshioki-obs/$service.pam.orig"
-        grep -Fq "@include common-auth" "/run/oshioki-obs/$service.pam.orig" || {
-            echo "/etc/pam.d/$service does not include common-auth; stack assumption broken" >&2
-            exit 1
-        }
-        {
-            printf "%s\n" "# Test-only stack for scripts/test-pam-acceptance."
-            awk '\''/^@include common-auth$/ {
-                    print "auth [success=done authinfo_unavail=ignore default=die] liboshioki_pam.so"
-                    print "auth required pam_unix.so"
-                    next
-                }
-                { print }'\'' "/run/oshioki-obs/$service.pam.orig"
-        } >"/etc/pam.d/$service"
     done
-    cp /etc/pam.d/sudo /run/oshioki-obs/sudo.pam.test
-    if grep -Fq liboshioki_pam.so /etc/pam.d/common-auth; then
-        echo "the module leaked into common-auth" >&2
-        exit 1
-    fi
+    cp /etc/pam.d/common-auth /run/oshioki-obs/common-auth.orig
 
     useradd --create-home --shell /bin/bash fixture
     chpasswd </run/oshioki-test/fixture-password
@@ -269,6 +255,72 @@ fixture ALL=(root) PASSWD: ALL
 fixture ALL=(root) NOPASSWD: /usr/local/bin/oshioki-nopass
 SUDOERS
     chmod 0440 /etc/sudoers.d/oshioki-pam-acceptance
+    visudo -c >/dev/null
+
+    # ---------------------------------------------------------------------
+    # The legacy state this host is migrating FROM: the approval plugin in
+    # sudo.conf and the blanket NOPASSWD drop-in. Writing it first is what
+    # makes the run exercise the migration path rather than a green-field
+    # install -- the installer has to take both of these out, in order,
+    # before the module exists.
+    # ---------------------------------------------------------------------
+    install -d -o root -g root -m 0755 /usr/local/libexec/sudo
+    printf "%s\n" "# BEGIN oshioki" \
+        "Plugin approval_exec /usr/local/libexec/sudo/oshioki.so" \
+        "# END oshioki" >/etc/sudo.conf
+    chmod 0644 /etc/sudo.conf
+    printf "fixture ALL=(ALL) NOSETENV: NOPASSWD: ALL\n" >/etc/sudoers.d/oshioki
+    chmod 0440 /etc/sudoers.d/oshioki
+    chown root:root /etc/sudoers.d/oshioki
+
+    # An active hardware-backed device: the installer refuses to migrate a
+    # host that has nothing capable of answering an authentication.
+    install -o root -g root -m 0600 /run/oshioki-test/devices-hardware.json /etc/oshioki/devices.json
+
+    # The installer verifies the module against a checksum manifest. The
+    # release mount is read-only, so the manifest is built next to it.
+    ( cd /run/oshioki-release && sha256sum liboshioki_pam.so ) >/run/oshioki-obs/SHA256SUMS
+
+    install -d -o root -g root -m 0755 /run/oshioki-installer/scripts
+    install -o root -g root -m 0755 /run/oshioki-test/install-oshioki-hook \
+        /run/oshioki-installer/scripts/install-oshioki-hook
+
+    OSHIOKI_CHECKSUMS=/run/oshioki-obs/SHA256SUMS \
+    PAM_MODULE_BIN=/run/oshioki-release/liboshioki_pam.so \
+        /run/oshioki-installer/scripts/install-oshioki-hook --contextual-pam
+
+    security_dir="$(dirname "$(dpkg-query -L libpam-modules | grep -E "/pam_unix[.]so$" | head -1)")"
+    printf "%s\n" "$security_dir" >/run/oshioki-test/security-dir
+    [ -f "$security_dir/liboshioki_pam.so" ] || {
+        echo "the installer did not place the module in $security_dir" >&2; exit 1; }
+
+    # Everything below is an assertion about what the INSTALLER produced.
+    for service in sudo sudo-i; do
+        grep -Fxq "auth [success=done authinfo_unavail=ignore module_unknown=ignore ignore=ignore default=die] liboshioki_pam.so" \
+            "/etc/pam.d/$service" || {
+            echo "/etc/pam.d/$service has no exact oshioki auth line" >&2; exit 1; }
+        [ "$(grep -c "^# BEGIN oshioki pam$" "/etc/pam.d/$service")" = 1 ] || {
+            echo "/etc/pam.d/$service block count is wrong" >&2; exit 1; }
+        sed "/^# BEGIN oshioki pam$/,/^# END oshioki pam$/d" "/etc/pam.d/$service" \
+            >/run/oshioki-obs/$service.stripped
+        cmp -s "/run/oshioki-obs/$service.stripped" "/run/oshioki-obs/$service.pam.orig" || {
+            echo "/etc/pam.d/$service changed outside the owned block" >&2; exit 1; }
+    done
+    cp /etc/pam.d/sudo /run/oshioki-obs/sudo.pam.test
+    cp /etc/pam.d/sudo-i /run/oshioki-obs/sudo-i.pam.test
+    if grep -Fq liboshioki_pam.so /etc/pam.d/common-auth; then
+        echo "the module leaked into common-auth" >&2
+        exit 1
+    fi
+    cmp -s /etc/pam.d/common-auth /run/oshioki-obs/common-auth.orig || {
+        echo "common-auth was modified" >&2; exit 1; }
+    # The legacy lane is gone in the same run: no double-authentication
+    # window, and no blanket NOPASSWD rule left behind.
+    [ ! -e /etc/sudoers.d/oshioki ] || {
+        echo "the migration left the blanket NOPASSWD rule in place" >&2; exit 1; }
+    if grep -q "^Plugin approval_exec " /etc/sudo.conf; then
+        echo "the migration left the legacy approval plugin configured" >&2; exit 1
+    fi
     visudo -c >/dev/null
 ' >"$SHARE/bootstrap.log" 2>&1 || {
     echo 'FAIL: container bootstrap' >&2
@@ -845,6 +897,140 @@ scenario_ack_then_drop() {
     report_pass "$name" "rc=$rc elapsed=${elapsed}ms helper_invocations=$count drops=$dropped strays=0 (exit 2 -> password fallback)"
 }
 
+# =========================================================================
+# Scenario 12: the module file is gone but the PAM entry is still there.
+#
+# This is the whole reason the installed control line carries
+# `module_unknown=ignore`. Without that token a removal-ordering bug, an
+# architecture mismatch, or a `dpkg --purge` race would meet `default=die` and
+# deny EVERY sudo on the host with no password prompt at all -- an
+# unrecoverable lockout from a missing file.
+#
+# Expectation: PAM cannot load the module, ignores it, and the ordinary
+# password path still authorises the command. The helper never runs.
+# =========================================================================
+scenario_missing_module() {
+    local name=12-missing-module
+    local log="$SHARE/$name.log"
+    local security_dir
+    security_dir="$(cat "$SHARE/security-dir")"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    in_container "mv $security_dir/liboshioki_pam.so /run/oshioki-obs/liboshioki_pam.stashed" >/dev/null
+    local driver=0
+    pty_run "$log" --expect-prompt yes --timeout 40 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true || driver=$?
+    in_container "install -o root -g root -m 0644 /run/oshioki-obs/liboshioki_pam.stashed $security_dir/liboshioki_pam.so
+                  rm -f /run/oshioki-obs/liboshioki_pam.stashed" >/dev/null
+    [ "$driver" -eq 0 ] || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc prompts count
+    rc="$(pty_field "$log" PTY_RC)"
+    prompts="$(pty_field "$log" PTY_PROMPT)"
+    count="$(obs_count)"
+    [ "$count" = 0 ] || { report_fail "$name" "the helper ran $count time(s) with the module removed"; return; }
+    [ "$rc" = 0 ] || {
+        report_fail "$name" "a missing module denied sudo (rc=$rc); module_unknown=ignore is not doing its job" "$log"
+        return
+    }
+    [ "${prompts:-0}" != 0 ] || { report_fail "$name" 'no password prompt appeared; the stack did not fall through' "$log"; return; }
+    report_pass "$name" "rc=$rc prompts=$prompts helper_invocations=0 (module_unknown=ignore -> password path)"
+}
+
+# =========================================================================
+# Scenario 13: --disable-contextual-pam.
+#
+# Expectation: /etc/pam.d/sudo and sudo-i come back byte-identical to the
+# files the distribution shipped, the module file is gone, and the order was
+# PAM entries first. Uninstall that leaves a referenced-but-missing module, or
+# a "restored" file that is merely equivalent rather than identical, is a
+# failed uninstall.
+# =========================================================================
+scenario_disable() {
+    local name=13-disable
+    local log="$SHARE/$name.log"
+    local security_dir
+    security_dir="$(cat "$SHARE/security-dir")"
+    if ! in_container "INSTALL_TRACE=/run/oshioki-obs/disable.trace \
+            /run/oshioki-installer/scripts/install-oshioki-hook --disable-contextual-pam" \
+            >"$log" 2>&1; then
+        report_fail "$name" '--disable-contextual-pam exited non-zero' "$log"
+        return
+    fi
+    local identical=1 detail=""
+    for service in sudo sudo-i; do
+        if ! in_container "cmp -s /etc/pam.d/$service /run/oshioki-obs/$service.pam.orig" >/dev/null 2>&1; then
+            identical=0
+            detail="$detail $service"
+        fi
+    done
+    [ "$identical" = 1 ] || { report_fail "$name" "uninstall did not restore stock bytes for:$detail" "$log"; return; }
+    if in_container "test -e $security_dir/liboshioki_pam.so" >/dev/null 2>&1; then
+        report_fail "$name" 'uninstall left the module file behind'
+        return
+    fi
+    # The order is the safety property: entries out before the file goes.
+    local order
+    order="$(in_container 'grep -n "^pam:disable:" /run/oshioki-obs/disable.trace' 2>/dev/null || true)"
+    case "$order" in
+        *edit:sudo*) ;;
+        *) report_fail "$name" 'the disable trace records no PAM edit'; return ;;
+    esac
+    local edit_line unlink_line
+    edit_line="$(printf '%s\n' "$order" | grep 'pam:disable:edit:sudo$' | head -1 | cut -d: -f1)"
+    unlink_line="$(printf '%s\n' "$order" | grep 'pam:disable:module-removed:' | head -1 | cut -d: -f1)"
+    [ -n "$edit_line" ] && [ -n "$unlink_line" ] || { report_fail "$name" 'the disable trace is missing a step'; return; }
+    [ "$edit_line" -lt "$unlink_line" ] || { report_fail "$name" 'the module was unlinked before the PAM entries were removed'; return; }
+    # A stock host must still sudo.
+    drop_timestamp
+    pty_run "$SHARE/$name.sudo.log" --expect-prompt yes --timeout 40 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true \
+        || { report_fail "$name" 'PTY driver rejected the post-uninstall sudo' "$SHARE/$name.sudo.log"; return; }
+    local rc
+    rc="$(pty_field "$SHARE/$name.sudo.log" PTY_RC)"
+    [ "$rc" = 0 ] || { report_fail "$name" "password sudo failed after uninstall (rc=$rc)" "$SHARE/$name.sudo.log"; return; }
+    report_pass "$name" "stock-identical sudo and sudo-i, module removed, entries removed first, password sudo rc=$rc"
+}
+
+# =========================================================================
+# Scenario 14: a customised sudo stack.
+#
+# An administrator with their own auth policy in /etc/pam.d/sudo is not a
+# stack this installer understands. Inserting above @include common-auth would
+# land after their line and silently change what it means.
+#
+# Expectation: the installer refuses, exits non-zero, and leaves every file
+# byte-identical -- including no module on disk. Runs after scenario 13, so
+# the host starts from the stock state that scenario restored.
+# =========================================================================
+scenario_customised_stack_refused() {
+    local name=14-customised-stack
+    local log="$SHARE/$name.log"
+    local security_dir
+    security_dir="$(cat "$SHARE/security-dir")"
+    in_container 'awk "/^@include common-auth\$/ { print \"auth required pam_faillock.so preauth\" } { print }" \
+                    /run/oshioki-obs/sudo.pam.orig >/etc/pam.d/sudo
+                  cp /etc/pam.d/sudo /run/oshioki-obs/sudo.customised' >/dev/null
+    local rc=0
+    in_container "OSHIOKI_CHECKSUMS=/run/oshioki-obs/SHA256SUMS \
+        PAM_MODULE_BIN=/run/oshioki-release/liboshioki_pam.so \
+        /run/oshioki-installer/scripts/install-oshioki-hook --contextual-pam" >"$log" 2>&1 || rc=$?
+    local unchanged=1
+    in_container 'cmp -s /etc/pam.d/sudo /run/oshioki-obs/sudo.customised' >/dev/null 2>&1 || unchanged=0
+    in_container 'cmp -s /etc/pam.d/sudo-i /run/oshioki-obs/sudo-i.pam.orig' >/dev/null 2>&1 || unchanged=0
+    local module_absent=1
+    in_container "test ! -e $security_dir/liboshioki_pam.so" >/dev/null 2>&1 || module_absent=0
+    # Restore the stock file whatever happened, so a failure here does not
+    # poison anything that runs afterwards.
+    in_container 'cp /run/oshioki-obs/sudo.pam.orig /etc/pam.d/sudo' >/dev/null
+    [ "$rc" != 0 ] || { report_fail "$name" 'the installer accepted a customised sudo stack' "$log"; return; }
+    grep -Fq 'refusing a customised PAM stack' "$log" || { report_fail "$name" 'the refusal was not explained' "$log"; return; }
+    [ "$unchanged" = 1 ] || { report_fail "$name" 'the refusal modified a PAM file' "$log"; return; }
+    [ "$module_absent" = 1 ] || { report_fail "$name" 'the refusal installed the module anyway' "$log"; return; }
+    report_pass "$name" "rc=$rc, stack unmodified, no module installed"
+}
+
 # --- run -----------------------------------------------------------------
 # In scenario-number order, which is also the order the functions are defined
 # in above. Each scenario sets its own config, registry and timestamp state, so
@@ -860,6 +1046,12 @@ scenario_timestamp
 scenario_sudo_i
 scenario_sigint
 scenario_ack_then_drop
+# 12-14 are installer/uninstaller cases and 13 deliberately tears the stack
+# down, so they run last and in this order: 14 relies on 13 having restored
+# the stock files.
+scenario_missing_module
+scenario_disable
+scenario_customised_stack_refused
 
 echo
 echo "* captured v2 request (scenario 2):"
@@ -870,4 +1062,4 @@ if [ "$FAILURES" -ne 0 ]; then
     exit 1
 fi
 TEST_SUCCEEDED=1
-echo "* PASS: all $PASSES PAM acceptance scenarios (Ubuntu 24.04, real sudo + PAM, issue #73)"
+echo "* PASS: all $PASSES PAM acceptance scenarios (Ubuntu 24.04, real sudo + PAM + installer, issue #73)"
