@@ -1752,15 +1752,16 @@ fn build_request(values: &[(String, String)]) -> Result<RequestV1> {
             env.len()
         );
     }
+    let uid: u32 = last_value("info.uid")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u32::MAX);
     let request = RequestV1 {
         version: VERSION_V1,
         request_id: Uuid::new_v4().to_string(),
         nonce: URL_SAFE_NO_PAD.encode(nonce),
         host: hostname(),
         user: last_value("info.user").map_or_else(|| "unknown".into(), str::to_owned),
-        uid: last_value("info.uid")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(u32::MAX),
+        uid,
         runas_uid: last_value("info.runas_uid")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
@@ -1771,12 +1772,53 @@ fn build_request(values: &[(String, String)]) -> Result<RequestV1> {
         command,
         argv,
         pid_chain: pid_chain(),
+        session: session_label(values),
         env,
         issued_at,
         expires_at: issued_at + 90,
     };
     request.validate()?;
     Ok(request)
+}
+
+/// Resolves the caller's session label from the bound request values.
+///
+/// The one supported mechanism: an `OSHIOKI_SESSION` entry from the
+/// invoking user's original environment, bound by the plugin under the
+/// `session.` prefix (distinct from `env.*`, which is the post-`env_reset`
+/// environment the command actually executes with — see `gather_context`
+/// in `plugin/src/lib.rs`). Documented in `docs/configuration.md`, along
+/// with recipes for setting it from a coding agent, tmux, or an ssh client.
+///
+/// `None` when absent, empty, or invalid; the agent's own fallbacks
+/// (`pid_chain`, then tty) apply in that case — see `session_name_for` in
+/// `agent/src/main.rs`.
+///
+/// The label is bounded and trimmed to satisfy `RequestV1::validate`; an
+/// overlong or empty result after trimming is treated as no match.
+fn session_label(values: &[(String, String)]) -> Option<String> {
+    let last_value = |key: &str| {
+        values
+            .iter()
+            .rev()
+            .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+    };
+    last_value("session.OSHIOKI_SESSION").and_then(normalize_session_label)
+}
+
+/// Bounds and trims a candidate session label to the limits
+/// `RequestV1::validate` enforces: at most 64 characters, no control
+/// characters, non-empty after trimming. Returns `None` rather than a
+/// truncated value, since a clipped label could misrepresent the session.
+fn normalize_session_label(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() > 64
+        || trimmed.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
 }
 
 fn build_synthetic_request() -> RequestV1 {
@@ -1800,6 +1842,7 @@ fn build_synthetic_request() -> RequestV1 {
         argv: vec!["/usr/bin/true".into()],
         pid_chain: pid_chain(),
         env: vec![],
+        session: None,
         issued_at,
         expires_at: issued_at + 90,
     }
@@ -3520,5 +3563,63 @@ mod tests {
         )
         .await
         .expect("signed approval must approve");
+    }
+
+    /// The one supported mechanism: a `session.OSHIOKI_SESSION` bound value
+    /// (the plugin's prefix for a label pulled from the caller's
+    /// pre-`env_reset` environment) becomes the resolved session label.
+    #[test]
+    fn session_label_reads_bound_session_prefix() {
+        let values = vec![("session.OSHIOKI_SESSION".into(), "explicit-session".into())];
+        assert_eq!(session_label(&values), Some("explicit-session".into()));
+    }
+
+    /// `env.OSHIOKI_SESSION` — the post-`env_reset` environment the command
+    /// actually executes with — is never read as a session label; only the
+    /// `session.` prefix the plugin binds from `submit_envp` counts. A
+    /// stray `env.OSHIOKI_SESSION` (e.g. from `env_keep` or a command that
+    /// sets it explicitly) must not be mistaken for the caller's label.
+    #[test]
+    fn session_label_ignores_env_prefixed_oshioki_session() {
+        let values = vec![("env.OSHIOKI_SESSION".into(), "not-a-label".into())];
+        assert_eq!(session_label(&values), None);
+    }
+
+    /// An empty `session.OSHIOKI_SESSION` value does not win; the resolver
+    /// falls through to nothing (the agent's own fallbacks then apply).
+    #[test]
+    fn session_label_treats_empty_value_as_absent() {
+        let values = vec![("session.OSHIOKI_SESSION".into(), String::new())];
+        assert_eq!(session_label(&values), None);
+    }
+
+    /// No `session.OSHIOKI_SESSION` entry at all yields no label.
+    #[test]
+    fn session_label_absent_yields_none() {
+        let values: Vec<(String, String)> = vec![];
+        assert_eq!(session_label(&values), None);
+    }
+
+    /// When `session.OSHIOKI_SESSION` is bound more than once, the last
+    /// value wins, matching every other bound-value lookup in the hook.
+    #[test]
+    fn session_label_last_value_wins_on_duplicate() {
+        let values = vec![
+            ("session.OSHIOKI_SESSION".into(), "first".into()),
+            ("session.OSHIOKI_SESSION".into(), "second".into()),
+        ];
+        assert_eq!(session_label(&values), Some("second".into()));
+    }
+
+    /// `normalize_session_label` trims whitespace, rejects control
+    /// characters, and caps length at 64 characters.
+    #[test]
+    fn normalize_session_label_bounds_and_trims() {
+        assert_eq!(normalize_session_label("  claude  "), Some("claude".into()));
+        assert_eq!(normalize_session_label(""), None);
+        assert_eq!(normalize_session_label("   "), None);
+        assert_eq!(normalize_session_label(&"x".repeat(64)), Some("x".repeat(64)));
+        assert_eq!(normalize_session_label(&"x".repeat(65)), None);
+        assert_eq!(normalize_session_label("bad\u{0007}name"), None);
     }
 }

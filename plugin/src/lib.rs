@@ -131,7 +131,24 @@ static OPEN_STATE: Mutex<Option<OpenState>> = Mutex::new(None);
 struct OpenState {
     user_info: Vec<(String, String)>,
     noninteractive: bool,
+    /// The session label, if any, pulled from `submit_envp` — the invoking
+    /// user's original environment as sudo received it, before sudoers
+    /// `env_reset` strips it down to the handful of variables that actually
+    /// reach the executed command. `run_envp` (seen in `check`) is that
+    /// post-`env_reset` environment, so `OSHIOKI_SESSION` is never present
+    /// there on a host with the (default) `env_reset` sudoers setting. This
+    /// is carried separately from `env.*` in the payload precisely because
+    /// it is not part of what gets signed as "the environment the command
+    /// runs with" — it is a label, sourced from bytes the executed command
+    /// never sees.
+    session_env: Option<String>,
 }
+
+/// The one environment variable this plugin reads out of the invoking
+/// user's original environment to label a session. Kept as a single-item
+/// list (rather than a bare constant) so a future label source can be added
+/// here without reshaping the extraction helper.
+const SESSION_ENV_VARS: &[&str] = &["OSHIOKI_SESSION"];
 
 /// Capture the invoking identity for the following one-shot approval check.
 ///
@@ -145,24 +162,26 @@ extern "C" fn plugin_open(
     user_info: *const *const c_char,
     _submit_optind: c_int,
     _submit_argv: *const *const c_char,
-    _submit_envp: *const *const c_char,
+    submit_envp: *const *const c_char,
     _plugin_options: *const *const c_char,
     _errstr: *const *const c_char,
 ) -> c_int {
-    // SAFETY: sudo supplies valid, callback-scoped settings and user_info
-    // arrays. The capture function copies both before this callback returns.
-    unsafe { capture_open_state(settings, user_info) }
+    // SAFETY: sudo supplies valid, callback-scoped settings, user_info, and
+    // submit_envp arrays. The capture function copies all three before this
+    // callback returns.
+    unsafe { capture_open_state(settings, user_info, submit_envp) }
 }
 
-/// Capture `settings` and `user_info` and map every failure to sudo's fatal
-/// open result.
+/// Capture `settings`, `user_info`, and the session label (if any) out of
+/// `submit_envp`, and map every failure to sudo's fatal open result.
 ///
 /// # Safety
 ///
-/// Both arrays must satisfy `parse_sudo_array`'s pointer contract.
+/// All three arrays must satisfy `parse_sudo_array`'s pointer contract.
 unsafe fn capture_open_state(
     settings: *const *const c_char,
     user_info: *const *const c_char,
+    submit_envp: *const *const c_char,
 ) -> c_int {
     // No panics may cross the FFI boundary. A panic or poisoned state denies.
     let captured = catch_unwind(move || {
@@ -174,6 +193,14 @@ unsafe fn capture_open_state(
         // for the duration of this callback. Both parsers copy their values.
         let settings = unsafe { parse_sudo_array(settings) }?;
         let user_info = unsafe { parse_sudo_array(user_info) }?;
+        // SAFETY: same contract as above. Unlike `command_info`/`run_envp`,
+        // `submit_envp` is the invoking user's original environment — sudo
+        // has not yet applied `env_reset` to it. Only the one variable this
+        // plugin cares about is kept; the rest of this array is not
+        // forwarded anywhere, precisely because it is not what gets signed
+        // or executed.
+        let submit_envp = unsafe { parse_sudo_array(submit_envp) }?;
+        let session_env = extract_session_env(&submit_envp);
         if !has_required_identity(&user_info) {
             return Some(false);
         }
@@ -183,6 +210,7 @@ unsafe fn capture_open_state(
         *state = Some(OpenState {
             user_info,
             noninteractive,
+            session_env,
         });
         Some(true)
     });
@@ -264,6 +292,7 @@ unsafe fn gather_context_after_open(
             run_argv,
             run_envp,
             &state.user_info,
+            state.session_env.as_deref(),
             state.noninteractive,
         )
     }
@@ -283,6 +312,34 @@ fn has_required_identity(info: &[(String, String)]) -> bool {
         && last_value("uid").is_some_and(|uid| uid.parse::<u32>().is_ok())
 }
 
+/// Pull the session label out of a parsed environment (`submit_envp`,
+/// already split into pairs). Bounded here to the same limits the hook's
+/// `normalize_session_label` enforces — 64 characters, no control
+/// characters, non-empty after trimming — so an oversized or malformed
+/// value never reaches the hook at all rather than being silently dropped
+/// downstream. Absent, empty, overlong, or control-character values all
+/// yield `None`; the last matching entry wins, matching how every other
+/// sudo array in this plugin is read.
+fn extract_session_env(envp: &[(String, String)]) -> Option<String> {
+    for name in SESSION_ENV_VARS {
+        let value = envp
+            .iter()
+            .rev()
+            .find_map(|(key, value)| (key == name).then_some(value.as_str()));
+        if let Some(value) = value {
+            let trimmed = value.trim();
+            if trimmed.is_empty()
+                || trimmed.chars().count() > 64
+                || trimmed.chars().any(char::is_control)
+            {
+                continue;
+            }
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
 /// Collect all sudo arrays into a single payload we can pipe to the hook.
 ///
 /// # Safety
@@ -296,6 +353,7 @@ unsafe fn gather_context(
     run_argv: *const *const c_char,
     run_envp: *const *const c_char,
     user_info: &[(String, String)],
+    session_env: Option<&str>,
     noninteractive: bool,
 ) -> Option<SudoContext> {
     // SAFETY: command_info, run_argv, and run_envp are valid NUL-terminated
@@ -332,6 +390,15 @@ unsafe fn gather_context(
     // only; it must never decide which execution bytes are authenticated.
     for (k, v) in &envp {
         push_kv(&mut payload, "env.", k, v);
+    }
+    // The session label, if any, is carried under its own `session.` prefix
+    // rather than `env.`: it comes from `submit_envp` (the invoking user's
+    // environment before sudoers `env_reset`), not from `run_envp` (the
+    // environment the command actually executes with). Mixing the two
+    // prefixes would let a display-only label masquerade as part of the
+    // authenticated execution environment.
+    if let Some(value) = session_env {
+        push_kv(&mut payload, "session.", "OSHIOKI_SESSION", value);
     }
     // These markers are part of the private plugin-to-hook framing, not the
     // v1 request wire format. Both sides require the version and environment
@@ -1754,6 +1821,15 @@ mod tests {
         argv: &[&[u8]],
         envp: &[&[u8]],
     ) -> Option<SudoContext> {
+        gather_test_context_with_session(command_info, argv, envp, None)
+    }
+
+    fn gather_test_context_with_session(
+        command_info: &[&[u8]],
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        session_env: Option<&str>,
+    ) -> Option<SudoContext> {
         let (_command_info_strings, command_info_ptrs) = c_array(command_info);
         let (_argv_strings, argv_ptrs) = c_array(argv);
         let (_envp_strings, envp_ptrs) = c_array(envp);
@@ -1770,6 +1846,7 @@ mod tests {
                 argv_ptrs.as_ptr(),
                 envp_ptrs.as_ptr(),
                 &user_info,
+                session_env,
                 false,
             )
         }
@@ -1799,14 +1876,14 @@ mod tests {
         let (_strings, pointers) = c_array(values);
         // SAFETY: The pointer array is NUL-terminated and its C strings live
         // for the duration of the call.
-        unsafe { capture_open_state(ptr::null(), pointers.as_ptr()) == SUDO_RC_OK }
+        unsafe { capture_open_state(ptr::null(), pointers.as_ptr(), ptr::null()) == SUDO_RC_OK }
     }
 
     fn capture_test_open_result(values: &[&[u8]]) -> c_int {
         let (_strings, pointers) = c_array(values);
         // SAFETY: The pointer array is NUL-terminated and its C strings live
         // for the duration of the call.
-        unsafe { capture_open_state(ptr::null(), pointers.as_ptr()) }
+        unsafe { capture_open_state(ptr::null(), pointers.as_ptr(), ptr::null()) }
     }
 
     fn capture_test_open_with_settings(settings: &[&[u8]], values: &[&[u8]]) -> c_int {
@@ -1814,7 +1891,17 @@ mod tests {
         let (_strings, pointers) = c_array(values);
         // SAFETY: Both pointer arrays are NUL-terminated and their C strings
         // live for the duration of the call.
-        unsafe { capture_open_state(setting_ptrs.as_ptr(), pointers.as_ptr()) }
+        unsafe { capture_open_state(setting_ptrs.as_ptr(), pointers.as_ptr(), ptr::null()) }
+    }
+
+    /// Captures open state with an explicit `submit_envp`, for tests that
+    /// need to observe the session label extracted from it.
+    fn capture_test_open_with_envp(user_info: &[&[u8]], submit_envp: &[&[u8]]) -> c_int {
+        let (_user_info_strings, user_info_ptrs) = c_array(user_info);
+        let (_envp_strings, envp_ptrs) = c_array(submit_envp);
+        // SAFETY: Both pointer arrays are NUL-terminated and their C strings
+        // live for the duration of the call.
+        unsafe { capture_open_state(ptr::null(), user_info_ptrs.as_ptr(), envp_ptrs.as_ptr()) }
     }
 
     #[test]
@@ -2113,5 +2200,150 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // extract_session_env — the helper that reads a session label out of
+    // submit_envp, the invoking user's pre-env_reset environment.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn extract_session_env_reads_present_value() {
+        let envp = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("OSHIOKI_SESSION".to_owned(), "claude-1b".to_owned()),
+        ];
+        assert_eq!(extract_session_env(&envp), Some("claude-1b".into()));
+    }
+
+    #[test]
+    fn extract_session_env_absent_yields_none() {
+        let envp = vec![("PATH".to_owned(), "/usr/bin".to_owned())];
+        assert_eq!(extract_session_env(&envp), None);
+    }
+
+    #[test]
+    fn extract_session_env_empty_value_yields_none() {
+        let envp = vec![("OSHIOKI_SESSION".to_owned(), String::new())];
+        assert_eq!(extract_session_env(&envp), None);
+    }
+
+    #[test]
+    fn extract_session_env_overlong_value_yields_none() {
+        let envp = vec![("OSHIOKI_SESSION".to_owned(), "x".repeat(65))];
+        assert_eq!(extract_session_env(&envp), None);
+    }
+
+    #[test]
+    fn extract_session_env_rejects_control_characters() {
+        let envp = vec![("OSHIOKI_SESSION".to_owned(), "bad\u{0007}name".to_owned())];
+        assert_eq!(extract_session_env(&envp), None);
+    }
+
+    #[test]
+    fn extract_session_env_trims_whitespace() {
+        let envp = vec![("OSHIOKI_SESSION".to_owned(), "  claude  ".to_owned())];
+        assert_eq!(extract_session_env(&envp), Some("claude".into()));
+    }
+
+    #[test]
+    fn extract_session_env_last_value_wins_on_duplicate() {
+        let envp = vec![
+            ("OSHIOKI_SESSION".to_owned(), "first".to_owned()),
+            ("OSHIOKI_SESSION".to_owned(), "second".to_owned()),
+        ];
+        assert_eq!(extract_session_env(&envp), Some("second".into()));
+    }
+
+    // -----------------------------------------------------------------
+    // open() -> check() threading: the session label captured from
+    // submit_envp in open() must reach the payload as session.OSHIOKI_SESSION,
+    // completely separately from run_envp's env.* entries.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn open_captures_session_env_and_check_payload_carries_it() {
+        let _serial = identity_test();
+
+        assert_eq!(
+            capture_test_open_with_envp(
+                &[b"user=approvalcaller", b"uid=12345"],
+                &[b"OSHIOKI_SESSION=claude-1b", b"PATH=/usr/bin"],
+            ),
+            SUDO_RC_OK
+        );
+
+        let context = gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[b"PATH=/usr/bin"],
+        )
+        .expect("captured identity must yield a context");
+
+        let payload = String::from_utf8(context.payload).unwrap();
+        assert!(payload.contains("session.OSHIOKI_SESSION=claude-1b\n"));
+        // submit_envp's OSHIOKI_SESSION must never leak into env.* — only
+        // run_envp's (post-env_reset) entries go there.
+        assert!(!payload.contains("env.OSHIOKI_SESSION"));
+    }
+
+    #[test]
+    fn open_with_no_session_env_omits_session_prefix_from_payload() {
+        let _serial = identity_test();
+
+        assert_eq!(
+            capture_test_open_with_envp(
+                &[b"user=approvalcaller", b"uid=12345"],
+                &[b"PATH=/usr/bin"],
+            ),
+            SUDO_RC_OK
+        );
+
+        let context = gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[b"PATH=/usr/bin"],
+        )
+        .expect("captured identity must yield a context");
+
+        let payload = String::from_utf8(context.payload).unwrap();
+        assert!(!payload.contains("session."));
+    }
+
+    #[test]
+    fn open_with_overlong_session_env_omits_session_prefix() {
+        let _serial = identity_test();
+
+        let overlong = format!("OSHIOKI_SESSION={}", "x".repeat(65));
+        assert_eq!(
+            capture_test_open_with_envp(
+                &[b"user=approvalcaller", b"uid=12345"],
+                &[overlong.as_bytes()],
+            ),
+            SUDO_RC_OK
+        );
+
+        let context = gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[b"PATH=/usr/bin"],
+        )
+        .expect("captured identity must yield a context");
+
+        let payload = String::from_utf8(context.payload).unwrap();
+        assert!(!payload.contains("session."));
+    }
+
+    #[test]
+    fn gather_context_with_session_env_writes_session_prefix() {
+        let context = gather_test_context_with_session(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[b"PATH=/usr/bin"],
+            Some("claude-1b"),
+        )
+        .expect("valid sudo arrays must yield a context");
+        let payload = String::from_utf8(context.payload).unwrap();
+        assert!(payload.contains("session.OSHIOKI_SESSION=claude-1b\n"));
     }
 }

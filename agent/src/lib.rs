@@ -764,6 +764,7 @@ mod tests {
             argv: vec!["true".into()],
             pid_chain: vec![],
             env: vec![],
+            session: None,
             issued_at: 1_000,
             expires_at: 1_090,
         }
