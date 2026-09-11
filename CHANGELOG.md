@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The approval plugin's `open()` callback no longer fails when the invoking
+  user's environment holds a multi-line or non-UTF-8 variable. Since 0.1.5 it
+  parsed `submit_envp` — the caller's whole pre-`env_reset` environment — with
+  the strict parser used for the signed arrays, so a single unrelated entry
+  (Woodpecker's multi-line `CI_COMMIT_MESSAGE`, for example) made `open()`
+  return sudo's fatal result and every `sudo` from that environment died with
+  `sudo: error initializing approval plugin approval_exec`. `submit_envp` is
+  now walked leniently: entries that are not single-line valid UTF-8, or that
+  carry no `=`, are skipped, and only `OSHIOKI_SESSION` is read out of it,
+  still bounded by the same session-label validation as before. A malformed
+  `OSHIOKI_SESSION` drops the label instead of denying the request. The strict
+  parser is unchanged for `settings`, `user_info`, `command_info`, `run_argv`,
+  and `run_envp`, which are signed and forwarded; nothing new is forwarded to
+  the hook.
+
 ## [0.1.5] - 2026-09-10
 
 ### Added

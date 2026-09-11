@@ -198,8 +198,11 @@ unsafe fn capture_open_state(
         // has not yet applied `env_reset` to it. Only the one variable this
         // plugin cares about is kept; the rest of this array is not
         // forwarded anywhere, precisely because it is not what gets signed
-        // or executed.
-        let submit_envp = unsafe { parse_sudo_array(submit_envp) }?;
+        // or executed. That is why it is parsed leniently: a multi-line or
+        // non-UTF-8 variable belonging to some unrelated program (a CI
+        // runner's commit message, say) must not fail `open()` and abort
+        // every sudo invocation from that environment.
+        let submit_envp = unsafe { parse_sudo_env_lenient(submit_envp) };
         let session_env = extract_session_env(&submit_envp);
         if !has_required_identity(&user_info) {
             return Some(false);
@@ -456,6 +459,51 @@ unsafe fn parse_sudo_array(arr: *const *const c_char) -> Option<Vec<(String, Str
             })
             .collect(),
     )
+}
+
+/// Walk a NUL-terminated `char **` environment array, keeping only the
+/// entries this plugin can interpret.
+///
+/// Unlike every other sudo array the plugin reads, `submit_envp` is the
+/// invoking user's pre-`env_reset` environment: it is neither signed nor
+/// forwarded, and only [`SESSION_ENV_VARS`] is read out of it. An entry that
+/// is not single-line valid UTF-8, or that carries no `=`, therefore cannot
+/// affect the approval payload and is skipped instead of denying the whole
+/// request. The values that do survive are still validated by
+/// [`extract_session_env`] before anything reaches the hook.
+///
+/// # Safety
+///
+/// `arr` has the same valid sudo array contract as [`parse_sudo_array`].
+unsafe fn parse_sudo_env_lenient(arr: *const *const c_char) -> Vec<(String, String)> {
+    let mut items = Vec::new();
+    if arr.is_null() {
+        return items;
+    }
+    let mut i = 0usize;
+    loop {
+        // SAFETY: `arr.add(i)` stays within the array bounds because the
+        // array is NUL-terminated (sudo ABI guarantee). We read only one
+        // pointer at a time and stop at the first NULL.
+        let ptr = unsafe { *arr.add(i) };
+        if ptr.is_null() {
+            break;
+        }
+        i += 1;
+        // SAFETY: `ptr` is a valid, NUL-terminated C string that lives as
+        // long as the array does (borrowed from sudo's memory).
+        let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes();
+        if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+            continue;
+        }
+        let Ok(entry) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        if let Some((key, value)) = entry.split_once('=') {
+            items.push((key.to_owned(), value.to_owned()));
+        }
+    }
+    items
 }
 
 /// Parse the effective environment while retaining its original order and
@@ -2332,6 +2380,86 @@ mod tests {
 
         let payload = String::from_utf8(context.payload).unwrap();
         assert!(!payload.contains("session."));
+    }
+
+    #[test]
+    fn open_tolerates_multiline_unrelated_submit_env_entry() {
+        let _serial = identity_test();
+
+        // A CI runner's multi-line commit message must not fail open() and
+        // abort every sudo invocation from that environment (issue #76).
+        assert_eq!(
+            capture_test_open_with_envp(
+                &[b"user=approvalcaller", b"uid=12345"],
+                &[
+                    b"CI_COMMIT_MESSAGE=subject\n\nbody line",
+                    b"OSHIOKI_SESSION=claude-1b",
+                    b"PATH=/usr/bin",
+                ],
+            ),
+            SUDO_RC_OK
+        );
+
+        let context = gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[b"PATH=/usr/bin"],
+        )
+        .expect("captured identity must yield a context");
+
+        let payload = String::from_utf8(context.payload).unwrap();
+        assert!(payload.contains("session.OSHIOKI_SESSION=claude-1b\n"));
+        assert!(!payload.contains("CI_COMMIT_MESSAGE"));
+    }
+
+    #[test]
+    fn open_with_multiline_session_env_succeeds_without_label() {
+        let _serial = identity_test();
+
+        assert_eq!(
+            capture_test_open_with_envp(
+                &[b"user=approvalcaller", b"uid=12345"],
+                &[b"OSHIOKI_SESSION=claude\n1b", b"PATH=/usr/bin"],
+            ),
+            SUDO_RC_OK
+        );
+
+        let context = gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[b"PATH=/usr/bin"],
+        )
+        .expect("captured identity must yield a context");
+
+        let payload = String::from_utf8(context.payload).unwrap();
+        assert!(!payload.contains("session."));
+    }
+
+    #[test]
+    fn open_tolerates_invalid_utf8_and_separatorless_submit_env_entries() {
+        let _serial = identity_test();
+
+        assert_eq!(
+            capture_test_open_with_envp(
+                &[b"user=approvalcaller", b"uid=12345"],
+                &[
+                    b"LATIN1=caf\xe9",
+                    b"NO_SEPARATOR",
+                    b"OSHIOKI_SESSION=claude-1b",
+                ],
+            ),
+            SUDO_RC_OK
+        );
+
+        let context = gather_after_captured_identity(
+            &[b"command=/usr/bin/echo"],
+            &[b"/usr/bin/echo"],
+            &[b"PATH=/usr/bin"],
+        )
+        .expect("captured identity must yield a context");
+
+        let payload = String::from_utf8(context.payload).unwrap();
+        assert!(payload.contains("session.OSHIOKI_SESSION=claude-1b\n"));
     }
 
     #[test]
