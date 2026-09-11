@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth_v1;
 pub mod enrollment_v1;
 pub mod error;
 pub mod native_v1;
@@ -16,6 +17,13 @@ pub mod terminal;
 pub mod v1;
 pub mod webauthn_v1;
 
+pub use auth_v1::{
+    AUTH_ENVELOPE_TYPE, AUTH_NATIVE_DECISION_TYPE, AUTH_REQUEST_TYPE, AUTH_WEBAUTHN_DECISION_TYPE,
+    AUTH_WIRE_VERSION, AuthApproveNativeV1, AuthApproveWebauthnV1, AuthDecisionV1, AuthEnvelopeV1,
+    AuthInvocationV1, AuthRequestV1, OpenedAuthRequestV1, SubmittedAuthContextV1,
+    TrustedAuthContextV1, auth_challenge, hardware_auth_recipients, is_hardware_auth_device,
+    verify_native_authentication_v1, verify_webauthn_authentication_v1,
+};
 pub use enrollment_v1::{enrollment_hmac, verify_enrollment_v1};
 pub use error::Error;
 pub use native_v1::{
