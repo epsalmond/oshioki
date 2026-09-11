@@ -623,13 +623,17 @@ def _nats_config(state: Path, credentials: dict[str, str], port: int) -> Path:
     #                      oshioki.device.revoked.<fp>, oshioki.request.> (watch_requests)
     #   server publishes: oshioki.ack.<id>, oshioki.verdict.<id>, oshioki.delivery.<id>
     #                      (DeliveryV1, added in #57), oshioki.device.revoked.<fp>,
-    #                      $JS.API.> (JetStream admin/consumer calls), $JS.ACK.> (consumer acks)
+    #                      oshioki.enrollment.submission.<id> (server/src/db.rs inserts an
+    #                      outbox row whose subject is the enrollment's reply_subject, and
+    #                      server/src/main.rs's outbox worker publishes it back to the hook
+    #                      that is waiting on that subject), $JS.API.> (JetStream
+    #                      admin/consumer calls), $JS.ACK.> (consumer acks)
     #   server subscribes: oshioki.request.> (JetStream consumer), oshioki.enrollment.intent,
     #                      oshioki.enrollment.submission.>, oshioki.enrollment.activation.>,
     #                      oshioki.device.revoke.>, _INBOX.> (JetStream API + revoke replies)
     hook_publish = ["oshioki.request.>", "oshioki.enrollment.intent", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>"]
     hook_subscribe = ["oshioki.verdict.>", "oshioki.ack.>", "oshioki.delivery.>", "oshioki.enrollment.submission.>", "oshioki.device.revoked.>", "oshioki.request.>"]
-    server_publish = ["oshioki.ack.>", "oshioki.verdict.>", "oshioki.delivery.>", "oshioki.device.revoked.>", "$JS.API.>", "$JS.ACK.>"]
+    server_publish = ["oshioki.ack.>", "oshioki.verdict.>", "oshioki.delivery.>", "oshioki.enrollment.submission.>", "oshioki.device.revoked.>", "$JS.API.>", "$JS.ACK.>"]
     server_subscribe = ["oshioki.request.>", "oshioki.enrollment.intent", "oshioki.enrollment.submission.>", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>", "_INBOX.>"]
 
     def items(values: list[str]) -> str:

@@ -16,11 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   script's `_nats_config` still wrote the pre-#57 permission lists, so every
   phone/browser approval routed through a phone-setup NATS instance failed
   with `Permissions Violation for Publish to "oshioki.delivery.<id>"` on the
-  server and a daemon delivery-receipt timeout on the hook. The server's
-  publish permissions also dropped a stray, unused
-  `oshioki.enrollment.submission.>` grant (the server only subscribes to
-  that subject). `docs/requirements.md`'s hand-written permission checklist
-  is updated to match.
+  server and a daemon delivery-receipt timeout on the hook.
+  `docs/requirements.md`'s hand-written permission checklist is updated to
+  match.
 
 ## [0.1.6] - 2026-09-10
 
