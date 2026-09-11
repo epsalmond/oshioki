@@ -254,6 +254,7 @@ INNER_SCRIPT="$SHARE/sudo-inner.sh"
   printf 'EXPECTED_CMD=%q\n' "$EXPECTED_CMD"
   printf 'EXPECTED_USER=%q\n' "$EXPECTED_USER"
   printf 'EXPECTED_UID=%q\n' "$EXPECTED_UID"
+  printf 'EXPECTED_ORIGIN=%q\n' "$ORIGIN_VALUE"
   printf 'ARGS=('
   printf ' %q' "${ARGS[@]}"
   printf ' )\n'
@@ -290,13 +291,16 @@ echo "[inner] caller $EXPECTED_USER uid=$EXPECTED_UID created"
 sudo -k || true
 echo "[inner] running sudo as $EXPECTED_USER: $EXPECTED_CMD ${ARGS[*]}"
 sudo_started=$SECONDS
-if runuser -u "$EXPECTED_USER" -- sudo "$EXPECTED_CMD" "${ARGS[@]}"; then
+if runuser -u "$EXPECTED_USER" -- sudo "$EXPECTED_CMD" "${ARGS[@]}" \
+    >"$SHARE_DIR/valid.stdout" 2>"$SHARE_DIR/valid.stderr"; then
   sudo_status=0
 else
   sudo_status=$?
 fi
 sudo_elapsed=$((SECONDS - sudo_started))
 echo "[inner] sudo returned $sudo_status"
+cat "$SHARE_DIR/valid.stdout"
+cat "$SHARE_DIR/valid.stderr" >&2
 printf '%s\n' "$sudo_status" >"$SHARE_DIR/sudo.status"
 printf '%s\n' "$sudo_elapsed" >"$SHARE_DIR/sudo.elapsed"
 
@@ -306,6 +310,15 @@ if [ "$sudo_status" -ne 0 ]; then
 fi
 if [ "$sudo_elapsed" -gt 10 ]; then
   echo "[inner] FAIL: immediate verdict took ${sudo_elapsed}s" >&2
+  exit 1
+fi
+if [ "$(cat "$SHARE_DIR/valid.stdout")" != "${ARGS[*]}" ]; then
+  echo "[inner] FAIL: approved command stdout was not preserved" >&2
+  exit 1
+fi
+if ! grep -Fq "Approval URL (expires in " "$SHARE_DIR/valid.stderr" ||
+   ! grep -Fq "  $EXPECTED_ORIGIN/r/" "$SHARE_DIR/valid.stderr"; then
+  echo "[inner] FAIL: browser approval URL was not forwarded on stderr" >&2
   exit 1
 fi
 
