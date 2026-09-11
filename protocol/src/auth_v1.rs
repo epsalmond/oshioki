@@ -618,8 +618,8 @@ pub fn hardware_auth_recipients(registry: &DeviceRegistryV1) -> Vec<&DevicePubli
 mod tests {
     use super::*;
     use crate::{
-        DecisionV1, RequestEnvelopeV1, VERSION_V1, approve_challenge, device_fingerprint,
-        encode_base64url, seal_v1,
+        ApproveNativeV1, DecisionV1, RequestEnvelopeV1, RequestV1, VERSION_V1, approve_challenge,
+        device_fingerprint, encode_base64url, seal_v1,
     };
     use p256::{
         ecdsa::{SigningKey, signature::Signer as _},
@@ -809,6 +809,61 @@ mod tests {
     }
 
     #[test]
+    fn legacy_wire_values_are_rejected_by_auth_decoders() {
+        let legacy_request = RequestV1 {
+            version: VERSION_V1,
+            request_id: "legacy-1".into(),
+            nonce: encode_base64url(&[1; 16]),
+            host: "host.example".into(),
+            user: "eric".into(),
+            uid: 1000,
+            runas_uid: 0,
+            cwd: "/tmp".into(),
+            tty: None,
+            command: "/usr/bin/id".into(),
+            argv: vec!["id".into()],
+            pid_chain: vec![],
+            env: vec![],
+            session: None,
+            issued_at: NOW,
+            expires_at: NOW + 60,
+        };
+        assert!(
+            serde_json::from_slice::<AuthRequestV1>(&serde_json::to_vec(&legacy_request).unwrap())
+                .is_err()
+        );
+
+        let legacy_envelope = RequestEnvelopeV1 {
+            version: VERSION_V1,
+            request_id: "legacy-1".into(),
+            host: "host.example".into(),
+            user: "eric".into(),
+            issued_at: NOW,
+            expires_at: NOW + 60,
+            sealed: vec![],
+        };
+        assert!(
+            serde_json::from_slice::<AuthEnvelopeV1>(
+                &serde_json::to_vec(&legacy_envelope).unwrap()
+            )
+            .is_err()
+        );
+
+        let legacy_decision = DecisionV1::ApproveNative(ApproveNativeV1 {
+            version: VERSION_V1,
+            request_id: "legacy-1".into(),
+            device_fingerprint: encode_base64url(&[8; 16]),
+            signature: encode_base64url(&[9; 64]),
+        });
+        assert!(
+            serde_json::from_slice::<AuthDecisionV1>(
+                &serde_json::to_vec(&legacy_decision).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn old_command_signature_cannot_authenticate_new_request() {
         let key = signing_key();
         let device = secure_enclave_device(&key, &[4; 32]);
@@ -986,6 +1041,33 @@ mod tests {
     }
 
     #[test]
+    fn hardware_recipients_include_active_webauthn_and_secure_enclave_devices() {
+        let secure_key = signing_key();
+        let secure = secure_enclave_device(&secure_key, &[13; 32]);
+        let webauthn_key = signing_key();
+        let (webauthn, _) = webauthn_fixture(&webauthn_key);
+        let software_key = signing_key();
+        let mut software = secure_enclave_device(&software_key, &[14; 32]);
+        software.kind = DeviceKindV1::Software;
+        let registry = DeviceRegistryV1 {
+            version: VERSION_V1,
+            devices: vec![secure, webauthn, software],
+        };
+        let recipients = hardware_auth_recipients(&registry);
+        assert_eq!(recipients.len(), 2);
+        assert!(
+            recipients
+                .iter()
+                .any(|device| device.kind == DeviceKindV1::SecureEnclave)
+        );
+        assert!(
+            recipients
+                .iter()
+                .any(|device| device.kind == DeviceKindV1::Webauthn)
+        );
+    }
+
+    #[test]
     fn auth_envelope_checks_inner_metadata_after_unseal() {
         let key = signing_key();
         let box_secret = StaticSecret::from([9; 32]);
@@ -1023,6 +1105,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(opened.request.request_id, "auth-1");
+
+        let mut wrong_host = envelope.clone();
+        wrong_host.host = "other.example".into();
+        assert!(
+            wrong_host
+                .open_for_device(&device.fingerprint, &box_secret, NOW)
+                .is_err()
+        );
+
+        let mut wrong_times = envelope;
+        wrong_times.issued_at += 1;
+        wrong_times.expires_at += 1;
+        assert!(
+            wrong_times
+                .open_for_device(&device.fingerprint, &box_secret, NOW)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1072,6 +1171,44 @@ mod tests {
             omitted_args: Some(0),
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn invocation_and_raw_request_bounds_are_enforced() {
+        let max_command = AuthInvocationV1::Available {
+            command: "x".repeat(MAX_INVOCATION_STRING_BYTES),
+            argv: vec![],
+            cwd: "/tmp".into(),
+        };
+        max_command.validate().unwrap();
+        let too_long_command = AuthInvocationV1::Available {
+            command: "x".repeat(MAX_INVOCATION_STRING_BYTES + 1),
+            argv: vec![],
+            cwd: "/tmp".into(),
+        };
+        assert!(too_long_command.validate().is_err());
+
+        let max_argv = AuthInvocationV1::Available {
+            command: "id".into(),
+            argv: vec![String::new(); MAX_INVOCATION_ARGS],
+            cwd: "/tmp".into(),
+        };
+        max_argv.validate().unwrap();
+        let too_many_argv = AuthInvocationV1::Available {
+            command: "id".into(),
+            argv: vec![String::new(); MAX_INVOCATION_ARGS + 1],
+            cwd: "/tmp".into(),
+        };
+        assert!(too_many_argv.validate().is_err());
+
+        let mut oversized = auth_request();
+        oversized.submitted.invocation = AuthInvocationV1::Available {
+            command: "id".into(),
+            argv: vec!["x".repeat(64); MAX_INVOCATION_ARGS],
+            cwd: "/tmp".into(),
+        };
+        oversized.validate().unwrap();
+        assert!(oversized.raw_json().is_err());
     }
 
     #[test]
