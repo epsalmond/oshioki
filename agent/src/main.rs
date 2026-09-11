@@ -27,7 +27,6 @@ use oshioki_protocol::{
     ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, AliveV1, DecisionV1, RequestEnvelopeV1,
     allow_plaintext_nats, check_nats_url, escape_for_terminal, nats_url_is_tls,
 };
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{info, warn};
@@ -696,7 +695,7 @@ async fn decide(
             answer
         }
     };
-    let reason = approval_reason_for_raw(request, &opened.raw);
+    let reason = approval_reason_for_raw(request);
     let decision = if approve {
         identity.approve(opened, &reason)?
     } else {
@@ -1014,58 +1013,150 @@ enum Decider {
     TouchId(oshioki_agent::touchid::TouchIdPrompt),
 }
 
-/// Computes the fingerprint shown in the companion review and the biometric
-/// reason. The digest is over the exact bytes retained for signature
-/// verification, rather than a re-serialization that could hide a mismatch.
-fn request_digest(raw: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut digest = String::with_capacity(64);
-    for byte in Sha256::digest(raw) {
-        let _ = write!(digest, "{byte:02x}");
+/// What the operator is being asked to allow, shown on the Touch ID sheet
+/// itself: the companion review dialog this text once deferred to is gone
+/// (#70), so the sheet is the only thing an operator reads before approving.
+/// A hash and a request ID told them nothing; host, user, and the command
+/// are what a person actually recognizes at a glance. Everything here still
+/// comes from the signed request, so a truncated or even fully dropped
+/// suffix cannot change what gets executed — the full bytes are verified
+/// independently of this display string.
+///
+/// Format: `<session>: <user>@<host> sudo <argv...>`, with the `<session>: `
+/// prefix dropped when no session name resolves, and `sudo` omitted when
+/// `argv[0]` already names it. Host and user are never dropped; the argv
+/// tail is truncated with "…" to fit the cap, and the session prefix is the
+/// first thing dropped under pressure.
+fn approval_reason_for_raw(request: &oshioki_protocol::RequestV1) -> String {
+    let target = format!(
+        "{}@{}",
+        escape_for_terminal(&request.user),
+        escape_for_terminal(&request.host)
+    );
+    let argv = quote_argv(&request.argv);
+    let wants_sudo_prefix = !matches!(request.argv.first(), Some(first) if first == "sudo");
+    let command = if argv.is_empty() {
+        escape_for_terminal(&request.command)
+    } else if wants_sudo_prefix {
+        format!("sudo {}", escape_for_terminal(&argv))
+    } else {
+        escape_for_terminal(&argv)
+    };
+    let session = session_name_for(request);
+
+    // The target (`<user>@<host>`) is never truncated or dropped. The
+    // session prefix is the first thing dropped under pressure: the command
+    // is more useful than the session label when space is tight, so the
+    // session is shown only when the full command fits alongside it too —
+    // never as a surviving label next to a chopped-up command.
+    let target_only_room = MAX_APPROVAL_REASON_CHARS.saturating_sub(target.chars().count() + 1);
+    if target_only_room == 0 {
+        // The target alone overflows the cap (an implausibly long
+        // user/host): show as much of it as fits rather than nothing.
+        return truncate_chars(&target, MAX_APPROVAL_REASON_CHARS);
     }
-    digest
+    if let Some(name) = &session {
+        let prefix = format!("{name}: ");
+        let fixed_len = prefix.chars().count() + target.chars().count() + 1;
+        if fixed_len + command.chars().count() <= MAX_APPROVAL_REASON_CHARS {
+            return format!("{prefix}{target} {command}");
+        }
+        // The session plus the full command does not fit: drop the session
+        // rather than show a truncated command next to an intact label.
+    }
+    format!("{target} {}", truncate_chars(&command, target_only_room))
 }
 
-/// Builds the complete read-only document shown before a native approval.
-/// `raw` is JSON produced by the requesting hook, so its string escapes are
-/// also the unambiguous representation of every command, argument, and
-/// environment value that the signature covers.
-#[cfg(any(target_os = "macos", test))]
-fn full_review_document(request: &oshioki_protocol::RequestV1, raw: &[u8]) -> String {
-    format!(
-        "Oshioki approval review\n\nRequest ID: {}\nExact signed request SHA-256: {}\n\nThe JSON below is the complete signed request. Review every field, including every argv and env entry, before continuing to Touch ID.\n\n{}\n",
-        escape_for_terminal(&request.request_id),
-        request_digest(raw),
-        String::from_utf8_lossy(raw),
+/// Shrinks `value` to at most `max_chars` characters, replacing a dropped
+/// tail with "…" so the operator can tell the text was cut rather than
+/// reading a command that happens to end early.
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut truncated: String = value.chars().take(keep).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Names the session a request came from, using only fields carried on the
+/// request itself — the agent never reads the requesting host's live
+/// process table. First match wins:
+///
+/// 1. An `OSHIOKI_SESSION` environment entry, which a user can export in a
+///    shell or terminal tab to label it (documented in `docs/configuration.md`).
+/// 2. The nearest "interesting" ancestor in `pid_chain` — entries are
+///    `"pid:comm"` pairs (see `pid_chain_darwin`/`pid_chain_linux` in
+///    `hook/src/main.rs`), so a process name like `claude`, `codex`, or
+///    `tmux` is usable directly; shells and `sudo` itself are skipped as
+///    uninteresting.
+/// 3. The tty's basename (e.g. `ttys004`), if the request carries one.
+///
+/// `None` when nothing resolves, in which case the reason drops the prefix
+/// entirely rather than show a blank label.
+fn session_name_for(request: &oshioki_protocol::RequestV1) -> Option<String> {
+    if let Some(entry) = request
+        .env
+        .iter()
+        .rev()
+        .find(|entry| entry.name == "OSHIOKI_SESSION" && !entry.value.is_empty())
+    {
+        return Some(escape_for_terminal(&entry.value));
+    }
+    if let Some(name) = request
+        .pid_chain
+        .iter()
+        .filter_map(|entry| entry.split_once(':').map(|(_, comm)| comm))
+        .find(|comm| is_interesting_session_process(comm))
+    {
+        return Some(escape_for_terminal(name));
+    }
+    if let Some(tty) = &request.tty {
+        if let Some(basename) = tty.rsplit('/').next().filter(|value| !value.is_empty()) {
+            return Some(escape_for_terminal(basename));
+        }
+    }
+    None
+}
+
+/// Whether a `pid_chain` process name is worth naming a session after.
+/// Shells, `sudo` itself, and init/daemon wrappers say nothing a user would
+/// recognize as "their" session; an agent harness or multiplexer name does.
+fn is_interesting_session_process(comm: &str) -> bool {
+    !matches!(
+        comm,
+        "sudo"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "dash"
+            | "fish"
+            | "login"
+            | "sshd"
+            | "systemd"
+            | "launchd"
+            | "init"
     )
 }
 
-/// What the operator is being asked to allow after the complete companion
-/// document has been reviewed. No executable input is put in this string:
-/// `LocalAuthentication` may truncate a localized reason, so it must never be
-/// the only place a behavior-changing field appears.
-fn approval_reason_for_raw(request: &oshioki_protocol::RequestV1, raw: &[u8]) -> String {
-    let digest = request_digest(raw);
-    let reason = format!(
-        "Approve {} [sha256:{}] after full review.",
-        escape_for_terminal(&request.request_id),
-        &digest[..16],
-    );
-    debug_assert!(reason.chars().count() <= MAX_APPROVAL_REASON_CHARS);
-    reason
-}
-
-/// The request ID is bounded to 128 ASCII bytes by the protocol. Together
-/// with this fixed wording and a 16-hex digest prefix, the reason stays below
-/// the conservative limit used for a system-owned biometric prompt.
-const MAX_APPROVAL_REASON_CHARS: usize = 96;
+/// The reason's cap for a system-owned biometric prompt. `LocalAuthentication`
+/// wraps a long reason across lines on the sheet rather than truncating it
+/// outright (confirmed on-device with a two-line reason under the previous,
+/// tighter cap), so this is set with headroom for host, user, and a short
+/// command rather than the bare id-and-hash the sheet used to show. Still
+/// conservative pending a longer on-device check of how many lines look
+/// reasonable.
+const MAX_APPROVAL_REASON_CHARS: usize = 160;
 
 /// Test helper for the short reason generated from a semantically valid
 /// request. Production paths use the exact retained bytes directly.
 #[cfg(test)]
 fn approval_reason(request: &oshioki_protocol::RequestV1) -> String {
-    let raw = request.raw_json().unwrap_or_default();
-    approval_reason_for_raw(request, &raw)
+    approval_reason_for_raw(request)
 }
 
 /// The complete bound environment as approver-visible lines, empty when the
@@ -1227,17 +1318,9 @@ fn now() -> i64 {
 /// screen is locked, and how to tear a sheet down at a deadline.
 #[cfg(target_os = "macos")]
 mod mac {
-    use std::{
-        fs::{self, OpenOptions},
-        io::Write as _,
-        os::unix::fs::OpenOptionsExt as _,
-        path::{Path, PathBuf},
-        process::{Command, Stdio},
-        sync::Arc,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-    };
+    use std::sync::Arc;
 
-    use anyhow::{Context as _, Result, bail};
+    use anyhow::Result;
     use oshioki_agent::{
         Identity, OpenedRequest,
         touchid::{AttemptError, Outcome, PromptCancel, ScreenLock, TouchIdPrompt},
@@ -1246,63 +1329,7 @@ mod mac {
     use oshioki_protocol::{DecisionV1, escape_for_terminal};
     use tracing::{error, info};
 
-    use super::{approval_reason_for_raw, full_review_document, now};
-    use oshioki_agent::remaining_until;
-
-    /// The result of the review helper, before Touch ID is attempted.
-    #[derive(Debug, PartialEq, Eq)]
-    enum ReviewOutcome {
-        Approved,
-        Canceled,
-        Expired,
-    }
-
-    /// The request is shown in a transient, read-only `AppKit` view rather than
-    /// in `LocalAuthentication`'s one-line reason. The JXA is constant and the
-    /// path is passed as data, so neither request contents nor shell syntax
-    /// are interpreted by the helper.
-    const REVIEW_SCRIPT: &str = r"
-ObjC.import('AppKit');
-ObjC.import('Foundation');
-
-function run(argv) {
-    if (argv.length !== 1) throw new Error('invalid review arguments');
-    const path = $(argv[0]);
-    const contents = $.NSString.stringWithContentsOfFileEncodingError(
-        path, $.NSUTF8StringEncoding, null);
-    if (contents === null) throw new Error('could not read the approval review');
-
-    const alert = $.NSAlert.alloc.init;
-    alert.messageText = 'Review sudo request';
-    alert.informativeText = 'Read the complete signed request below. Continue only if every command, argument, and environment entry is expected.';
-    alert.addButtonWithTitle('Cancel');
-    alert.addButtonWithTitle('Continue to Touch ID');
-
-    const frame = $.NSMakeRect(0, 0, 700, 420);
-    const textView = $.NSTextView.alloc.initWithFrame(frame);
-    textView.string = ObjC.unwrap(contents);
-    textView.editable = false;
-    textView.selectable = true;
-    textView.richText = false;
-    textView.horizontallyResizable = true;
-    textView.verticallyResizable = true;
-    textView.maxSize = $.NSMakeSize(100000, 100000);
-
-    const scrollView = $.NSScrollView.alloc.initWithFrame(frame);
-    scrollView.hasVerticalScroller = true;
-    scrollView.hasHorizontalScroller = true;
-    scrollView.autohidesScrollers = false;
-    scrollView.documentView = textView;
-    alert.accessoryView = scrollView;
-    alert.layout();
-
-    $.NSApplication.sharedApplication;
-    $.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
-    const response = alert.runModal();
-    if (response != 1001) throw new Error('approval review was canceled');
-    return 0;
-}
-";
+    use super::approval_reason_for_raw;
 
     /// The login session's lock state, read fresh each time it is asked for.
     pub struct Screen;
@@ -1336,60 +1363,13 @@ function run(argv) {
         opened: &OpenedRequest,
     ) -> Result<Option<DecisionV1>> {
         let request = &opened.request;
-        // The permit covers both the review window and the subsequent Touch
-        // ID sheet. A second native request fails closed immediately instead
-        // of stacking a review dialog and consuming an admission slot.
-        let Some(permit) = prompt.try_acquire() else {
-            info!(
-                request_id = %escape_for_terminal(&request.request_id),
-                "another native approval is already under review"
-            );
-            return Ok(None);
-        };
-        // LocalAuthentication can truncate localized reasons, so the full
-        // signed bytes must be inspected in the companion first. A launchd
-        // agent has no terminal; failure to reach the GUI is therefore a
-        // deliberate fail-closed result.
-        let document = full_review_document(request, &opened.raw);
-        let expires_at = request.expires_at;
-        let reviewed = tokio::task::spawn_blocking(move || show_review(&document, expires_at))
-            .await
-            .context("the approval review thread panicked")??;
-        match reviewed {
-            ReviewOutcome::Approved => {}
-            ReviewOutcome::Canceled => {
-                info!(
-                    request_id = %escape_for_terminal(&request.request_id),
-                    "approval review was canceled"
-                );
-                return Ok(None);
-            }
-            ReviewOutcome::Expired => {
-                info!(
-                    request_id = %escape_for_terminal(&request.request_id),
-                    "request expired during approval review"
-                );
-                return Ok(None);
-            }
-        }
-        if request.expires_at <= now() {
-            info!(
-                request_id = %escape_for_terminal(&request.request_id),
-                "request expired during approval review"
-            );
-            return Ok(None);
-        }
-        let reason = approval_reason_for_raw(request, &opened.raw);
-        info!(
-            request_id = %escape_for_terminal(&request.request_id),
-            "request reviewed; asking for Touch ID"
-        );
+        let reason = approval_reason_for_raw(request);
         let sign = {
             let (identity, opened, reason) = (Arc::clone(identity), opened.clone(), reason.clone());
             move || identity.approve(&opened, &reason).map_err(classify)
         };
         match prompt
-            .ask_with_permit(permit, &request.request_id, request.expires_at, sign)
+            .ask(&request.request_id, request.expires_at, sign)
             .await
         {
             Ok(Outcome::Approved(decision)) => Ok(Some(decision)),
@@ -1419,96 +1399,6 @@ function run(argv) {
         }
     }
 
-    /// Displays the exact signed request in a transient `AppKit` alert and waits
-    /// for the operator to explicitly continue. The file is owner-only and
-    /// is unlinked on every path; if either display or cleanup fails, approval
-    /// is refused rather than leaving secrets behind or signing blindly.
-    fn show_review(document: &str, expires_at: i64) -> Result<ReviewOutcome> {
-        let Some(remaining) = remaining_until(expires_at) else {
-            return Ok(ReviewOutcome::Expired);
-        };
-        show_review_with_deadline(
-            document,
-            Instant::now() + remaining,
-            Path::new("/usr/bin/osascript"),
-            &std::env::temp_dir(),
-        )
-    }
-
-    /// Runs a review helper while retaining a hard deadline. Killing the
-    /// child is required because aborting the blocking task would leave an
-    /// interactive osascript process and its dialog behind.
-    fn show_review_with_deadline(
-        document: &str,
-        deadline: Instant,
-        helper: &Path,
-        temp_dir: &Path,
-    ) -> Result<ReviewOutcome> {
-        let (path, file) = create_review_file_in(temp_dir)?;
-        let display_result = (|| -> Result<ReviewOutcome> {
-            let mut file = file;
-            file.write_all(document.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            let path_string = path
-                .to_str()
-                .context("approval review path is not valid UTF-8")?;
-            let mut child = Command::new(helper)
-                .env_clear()
-                .args(["-l", "JavaScript", "-e", REVIEW_SCRIPT, path_string])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("launch the approval review")?;
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    return Ok(if status.success() {
-                        ReviewOutcome::Approved
-                    } else {
-                        ReviewOutcome::Canceled
-                    });
-                }
-                if Instant::now() >= deadline {
-                    child
-                        .kill()
-                        .context("terminate the expired approval review")?;
-                    child.wait().context("reap the expired approval review")?;
-                    return Ok(ReviewOutcome::Expired);
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        })();
-        let cleanup_result = fs::remove_file(&path)
-            .map_err(|error| anyhow::anyhow!("remove the temporary approval review: {error}"));
-        cleanup_result?;
-        display_result
-    }
-
-    fn create_review_file_in(temp_dir: &Path) -> Result<(PathBuf, fs::File)> {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        for attempt in 0..100u8 {
-            let path = temp_dir.join(format!(
-                "oshioki-review-{}-{stamp}-{attempt}.txt",
-                std::process::id()
-            ));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(file) => return Ok((path, file)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error).context("create the approval review"),
-            }
-        }
-        bail!("could not allocate a unique approval review file")
-    }
-
     /// A dismissed sheet is an answer; anything else is a broken key.
     fn classify(error: anyhow::Error) -> AttemptError {
         if matches!(error.downcast_ref::<SignError>(), Some(SignError::Canceled)) {
@@ -1517,157 +1407,15 @@ function run(argv) {
             AttemptError::Failed(error)
         }
     }
-
-    #[cfg(test)]
-    mod tests {
-        use std::{
-            fs,
-            os::unix::fs::PermissionsExt as _,
-            path::{Path, PathBuf},
-            time::{Duration, Instant},
-        };
-
-        use super::{REVIEW_SCRIPT, ReviewOutcome, show_review_with_deadline};
-
-        fn test_dir(name: &str) -> PathBuf {
-            let path = std::env::temp_dir()
-                .join(format!("oshioki-review-test-{name}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            path
-        }
-
-        fn helper(dir: &Path, name: &str, body: &str) -> PathBuf {
-            let path = dir.join(name);
-            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            let mut permissions = fs::metadata(&path).unwrap().permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(&path, permissions).unwrap();
-            path
-        }
-
-        fn review_files(dir: &Path) -> Vec<PathBuf> {
-            fs::read_dir(dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("oshioki-review-"))
-                })
-                .collect()
-        }
-
-        /// The real helper receives the review path as its final argument.
-        /// These non-interactive helpers inspect that file before returning,
-        /// which exercises its permissions, contents, and cleanup on each
-        /// exit-status path.
-        #[test]
-        fn review_file_lifecycle_is_fail_closed_and_owner_only() {
-            let dir = test_dir("lifecycle");
-            let ok = helper(
-                &dir,
-                "approve.sh",
-                "path=\"$5\"; cat \"$path\" > \"$path.capture\"; stat -f %Lp \"$path\" > \"$path.mode\"; exit 0",
-            );
-            let document = "signed request with a complete environment";
-            assert_eq!(
-                show_review_with_deadline(
-                    document,
-                    Instant::now() + Duration::from_secs(5),
-                    &ok,
-                    &dir,
-                )
-                .unwrap(),
-                ReviewOutcome::Approved
-            );
-            let capture = review_files(&dir)
-                .into_iter()
-                .find(|path| path.extension().is_some_and(|ext| ext == "capture"))
-                .unwrap();
-            assert_eq!(fs::read_to_string(&capture).unwrap(), document);
-            let mode = capture.with_extension("mode");
-            assert_eq!(fs::read_to_string(mode).unwrap().trim(), "600");
-            assert!(review_files(&dir).iter().all(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "capture" || extension == "mode")
-            }));
-
-            let cancel = helper(
-                &dir,
-                "cancel.sh",
-                "path=\"$5\"; cat \"$path\" > \"$path.capture\"; stat -f %Lp \"$path\" > \"$path.mode\"; exit 1",
-            );
-            assert_eq!(
-                show_review_with_deadline(
-                    document,
-                    Instant::now() + Duration::from_secs(5),
-                    &cancel,
-                    &dir,
-                )
-                .unwrap(),
-                ReviewOutcome::Canceled
-            );
-            assert!(review_files(&dir).iter().all(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "capture" || extension == "mode")
-            }));
-
-            let missing = dir.join("missing-helper");
-            assert!(
-                show_review_with_deadline(
-                    document,
-                    Instant::now() + Duration::from_secs(5),
-                    &missing,
-                    &dir,
-                )
-                .is_err()
-            );
-            assert!(review_files(&dir).iter().all(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "capture" || extension == "mode")
-            }));
-            let _ = fs::remove_dir_all(dir);
-        }
-
-        #[test]
-        fn review_expiry_kills_the_helper_before_cleanup() {
-            let dir = test_dir("expiry");
-            let started = dir.join("helper.started");
-            let helper = helper(
-                &dir,
-                "hang.sh",
-                &format!(": > '{}'; exec /bin/sleep 60", started.display()),
-            );
-            let outcome = show_review_with_deadline(
-                "expiring request",
-                Instant::now() + Duration::from_secs(1),
-                &helper,
-                &dir,
-            )
-            .unwrap();
-            assert_eq!(outcome, ReviewOutcome::Expired);
-            assert!(started.exists());
-            assert!(review_files(&dir).is_empty());
-            let _ = fs::remove_dir_all(dir);
-        }
-
-        #[test]
-        fn jxa_buttons_map_cancel_to_non_continue_and_continue_to_1001() {
-            assert!(REVIEW_SCRIPT.contains("alert.addButtonWithTitle('Cancel');"));
-            assert!(REVIEW_SCRIPT.contains("alert.addButtonWithTitle('Continue to Touch ID');"));
-            assert!(REVIEW_SCRIPT.contains("if (response != 1001)"));
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         Cli, Decider, MAX_APPROVAL_REASON_CHARS, MAX_IN_FLIGHT_REQUESTS, Pairing, Prompter,
-        RequestAdmission, Verb, approval_reason, approval_reason_for_raw, bind_socket, decide,
-        dispatch_nats_request, format_env, full_review_document, load_or_create_with, now,
-        prompt_output, quote_argv, request_digest, runas_label, socket_path,
+        RequestAdmission, Verb, approval_reason, bind_socket, decide,
+        dispatch_nats_request, format_env, load_or_create_with, now,
+        prompt_output, quote_argv, runas_label, socket_path,
     };
     use clap::Parser as _;
     use oshioki_agent::SignerKind;
@@ -1840,19 +1588,148 @@ mod tests {
         assert_eq!(runas_label(1000), "uid 1000");
     }
 
-    /// Touch ID receives only a short reference to the companion review. No
-    /// command or environment suffix is delegated to a potentially truncated
-    /// `LocalAuthentication` reason.
+    /// With no session name, the reason is `<user>@<host> sudo <argv>` and
+    /// stays within the cap.
     #[test]
-    fn the_sheet_reason_references_the_full_review_compactly() {
-        let mut request = request_for_reason();
-        let raw = request.raw_json().unwrap();
-        let reason = approval_reason_for_raw(&request, &raw);
-        assert!(reason.contains("req-1"));
-        assert!(reason.contains(&request_digest(&raw)[..16]));
-        assert!(!reason.contains("/usr/bin/apt"));
+    fn reason_without_session_shows_user_host_and_command() {
+        let request = request_for_reason();
+        let reason = approval_reason(&request);
+        assert_eq!(reason, "eric@host.example sudo apt update");
         assert!(reason.chars().count() <= MAX_APPROVAL_REASON_CHARS);
-        request.runas_uid = 1000;
+    }
+
+    /// `OSHIOKI_SESSION` in the bound environment names the session, shown
+    /// as a prefix ahead of the usual user@host/command text.
+    #[test]
+    fn reason_with_session_env_shows_session_prefix() {
+        let mut request = request_for_reason();
+        request.env = vec![EnvEntryV1 {
+            name: "OSHIOKI_SESSION".into(),
+            value: "laptop-ghostty".into(),
+        }];
+        assert_eq!(
+            approval_reason(&request),
+            "laptop-ghostty: eric@host.example sudo apt update"
+        );
+    }
+
+    /// A later duplicate `OSHIOKI_SESSION` entry wins, matching the protocol
+    /// rule that a duplicated env name's last value is the effective one.
+    #[test]
+    fn reason_session_env_prefers_last_duplicate() {
+        let mut request = request_for_reason();
+        request.env = vec![
+            EnvEntryV1 {
+                name: "OSHIOKI_SESSION".into(),
+                value: "first".into(),
+            },
+            EnvEntryV1 {
+                name: "OSHIOKI_SESSION".into(),
+                value: "second".into(),
+            },
+        ];
+        assert!(approval_reason(&request).starts_with("second: "));
+    }
+
+    /// Without an `OSHIOKI_SESSION` entry, the nearest interesting
+    /// `pid_chain` ancestor names the session; shells and `sudo` itself are
+    /// skipped as uninteresting.
+    #[test]
+    fn reason_falls_back_to_interesting_pid_chain_ancestor() {
+        let mut request = request_for_reason();
+        request.pid_chain = vec![
+            "100:sudo".into(),
+            "99:zsh".into(),
+            "50:claude".into(),
+            "1:launchd".into(),
+        ];
+        assert!(approval_reason(&request).starts_with("claude: "));
+    }
+
+    /// With no session env and no interesting `pid_chain` entry, the tty
+    /// basename is the last resort.
+    #[test]
+    fn reason_falls_back_to_tty_basename() {
+        let mut request = request_for_reason();
+        request.pid_chain = vec!["99:zsh".into(), "1:launchd".into()];
+        request.tty = Some("/dev/ttys004".into());
+        assert!(approval_reason(&request).starts_with("ttys004: "));
+    }
+
+    /// No session env, no interesting `pid_chain` ancestor, and no tty: the
+    /// reason drops the prefix entirely rather than show an empty label.
+    #[test]
+    fn reason_drops_prefix_when_nothing_resolves() {
+        let mut request = request_for_reason();
+        request.pid_chain = vec!["99:zsh".into()];
+        request.tty = None;
+        let reason = approval_reason(&request);
+        assert!(!reason.contains(':') || reason.starts_with("eric@"));
+        assert_eq!(reason, "eric@host.example sudo apt update");
+    }
+
+    /// `sudo` is not repeated when the caller's argv already names it.
+    #[test]
+    fn reason_does_not_double_sudo() {
+        let mut request = request_for_reason();
+        request.argv = vec!["sudo".into(), "apt".into(), "update".into()];
+        assert_eq!(approval_reason(&request), "eric@host.example sudo apt update");
+    }
+
+    /// Host and user are never truncated or dropped, even when the argv is
+    /// far too long to fit alongside them; the tail shrinks with "…" rather
+    /// than overflowing the cap or cutting into user/host.
+    #[test]
+    fn reason_truncates_long_argv_without_touching_user_host() {
+        let mut request = request_for_reason();
+        request.command = "/usr/bin/find".into();
+        request.argv = vec![
+            "find".into(),
+            "/".into(),
+            "-name".into(),
+            "*.rs".into(),
+            "-exec".into(),
+            "grep".into(),
+            "-l".into(),
+            "needle-".repeat(20),
+            "{}".into(),
+            "+".into(),
+        ];
+        let reason = approval_reason(&request);
+        assert!(reason.chars().count() <= MAX_APPROVAL_REASON_CHARS);
+        assert!(reason.starts_with("eric@host.example sudo "));
+        assert!(reason.ends_with('…'));
+    }
+
+    /// Under the same pressure, a session-carrying request still shows the
+    /// full user@host and drops the session prefix entirely rather than
+    /// truncate it, since the command is more useful when space is tight.
+    #[test]
+    fn reason_truncation_prefers_command_over_session_name() {
+        let mut request = request_for_reason();
+        request.env = vec![EnvEntryV1 {
+            name: "OSHIOKI_SESSION".into(),
+            value: "a-very-long-session-label-that-eats-the-budget".into(),
+        }];
+        request.command = "/usr/bin/find".into();
+        request.argv = vec!["find".into(), "/".into(), "-name".into(), "needle-".repeat(20)];
+        let reason = approval_reason(&request);
+        assert!(reason.chars().count() <= MAX_APPROVAL_REASON_CHARS);
+        assert!(reason.starts_with("eric@host.example sudo "));
+        assert!(
+            !reason.contains("a-very-long-session-label"),
+            "the session prefix should be dropped, not truncated into noise: {reason}"
+        );
+        assert!(reason.ends_with('…'));
+    }
+
+    /// Changing the target account changes the reason: it is not a fixed
+    /// template independent of the request.
+    #[test]
+    fn reason_changes_with_the_request() {
+        let mut request = request_for_reason();
+        let reason = approval_reason(&request);
+        request.user = "otheruser".into();
         assert_ne!(approval_reason(&request), reason);
     }
 
@@ -1925,35 +1802,6 @@ mod tests {
         assert_eq!(shown.lines().count(), 64, "{shown}");
         assert!(shown.ends_with(&format!("  env[63] PATH63={}\n", "x".repeat(1024))));
         assert!(shown.contains(&"x".repeat(1024)), "{shown}");
-    }
-
-    /// The native companion contains the exact signed bytes, including
-    /// behavior-changing variables and a suffix beyond the former
-    /// `LocalAuthentication` reason cut.
-    #[test]
-    fn full_review_keeps_bash_env_ld_preload_and_long_suffix() {
-        let mut request = request_for_reason();
-        request.command = "/bin/sh".into();
-        request.argv = vec![
-            "-c".into(),
-            format!("{}{}", "x".repeat(100), ";echo malicious-suffix"),
-        ];
-        request.env = vec![
-            EnvEntryV1 {
-                name: "BASH_ENV".into(),
-                value: "/tmp/attacker-init".into(),
-            },
-            EnvEntryV1 {
-                name: "LD_PRELOAD".into(),
-                value: "/tmp/evil.so".into(),
-            },
-        ];
-        let raw = request.raw_json().unwrap();
-        let document = full_review_document(&request, &raw);
-        assert!(document.contains("BASH_ENV"), "{document}");
-        assert!(document.contains("LD_PRELOAD"), "{document}");
-        assert!(document.contains("malicious-suffix"), "{document}");
-        assert!(document.contains(&request_digest(&raw)), "{document}");
     }
 
     /// Same command, different environments: the signatures differ, because
@@ -2521,6 +2369,9 @@ mod tests {
             .ok_or(())
     }
 
+    /// The decision paths log the request ID and host for operability, but
+    /// never the reason text (shown only on the Touch ID sheet or the
+    /// terminal prompt) or any other request field.
     #[tokio::test]
     async fn request_plaintext_never_reaches_the_log() {
         let logs = CapturedLogs::default();
@@ -2544,10 +2395,15 @@ mod tests {
         );
 
         // The probe request really carries the marker everywhere the log
-        // must not see it.
+        // must not see it. The Touch ID reason is shown on-device rather
+        // than logged (asserted below via `text`), so it legitimately
+        // carries the probe now that the sheet shows user/host/command.
         let request = request_for_log_probe();
         let reason = approval_reason(&request);
-        assert!(!reason.contains(LOG_PROBE), "{reason}");
+        assert!(
+            reason.contains(&format!("user-{LOG_PROBE}")),
+            "the reason should show who asked: {reason}"
+        );
 
         // Terminal prompt path: answer yes to the canned prompt.
         let envelope: RequestEnvelopeV1 =
