@@ -2,6 +2,10 @@ ARG RUST_IMAGE=rust:1.85-bookworm
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /build
 COPY . ./
+# The oshioki-pam workspace member links libpam.
+RUN apt-get update \
+ && apt-get install --yes --no-install-recommends libpam0g-dev \
+ && rm -rf /var/lib/apt/lists/*
 RUN cargo build --locked --release --workspace \
  && cd target/release \
  && sha256sum oshioki oshioki-agent oshioki-server liboshioki_plugin.so > SHA256SUMS

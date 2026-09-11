@@ -1330,6 +1330,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oshioki-pam"
+version = "0.1.6"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "oshioki-plugin"
 version = "0.1.6"
 dependencies = [
