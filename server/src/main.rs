@@ -15,8 +15,9 @@ use axum::{
 use db::{InsertResult, RequestLifecycle, Store};
 use futures::StreamExt as _;
 use oshioki_protocol::{
-    ActivationV1, AliveV1, ApproveV1, DecisionV1, DenyV1, EnrollmentIntentV1,
-    EnrollmentSubmissionV1, RequestEnvelopeV1, SealedDeviceBodyV1,
+    AUTH_ENVELOPE_TYPE, ActivationV1, AliveV1, ApproveV1, AuthApproveWebauthnV1, AuthDecisionV1,
+    AuthEnvelopeV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
+    RequestEnvelopeV1, SealedDeviceBodyV1,
 };
 use oshioki_transport::{Ack, JetStreamMessage, NatsTransport, ServerTransport};
 use serde::Serialize;
@@ -32,6 +33,22 @@ use std::{
 use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
+
+/// Every path the authentication lane serves. The router is built from this
+/// list and from nothing else, so the lane's route table is this array: a
+/// test asserting that none of these is a refusal is a check on the router
+/// itself rather than on the text of this file.
+///
+/// There is no denial route and there must never be one. Cancelling in the
+/// browser sends nothing at all, and sudo asks for a password at the host's
+/// deadline; a route that could record a "no" would turn a request nobody
+/// read into a failure nobody chose.
+const AUTH_ROUTES: [&str; 4] = [
+    "/api/v1/auth/:id",
+    "/api/v1/auth/:id/ack",
+    "/api/v1/auth/:id/authenticate-webauthn",
+    "/api/v1/auth/:id/verdict",
+];
 
 const MAX_HTTP_BODY: usize = 3 * 1024 * 1024;
 /// Largest servable Darwin artifact. Release tarballs are tens of megabytes,
@@ -65,7 +82,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct RequestResponse {
     sealed: SealedDeviceBodyV1,
     expires_at: i64,
@@ -110,6 +127,7 @@ async fn main() -> Result<()> {
     spawn_workers(&state);
     let app = Router::new()
         .route("/r/:id", get(request_page))
+        .route("/a/:id", get(authentication_page))
         .route("/enroll/:id", get(enrollment_page))
         .route("/assets/app.js", get(app_js))
         .route("/assets/app.css", get(app_css))
@@ -119,6 +137,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/requests/:id/approve", post(approve_request))
         .route("/api/v1/requests/:id/deny", post(deny_request))
         .route("/api/v1/requests/:id/verdict", get(recorded_verdict))
+        .route(AUTH_ROUTES[0], get(get_auth_request))
+        .route(AUTH_ROUTES[1], post(acknowledge_auth_request))
+        .route(AUTH_ROUTES[2], post(authenticate_webauthn))
+        .route(AUTH_ROUTES[3], get(recorded_auth_verdict))
         .route(
             "/api/v1/enrollments/:id/submission",
             post(submit_enrollment),
@@ -194,6 +216,25 @@ async fn request_consumer(state: AppState) -> Result<()> {
                 state.consumer_last_ok.store(now(), Ordering::Relaxed);
                 continue;
             }
+            // The lane is decided by the envelope's own `type` tag, not by
+            // the subject it arrived on. The legacy command envelope carries
+            // no tag at all, so it routes exactly as it always has; a tag
+            // this build does not implement is terminated rather than
+            // guessed at, and never reaches the command decoder.
+            match envelope_type(raw) {
+                None => {}
+                Some(message_type) if message_type == AUTH_ENVELOPE_TYPE => {
+                    ingest_auth_envelope(&state, raw, ack).await?;
+                    state.consumer_last_ok.store(now(), Ordering::Relaxed);
+                    continue;
+                }
+                Some(message_type) => {
+                    warn!(%message_type, "terminating envelope of an unknown type");
+                    ack(Ack::Term).await?;
+                    state.consumer_last_ok.store(now(), Ordering::Relaxed);
+                    continue;
+                }
+            }
             let envelope = match serde_json::from_slice::<RequestEnvelopeV1>(raw) {
                 Ok(value) => value,
                 Err(error) => {
@@ -222,6 +263,57 @@ async fn request_consumer(state: AppState) -> Result<()> {
             state.consumer_last_ok.store(now(), Ordering::Relaxed);
         }
     }
+}
+
+/// Reads only an envelope's `type` tag, so one delivery can be routed before
+/// anything decides how to parse the rest of it. `None` covers both an
+/// untagged legacy envelope and a payload that is not JSON at all; the
+/// command decode is what reports the latter, as it always has.
+fn envelope_type(raw: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct EnvelopeTypeV1 {
+        #[serde(rename = "type")]
+        message_type: Option<String>,
+    }
+    serde_json::from_slice::<EnvelopeTypeV1>(raw)
+        .ok()
+        .and_then(|envelope| envelope.message_type)
+}
+
+/// Stores one contextual sudo authentication envelope, with the same
+/// acknowledgement contract the command lane uses: stored or already stored
+/// is an Ack, and anything undecodable, conflicting, or expired is a Term so
+/// it never redelivers.
+async fn ingest_auth_envelope(
+    state: &AppState,
+    raw: &[u8],
+    ack: oshioki_transport::AckFn,
+) -> Result<()> {
+    let envelope = match serde_json::from_slice::<AuthEnvelopeV1>(raw) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(%error, "terminating malformed authentication envelope");
+            ack(Ack::Term).await?;
+            return Ok(());
+        }
+    };
+    match state.store.ingest_auth_request(raw, &envelope, now()) {
+        Ok(result @ (InsertResult::Inserted | InsertResult::Identical)) => {
+            if result == InsertResult::Inserted {
+                queue_auth_notification(state, &envelope)?;
+            }
+            ack(Ack::Ok).await?;
+        }
+        Ok(InsertResult::Conflict) => {
+            warn!(request_id=%envelope.request_id, "terminating conflicting authentication request id reuse");
+            ack(Ack::Term).await?;
+        }
+        Err(error) => {
+            warn!(%error, "terminating invalid or expired authentication request");
+            ack(Ack::Term).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn enrollment_consumer(state: AppState) -> Result<()> {
@@ -410,8 +502,32 @@ fn queue_notification(state: &AppState, envelope: &RequestEnvelopeV1) -> Result<
         .queue_notification(&envelope.request_id, endpoint, &payload)
 }
 
+/// The authentication lane's notification. It names the host and the
+/// request, and nothing about the account or the invocation: that context is
+/// inside the sealed body, and a push notification is not a place to put it.
+fn queue_auth_notification(state: &AppState, envelope: &AuthEnvelopeV1) -> Result<()> {
+    let Some(endpoint) = &state.ntfy_url else {
+        return Ok(());
+    };
+    let payload = serde_json::to_vec(&json!({
+        "title": format!("sudo authentication on {}", envelope.host),
+        "message": format!("sudo is asking for authentication ({})", envelope.request_id),
+        "click": format!("{}/a/{}", state.origin, envelope.request_id),
+    }))?;
+    state
+        .store
+        .queue_notification(&envelope.request_id, endpoint, &payload)
+}
+
 async fn request_page(Path(_id): Path<String>) -> Response {
     html(include_str!("../web/request.html"))
+}
+/// The authentication lane has its own page at its own path. Keeping it off
+/// `/r/:id` is the simplest thing that leaves every existing request page
+/// byte-for-byte what it was, and makes a link to the wrong lane a plain
+/// 404 rather than a page that renders the wrong question.
+async fn authentication_page(Path(_id): Path<String>) -> Response {
+    html(include_str!("../web/auth.html"))
 }
 async fn enrollment_page(Path(_id): Path<String>) -> Response {
     html(include_str!("../web/enroll.html"))
@@ -560,6 +676,159 @@ fn queue_decision(
         Err(error) if error.to_string().contains("expired") => Err(ApiError(StatusCode::GONE)),
         Err(error) if error.to_string().contains("unknown") => Err(ApiError(StatusCode::NOT_FOUND)),
         Err(_) => Err(ApiError(StatusCode::CONFLICT)),
+    }
+}
+
+/// The sealed authentication body for the browser profile holding this API
+/// token. Deliberately a separate path from `/api/v1/requests/:id`: an
+/// authentication id is unknown to that route and a command request id is
+/// unknown to this one, so a client aimed at the wrong lane is told so.
+async fn get_auth_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<RequestResponse>, ApiError> {
+    require_pending_auth(&state, &id)?;
+    let token = bearer_token(&headers)?;
+    let request = state
+        .store
+        .sealed_auth_request_for_token(&id, token.as_bytes(), now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let sealed = serde_json::from_str(&request.body_json)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(Json(RequestResponse {
+        sealed,
+        expires_at: request.expires_at,
+    }))
+}
+
+/// Relays the browser's liveness acknowledgement for an authentication, on
+/// the same `oshioki.ack.<id>` subject the hook already waits on.
+async fn acknowledge_auth_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(acknowledgement): Json<AliveV1>,
+) -> Result<StatusCode, ApiError> {
+    acknowledgement
+        .validate(&id)
+        .map_err(|_| ApiError(StatusCode::CONFLICT))?;
+    require_pending_auth(&state, &id)?;
+    let token = bearer_token(&headers)?;
+    state
+        .store
+        .sealed_auth_request_for_token(&id, token.as_bytes(), now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let payload = serde_json::to_vec(&acknowledgement)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+    state
+        .transport
+        .publish(format!("oshioki.ack.{id}"), payload)
+        .await
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Queues one `WebAuthn` authentication assertion for the hook.
+///
+/// This is the only decision route on the lane. There is no denial
+/// counterpart and there must never be one: cancelling in the browser sends
+/// nothing, and the host then asks for a password. The server verifies no
+/// signature here, exactly as it verifies none for a command approval — the
+/// hook checks the assertion against its own pinned registry.
+async fn authenticate_webauthn(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(approval): Json<AuthApproveWebauthnV1>,
+) -> Result<StatusCode, ApiError> {
+    approval
+        .validate_shape()
+        .map_err(|_| ApiError(StatusCode::CONFLICT))?;
+    authorize_auth_request(&state, &id, &headers, &approval.device_fingerprint)?;
+    if approval.request_id != id {
+        return Err(ApiError(StatusCode::CONFLICT));
+    }
+    let fingerprint = approval.device_fingerprint.clone();
+    match state.store.queue_auth_decision(
+        &id,
+        &fingerprint,
+        &AuthDecisionV1::AuthenticateWebauthn(approval),
+        now(),
+    ) {
+        Ok(InsertResult::Inserted | InsertResult::Identical) => Ok(StatusCode::ACCEPTED),
+        Ok(InsertResult::Conflict) => Err(ApiError(StatusCode::GONE)),
+        Err(error) if error.to_string().contains("expired") => Err(ApiError(StatusCode::GONE)),
+        Err(error) if error.to_string().contains("unknown") => Err(ApiError(StatusCode::NOT_FOUND)),
+        Err(_) => Err(ApiError(StatusCode::CONFLICT)),
+    }
+}
+
+/// The server's recorded assertion for an authentication request, in its own
+/// lane: a command verdict is never readable here, nor this one there.
+///
+/// Follow-ups deferred out of this slice, recorded here so they are not
+/// lost (none of them is a behaviour change made in this pass):
+///
+/// * This route is unauthenticated, for parity with
+///   `/api/v1/requests/:id/verdict`: a verdict is an outcome, not a secret,
+///   and the payload was already published on NATS. Whether either route
+///   should require a token is one decision for both lanes together.
+/// * Decision-to-status mapping in `queue_decision` and
+///   `authenticate_webauthn` dispatches on `error.to_string().contains(...)`.
+///   That is the existing command-lane pattern, carried over deliberately so
+///   the two stay identical; a typed store error would be better and belongs
+///   to both lanes at once.
+/// * `SubmittedAuthContextV1::agent_label` is signed and carried but shown
+///   nowhere — neither the browser page nor the agent's terminal prompt
+///   renders it. The hook does not populate it yet, so displaying it is work
+///   for whichever slice starts to.
+async fn recorded_auth_verdict(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    match state
+        .store
+        .recorded_auth_verdict(&id)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+    {
+        Some(payload) => Ok(asset("application/json", &payload, false)),
+        None => Err(ApiError(StatusCode::NOT_FOUND)),
+    }
+}
+
+fn authorize_auth_request(
+    state: &AppState,
+    id: &str,
+    headers: &HeaderMap,
+    fingerprint: &str,
+) -> Result<(), ApiError> {
+    require_pending_auth(state, id)?;
+    let token = bearer_token(headers)?;
+    let request = state
+        .store
+        .sealed_auth_request_for_token(id, token.as_bytes(), now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let sealed: SealedDeviceBodyV1 = serde_json::from_str(&request.body_json)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+    if sealed.device_fingerprint != fingerprint {
+        return Err(ApiError(StatusCode::UNAUTHORIZED));
+    }
+    Ok(())
+}
+
+fn require_pending_auth(state: &AppState, id: &str) -> Result<(), ApiError> {
+    match state
+        .store
+        .auth_request_lifecycle(id, now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+    {
+        Some(RequestLifecycle::Pending) => Ok(()),
+        Some(RequestLifecycle::Gone) => Err(ApiError(StatusCode::GONE)),
+        None => Err(ApiError(StatusCode::NOT_FOUND)),
     }
 }
 
@@ -1296,6 +1565,509 @@ mod tests {
                 .is_some()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn auth_test_state(
+        name: &str,
+    ) -> (PathBuf, AppState, oshioki_transport::MockTransport, String) {
+        let dir =
+            std::env::temp_dir().join(format!("oshioki-server-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("state.sqlite3")).unwrap());
+        store.ready().unwrap();
+        let token = "browser-token-012345678901234567890".to_owned();
+        let mut device = test_device();
+        device.api_token_hash =
+            oshioki_protocol::encode_base64url(&sha2::Sha256::digest(token.as_bytes()));
+        store.put_device(&device).unwrap();
+        let transport = oshioki_transport::MockTransport::new();
+        let state = AppState {
+            store,
+            transport: Arc::new(transport.clone()),
+            dist_root: Arc::new(PathBuf::from("/nonexistent")),
+            artifact_permits: Arc::new(Semaphore::new(1)),
+            consumer_last_ok: Arc::new(AtomicI64::new(0)),
+            outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            origin: Arc::new("https://sudo.test".into()),
+            rp_id: Arc::new("sudo.test".into()),
+            ntfy_url: None,
+        };
+        (dir, state, transport, token)
+    }
+
+    fn auth_envelope(id: &str, fingerprint: &str) -> AuthEnvelopeV1 {
+        let issued_at = now() - 1;
+        AuthEnvelopeV1 {
+            message_type: AUTH_ENVELOPE_TYPE.into(),
+            version: oshioki_protocol::AUTH_WIRE_VERSION,
+            request_id: id.into(),
+            host: "nas".into(),
+            issued_at,
+            expires_at: issued_at + 75,
+            sealed: vec![SealedDeviceBodyV1 {
+                device_fingerprint: fingerprint.to_owned(),
+                ephemeral_pub: oshioki_protocol::encode_base64url(&[4; 32]),
+                nonce: oshioki_protocol::encode_base64url(&[5; 12]),
+                ciphertext: oshioki_protocol::encode_base64url(&[6; 32]),
+            }],
+        }
+    }
+
+    fn command_envelope(id: &str, fingerprint: &str) -> RequestEnvelopeV1 {
+        let issued_at = now() - 1;
+        RequestEnvelopeV1 {
+            version: oshioki_protocol::VERSION_V1,
+            request_id: id.into(),
+            host: "nas".into(),
+            user: "eric".into(),
+            issued_at,
+            expires_at: issued_at + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS - 1,
+            sealed: vec![SealedDeviceBodyV1 {
+                device_fingerprint: fingerprint.to_owned(),
+                ephemeral_pub: oshioki_protocol::encode_base64url(&[4; 32]),
+                nonce: oshioki_protocol::encode_base64url(&[5; 12]),
+                ciphertext: oshioki_protocol::encode_base64url(&[6; 32]),
+            }],
+        }
+    }
+
+    fn webauthn_assertion(id: &str, fingerprint: &str) -> AuthApproveWebauthnV1 {
+        AuthApproveWebauthnV1 {
+            version: oshioki_protocol::AUTH_WIRE_VERSION,
+            request_id: id.into(),
+            device_fingerprint: fingerprint.to_owned(),
+            credential_id: oshioki_protocol::encode_base64url(&[1; 16]),
+            authenticator_data: oshioki_protocol::encode_base64url(&[7; 37]),
+            client_data_json: oshioki_protocol::encode_base64url(b"{\"type\":\"webauthn.get\"}"),
+            signature: oshioki_protocol::encode_base64url(&[8; 70]),
+        }
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    /// One authentication, from the durable stream to the verdict the hook
+    /// reads back: it is stored in its own lane, served to the browser
+    /// profile that owns it, acknowledged, and answered with a `WebAuthn`
+    /// assertion queued on the verdict subject for this request id.
+    #[tokio::test]
+    async fn an_authentication_runs_from_ingest_to_verdict() {
+        let (dir, state, transport, token) = auth_test_state("auth-lane");
+        let device = test_device();
+        let envelope = auth_envelope("auth-request", &device.fingerprint);
+        let raw = serde_json::to_vec(&envelope).unwrap();
+        assert_eq!(
+            state
+                .store
+                .ingest_auth_request(&raw, &envelope, now())
+                .unwrap(),
+            InsertResult::Inserted
+        );
+        // A redelivery of the same bytes changes nothing.
+        assert_eq!(
+            state
+                .store
+                .ingest_auth_request(&raw, &envelope, now())
+                .unwrap(),
+            InsertResult::Identical
+        );
+
+        let Json(served) = get_auth_request(
+            State(state.clone()),
+            Path("auth-request".into()),
+            bearer(&token),
+        )
+        .await
+        .unwrap();
+        assert_eq!(served.sealed.device_fingerprint, device.fingerprint);
+        assert_eq!(served.expires_at, envelope.expires_at);
+
+        let ack = AliveV1::for_request("auth-request");
+        assert_eq!(
+            acknowledge_auth_request(
+                State(state.clone()),
+                Path("auth-request".into()),
+                bearer(&token),
+                Json(ack.clone()),
+            )
+            .await
+            .unwrap(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            transport.published(),
+            vec![(
+                "oshioki.ack.auth-request".to_owned(),
+                serde_json::to_vec(&ack).unwrap()
+            )]
+        );
+
+        let assertion = webauthn_assertion("auth-request", &device.fingerprint);
+        assert_eq!(
+            authenticate_webauthn(
+                State(state.clone()),
+                Path("auth-request".into()),
+                bearer(&token),
+                Json(assertion.clone()),
+            )
+            .await
+            .unwrap(),
+            StatusCode::ACCEPTED
+        );
+        let queued = state
+            .store
+            .pending_verdicts(8)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.subject == "oshioki.verdict.auth-request")
+            .expect("the assertion was queued on this request's verdict subject");
+        let decision: AuthDecisionV1 = serde_json::from_slice(&queued.payload).unwrap();
+        assert_eq!(
+            decision,
+            AuthDecisionV1::AuthenticateWebauthn(assertion.clone())
+        );
+
+        let recorded = state
+            .store
+            .recorded_auth_verdict("auth-request")
+            .unwrap()
+            .expect("the assertion is readable back on its own lane");
+        assert_eq!(recorded, queued.payload);
+        // Lane isolation both ways: the command verdict route knows nothing
+        // about this id, and the authentication route nothing about a
+        // command one.
+        assert!(
+            state
+                .store
+                .recorded_verdict("auth-request")
+                .unwrap()
+                .is_none()
+        );
+
+        // The request is answered: a second, different assertion is refused.
+        let mut replacement = assertion;
+        replacement.signature = oshioki_protocol::encode_base64url(&[9; 70]);
+        assert_eq!(
+            authenticate_webauthn(
+                State(state),
+                Path("auth-request".into()),
+                bearer(&token),
+                Json(replacement),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::GONE
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The durable consumer decides the lane from the envelope, not the
+    /// subject: a command envelope and an authentication envelope both
+    /// store and Ack, each in its own table.
+    #[tokio::test]
+    async fn the_consumer_stores_each_envelope_in_its_own_lane() {
+        async fn wait_for(rx: &std::sync::mpsc::Receiver<()>, what: &str) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if rx.try_recv().is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what} never fired"));
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "oshioki-server-consumer-lanes-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("state.sqlite3")).unwrap());
+        store.ready().unwrap();
+        let device = test_device();
+        let transport = oshioki_transport::MockTransport::new();
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (auth_tx, auth_rx) = std::sync::mpsc::channel();
+        let (term_tx, term_rx) = std::sync::mpsc::channel();
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            payload: serde_json::to_vec(&command_envelope("cmd-1", &device.fingerprint)).unwrap(),
+            on_term: None,
+            on_ack: Some(command_tx),
+        });
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            payload: serde_json::to_vec(&auth_envelope("auth-1", &device.fingerprint)).unwrap(),
+            on_term: None,
+            on_ack: Some(auth_tx),
+        });
+        // An authentication envelope that does not decode is terminated, not
+        // retried forever and not fed to the command decoder.
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            payload: serde_json::to_vec(&serde_json::json!({
+                "type": AUTH_ENVELOPE_TYPE,
+                "version": 2,
+                "request_id": "auth-broken",
+            }))
+            .unwrap(),
+            on_term: Some(term_tx),
+            on_ack: None,
+        });
+        // A type this build does not implement is terminated as well. It
+        // must never reach the command decoder: a tagged envelope that
+        // happens to carry the command lane's fields would otherwise be
+        // stored as a command approval request.
+        let (unknown_tx, unknown_rx) = std::sync::mpsc::channel();
+        let mut disguised =
+            serde_json::to_value(command_envelope("cmd-disguised", &device.fingerprint)).unwrap();
+        disguised["type"] = serde_json::json!("sudo_something_else");
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            payload: serde_json::to_vec(&disguised).unwrap(),
+            on_term: Some(unknown_tx),
+            on_ack: None,
+        });
+        let state = AppState {
+            store: Arc::clone(&store),
+            transport: Arc::new(transport),
+            dist_root: Arc::new(PathBuf::from("/nonexistent")),
+            artifact_permits: Arc::new(Semaphore::new(1)),
+            consumer_last_ok: Arc::new(AtomicI64::new(0)),
+            outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            origin: Arc::new("https://sudo.test".into()),
+            rp_id: Arc::new("sudo.test".into()),
+            ntfy_url: None,
+        };
+        let worker = tokio::spawn(request_consumer(state));
+        wait_for(&command_rx, "command envelope ack").await;
+        wait_for(&auth_rx, "authentication envelope ack").await;
+        wait_for(&term_rx, "malformed authentication envelope term").await;
+        wait_for(&unknown_rx, "unknown envelope type term").await;
+        worker.abort();
+        assert!(store.request_lifecycle("cmd-1", now()).unwrap().is_some());
+        assert!(
+            store
+                .auth_request_lifecycle("cmd-1", now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .auth_request_lifecycle("auth-1", now())
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.request_lifecycle("auth-1", now()).unwrap().is_none());
+        // The disguised envelope was stored by neither lane.
+        assert!(
+            store
+                .request_lifecycle("cmd-disguised", now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .auth_request_lifecycle("cmd-disguised", now())
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Neither lane answers for the other. A command approval or denial
+    /// aimed at an authentication id, and an assertion aimed at a command
+    /// id, are both refused before anything is stored or published.
+    #[tokio::test]
+    async fn a_decision_aimed_at_the_wrong_lane_is_refused() {
+        let (dir, state, transport, token) = auth_test_state("cross-lane");
+        let device = test_device();
+        let auth = auth_envelope("auth-cross", &device.fingerprint);
+        state
+            .store
+            .ingest_auth_request(&serde_json::to_vec(&auth).unwrap(), &auth, now())
+            .unwrap();
+        let command = command_envelope("cmd-cross", &device.fingerprint);
+        state
+            .store
+            .ingest_request(&serde_json::to_vec(&command).unwrap(), &command, now())
+            .unwrap();
+
+        let approval = ApproveV1 {
+            version: oshioki_protocol::VERSION_V1,
+            request_id: "auth-cross".into(),
+            device_fingerprint: device.fingerprint.clone(),
+            credential_id: oshioki_protocol::encode_base64url(&[1; 16]),
+            authenticator_data: oshioki_protocol::encode_base64url(&[7; 37]),
+            client_data_json: oshioki_protocol::encode_base64url(b"{\"type\":\"webauthn.get\"}"),
+            signature: oshioki_protocol::encode_base64url(&[8; 70]),
+        };
+        assert_eq!(
+            approve_request(
+                State(state.clone()),
+                Path("auth-cross".into()),
+                bearer(&token),
+                Json(approval),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let denial = DenyV1 {
+            version: oshioki_protocol::VERSION_V1,
+            request_id: "auth-cross".into(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: None,
+        };
+        assert_eq!(
+            deny_request(
+                State(state.clone()),
+                Path("auth-cross".into()),
+                bearer(&token),
+                Json(denial),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_auth_request(
+                State(state.clone()),
+                Path("cmd-cross".into()),
+                bearer(&token),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_request(
+                State(state.clone()),
+                Path("auth-cross".into()),
+                bearer(&token),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        // Nothing above queued a verdict or published anything. (Ingest
+        // queues a browser delivery receipt on each lane; that is not a
+        // verdict and is expected here.)
+        assert!(transport.published().is_empty());
+        assert!(
+            state
+                .store
+                .pending_verdicts(8)
+                .unwrap()
+                .iter()
+                .all(|item| !item.subject.starts_with("oshioki.verdict."))
+        );
+        assert!(
+            state
+                .store
+                .auth_request_lifecycle("auth-cross", now())
+                .unwrap()
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mirror of the case above: an authentication assertion may not be
+    /// posted against a command request id, nor against an authentication id
+    /// other than its own.
+    #[tokio::test]
+    async fn an_assertion_aimed_at_the_wrong_request_is_refused() {
+        let (dir, state, transport, token) = auth_test_state("assertion-cross");
+        let device = test_device();
+        let auth = auth_envelope("auth-target", &device.fingerprint);
+        state
+            .store
+            .ingest_auth_request(&serde_json::to_vec(&auth).unwrap(), &auth, now())
+            .unwrap();
+        let command = command_envelope("cmd-target", &device.fingerprint);
+        state
+            .store
+            .ingest_request(&serde_json::to_vec(&command).unwrap(), &command, now())
+            .unwrap();
+        assert_eq!(
+            authenticate_webauthn(
+                State(state.clone()),
+                Path("cmd-target".into()),
+                bearer(&token),
+                Json(webauthn_assertion("cmd-target", &device.fingerprint)),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            authenticate_webauthn(
+                State(state.clone()),
+                Path("auth-target".into()),
+                bearer(&token),
+                Json(webauthn_assertion("auth-other", &device.fingerprint)),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert!(transport.published().is_empty());
+        assert!(
+            state
+                .store
+                .pending_verdicts(8)
+                .unwrap()
+                .iter()
+                .all(|item| !item.subject.starts_with("oshioki.verdict."))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// There is no refusal on the authentication lane, and there must never
+    /// be one: cancelling in the browser sends nothing and the host asks for
+    /// a password. The wire type has no `Deny` variant at all, so this guards
+    /// the three places that could still grow one — the lane's route table,
+    /// a hand-registered route that bypassed it, and a button on the page.
+    #[test]
+    fn the_authentication_lane_has_no_denial() {
+        // The router registers these and nothing else, so this is the lane's
+        // complete route table.
+        assert_eq!(AUTH_ROUTES.len(), 4);
+        let prefix = concat!("/api/v1/", "auth/");
+        for route in AUTH_ROUTES {
+            assert!(route.starts_with(prefix), "{route}");
+            for forbidden in ["deny", "refuse", "reject", "approve"] {
+                assert!(!route.contains(forbidden), "{route}");
+            }
+        }
+        assert!(AUTH_ROUTES.contains(&"/api/v1/auth/:id/authenticate-webauthn"));
+        // And nothing registers a lane path outside that table: every line
+        // of this file naming one is checked, so a hand-added `.route(...)`
+        // in any form is caught too. The needle is split above so this test's
+        // own source cannot match itself.
+        for line in include_str!("main.rs").lines() {
+            if !line.contains(prefix) {
+                continue;
+            }
+            for forbidden in ["deny", "refuse", "reject", "approve"] {
+                assert!(!line.contains(forbidden), "{line}");
+            }
+        }
+        let page = include_str!("../web/auth.html");
+        assert!(page.contains("id=\"authenticate\""));
+        assert!(!page.to_lowercase().contains("deny"));
     }
 
     fn test_device() -> oshioki_protocol::DevicePublicRecordV1 {

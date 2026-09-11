@@ -1951,15 +1951,21 @@ async fn nats_auth_fallback(
             "authentication deadline exceeded before the NATS verdict wait",
         ));
     }
-    // TODO(server auth ingest slice): print the approval link here, the way
-    // `nats_fallback` does for the command lane. It is deliberately absent
-    // for now because nothing consumes `oshioki.auth.>` yet: the server's
-    // JetStream handler still Terms any envelope that is not a
-    // `RequestEnvelopeV1`, so no `/r/<id>` page would exist behind the link
-    // and the browser would show an operator a dead URL. When it is restored
-    // it must be printed with `if let Ok(config) = ...` — the link is a
-    // convenience, and a missing or invalid `hook.json` must never be able to
-    // fail an authentication that the transport could still answer.
+    // The authentication page lives at `/a/<id>`, not `/r/<id>`: the server
+    // stores the two lanes separately and serves a different page for each,
+    // so a command link here would be a dead URL.
+    //
+    // `if let Ok(config)` deliberately, not `?`: the link is a convenience
+    // for a browser recipient, and a missing or invalid `hook.json` must
+    // never fail an authentication that the transport could still answer.
+    if has_browser_recipient && let Ok(config) = load_hook_config_from(directory) {
+        eprintln!(
+            "Authentication URL (expires in {} seconds):\n  {}",
+            remaining.as_secs(),
+            terminal_authentication_url(&config.server_base_url, &request.request_id)
+        );
+        let _ = io::stderr().flush();
+    }
     transport
         .request_authentication(
             &request.trusted.host,
@@ -2069,6 +2075,17 @@ fn apply_auth_decision(
 
 fn approval_url(server_base_url: &str, request_id: &str) -> String {
     format!("{server_base_url}/r/{request_id}")
+}
+
+/// The authentication lane's page. A separate path from `approval_url`
+/// because the server keeps the two lanes separate: an authentication id is
+/// not a request id and does not render as one.
+fn authentication_url(server_base_url: &str, request_id: &str) -> String {
+    format!("{server_base_url}/a/{request_id}")
+}
+
+fn terminal_authentication_url(server_base_url: &str, request_id: &str) -> String {
+    escape_for_terminal(&authentication_url(server_base_url, request_id))
 }
 
 fn terminal_approval_url(server_base_url: &str, request_id: &str) -> String {

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authenticate sudo</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body data-page="auth">
+  <main>
+    <h1>Authenticate sudo</h1>
+    <p id="status">Loading encrypted authentication request…</p>
+    <dl id="request" hidden>
+      <dt>Host</dt><dd id="host"></dd>
+      <dt>Authenticating</dt><dd id="principal"></dd>
+      <dt>Invoked by</dt><dd id="invoking-user"></dd>
+      <dt>Service</dt><dd id="service"></dd>
+      <dt>Terminal</dt><dd id="tty"></dd>
+      <dt id="session-label" hidden>Session</dt><dd id="session" hidden></dd>
+      <dt>Submitted invocation</dt><dd id="invocation"></dd>
+    </dl>
+    <p id="invocation-note" hidden>The submitted invocation is context captured before sudo
+      decided what to run. It is not the command this authentication approves, and no signature
+      here authorizes a particular command.</p>
+    <div id="actions" hidden><button id="authenticate" type="button">Authenticate</button></div>
+    <p id="cancel-note" hidden>To refuse, close this page: nothing is sent, and sudo asks for
+      your password at the terminal instead.</p>
+  </main>
+  <script src="/assets/libsodium.js"></script><script src="/assets/app.js"></script>
+</body>
+</html>

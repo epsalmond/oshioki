@@ -7,5 +7,6 @@ dl { display: grid; grid-template-columns: 9rem 1fr; gap: .65rem 1rem; }
 dt { color: GrayText; }
 dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 button { font: inherit; padding: .7rem 1.1rem; margin: 1rem .7rem 0 0; }
-#approve { background: #08783e; color: white; border: 0; border-radius: .35rem; }
+#approve, #authenticate { background: #08783e; color: white; border: 0; border-radius: .35rem; }
+#invocation-note, #cancel-note { color: GrayText; font-size: .9rem; }
 #deny { background: transparent; color: #c73535; border: 1px solid currentColor; border-radius: .35rem; }

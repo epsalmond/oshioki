@@ -21,10 +21,11 @@ use sha2::{Digest as _, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use oshioki_protocol::{
-    ApproveNativeV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1,
-    NativeEnrollmentSubmissionV1, RequestEnvelopeV1, RequestV1, VERSION_V1, approve_challenge,
-    decode_base64url, deny_challenge, device_fingerprint, encode_base64url, native_credential_id,
-    native_enrollment_proof, native_transcript_hmac_for_kind, unseal_v1,
+    AUTH_WIRE_VERSION, ApproveNativeV1, AuthApproveNativeV1, AuthDecisionV1, AuthEnvelopeV1,
+    DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1, NativeEnrollmentSubmissionV1,
+    OpenedAuthRequestV1, RequestEnvelopeV1, RequestV1, VERSION_V1, approve_challenge,
+    auth_challenge, decode_base64url, deny_challenge, device_fingerprint, encode_base64url,
+    native_credential_id, native_enrollment_proof, native_transcript_hmac_for_kind, unseal_v1,
 };
 
 /// What the enrollment proof signature approves, for a backend that asks.
@@ -549,6 +550,69 @@ impl Identity {
         }))
     }
 
+    /// Finds this device's sealed body in a contextual sudo authentication
+    /// envelope and opens it. `None` when the envelope carries nothing for
+    /// this device, which is the normal case on a host it never enrolled
+    /// with. The exact decrypted bytes are retained: they, and nothing
+    /// rebuilt from them, are what [`Identity::authenticate`] signs.
+    pub fn open_auth_request(
+        &self,
+        envelope: &AuthEnvelopeV1,
+    ) -> Result<Option<OpenedAuthRequestV1>> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        self.open_auth_request_at(envelope, now)
+    }
+
+    /// Opens this device's authentication body against a receiver-local
+    /// timestamp, so the envelope and its sealed request are never checked
+    /// against different seconds at a boundary.
+    ///
+    /// A software identity refuses here rather than at signing time: an
+    /// authentication request is a hardware-assurance question, and opening
+    /// one for a key that may never answer it would only invite a caller to
+    /// build a decision that no verifier can accept.
+    pub fn open_auth_request_at(
+        &self,
+        envelope: &AuthEnvelopeV1,
+        now: i64,
+    ) -> Result<Option<OpenedAuthRequestV1>> {
+        if self.device_kind() != DeviceKindV1::SecureEnclave {
+            bail!("a software identity cannot answer a sudo authentication request");
+        }
+        envelope
+            .open_for_device(&self.fingerprint(), &self.box_secret, now)
+            .context("open sealed authentication body")
+    }
+
+    /// Signs a sudo authentication assertion over the retained raw bytes of
+    /// an opened authentication request.
+    ///
+    /// The challenge is domain-separated from command approval, so neither
+    /// lane's signature can ever satisfy the other's verifier. There is no
+    /// denial counterpart: cancelling means signing nothing, and the hook
+    /// falls back to the password path at its deadline.
+    ///
+    /// The native assertion carries no signature counter — unlike a
+    /// `WebAuthn` authenticator, the enclave exposes none, and
+    /// `AuthApproveNativeV1` has no field for one — so there is nothing to
+    /// maintain here.
+    pub fn authenticate(
+        &self,
+        opened: &OpenedAuthRequestV1,
+        reason: &str,
+    ) -> Result<AuthDecisionV1> {
+        if self.device_kind() != DeviceKindV1::SecureEnclave {
+            bail!("a software identity cannot answer a sudo authentication request");
+        }
+        let signature = self.signer.sign_der(&auth_challenge(&opened.raw), reason)?;
+        Ok(AuthDecisionV1::AuthenticateNative(AuthApproveNativeV1 {
+            version: AUTH_WIRE_VERSION,
+            request_id: opened.request.request_id.clone(),
+            device_fingerprint: self.fingerprint(),
+            signature: encode_base64url(&signature),
+        }))
+    }
+
     /// The protocol assurance kind corresponding to this identity's signer.
     pub fn device_kind(&self) -> DeviceKindV1 {
         match self.signer_kind() {
@@ -809,6 +873,149 @@ mod tests {
         .validate()
         .unwrap();
         assert!(verify_native_enrollment_v1(&submission, &[6; 32]).is_err());
+    }
+
+    /// An identity whose on-disk record says Secure Enclave, backed here by
+    /// a software signer.
+    ///
+    /// The enclave is a Mac facility, so the real backend cannot run in this
+    /// test at all. The backend is not what this lane pins: the wire format,
+    /// the challenge, and the verifier all work from the enrolled record's
+    /// kind and public key, so labelling the record is exactly the part
+    /// under test. Nothing here can create such an identity outside tests —
+    /// `SigningFileV1::Enclave` only ever comes from a Mac that made the key.
+    fn enclave_labelled_identity() -> Identity {
+        Identity {
+            signer: Box::new(SoftwareSigner(SigningKey::from_slice(&[0x55; 32]).unwrap())),
+            signing: SigningFileV1::Enclave {
+                blob: encode_base64url(&[0x44; 32]),
+            },
+            box_secret: StaticSecret::from([0x66; 32]),
+            box_secret_ref: None,
+            api_token_hash: [0x77; 32],
+        }
+    }
+
+    fn auth_request() -> oshioki_protocol::AuthRequestV1 {
+        oshioki_protocol::AuthRequestV1 {
+            message_type: oshioki_protocol::AUTH_REQUEST_TYPE.into(),
+            version: oshioki_protocol::AUTH_WIRE_VERSION,
+            request_id: "auth-1".into(),
+            nonce: encode_base64url(&[9; 16]),
+            issued_at: 1_000,
+            expires_at: 1_075,
+            trusted: oshioki_protocol::TrustedAuthContextV1 {
+                host: "host.example".into(),
+                service: "sudo".into(),
+                pam_user: "root".into(),
+                pam_uid: 0,
+                invoking_uid: 1000,
+                invoking_user: Some("eric".into()),
+                tty: Some("/dev/pts/3".into()),
+            },
+            submitted: oshioki_protocol::SubmittedAuthContextV1 {
+                session: None,
+                agent_label: None,
+                invocation: oshioki_protocol::AuthInvocationV1::Truncated {
+                    command: None,
+                    argv: vec!["apt".into(), "upgrade".into()],
+                    cwd: None,
+                    omitted_args: Some(2),
+                },
+            },
+        }
+    }
+
+    fn auth_envelope(
+        request: &oshioki_protocol::AuthRequestV1,
+        devices: &[DevicePublicRecordV1],
+    ) -> (oshioki_protocol::AuthEnvelopeV1, Vec<u8>) {
+        let raw = request.raw_json().unwrap();
+        let sealed = devices
+            .iter()
+            .map(|device| seal_v1(&raw, device).unwrap())
+            .collect();
+        (
+            oshioki_protocol::AuthEnvelopeV1 {
+                message_type: oshioki_protocol::AUTH_ENVELOPE_TYPE.into(),
+                version: oshioki_protocol::AUTH_WIRE_VERSION,
+                request_id: request.request_id.clone(),
+                host: request.trusted.host.clone(),
+                issued_at: request.issued_at,
+                expires_at: request.expires_at,
+                sealed,
+            },
+            raw,
+        )
+    }
+
+    /// The authentication lane end to end inside the agent: open this
+    /// device's sealed body, sign the exact bytes it carried, and have the
+    /// host's own verifier accept it against the pinned record.
+    #[test]
+    fn opens_an_auth_body_and_signs_a_verifiable_authentication() {
+        let identity = enclave_labelled_identity();
+        let device = identity.device_record("laptop");
+        assert_eq!(device.kind, DeviceKindV1::SecureEnclave);
+        let request = auth_request();
+        let (envelope, raw) = auth_envelope(&request, std::slice::from_ref(&device));
+        let opened = identity
+            .open_auth_request_at(&envelope, 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.raw, raw);
+        assert_eq!(opened.request, request);
+        let AuthDecisionV1::AuthenticateNative(approval) =
+            identity.authenticate(&opened, "authenticate sudo").unwrap()
+        else {
+            panic!("expected a native authentication");
+        };
+        approval.validate_shape().unwrap();
+        assert_eq!(approval.version, AUTH_WIRE_VERSION);
+        assert_eq!(approval.request_id, request.request_id);
+        assert_eq!(approval.device_fingerprint, device.fingerprint);
+        oshioki_protocol::verify_native_authentication_v1(&approval, &raw, &device, 1_000).unwrap();
+        // The signature is over these bytes and this domain only: neither a
+        // different request nor the command lane's challenge satisfies it.
+        assert!(
+            oshioki_protocol::verify_native_authentication_v1(&approval, b"{}", &device, 1_000)
+                .is_err()
+        );
+        // Domain separation, over identical bytes: a command approval
+        // signature can never satisfy this verifier, and vice versa.
+        assert_ne!(auth_challenge(&raw), approve_challenge(&raw));
+    }
+
+    /// A software key may not answer this lane at all: it refuses before it
+    /// opens anything, and refuses again if a caller hands it an already
+    /// opened request. Hardware assurance is the whole content of a sudo
+    /// authentication, and a key any process can read carries none.
+    #[test]
+    fn a_software_identity_refuses_to_authenticate() {
+        let software = identity();
+        let enclave = enclave_labelled_identity();
+        let sealed = auth_envelope(
+            &auth_request(),
+            &[
+                software.device_record("laptop"),
+                enclave.device_record("mac"),
+            ],
+        );
+        assert!(software.open_auth_request_at(&sealed.0, 1_000).is_err());
+        let opened = enclave
+            .open_auth_request_at(&sealed.0, 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.raw, sealed.1);
+        assert!(software.authenticate(&opened, "authenticate sudo").is_err());
+        // The command lane is untouched by the refusal above.
+        let (command_envelope, _) = envelope(&request(), &[software.device_record("laptop")]);
+        assert!(
+            software
+                .open_request_at(&command_envelope, 1_000)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
