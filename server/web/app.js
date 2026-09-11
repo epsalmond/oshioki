@@ -158,7 +158,9 @@ async function approval() {
   const request = JSON.parse(dec.decode(raw)); if (request.version !== 1 || request.request_id !== id) throw new Error("request mismatch");
   const acknowledgement = await fetch(`/api/v1/requests/${id}/ack`, { method: "POST", headers: { authorization: `Bearer ${selected.device.apiToken}`, "content-type": "application/json" }, body: JSON.stringify({ type: "alive", version: 1, request_id: id }) });
   if (!acknowledgement.ok) throw new Error(`acknowledgement failed ${acknowledgement.status}`);
-  text("host", request.host); text("user", `${request.user} / ${request.uid}`); text("runas", runAsLabel(request.runas_uid)); text("command", request.command);
+  text("host", request.host); text("user", `${request.user} / ${request.uid}`); text("runas", runAsLabel(request.runas_uid));
+  if (request.session) { text("session", request.session); document.getElementById("session-label").hidden = false; document.getElementById("session").hidden = false; }
+  text("command", request.command);
   text("argv", request.argv.map(quoteArgument).join("\n")); text("cwd", request.cwd); text("process-chain", request.pid_chain.join("\n"));
   text("env", formatEnvironment(request.env ?? []));
   text("status", `Expires ${new Date(request.expires_at * 1000).toLocaleTimeString()}`); document.getElementById("request").hidden = false; document.getElementById("actions").hidden = false;

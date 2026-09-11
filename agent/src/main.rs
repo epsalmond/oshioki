@@ -1087,18 +1087,28 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 /// request itself — the agent never reads the requesting host's live
 /// process table. First match wins:
 ///
-/// 1. An `OSHIOKI_SESSION` environment entry, which a user can export in a
+/// 1. The request's `session` field, which the hook resolves on the host
+///    (an `OSHIOKI_SESSION` environment entry, or a coding agent's own
+///    session label — see `session_label` in `hook/src/main.rs`). Absent
+///    when the hook predates this field (0.1.4 and earlier), in which case
+///    the remaining rules apply exactly as before.
+/// 2. An `OSHIOKI_SESSION` environment entry, which a user can export in a
 ///    shell or terminal tab to label it (documented in `docs/configuration.md`).
-/// 2. The nearest "interesting" ancestor in `pid_chain` — entries are
+///    Kept as a fallback for an old hook that bound the environment but
+///    never resolved `session` itself.
+/// 3. The nearest "interesting" ancestor in `pid_chain` — entries are
 ///    `"pid:comm"` pairs (see `pid_chain_darwin`/`pid_chain_linux` in
 ///    `hook/src/main.rs`), so a process name like `claude`, `codex`, or
 ///    `tmux` is usable directly; shells and `sudo` itself are skipped as
 ///    uninteresting.
-/// 3. The tty's basename (e.g. `ttys004`), if the request carries one.
+/// 4. The tty's basename (e.g. `ttys004`), if the request carries one.
 ///
 /// `None` when nothing resolves, in which case the reason drops the prefix
 /// entirely rather than show a blank label.
 fn session_name_for(request: &oshioki_protocol::RequestV1) -> Option<String> {
+    if let Some(session) = request.session.as_ref().filter(|value| !value.is_empty()) {
+        return Some(escape_for_terminal(session));
+    }
     if let Some(entry) = request
         .env
         .iter()
@@ -1545,6 +1555,7 @@ mod tests {
             argv: vec!["apt".into(), "update".into()],
             pid_chain: vec![],
             env: vec![],
+            session: None,
             issued_at: 1_000,
             expires_at: 1_090,
         }
@@ -1596,6 +1607,22 @@ mod tests {
         let reason = approval_reason(&request);
         assert_eq!(reason, "eric@host.example sudo apt update");
         assert!(reason.chars().count() <= MAX_APPROVAL_REASON_CHARS);
+    }
+
+    /// The request's `session` field, which the hook resolves on the host,
+    /// takes priority over an `OSHIOKI_SESSION` environment entry.
+    #[test]
+    fn reason_prefers_request_session_field_over_env() {
+        let mut request = request_for_reason();
+        request.session = Some("oshioki-1b".into());
+        request.env = vec![EnvEntryV1 {
+            name: "OSHIOKI_SESSION".into(),
+            value: "laptop-ghostty".into(),
+        }];
+        assert_eq!(
+            approval_reason(&request),
+            "oshioki-1b: eric@host.example sudo apt update"
+        );
     }
 
     /// `OSHIOKI_SESSION` in the bound environment names the session, shown
@@ -2199,6 +2226,7 @@ mod tests {
             argv: vec!["do".into(), format!("--token={LOG_PROBE}")],
             pid_chain: vec![format!("{LOG_PROBE}:4242")],
             env: vec![],
+            session: None,
             issued_at: now(),
             expires_at: now() + 60,
         }

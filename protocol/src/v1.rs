@@ -119,6 +119,17 @@ pub struct RequestV1 {
     /// it, and old signatures keep verifying.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvEntryV1>,
+    /// The caller's session label, resolved on the host (e.g. from
+    /// `OSHIOKI_SESSION` or a Claude Code session file) rather than trusted
+    /// from the requesting process's own claim about itself beyond that. At
+    /// most 64 printable, non-control characters; trimmed. Absent when no
+    /// resolver matched. Serializes to nothing when absent, so requests
+    /// built before this field existed remain byte-identical and their
+    /// signatures keep verifying; a peer that does not know this field
+    /// simply ignores it when decoding (no `deny_unknown_fields` anywhere in
+    /// this protocol).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     pub issued_at: i64,
     pub expires_at: i64,
 }
@@ -148,8 +159,21 @@ impl RequestV1 {
                 .env
                 .iter()
                 .any(|entry| entry.name.len() > 256 || entry.value.len() > 32768)
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_empty() || session.chars().count() > 64)
         {
             return Err(Error::InvalidRequest("invalid request field size".into()));
+        }
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.chars().any(char::is_control))
+        {
+            return Err(Error::InvalidRequest(
+                "session label contains control characters".into(),
+            ));
         }
         Ok(())
     }
@@ -894,6 +918,7 @@ mod tests {
             argv: vec!["apt".into()],
             pid_chain: vec![],
             env: vec![],
+            session: None,
             issued_at: 1_000,
             expires_at: 1_090,
         }
@@ -977,6 +1002,58 @@ mod tests {
         let round_tripped: RequestV1 = serde_json::from_str(&with_env).unwrap();
         assert_eq!(round_tripped.env, request.env);
         round_tripped.validate().unwrap();
+    }
+
+    /// An absent session label serializes to nothing, same as env before
+    /// it: a request without one is byte-identical to one built before the
+    /// field existed, and a present label round-trips exactly.
+    #[test]
+    fn session_round_trips_and_is_absent_by_default() {
+        let mut request = minimal_request();
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("\"session\""), "{json}");
+        let loaded: RequestV1 = serde_json::from_str(&json).unwrap();
+        assert!(loaded.session.is_none());
+        loaded.validate().unwrap();
+
+        request.session = Some("claude".into());
+        let with_session = serde_json::to_string(&request).unwrap();
+        assert!(with_session.contains("\"session\""), "{with_session}");
+        let round_tripped: RequestV1 = serde_json::from_str(&with_session).unwrap();
+        assert_eq!(round_tripped.session, request.session);
+        round_tripped.validate().unwrap();
+    }
+
+    /// A peer that does not know about `session` (a 0.1.4 decoder) still
+    /// loads a request carrying it: serde ignores unknown fields by
+    /// default, and nothing in this protocol sets
+    /// `#[serde(deny_unknown_fields)]`.
+    #[test]
+    fn unknown_session_field_does_not_break_older_decoders() {
+        #[derive(Debug, serde::Deserialize)]
+        struct PreSessionRequestV1 {
+            version: u8,
+            request_id: String,
+        }
+        let mut request = minimal_request();
+        request.session = Some("claude".into());
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: PreSessionRequestV1 = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.version, VERSION_V1);
+        assert_eq!(decoded.request_id, "req-1");
+    }
+
+    #[test]
+    fn session_label_has_bounds() {
+        let mut request = minimal_request();
+        request.session = Some(String::new());
+        assert!(request.validate().is_err());
+        request.session = Some("x".repeat(65));
+        assert!(request.validate().is_err());
+        request.session = Some("x".repeat(64));
+        request.validate().unwrap();
+        request.session = Some("claude\u{0007}".into());
+        assert!(request.validate().is_err());
     }
 
     #[test]
