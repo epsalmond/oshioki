@@ -233,10 +233,21 @@ same target, but they have not been executed on macOS in this pass. This is
 build, test and ABI evidence only; real PAM stack behavior on either operating
 system has not been validated.
 
+The `authenticate` helper verb now exists in the hook: it reads this schema,
+seals a request to the enrolled hardware devices, and verifies the returned
+assertion. **It still has no consumer.** The helper publishes on
+`oshioki.auth.<host>`, and neither the agent nor the server subscribes to that
+subject tree yet: the agent listens only on `oshioki.request.>`, and the
+server's durable handler rejects any envelope that is not a command approval
+request. A real sudo against a host with this module enabled would therefore
+wait out the helper's device deadline and then fall back to a password every
+time. That is the correct unavailable result, not authentication, and it is
+another reason this module must not be enabled in a PAM configuration yet.
+
 The following acceptance work remains open:
 
-- the real `authenticate` helper verb, encrypted transport, browser/native
-  display, and accepted hardware-backed device flow;
+- the server and agent ingest for `oshioki.auth.>`, browser/native display,
+  and an accepted hardware-backed device flow end to end;
 - real stock sudo/PAM stacks on Linux and macOS, including required account,
   session, MFA, lockout, `pam_tid`, smart-card, and password fallback behavior;
 - native sudo timestamps, `sudo -k`/`-K`, `sudo -v`, `sudo -n`, alternate

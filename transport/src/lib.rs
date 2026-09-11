@@ -16,7 +16,9 @@ use futures::Stream;
 
 pub use mock::MockTransport;
 pub use nats::NatsTransport;
-use oshioki_protocol::{ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1};
+use oshioki_protocol::{
+    ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1, auth_v1::AuthDecisionV1,
+};
 
 /// A transport reports these control-plane milestones before a verdict. A
 /// delivery receipt proves that the relay durably routed a request to an
@@ -85,6 +87,22 @@ pub trait HookTransport: Send + Sync {
         has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
     ) -> BoxFuture<'_, DecisionV1>;
+
+    /// Publishes the sealed contextual sudo authentication envelope for
+    /// `host` on the separate authentication lane and waits up to `timeout`
+    /// for one [`AuthDecisionV1`] on `request_id`. The lane is deliberately
+    /// distinct from `request_decision`: an authentication verdict is never
+    /// a command approval and the two must not share a subject namespace for
+    /// the request itself.
+    fn request_authentication(
+        &self,
+        host: &str,
+        request_id: &str,
+        payload: Vec<u8>,
+        timeout: std::time::Duration,
+        has_browser_recipient: bool,
+        progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
+    ) -> BoxFuture<'_, AuthDecisionV1>;
 
     /// Publishes the enrollment intent, confirming server-side delivery
     /// before returning. Returns the pre-publish reply subscription so the

@@ -11,7 +11,8 @@ use std::{
     collections::HashMap,
     error::Error as StdError,
     fmt, fs,
-    io::{self, BufRead as _, Write as _},
+    io::{self, BufRead as _, Read as _, Write as _},
+    os::fd::RawFd,
     os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::Command,
@@ -23,6 +24,11 @@ use tracing::{debug, info, warn};
 use url::{Host, Url};
 use uuid::Uuid;
 
+use oshioki_protocol::auth_v1::{
+    AUTH_ENVELOPE_TYPE, AUTH_REQUEST_TYPE, AUTH_WIRE_VERSION, AuthDecisionV1, AuthEnvelopeV1,
+    AuthInvocationV1, AuthRequestV1, SubmittedAuthContextV1, TrustedAuthContextV1,
+    hardware_auth_recipients, verify_native_authentication_v1, verify_webauthn_authentication_v1,
+};
 use oshioki_protocol::{
     ActivationV1, DecisionV1, DenyV1, DeviceKindV1, DevicePublicRecordV1, DeviceRegistryV1,
     EnrollmentIntentV1, EnrollmentSubmissionV1, EnvEntryV1, HookConfigV1,
@@ -76,6 +82,16 @@ enum Verb {
         #[arg(long, hide = true)]
         plugin_protocol_version: Option<u8>,
     },
+    /// Private PAM-to-helper verb. `pam/README.md` owns its argument list and
+    /// its stdin schema; it is not an operator command and is hidden from
+    /// help for the same reason `check` hides its handshake.
+    #[command(hide = true)]
+    Authenticate {
+        #[arg(long, hide = true)]
+        pam_protocol_version: u8,
+        #[arg(long, hide = true)]
+        pam_liveness_fd: Option<RawFd>,
+    },
     Enroll {
         #[arg(long, allow_hyphen_values = true)]
         resume: Option<String>,
@@ -123,12 +139,18 @@ struct ServerHealthV1 {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let checking = matches!(cli.verb, Verb::Check { .. });
+    // Both privileged sudo verbs share the terminal/audit split and the
+    // exit-status contract; only their payloads differ.
+    let checking = matches!(cli.verb, Verb::Check { .. } | Verb::Authenticate { .. });
     logging::init(checking);
     let result = match cli.verb {
         Verb::Check {
             plugin_protocol_version,
         } => cmd_check(plugin_protocol_version).await,
+        Verb::Authenticate {
+            pam_protocol_version,
+            pam_liveness_fd,
+        } => Box::pin(cmd_authenticate(pam_protocol_version, pam_liveness_fd)).await,
         Verb::Enroll {
             resume,
             allow_localhost,
@@ -731,7 +753,9 @@ async fn execute_request_at(
     )
     .await?
     {
-        SocketOutcome::Decision(decision) => decision,
+        SocketOutcome::Verdict(bytes) => {
+            serde_json::from_slice(&bytes).context("decode socket decision")?
+        }
         SocketOutcome::Unconfigured => match &nats_url {
             Some(url) => {
                 debug!("no agent socket configured; trying NATS");
@@ -976,8 +1000,10 @@ fn nats_display_url(url: &str) -> String {
 
 /// What one attempt at the local agent socket concluded.
 enum SocketOutcome {
-    /// An agent took the request; the verdict is final.
-    Decision(DecisionV1),
+    /// An agent took the request; the verdict is final. The raw payload is
+    /// kept undecoded so both hook lanes share this path and each decodes
+    /// its own verdict type.
+    Verdict(Vec<u8>),
     /// No socket is configured; only NATS can answer.
     Unconfigured,
     /// A socket is configured but no verdict came back; the caller falls
@@ -1134,8 +1160,7 @@ async fn try_agent_socket(
             ));
         }
     };
-    let decision: DecisionV1 = serde_json::from_slice(&bytes).context("decode socket decision")?;
-    Ok(SocketOutcome::Decision(decision))
+    Ok(SocketOutcome::Verdict(bytes))
 }
 
 /// The socket path from `OSHIOKI_AGENT_SOCKET` in `config.env`, if set.
@@ -1267,6 +1292,776 @@ async fn apply_decision(
             verify_native_approval_v1(&approval, raw_request, device)
                 .context("native approval verification failed")?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contextual sudo authentication: the private `authenticate` helper verb.
+//
+// `pam/README.md` owns this boundary. The module writes one JSON request on
+// stdin and reads the answer from the exit status alone: `0` is a verified
+// hardware authentication, `2` leaves the surrounding PAM stack free to run
+// its password path, and anything else is an authentication failure. Nothing
+// on this path may turn a security failure into a success.
+// ---------------------------------------------------------------------------
+
+/// The only PAM-to-helper protocol version this binary speaks.
+const PAM_PROTOCOL_VERSION: u8 = 2;
+/// Largest PAM request accepted on stdin, matching the module's own cap.
+const MAX_PAM_REQUEST_BYTES: usize = 16 * 1024;
+/// The device deadline. The module kills the helper tree at ninety seconds;
+/// staying under it means an unanswered request expires as this hook's own
+/// answer rather than as a signal the module has to classify.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(75);
+/// Slack between the transport deadline and the request's own expiry. A
+/// decision signed in the last millisecond of the wait still has to travel
+/// back and be verified; without headroom `apply_auth_decision` would call it
+/// expired and turn a real hardware assertion into a denial.
+const AUTH_EXPIRY_HEADROOM: Duration = Duration::from_secs(5);
+/// `TrustedAuthContextV1`'s own tty bound, mirrored here so an over-long tty
+/// can be dropped as display context instead of failing a request.
+const MAX_AUTH_TTY_BYTES: usize = 4096;
+/// The PAM services the module is allowed to ask about. `pam/README.md` fixes
+/// this list on the module side; re-checking it here keeps the helper from
+/// trusting a caller that skipped that check.
+const ACCEPTED_PAM_SERVICES: [&str; 2] = ["sudo", "sudo-i"];
+/// Whole-budget bound on name-service resolution. `getpwnam_r` can block for
+/// an unbounded time on a stalled directory service, so the lookup runs on a
+/// detached thread and this budget, not the resolver, decides when to stop.
+const NAME_LOOKUP_BUDGET: Duration = Duration::from_secs(5);
+
+/// Reclassifies a host-local fault as unavailable.
+///
+/// Configuration, registry, and request-construction failures are facts about
+/// this host, not evidence about the operator. Answering `PAM_AUTH_ERR` for
+/// them would lock people out of sudo over a typo in `config.env`, so they
+/// leave the password path eligible instead. Only decision verification and
+/// an unresolvable identity may produce a hard failure on this lane.
+fn host_fault(context: &str, error: &anyhow::Error) -> anyhow::Error {
+    approval_unavailable(format!("{context}: {error:#}"))
+}
+
+/// One identity as the PAM module sends it: a name, never a resolved id.
+#[derive(Debug, Clone, Deserialize)]
+struct PamNameV1 {
+    name: String,
+}
+
+/// The module's advisory view of its own process arguments. `available` means
+/// the argument vector was readable; `truncated` means the module dropped
+/// entries to fit the request bound. Neither makes this a verified sudo
+/// command line.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PamArgvV1 {
+    #[serde(default)]
+    available: bool,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
+    values: Vec<String>,
+}
+
+/// The private PAM-to-helper request. Unknown fields are accepted so a later
+/// module revision inside protocol version 2 stays readable; the version
+/// field itself is checked explicitly.
+#[derive(Debug, Clone, Deserialize)]
+struct PamAuthRequestV1 {
+    pam_protocol_version: u8,
+    principal: PamNameV1,
+    invoking: PamNameV1,
+    service: String,
+    #[serde(default)]
+    tty: Option<String>,
+    process_pid: i64,
+    #[serde(default)]
+    submitted_argv: PamArgvV1,
+}
+
+/// What one name resolved to. An unknown name is an answer about the
+/// request, not a transport problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameLookupV1 {
+    Uid(u32),
+    Unknown,
+}
+
+/// Both PAM identities after name-service resolution. The protocol keeps
+/// `invoking_user` optional because a host may know the id without the name;
+/// this helper only proceeds when both names resolved, so it is always set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedIdentitiesV1 {
+    pam_uid: u32,
+    invoking_uid: u32,
+    invoking_user: Option<String>,
+}
+
+/// A watch on the PAM liveness descriptor. Readability or EOF on it means the
+/// PAM call, or the whole sudo process, is gone.
+#[derive(Debug)]
+struct LivenessWatch {
+    cancelled: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl LivenessWatch {
+    /// Resolves once the descriptor reports readability, EOF, or an error.
+    async fn cancelled(&mut self) {
+        // A dropped sender means the watcher is gone, which ends the
+        // descriptor's usefulness just as surely; either way, stop waiting.
+        let _ = (&mut self.cancelled).await;
+    }
+}
+
+/// Starts watching the descriptor the PAM module handed this process.
+///
+/// The read runs on a detached thread rather than a runtime blocking task on
+/// purpose: a descriptor that never becomes readable must not be able to hold
+/// the process open after a decision has already landed.
+fn watch_liveness(fd: RawFd) -> Result<LivenessWatch> {
+    // `pam/README.md` makes this the only non-standard descriptor the helper
+    // inherits, so it can never be one of the standard three. Reading stdin
+    // here would race the request read; reading stdout or stderr is nonsense.
+    // A descriptor that is not actually open is a module that did not set the
+    // pipe up. None of these say anything about the operator.
+    if fd <= 2 {
+        return Err(approval_unavailable(format!(
+            "the PAM liveness descriptor {fd} is a standard stream, not the module's pipe"
+        )));
+    }
+    nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).map_err(|error| {
+        approval_unavailable(format!(
+            "the PAM liveness descriptor {fd} is not open: {error}"
+        ))
+    })?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        // Exactly one read, and every outcome ends the watch: readability,
+        // EOF, and an error all mean the PAM call that owns the write end is
+        // no longer waiting. Retrying past an error would mean re-reading a
+        // bare descriptor number that another thread may since have reused,
+        // and a spurious cancellation only costs a password prompt.
+        let _ = nix::unistd::read(fd, &mut byte);
+        let _ = sender.send(());
+    });
+    Ok(LivenessWatch {
+        cancelled: receiver,
+    })
+}
+
+/// Runs `work` until it finishes or the PAM caller disappears. A vanished
+/// caller is unavailable, never a failure: there is nobody left to deny.
+async fn with_liveness<T>(
+    liveness: Option<LivenessWatch>,
+    work: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(mut watch) = liveness else {
+        return work.await;
+    };
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => result,
+        () = watch.cancelled() => Err(approval_unavailable(
+            "the PAM caller released its liveness descriptor before a device answered",
+        )),
+    }
+}
+
+async fn cmd_authenticate(pam_protocol_version: u8, pam_liveness_fd: Option<RawFd>) -> Result<()> {
+    // Refused before anything else is read, and refused as unavailable: a
+    // version this helper cannot speak is not evidence about the operator.
+    if pam_protocol_version != PAM_PROTOCOL_VERSION {
+        return Err(approval_unavailable(format!(
+            "unsupported PAM helper protocol version {pam_protocol_version}"
+        )));
+    }
+    // The module already requires effective UID 0 of itself, and this helper
+    // reads the root-owned registry and writes back signature counters.
+    if nix::unistd::geteuid().as_raw() != 0 {
+        return Err(approval_unavailable(
+            "the PAM authenticate helper must run with effective UID 0",
+        ));
+    }
+    // Armed before the request is read: a caller that vanishes mid-write must
+    // not leave the helper blocked on a pipe nobody will finish.
+    let liveness = pam_liveness_fd.map(watch_liveness).transpose()?;
+    // Decision: the stdin read and the name lookups below block this runtime
+    // thread rather than moving to `spawn_blocking`. Both are bounded — stdin
+    // by `MAX_PAM_REQUEST_BYTES` against a pipe the module closes to frame the
+    // request, resolution by `NAME_LOOKUP_BUDGET` — and nothing else is
+    // scheduled yet, so the only thing they can delay is themselves. Revisit
+    // if this verb ever starts work before the request is in hand.
+    let raw = read_pam_request_bytes(&mut io::stdin().lock())?;
+    let pam = parse_pam_request(&raw)?;
+    debug!(
+        service = %pam.service,
+        pam_process_pid = pam.process_pid,
+        argv_available = pam.submitted_argv.available,
+        argv_truncated = pam.submitted_argv.truncated,
+        "accepted a PAM authentication request"
+    );
+    let identities = resolve_identities(&pam, NAME_LOOKUP_BUDGET)?;
+    let request = build_auth_request(&pam, &identities)?;
+    Box::pin(execute_auth_request_at(
+        request,
+        AUTH_TIMEOUT,
+        check_config_dir(),
+        liveness,
+    ))
+    .await
+}
+
+/// Reads the single JSON request the module frames by closing the pipe.
+/// Anything over the bound, or an empty stream, is unavailable: a request
+/// this helper cannot read is not a denial.
+fn read_pam_request_bytes(reader: &mut impl io::Read) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let read = reader
+        .take(MAX_PAM_REQUEST_BYTES as u64 + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|error| approval_unavailable(format!("read the PAM request: {error}")))?;
+    if read > MAX_PAM_REQUEST_BYTES {
+        return Err(approval_unavailable(format!(
+            "the PAM request exceeds the {MAX_PAM_REQUEST_BYTES} byte bound"
+        )));
+    }
+    if buffer.is_empty() {
+        return Err(approval_unavailable("the PAM request is empty"));
+    }
+    Ok(buffer)
+}
+
+fn parse_pam_request(raw: &[u8]) -> Result<PamAuthRequestV1> {
+    let request: PamAuthRequestV1 = serde_json::from_slice(raw)
+        .map_err(|error| approval_unavailable(format!("decode the PAM request: {error}")))?;
+    if request.pam_protocol_version != PAM_PROTOCOL_VERSION {
+        return Err(approval_unavailable(format!(
+            "the PAM request declares protocol version {}; this helper speaks {PAM_PROTOCOL_VERSION}",
+            request.pam_protocol_version
+        )));
+    }
+    if request.principal.name.is_empty() || request.invoking.name.is_empty() {
+        return Err(approval_unavailable(
+            "the PAM request omits its identity text",
+        ));
+    }
+    if !ACCEPTED_PAM_SERVICES.contains(&request.service.as_str()) {
+        return Err(approval_unavailable(format!(
+            "the PAM request names service {:?}; this helper answers only for {}",
+            escape_for_terminal(&request.service),
+            ACCEPTED_PAM_SERVICES.join(" and ")
+        )));
+    }
+    Ok(request)
+}
+
+/// Resolves both PAM names inside one bounded budget.
+///
+/// Name resolution belongs here rather than in the module: this process is
+/// already root, and it can afford a deadline the module cannot. A stalled
+/// or failing name service is unavailable; a name the service answers for
+/// but does not know is a failure, because the request names an account this
+/// host cannot authenticate.
+fn resolve_identities(pam: &PamAuthRequestV1, budget: Duration) -> Result<ResolvedIdentitiesV1> {
+    let names = vec![pam.principal.name.clone(), pam.invoking.name.clone()];
+    let resolved = resolve_names(names, budget)?;
+    let [principal, invoking] = resolved[..] else {
+        return Err(approval_unavailable(
+            "name resolution returned the wrong number of answers",
+        ));
+    };
+    let (NameLookupV1::Uid(pam_uid), NameLookupV1::Uid(invoking_uid)) = (principal, invoking)
+    else {
+        bail!("the PAM request names an account this host cannot resolve");
+    };
+    Ok(ResolvedIdentitiesV1 {
+        pam_uid,
+        invoking_uid,
+        invoking_user: Some(pam.invoking.name.clone()),
+    })
+}
+
+fn resolve_names(names: Vec<String>, budget: Duration) -> Result<Vec<NameLookupV1>> {
+    resolve_names_with(names, budget, |name| {
+        match nix::unistd::User::from_name(name) {
+            Ok(Some(user)) => Ok(NameLookupV1::Uid(user.uid.as_raw())),
+            Ok(None) => Ok(NameLookupV1::Unknown),
+            Err(error) => Err(error.to_string()),
+        }
+    })
+}
+
+/// The budget half of [`resolve_names`], with the resolver injected so a test
+/// can supply one that is deliberately slower than its budget instead of
+/// racing a real `getpwnam_r` against a zero deadline.
+fn resolve_names_with<F>(
+    names: Vec<String>,
+    budget: Duration,
+    resolve: F,
+) -> Result<Vec<NameLookupV1>>
+where
+    F: Fn(&str) -> Result<NameLookupV1, String> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Detached on purpose: `getpwnam_r` cannot be cancelled, so a hung
+    // directory service must not be able to hold the helper past its budget.
+    std::thread::spawn(move || {
+        let resolved = names
+            .iter()
+            .map(|name| resolve(name))
+            .collect::<Result<Vec<_>, String>>();
+        let _ = sender.send(resolved);
+    });
+    match receiver.recv_timeout(budget) {
+        Ok(Ok(resolved)) => Ok(resolved),
+        Ok(Err(detail)) => Err(approval_unavailable(format!(
+            "the name service failed to answer: {detail}"
+        ))),
+        Err(_) => Err(approval_unavailable(format!(
+            "user name resolution exceeded its {}ms budget",
+            budget.as_millis()
+        ))),
+    }
+}
+
+fn build_auth_request(
+    pam: &PamAuthRequestV1,
+    identities: &ResolvedIdentitiesV1,
+) -> Result<AuthRequestV1> {
+    let issued_at = now();
+    let mut nonce = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let request = AuthRequestV1 {
+        message_type: AUTH_REQUEST_TYPE.to_owned(),
+        version: AUTH_WIRE_VERSION,
+        request_id: Uuid::new_v4().to_string(),
+        nonce: URL_SAFE_NO_PAD.encode(nonce),
+        issued_at,
+        expires_at: issued_at
+            + i64::try_from((AUTH_TIMEOUT + AUTH_EXPIRY_HEADROOM).as_secs())
+                .map_err(|error| host_fault("compute the request expiry", &error.into()))?,
+        trusted: TrustedAuthContextV1 {
+            host: hostname(),
+            service: pam.service.clone(),
+            pam_user: pam.principal.name.clone(),
+            pam_uid: identities.pam_uid,
+            invoking_uid: identities.invoking_uid,
+            invoking_user: identities.invoking_user.clone(),
+            tty: auth_tty(pam.tty.as_deref()),
+        },
+        submitted: SubmittedAuthContextV1 {
+            // PAM has no equivalent of the sudo plugin's
+            // `session.OSHIOKI_SESSION` binding, and this helper holds no
+            // trusted agent label of its own, so neither is claimed.
+            session: None,
+            agent_label: None,
+            invocation: auth_invocation(&pam.submitted_argv),
+        },
+    };
+    // A request this helper cannot even construct is a host-local fault, not
+    // a decision about the operator. The identity text came from a module
+    // that may have been built against a different bound; refusing it as a
+    // denial would be an answer nobody gave.
+    request
+        .validate()
+        .map_err(|error| host_fault("build the authentication request", &error.into()))?;
+    Ok(request)
+}
+
+/// Keeps a PAM tty only when it satisfies `TrustedAuthContextV1`'s rules.
+///
+/// A tty is display context. One that is empty, over-long, or carrying
+/// control bytes is context this helper drops rather than a reason to refuse
+/// an authentication: the terminal name says nothing about whether the
+/// operator should be let through.
+fn auth_tty(tty: Option<&str>) -> Option<String> {
+    tty.filter(|value| {
+        !value.is_empty()
+            && value.len() <= MAX_AUTH_TTY_BYTES
+            && !value.chars().any(char::is_control)
+    })
+    .map(str::to_owned)
+}
+
+/// Maps the module's advisory argument vector onto the protocol's invocation
+/// context.
+///
+/// `Available` is deliberately unreachable here. It promises a command and a
+/// working directory, and PAM supplies neither: the module sees its own
+/// process arguments, not sudo's finalized `command_info`. Everything the
+/// module did observe is therefore reported as `Truncated` context with the
+/// missing fields left empty rather than invented, and an unreadable argument
+/// vector is reported as `Unavailable`.
+fn auth_invocation(argv: &PamArgvV1) -> AuthInvocationV1 {
+    if !argv.available {
+        return AuthInvocationV1::Unavailable;
+    }
+    AuthInvocationV1::Truncated {
+        command: None,
+        argv: argv.values.clone(),
+        cwd: None,
+        // The module drops advisory arguments from the end without reporting
+        // how many; `None` is the protocol's answer for an unknown count.
+        omitted_args: None,
+    }
+}
+
+fn seal_auth_request(
+    request: &AuthRequestV1,
+    raw: &[u8],
+    devices: &[DevicePublicRecordV1],
+) -> Result<AuthEnvelopeV1> {
+    if devices.len() > oshioki_protocol::v1::MAX_DEVICES {
+        bail!("more than eight authentication recipients");
+    }
+    let envelope = AuthEnvelopeV1 {
+        message_type: AUTH_ENVELOPE_TYPE.to_owned(),
+        version: AUTH_WIRE_VERSION,
+        request_id: request.request_id.clone(),
+        host: request.trusted.host.clone(),
+        issued_at: request.issued_at,
+        expires_at: request.expires_at,
+        sealed: devices
+            .iter()
+            .map(|device| oshioki_protocol::seal_v1(raw, device))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    envelope.validate()?;
+    Ok(envelope)
+}
+
+/// Selects this request's recipients from the pinned registry.
+///
+/// Only active hardware devices qualify: a software native key can approve a
+/// command, but it must never stand in for the possession factor a sudo
+/// password is being replaced with.
+fn auth_recipients(registry: &DeviceRegistryV1) -> Vec<DevicePublicRecordV1> {
+    hardware_auth_recipients(registry)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_auth_request_at(
+    request: AuthRequestV1,
+    timeout: Duration,
+    directory: &Path,
+    liveness: Option<LivenessWatch>,
+) -> Result<()> {
+    // Everything between here and the transport wait is host-local: reading
+    // root's own configuration, reading root's own registry, and serializing
+    // a request this process just built. None of it is an answer about the
+    // operator, so all of it stays password-eligible (`host_fault`).
+    let nats_url = transports_from(directory)
+        .map_err(|error| host_fault("read the transport configuration", &error))?
+        .nats_url;
+    let raw_request = request
+        .raw_json()
+        .map_err(|error| host_fault("serialize the authentication request", &error.into()))?;
+    let mut registry = load_registry_from(directory)
+        .map_err(|error| host_fault("read the device registry", &error))?;
+    let recipients = auth_recipients(&registry);
+    if recipients.is_empty() {
+        // Nothing is published in this case. With no hardware device to
+        // answer, the honest result is unavailable and the PAM stack keeps
+        // its password path.
+        return Err(approval_unavailable(
+            "no active hardware authentication device is enrolled on this host",
+        ));
+    }
+    let has_browser_recipient = recipients
+        .iter()
+        .any(|device| device.kind == DeviceKindV1::Webauthn);
+    let payload = seal_auth_request(&request, &raw_request, &recipients)
+        .and_then(|envelope| Ok(serde_json::to_vec(&envelope)?))
+        .map_err(|error| host_fault("seal the authentication envelope", &error))?;
+    // The terminal gets context, never credentials: which account is being
+    // authenticated for which service. A failed write to stderr is not a
+    // reason to refuse an authentication either.
+    let _ = writeln!(
+        io::stderr(),
+        "Oshioki is authenticating {} for {}",
+        escape_for_terminal(&request.trusted.pam_user),
+        escape_for_terminal(&request.trusted.service)
+    );
+    let _ = io::stderr().flush();
+    let progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync> =
+        std::sync::Arc::new(|event: HookProgress| match event {
+            HookProgress::TransportFailed(error) => {
+                eprintln!("Transport failed: {}", sanitize_terminal_text(&error));
+            }
+            HookProgress::DaemonNotResponding(error) => {
+                eprintln!("Daemon not responding: {}", sanitize_terminal_text(&error));
+            }
+            HookProgress::RequestDelivered => {
+                eprintln!("Request delivered; waiting for approver...");
+                let _ = io::stderr().flush();
+            }
+            HookProgress::WaitingForApproval => {
+                eprintln!("Waiting for approval...");
+                let _ = io::stderr().flush();
+            }
+            HookProgress::ProtocolFailed(error) => {
+                eprintln!(
+                    "Transport protocol failed: {}",
+                    sanitize_terminal_text(&error)
+                );
+            }
+        });
+    let deadline = tokio::time::Instant::now() + timeout;
+    let decision = Box::pin(with_liveness(
+        liveness,
+        await_auth_decision(
+            directory,
+            &request,
+            payload,
+            deadline,
+            nats_url.as_deref(),
+            has_browser_recipient,
+            &progress,
+        ),
+    ))
+    .await?;
+    apply_auth_decision(
+        &decision,
+        &request,
+        &raw_request,
+        &recipients,
+        &mut registry,
+        directory,
+    )
+}
+
+/// The same two-transport matrix `execute_request_at` uses, on the
+/// authentication lane. A configured socket is tried first and NATS picks up
+/// whatever budget is left, so one PAM call can never outlive its deadline.
+async fn await_auth_decision(
+    directory: &Path,
+    request: &AuthRequestV1,
+    payload: Vec<u8>,
+    deadline: tokio::time::Instant,
+    nats_url: Option<&str>,
+    has_browser_recipient: bool,
+    progress: &std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
+) -> Result<AuthDecisionV1> {
+    let silence =
+        match try_agent_socket(directory, &request.request_id, &payload, deadline, progress).await?
+        {
+            SocketOutcome::Verdict(bytes) => {
+                return serde_json::from_slice(&bytes)
+                    .context("decode socket authentication decision");
+            }
+            SocketOutcome::Unconfigured => None,
+            SocketOutcome::Silent(SocketSilence::NoAgent { path, error }) => {
+                eprintln!(
+                    "Transport failed: socket {}: {}",
+                    sanitize_terminal_text(&path.display().to_string()),
+                    sanitize_terminal_text(&error)
+                );
+                Some(format!("no agent on {} ({error})", path.display()))
+            }
+            SocketOutcome::Silent(SocketSilence::NoAck { path, error }) => {
+                eprintln!(
+                    "Daemon not responding: socket {}: {}",
+                    sanitize_terminal_text(&path.display().to_string()),
+                    sanitize_terminal_text(&error)
+                );
+                Some(format!(
+                    "daemon not responding on {} ({error})",
+                    path.display()
+                ))
+            }
+        };
+    let Some(nats_url) = nats_url else {
+        return Err(approval_unavailable(match silence {
+            Some(detail) => format!(
+                "{detail} and no NATS fallback is configured — abandoning authentication request {}",
+                request.request_id
+            ),
+            // `transports_from` refuses an empty transport set, so this is
+            // only reachable if that contract ever changes.
+            None => "no authentication transport is configured".to_owned(),
+        }));
+    };
+    nats_auth_fallback(
+        directory,
+        request,
+        payload,
+        deadline,
+        nats_url,
+        has_browser_recipient,
+        progress.clone(),
+    )
+    .await
+}
+
+async fn nats_auth_fallback(
+    directory: &Path,
+    request: &AuthRequestV1,
+    payload: Vec<u8>,
+    deadline: tokio::time::Instant,
+    nats_url: &str,
+    has_browser_recipient: bool,
+    progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
+) -> Result<AuthDecisionV1> {
+    let display = nats_display_url(nats_url);
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        return Err(approval_unavailable(
+            "authentication deadline exceeded before the NATS fallback ran",
+        ));
+    }
+    let connect_timeout = remaining.min(DAEMON_ACK_TIMEOUT);
+    let transport = match tokio::time::timeout(connect_timeout, transport_from(directory)).await {
+        Err(_) => {
+            let error = format!(
+                "NATS connection timed out after {}ms",
+                connect_timeout.as_millis()
+            );
+            eprintln!(
+                "Transport failed: NATS fallback to {}: {}",
+                sanitize_terminal_text(&display),
+                sanitize_terminal_text(&error)
+            );
+            return Err(approval_unavailable(format!(
+                "NATS fallback to {display} failed: connect: {error}"
+            )));
+        }
+        Ok(Err(error)) => {
+            eprintln!(
+                "Transport failed: NATS fallback to {} failed: connect: {}",
+                sanitize_terminal_text(&display),
+                display_error(&error)
+            );
+            return Err(approval_unavailable(format!(
+                "NATS fallback to {display} failed: connect: {error:#}"
+            )));
+        }
+        Ok(Ok(transport)) => transport,
+    };
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        return Err(approval_unavailable(
+            "authentication deadline exceeded before the NATS verdict wait",
+        ));
+    }
+    // TODO(server auth ingest slice): print the approval link here, the way
+    // `nats_fallback` does for the command lane. It is deliberately absent
+    // for now because nothing consumes `oshioki.auth.>` yet: the server's
+    // JetStream handler still Terms any envelope that is not a
+    // `RequestEnvelopeV1`, so no `/r/<id>` page would exist behind the link
+    // and the browser would show an operator a dead URL. When it is restored
+    // it must be printed with `if let Ok(config) = ...` — the link is a
+    // convenience, and a missing or invalid `hook.json` must never be able to
+    // fail an authentication that the transport could still answer.
+    transport
+        .request_authentication(
+            &request.trusted.host,
+            &request.request_id,
+            payload,
+            remaining,
+            has_browser_recipient,
+            progress,
+        )
+        .await
+        .with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))
+}
+
+/// Applies one authentication decision. There is no `Deny` arm on this lane:
+/// a decision either verifies against a pinned hardware device over the exact
+/// bytes that were sealed, or the helper fails. Nothing here may widen into a
+/// success.
+fn apply_auth_decision(
+    decision: &AuthDecisionV1,
+    request: &AuthRequestV1,
+    raw_request: &[u8],
+    recipients: &[DevicePublicRecordV1],
+    registry: &mut DeviceRegistryV1,
+    directory: &Path,
+) -> Result<()> {
+    let now = now();
+    // A signature that arrives after the request expired must not stand in
+    // for one that arrived in time.
+    if request.expires_at <= now {
+        bail!("authentication request expired before its decision was applied");
+    }
+    match decision {
+        AuthDecisionV1::AuthenticateNative(approval) => {
+            approval
+                .validate_shape()
+                .context("validate native authentication decision")?;
+            if approval.request_id != request.request_id {
+                bail!("authentication request id mismatch");
+            }
+            let device = recipients
+                .iter()
+                .find(|device| {
+                    device.kind == DeviceKindV1::SecureEnclave
+                        && device.fingerprint == approval.device_fingerprint
+                })
+                .context("native authentication does not name one pinned Secure Enclave device")?;
+            verify_native_authentication_v1(approval, raw_request, device, now)
+                .context("native authentication verification failed")?;
+            info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, service=%request.trusted.service, pam_user=%request.trusted.pam_user, "sudo authentication accepted");
+            Ok(())
+        }
+        AuthDecisionV1::AuthenticateWebauthn(approval) => {
+            approval
+                .validate_shape()
+                .context("validate WebAuthn authentication decision")?;
+            if approval.request_id != request.request_id {
+                bail!("authentication request id mismatch");
+            }
+            let device = recipients
+                .iter()
+                .find(|device| {
+                    device.kind == DeviceKindV1::Webauthn
+                        && device.fingerprint == approval.device_fingerprint
+                        && device.credential_id == approval.credential_id
+                })
+                .context("WebAuthn authentication does not name one exact pinned credential")?;
+            let outcome = verify_webauthn_authentication_v1(
+                approval,
+                raw_request,
+                device,
+                &load_hook_config_from(directory)
+                    .map_err(|error| host_fault("read the hook configuration", &error))?,
+                now,
+            )
+            .context("WebAuthn authentication verification failed")?;
+            // Decision: a regressed signature counter is warned about, not
+            // rejected, exactly as the command approval lane treats it. Some
+            // authenticators legitimately report zero or a stalled counter,
+            // and diverging here would make this lane refuse hardware the
+            // other lane accepts. Tightening it is its own decision for both
+            // lanes together, not a side effect of this one.
+            if outcome.counter_regressed {
+                warn!(fingerprint=%device.fingerprint, stored=device.sign_count, observed=outcome.observed_sign_count, "authenticator signature counter regressed");
+            }
+            if outcome.observed_sign_count > device.sign_count {
+                if let Some(stored) = registry
+                    .devices
+                    .iter_mut()
+                    .find(|stored| stored.fingerprint == device.fingerprint)
+                {
+                    stored.sign_count = outcome.observed_sign_count;
+                }
+                // The device already authenticated; persisting the counter is
+                // bookkeeping and must not turn a verified assertion into a
+                // denial (read-only /etc, ENOSPC). The legacy command lane
+                // still propagates this error; tightening both is a joint
+                // decision.
+                if let Err(error) = write_registry_to(directory, registry) {
+                    warn!(request_id=%request.request_id, fingerprint=%device.fingerprint, error=%format!("{error:#}"), "sign count was not persisted");
+                }
+            }
+            info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, service=%request.trusted.service, pam_user=%request.trusted.pam_user, "sudo authentication accepted");
             Ok(())
         }
     }
@@ -1816,10 +2611,7 @@ fn session_label(values: &[(String, String)]) -> Option<String> {
 /// truncated value, since a clipped label could misrepresent the session.
 fn normalize_session_label(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    if trimmed.is_empty()
-        || trimmed.chars().count() > 64
-        || trimmed.chars().any(char::is_control)
-    {
+    if trimmed.is_empty() || trimmed.chars().count() > 64 || trimmed.chars().any(char::is_control) {
         return None;
     }
     Some(trimmed.to_owned())
@@ -2955,10 +3747,12 @@ mod tests {
             .await
             .unwrap()
         {
-            SocketOutcome::Decision(DecisionV1::Deny(denial)) => {
-                assert_eq!(denial.request_id, "req-1");
+            SocketOutcome::Verdict(bytes) => {
+                match serde_json::from_slice::<DecisionV1>(&bytes).unwrap() {
+                    DecisionV1::Deny(denial) => assert_eq!(denial.request_id, "req-1"),
+                    _ => panic!("stub sent a deny"),
+                }
             }
-            SocketOutcome::Decision(_) => panic!("stub sent a deny"),
             SocketOutcome::Unconfigured | SocketOutcome::Silent(_) => {
                 panic!("stub verdict was ignored")
             }
@@ -3063,7 +3857,9 @@ mod tests {
                 .await
                 .unwrap()
             {
-                SocketOutcome::Decision(decision) => decision,
+                SocketOutcome::Verdict(bytes) => {
+                    serde_json::from_slice::<DecisionV1>(&bytes).unwrap()
+                }
                 SocketOutcome::Unconfigured | SocketOutcome::Silent(_) => {
                     panic!("replacement socket verdict was ignored")
                 }
@@ -3142,10 +3938,18 @@ mod tests {
                 stream.write_all(&prefix).await.unwrap();
             });
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            let Err(error) =
-                try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress()).await
-            else {
-                panic!("malformed {name} verdict was accepted");
+            // The frame layer and the verdict decode are separate steps, as
+            // they are in `execute_request_at`: an oversized frame is
+            // rejected by the reader, an empty one decodes to nothing. Both
+            // must reach the same closed-fail exit class.
+            let error = match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+                .await
+            {
+                Err(error) => error,
+                Ok(SocketOutcome::Verdict(bytes)) => serde_json::from_slice::<DecisionV1>(&bytes)
+                    .context("decode socket decision")
+                    .expect_err("malformed verdict was accepted"),
+                Ok(_) => panic!("malformed {name} verdict was ignored"),
             };
             assert_eq!(
                 check_error_exit_code(&error),
@@ -3700,8 +4504,1186 @@ mod tests {
         assert_eq!(normalize_session_label("  claude  "), Some("claude".into()));
         assert_eq!(normalize_session_label(""), None);
         assert_eq!(normalize_session_label("   "), None);
-        assert_eq!(normalize_session_label(&"x".repeat(64)), Some("x".repeat(64)));
+        assert_eq!(
+            normalize_session_label(&"x".repeat(64)),
+            Some("x".repeat(64))
+        );
         assert_eq!(normalize_session_label(&"x".repeat(65)), None);
         assert_eq!(normalize_session_label("bad\u{0007}name"), None);
+    }
+}
+
+/// Tests for the private PAM `authenticate` verb. They pin the three things
+/// `pam/README.md` makes load-bearing: what this helper accepts on stdin,
+/// what it puts in a signed request, and the exit class of every way it can
+/// stop short of a verified hardware assertion.
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use oshioki_protocol::auth_v1::{AuthApproveNativeV1, auth_challenge};
+    use p256::ecdsa::{SigningKey, signature::Signer as _};
+
+    fn pam_json(overrides: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"pam_protocol_version":2,"principal":{{"name":"root"}},"#,
+                r#""invoking":{{"name":"alice"}},"service":"sudo","tty":"/dev/pts/3","#,
+                r#""process_pid":4242,{}}}"#
+            ),
+            overrides
+        )
+    }
+
+    fn argv_json(available: bool, truncated: bool, values: &str) -> String {
+        pam_json(&format!(
+            r#""submitted_argv":{{"available":{available},"truncated":{truncated},"values":[{values}]}}"#
+        ))
+    }
+
+    fn identities() -> ResolvedIdentitiesV1 {
+        ResolvedIdentitiesV1 {
+            pam_uid: 0,
+            invoking_uid: 1000,
+            invoking_user: Some("alice".into()),
+        }
+    }
+
+    /// A pinned Secure Enclave device and its private key, so a test can
+    /// produce the one signature `apply_auth_decision` will accept.
+    fn auth_test_device() -> (DevicePublicRecordV1, SigningKey) {
+        let signing = SigningKey::from_bytes((&[41; 32]).into()).unwrap();
+        let public = signing
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let credential_id = oshioki_protocol::native_credential_id(&public);
+        let fingerprint = oshioki_protocol::device_fingerprint(&credential_id, &public, &[42; 32]);
+        let device = DevicePublicRecordV1 {
+            version: VERSION_V1,
+            kind: DeviceKindV1::SecureEnclave,
+            fingerprint,
+            credential_id: URL_SAFE_NO_PAD.encode(&credential_id),
+            credential_public_key: URL_SAFE_NO_PAD.encode(&public),
+            box_public_key: URL_SAFE_NO_PAD.encode([42; 32]),
+            label: "auth-test".into(),
+            api_token_hash: URL_SAFE_NO_PAD.encode([43; 32]),
+            sign_count: 0,
+            active: true,
+        };
+        device.validate().unwrap();
+        (device, signing)
+    }
+
+    /// A pinned `WebAuthn` device and its private key, built the same way
+    /// `protocol/src/auth_v1.rs`'s own tests build one: a COSE P-256 public
+    /// key as the credential key, so `cose_p256_verifying_key` accepts it.
+    fn webauthn_test_device() -> (DevicePublicRecordV1, SigningKey) {
+        let signing = SigningKey::from_bytes((&[61; 32]).into()).unwrap();
+        let point = signing.verifying_key().to_encoded_point(false);
+        let cose = vec![
+            (
+                ciborium::Value::Integer(1.into()),
+                ciborium::Value::Integer(2.into()),
+            ),
+            (
+                ciborium::Value::Integer(3.into()),
+                ciborium::Value::Integer((-7).into()),
+            ),
+            (
+                ciborium::Value::Integer((-1).into()),
+                ciborium::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::Value::Integer((-2).into()),
+                ciborium::Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                ciborium::Value::Integer((-3).into()),
+                ciborium::Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ];
+        let mut cose_bytes = Vec::new();
+        ciborium::ser::into_writer(&ciborium::Value::Map(cose), &mut cose_bytes).unwrap();
+        let credential_id = vec![62; 32];
+        let box_public = [63; 32];
+        let device = DevicePublicRecordV1 {
+            version: VERSION_V1,
+            kind: DeviceKindV1::Webauthn,
+            fingerprint: oshioki_protocol::device_fingerprint(
+                &credential_id,
+                &cose_bytes,
+                &box_public,
+            ),
+            credential_id: URL_SAFE_NO_PAD.encode(&credential_id),
+            credential_public_key: URL_SAFE_NO_PAD.encode(&cose_bytes),
+            box_public_key: URL_SAFE_NO_PAD.encode(box_public),
+            label: "webauthn-test".into(),
+            api_token_hash: URL_SAFE_NO_PAD.encode([64; 32]),
+            sign_count: 0,
+            active: true,
+        };
+        device.validate().unwrap();
+        (device, signing)
+    }
+
+    const TEST_RP_ID: &str = "sudo.example";
+    const TEST_ORIGIN: &str = "https://sudo.example";
+
+    /// Writes the `hook.json` `verify_webauthn_authentication_v1` reads for
+    /// the expected origin and RP id.
+    fn seed_hook_config(directory: &Path) {
+        let config = HookConfigV1 {
+            version: VERSION_V1,
+            origin: TEST_ORIGIN.into(),
+            rp_id: TEST_RP_ID.into(),
+            server_base_url: TEST_ORIGIN.into(),
+        };
+        atomic_write_json(&directory.join("hook.json"), &config, 0o644).unwrap();
+    }
+
+    /// One assertion as a browser would produce it: authenticator data over
+    /// the RP id with the given flags and counter, plus client data binding
+    /// the domain-separated auth challenge over the exact sealed bytes.
+    fn webauthn_decision(
+        signing: &SigningKey,
+        device: &DevicePublicRecordV1,
+        request_id: &str,
+        raw: &[u8],
+        sign_count: u32,
+    ) -> AuthDecisionV1 {
+        let client = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"{TEST_ORIGIN}","crossOrigin":false}}"#,
+            URL_SAFE_NO_PAD.encode(auth_challenge(raw)),
+        );
+        let mut authenticator_data = Sha256::digest(TEST_RP_ID.as_bytes()).to_vec();
+        // User present and user verified, the two flags the verifier requires.
+        authenticator_data.push(0x05);
+        authenticator_data.extend_from_slice(&sign_count.to_be_bytes());
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&Sha256::digest(client.as_bytes()));
+        let signature: p256::ecdsa::Signature = signing.sign(&signed);
+        AuthDecisionV1::AuthenticateWebauthn(oshioki_protocol::auth_v1::AuthApproveWebauthnV1 {
+            version: AUTH_WIRE_VERSION,
+            request_id: request_id.to_owned(),
+            device_fingerprint: device.fingerprint.clone(),
+            credential_id: device.credential_id.clone(),
+            authenticator_data: URL_SAFE_NO_PAD.encode(&authenticator_data),
+            client_data_json: URL_SAFE_NO_PAD.encode(client.as_bytes()),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_der()),
+        })
+    }
+
+    fn software_device() -> DevicePublicRecordV1 {
+        let (mut device, _) = auth_test_device();
+        device.kind = DeviceKindV1::Software;
+        device
+    }
+
+    fn auth_request() -> AuthRequestV1 {
+        let pam = parse_pam_request(argv_json(false, false, "").as_bytes()).unwrap();
+        build_auth_request(&pam, &identities()).unwrap()
+    }
+
+    fn empty_registry() -> DeviceRegistryV1 {
+        DeviceRegistryV1 {
+            version: VERSION_V1,
+            devices: Vec::new(),
+        }
+    }
+
+    // --- stdin bounds -----------------------------------------------------
+
+    /// A request exactly at the bound is read; one byte more is refused, and
+    /// refused as unavailable rather than as a denial.
+    #[test]
+    fn stdin_is_bounded_at_the_pam_request_cap() {
+        let mut at_bound = vec![b' '; MAX_PAM_REQUEST_BYTES];
+        at_bound[0] = b'x';
+        assert_eq!(
+            read_pam_request_bytes(&mut at_bound.as_slice())
+                .unwrap()
+                .len(),
+            MAX_PAM_REQUEST_BYTES
+        );
+
+        let over_bound = vec![b'x'; MAX_PAM_REQUEST_BYTES + 1];
+        let error = read_pam_request_bytes(&mut over_bound.as_slice()).unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(display_error(&error).contains("exceeds"), "{error:#}");
+    }
+
+    /// An empty stdin is a module that never framed a request, not a denial.
+    #[test]
+    fn empty_stdin_is_unavailable() {
+        let error = read_pam_request_bytes(&mut [].as_slice()).unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+    }
+
+    /// Malformed JSON never becomes an authentication answer either way.
+    #[test]
+    fn malformed_json_is_unavailable() {
+        let error = parse_pam_request(b"{\"pam_protocol_version\":").unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+    }
+
+    /// Identity or service text the module could not supply is unavailable,
+    /// never a success.
+    #[test]
+    fn empty_identity_text_is_unavailable() {
+        for overrides in [
+            r#""principal":{"name":""}"#,
+            r#""invoking":{"name":""}"#,
+            r#""service":"""#,
+        ] {
+            let raw = format!(
+                r#"{{"pam_protocol_version":2,"principal":{{"name":"root"}},"invoking":{{"name":"alice"}},"service":"sudo","process_pid":1,{overrides}}}"#
+            );
+            let error = parse_pam_request(raw.as_bytes()).unwrap_err();
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_UNAVAILABLE,
+                "{overrides}"
+            );
+        }
+    }
+
+    // --- protocol version -------------------------------------------------
+
+    /// Every version but 2 is refused as unavailable, on the argument and in
+    /// the request body. A version this helper cannot speak is not evidence
+    /// about the operator, so it must never be a denial and never a success.
+    #[tokio::test]
+    async fn only_protocol_version_two_is_accepted() {
+        for version in [0_u8, 1, 3, 255] {
+            let error = cmd_authenticate(version, None).await.unwrap_err();
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_UNAVAILABLE,
+                "argv version {version}"
+            );
+            assert!(
+                display_error(&error).contains("unsupported PAM helper protocol version"),
+                "{error:#}"
+            );
+
+            let raw = format!(
+                r#"{{"pam_protocol_version":{version},"principal":{{"name":"root"}},"invoking":{{"name":"alice"}},"service":"sudo","process_pid":1}}"#
+            );
+            let error = parse_pam_request(raw.as_bytes()).unwrap_err();
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_UNAVAILABLE,
+                "body version {version}"
+            );
+        }
+    }
+
+    /// The verb parses the private argument list `pam/README.md` fixes, and
+    /// the liveness descriptor stays optional.
+    #[test]
+    fn the_authenticate_verb_parses_the_private_argument_list() {
+        let cli = Cli::try_parse_from([
+            "oshioki",
+            "authenticate",
+            "--pam-protocol-version",
+            "2",
+            "--pam-liveness-fd",
+            "7",
+        ])
+        .unwrap();
+        let Verb::Authenticate {
+            pam_protocol_version,
+            pam_liveness_fd,
+        } = cli.verb
+        else {
+            panic!("unexpected verb")
+        };
+        assert_eq!(pam_protocol_version, 2);
+        assert_eq!(pam_liveness_fd, Some(7));
+
+        let cli = Cli::try_parse_from(["oshioki", "authenticate", "--pam-protocol-version", "2"])
+            .unwrap();
+        let Verb::Authenticate {
+            pam_liveness_fd, ..
+        } = cli.verb
+        else {
+            panic!("unexpected verb")
+        };
+        assert_eq!(pam_liveness_fd, None);
+    }
+
+    // --- request mapping --------------------------------------------------
+
+    /// The trusted half carries exactly what PAM and this root helper know:
+    /// the host, the service, both identities, and the tty. Nothing about the
+    /// final sudo execution is claimed there.
+    #[test]
+    fn the_trusted_context_mirrors_the_pam_request() {
+        let request = auth_request();
+        request.validate().unwrap();
+        assert_eq!(request.message_type, AUTH_REQUEST_TYPE);
+        assert_eq!(request.version, AUTH_WIRE_VERSION);
+        assert_eq!(request.trusted.host, hostname());
+        assert_eq!(request.trusted.service, "sudo");
+        assert_eq!(request.trusted.pam_user, "root");
+        assert_eq!(request.trusted.pam_uid, 0);
+        assert_eq!(request.trusted.invoking_uid, 1000);
+        assert_eq!(request.trusted.invoking_user.as_deref(), Some("alice"));
+        assert_eq!(request.trusted.tty.as_deref(), Some("/dev/pts/3"));
+        assert!(request.expires_at > request.issued_at);
+        // Neither is derivable from PAM, so neither is invented.
+        assert_eq!(request.submitted.session, None);
+        assert_eq!(request.submitted.agent_label, None);
+    }
+
+    /// An empty tty is absent context, not an empty string on the wire.
+    #[test]
+    fn an_empty_tty_is_absent() {
+        let raw = r#"{"pam_protocol_version":2,"principal":{"name":"root"},"invoking":{"name":"alice"},"service":"sudo","tty":"","process_pid":1}"#;
+        let pam = parse_pam_request(raw.as_bytes()).unwrap();
+        let request = build_auth_request(&pam, &identities()).unwrap();
+        assert_eq!(request.trusted.tty, None);
+    }
+
+    /// An unreadable argument vector maps to `Unavailable`: the module saw
+    /// nothing, so the request claims nothing.
+    #[test]
+    fn an_unreadable_argv_is_unavailable_context() {
+        let pam = parse_pam_request(argv_json(false, false, "").as_bytes()).unwrap();
+        let request = build_auth_request(&pam, &identities()).unwrap();
+        assert_eq!(request.submitted.invocation, AuthInvocationV1::Unavailable);
+
+        // A module that reports values alongside `available: false` still
+        // gets `Unavailable`: the flag is the claim, not the array.
+        let pam = parse_pam_request(argv_json(false, false, r#""sudo","ls""#).as_bytes()).unwrap();
+        let request = build_auth_request(&pam, &identities()).unwrap();
+        assert_eq!(request.submitted.invocation, AuthInvocationV1::Unavailable);
+    }
+
+    /// A readable argument vector maps to `Truncated`, never `Available`.
+    /// `Available` promises a command and a working directory, and PAM gives
+    /// this helper neither; the observed arguments are carried as-is with the
+    /// missing fields left empty.
+    #[test]
+    fn a_readable_argv_is_truncated_context() {
+        for truncated in [false, true] {
+            let pam =
+                parse_pam_request(argv_json(true, truncated, r#""sudo","-i""#).as_bytes()).unwrap();
+            let request = build_auth_request(&pam, &identities()).unwrap();
+            let AuthInvocationV1::Truncated {
+                command,
+                argv,
+                cwd,
+                omitted_args,
+            } = request.submitted.invocation
+            else {
+                panic!("readable argv must be truncated context, not {truncated}")
+            };
+            assert_eq!(command, None);
+            assert_eq!(cwd, None);
+            assert_eq!(omitted_args, None);
+            assert_eq!(argv, ["sudo", "-i"]);
+        }
+    }
+
+    /// A fully trimmed argument vector (`available: true, values: []`) is
+    /// still readable context and must still validate.
+    #[test]
+    fn a_fully_trimmed_argv_still_builds_a_valid_request() {
+        let pam = parse_pam_request(argv_json(true, true, "").as_bytes()).unwrap();
+        let request = build_auth_request(&pam, &identities()).unwrap();
+        request.validate().unwrap();
+        assert!(matches!(
+            request.submitted.invocation,
+            AuthInvocationV1::Truncated { .. }
+        ));
+    }
+
+    /// A missing `submitted_argv` object is unavailable context rather than a
+    /// parse failure, so an older module inside protocol 2 still works.
+    #[test]
+    fn a_missing_argv_object_is_unavailable_context() {
+        let raw = r#"{"pam_protocol_version":2,"principal":{"name":"root"},"invoking":{"name":"alice"},"service":"sudo","process_pid":1}"#;
+        let pam = parse_pam_request(raw.as_bytes()).unwrap();
+        let request = build_auth_request(&pam, &identities()).unwrap();
+        assert_eq!(request.submitted.invocation, AuthInvocationV1::Unavailable);
+    }
+
+    // --- recipient selection ---------------------------------------------
+
+    /// Software native devices are never authentication recipients: they can
+    /// approve a command, but they are not the possession factor a password
+    /// is being replaced with. Inactive hardware is excluded too.
+    #[test]
+    fn only_active_hardware_devices_are_recipients() {
+        let (hardware, _) = auth_test_device();
+        let mut inactive = software_device();
+        inactive.kind = DeviceKindV1::SecureEnclave;
+        inactive.fingerprint = "inactive-fingerprint".into();
+        inactive.active = false;
+        let registry = DeviceRegistryV1 {
+            version: VERSION_V1,
+            devices: vec![software_device(), inactive, hardware.clone()],
+        };
+        let recipients = auth_recipients(&registry);
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].fingerprint, hardware.fingerprint);
+    }
+
+    /// With no hardware recipient the helper publishes nothing at all and
+    /// exits unavailable, so the PAM stack keeps its password path.
+    #[tokio::test]
+    async fn no_hardware_recipient_is_unavailable_and_sends_nothing() {
+        let directory = std::env::temp_dir().join(format!("oshioki-auth-none-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        // A socket path that does not exist: reaching a transport at all
+        // would be the failure this test is asserting cannot happen.
+        std::fs::write(
+            directory.join("config.env"),
+            format!(
+                "OSHIOKI_AGENT_SOCKET={}\n",
+                directory.join("absent.sock").display()
+            ),
+        )
+        .unwrap();
+        let registry = DeviceRegistryV1 {
+            version: VERSION_V1,
+            devices: vec![software_device()],
+        };
+        atomic_write_json(&directory.join("devices.json"), &registry, 0o600).unwrap();
+
+        let error =
+            execute_auth_request_at(auth_request(), Duration::from_secs(5), &directory, None)
+                .await
+                .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(
+            display_error(&error).contains("no active hardware authentication device"),
+            "{error:#}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The sealed envelope addresses exactly the recipients it was given and
+    /// carries the authentication type tags, not the command ones.
+    #[test]
+    fn the_envelope_is_sealed_to_its_recipients() {
+        let (device, _) = auth_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let envelope = seal_auth_request(&request, &raw, std::slice::from_ref(&device)).unwrap();
+        assert_eq!(envelope.message_type, AUTH_ENVELOPE_TYPE);
+        assert_eq!(envelope.version, AUTH_WIRE_VERSION);
+        assert_eq!(envelope.request_id, request.request_id);
+        assert_eq!(envelope.host, request.trusted.host);
+        assert_eq!(envelope.sealed.len(), 1);
+        assert_eq!(envelope.sealed[0].device_fingerprint, device.fingerprint);
+    }
+
+    // --- decision verification -------------------------------------------
+
+    fn native_decision(
+        signing: &SigningKey,
+        device: &DevicePublicRecordV1,
+        request_id: &str,
+        raw: &[u8],
+    ) -> AuthDecisionV1 {
+        let signature: p256::ecdsa::Signature = signing.sign(&auth_challenge(raw));
+        AuthDecisionV1::AuthenticateNative(AuthApproveNativeV1 {
+            version: AUTH_WIRE_VERSION,
+            request_id: request_id.to_owned(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_der()),
+        })
+    }
+
+    /// The one path to exit 0: a signature over the exact bytes that were
+    /// sealed, from a pinned active hardware device.
+    #[test]
+    fn a_verified_native_assertion_authenticates() {
+        let (device, signing) = auth_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let decision = native_decision(&signing, &device, &request.request_id, &raw);
+        let mut registry = empty_registry();
+        apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            Path::new("/nonexistent"),
+        )
+        .unwrap();
+    }
+
+    /// A signature over different bytes is a failure, not unavailable: a
+    /// security failure must never leave the password branch looking like the
+    /// same outcome as a broken transport, and must never succeed.
+    #[test]
+    fn a_signature_over_other_bytes_fails() {
+        let (device, signing) = auth_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let other = auth_request().raw_json().unwrap();
+        let decision = native_decision(&signing, &device, &request.request_id, &other);
+        let mut registry = empty_registry();
+        let error = apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            Path::new("/nonexistent"),
+        )
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+    }
+
+    /// A correct signature from a key that is not among this request's
+    /// recipients is a failure.
+    #[test]
+    fn an_unpinned_device_fails() {
+        let (device, _) = auth_test_device();
+        let impostor = SigningKey::from_bytes((&[51; 32]).into()).unwrap();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let decision = native_decision(&impostor, &device, &request.request_id, &raw);
+        let mut registry = empty_registry();
+        let error = apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            &[],
+            &mut registry,
+            Path::new("/nonexistent"),
+        )
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(
+            display_error(&error).contains("does not name one pinned Secure Enclave device"),
+            "{error:#}"
+        );
+
+        // Present but with the wrong key: the record is pinned, the
+        // signature is not the record's.
+        let error = apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            Path::new("/nonexistent"),
+        )
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+    }
+
+    /// A decision naming another request never authenticates this one.
+    #[test]
+    fn a_request_id_mismatch_fails() {
+        let (device, signing) = auth_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let decision = native_decision(&signing, &device, &Uuid::new_v4().to_string(), &raw);
+        let mut registry = empty_registry();
+        let error = apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            Path::new("/nonexistent"),
+        )
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(
+            display_error(&error).contains("request id mismatch"),
+            "{error:#}"
+        );
+    }
+
+    // --- the WebAuthn arm -------------------------------------------------
+
+    /// The happy path: a browser assertion over the exact sealed bytes, from
+    /// the one pinned credential, with user presence and verification set.
+    #[test]
+    fn a_verified_webauthn_assertion_authenticates() {
+        let directory = auth_config_dir("webauthn-ok");
+        seed_hook_config(&directory);
+        let (device, signing) = webauthn_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let decision = webauthn_decision(&signing, &device, &request.request_id, &raw, 1);
+        let mut registry = DeviceRegistryV1 {
+            version: VERSION_V1,
+            devices: vec![device.clone()],
+        };
+        apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            &directory,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The credential id is pinned, not just the fingerprint. An assertion
+    /// naming a different credential on the same device record is a failure:
+    /// the key that signed is not the key that was enrolled.
+    #[test]
+    fn a_webauthn_credential_id_mismatch_fails() {
+        let directory = auth_config_dir("webauthn-credid");
+        seed_hook_config(&directory);
+        let (device, signing) = webauthn_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let AuthDecisionV1::AuthenticateWebauthn(mut approval) =
+            webauthn_decision(&signing, &device, &request.request_id, &raw, 1)
+        else {
+            panic!("expected a WebAuthn decision")
+        };
+        approval.credential_id = URL_SAFE_NO_PAD.encode([99; 32]);
+        let mut registry = empty_registry();
+        let error = apply_auth_decision(
+            &AuthDecisionV1::AuthenticateWebauthn(approval),
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            &directory,
+        )
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(
+            display_error(&error).contains("does not name one exact pinned credential"),
+            "{error:#}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A `WebAuthn` decision can never be satisfied by a Secure Enclave record,
+    /// and a native decision can never be satisfied by a `WebAuthn` one. The
+    /// two device kinds are separate assurance claims, so the arms must not
+    /// cross over even when the fingerprint matches.
+    #[test]
+    fn the_two_decision_arms_do_not_cross_device_kinds() {
+        let directory = auth_config_dir("webauthn-kind");
+        seed_hook_config(&directory);
+        let (webauthn, webauthn_key) = webauthn_test_device();
+        let (native, native_key) = auth_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let mut registry = empty_registry();
+
+        // A WebAuthn assertion offered against the Secure Enclave record.
+        let mut impostor = native.clone();
+        impostor.fingerprint = webauthn.fingerprint.clone();
+        impostor.credential_id = webauthn.credential_id.clone();
+        let decision = webauthn_decision(&webauthn_key, &webauthn, &request.request_id, &raw, 1);
+        let error = apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&impostor),
+            &mut registry,
+            &directory,
+        )
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+
+        // A native assertion offered against the WebAuthn record.
+        let mut impostor = webauthn.clone();
+        impostor.fingerprint = native.fingerprint.clone();
+        let decision = native_decision(&native_key, &native, &request.request_id, &raw);
+        let error = apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&impostor),
+            &mut registry,
+            &directory,
+        )
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A counter that advanced is written back to the registry on disk, so
+    /// the next request compares against what this authenticator last
+    /// reported rather than against the enrolment value forever.
+    #[test]
+    fn an_advanced_sign_count_is_persisted() {
+        let directory = auth_config_dir("webauthn-counter");
+        seed_hook_config(&directory);
+        let (device, signing) = webauthn_test_device();
+        seed_registry(&directory, vec![device.clone()]);
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let decision = webauthn_decision(&signing, &device, &request.request_id, &raw, 17);
+        let mut registry = load_registry_from(&directory).unwrap();
+        apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            &directory,
+        )
+        .unwrap();
+        assert_eq!(registry.devices[0].sign_count, 17);
+        let reloaded = load_registry_from(&directory).unwrap();
+        assert_eq!(reloaded.devices[0].sign_count, 17);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A regressed counter is warned about, not rejected, and the stored
+    /// value is left alone. This matches the command approval lane; see the
+    /// decision comment on `apply_auth_decision`.
+    #[test]
+    fn a_regressed_sign_count_is_warned_about_not_rejected() {
+        let directory = auth_config_dir("webauthn-regress");
+        seed_hook_config(&directory);
+        let (mut device, signing) = webauthn_test_device();
+        device.sign_count = 40;
+        seed_registry(&directory, vec![device.clone()]);
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let decision = webauthn_decision(&signing, &device, &request.request_id, &raw, 9);
+        let mut registry = load_registry_from(&directory).unwrap();
+        apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            &directory,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.devices[0].sign_count, 40,
+            "a regressed counter must not lower the stored value"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A browser assertion bound to a different origin does not authenticate.
+    #[test]
+    fn a_webauthn_assertion_for_another_origin_fails() {
+        let directory = auth_config_dir("webauthn-origin");
+        let config = HookConfigV1 {
+            version: VERSION_V1,
+            origin: "https://other.example".into(),
+            rp_id: "other.example".into(),
+            server_base_url: "https://other.example".into(),
+        };
+        atomic_write_json(&directory.join("hook.json"), &config, 0o644).unwrap();
+        let (device, signing) = webauthn_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let decision = webauthn_decision(&signing, &device, &request.request_id, &raw, 1);
+        let mut registry = empty_registry();
+        let error = apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            &directory,
+        )
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // --- lane separation --------------------------------------------------
+
+    /// A legacy command-approval decision delivered on the authentication
+    /// lane must not authenticate. `DecisionV1` tags its variants with
+    /// `action`; `AuthDecisionV1` tags with `type`, so the legacy JSON simply
+    /// does not decode — and a decode failure is exit 1, never exit 0.
+    #[test]
+    fn a_legacy_command_decision_does_not_authenticate() {
+        let (device, signing) = auth_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let challenge = oshioki_protocol::approve_challenge(&raw);
+        let signature: p256::ecdsa::Signature = signing.sign(&challenge);
+        let legacy = DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
+            version: VERSION_V1,
+            request_id: request.request_id.clone(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_der()),
+        });
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(r#""action":"approve_native""#),
+            "the legacy encoding must keep its own tag"
+        );
+        let error = serde_json::from_slice::<AuthDecisionV1>(&bytes)
+            .context("decode socket authentication decision")
+            .expect_err("a command approval must not decode as an authentication");
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+    }
+
+    /// A verdict that arrives after the request expired is a failure. A
+    /// verdict that never arrives is a timeout, which is unavailable; the two
+    /// must not be confused.
+    #[test]
+    fn an_expired_request_is_not_authenticated_late() {
+        let (device, signing) = auth_test_device();
+        let mut request = auth_request();
+        request.issued_at = now() - 600;
+        request.expires_at = now() - 300;
+        let raw = serde_json::to_vec(&request).unwrap();
+        let decision = native_decision(&signing, &device, &request.request_id, &raw);
+        let mut registry = empty_registry();
+        let error = apply_auth_decision(
+            &decision,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            &mut registry,
+            Path::new("/nonexistent"),
+        )
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(display_error(&error).contains("expired"), "{error:#}");
+    }
+
+    // --- liveness ---------------------------------------------------------
+
+    /// EOF on the liveness descriptor abandons the wait promptly and reports
+    /// unavailable: the PAM call that would have consumed a success is gone.
+    #[tokio::test]
+    async fn liveness_eof_abandons_the_wait_as_unavailable() {
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        let watch = watch_liveness(std::os::fd::AsRawFd::as_raw_fd(&read_end)).unwrap();
+        // The PAM call goes away.
+        drop(write_end);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_liveness(Some(watch), async {
+                // Far longer than any real deadline: only the liveness
+                // channel can end this wait.
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(())
+            }),
+        )
+        .await
+        .expect("liveness EOF must end the wait promptly")
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(
+            display_error(&error).contains("liveness descriptor"),
+            "{error:#}"
+        );
+        drop(read_end);
+    }
+
+    /// A live descriptor does not disturb a wait that completes normally.
+    #[tokio::test]
+    async fn a_live_descriptor_does_not_interrupt_the_wait() {
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        let watch = watch_liveness(std::os::fd::AsRawFd::as_raw_fd(&read_end)).unwrap();
+        let value = with_liveness(Some(watch), async { Ok(7_u8) })
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+        drop(write_end);
+        drop(read_end);
+    }
+
+    /// With no descriptor the wait is simply the work itself.
+    #[tokio::test]
+    async fn an_absent_descriptor_leaves_the_wait_alone() {
+        assert_eq!(with_liveness(None, async { Ok(3_u8) }).await.unwrap(), 3);
+    }
+
+    /// A descriptor that cannot be the module's pipe is refused before any
+    /// read happens, and refused as unavailable. The standard three are named
+    /// explicitly: reading stdin here would race the request read.
+    #[test]
+    fn an_implausible_liveness_descriptor_is_unavailable() {
+        for fd in [-1, 0, 1, 2] {
+            let error = watch_liveness(fd).unwrap_err();
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_UNAVAILABLE,
+                "fd {fd}"
+            );
+        }
+    }
+
+    /// A descriptor number that is not open is a module that did not set the
+    /// pipe up, not a reason to read whatever lands on that number later.
+    ///
+    /// The number is deliberately far above any descriptor this process could
+    /// hold rather than a just-closed one: a recycled number would make this
+    /// race the other tests in this binary.
+    #[test]
+    fn an_unopened_liveness_descriptor_is_unavailable() {
+        let error = watch_liveness(RawFd::MAX - 1).unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(display_error(&error).contains("not open"), "{error:#}");
+    }
+
+    // --- name resolution --------------------------------------------------
+
+    /// A name service that cannot answer inside the budget is unavailable,
+    /// never a denial. The resolver is deliberately slower than the budget
+    /// rather than the budget being zero, so this asserts the deadline and
+    /// not a scheduling race.
+    #[test]
+    fn a_name_lookup_timeout_is_unavailable() {
+        let error = resolve_names_with(vec!["root".into()], Duration::from_millis(50), |_| {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(NameLookupV1::Uid(0))
+        })
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(display_error(&error).contains("budget"), "{error:#}");
+    }
+
+    /// A name service that answers with an error is unavailable too: a
+    /// directory that is down is not evidence about the operator.
+    #[test]
+    fn a_name_service_error_is_unavailable() {
+        let error = resolve_names_with(vec!["root".into()], Duration::from_secs(5), |_| {
+            Err("connection refused".into())
+        })
+        .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+    }
+
+    /// A name the service answers for but does not know is a failure: the
+    /// request names an account this host cannot authenticate. It must never
+    /// be a success, and it is not a transport problem.
+    #[test]
+    fn an_unknown_user_name_fails() {
+        let raw = format!(
+            r#"{{"pam_protocol_version":2,"principal":{{"name":"{}"}},"invoking":{{"name":"{}"}},"service":"sudo","process_pid":1}}"#,
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        let pam = parse_pam_request(raw.as_bytes()).unwrap();
+        let error = resolve_identities(&pam, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(
+            display_error(&error).contains("cannot resolve"),
+            "{error:#}"
+        );
+    }
+
+    // --- host-local faults are never denials ------------------------------
+
+    /// Builds a config directory with an unreachable socket transport, so a
+    /// test that must not reach a transport still has a valid config.
+    fn auth_config_dir(name: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("oshioki-auth-{name}-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("config.env"),
+            format!(
+                "OSHIOKI_AGENT_SOCKET={}\n",
+                directory.join("absent.sock").display()
+            ),
+        )
+        .unwrap();
+        directory
+    }
+
+    fn seed_registry(directory: &Path, devices: Vec<DevicePublicRecordV1>) {
+        let registry = DeviceRegistryV1 {
+            version: VERSION_V1,
+            devices,
+        };
+        atomic_write_json(&directory.join("devices.json"), &registry, 0o600).unwrap();
+    }
+
+    /// A missing `config.env` is a host that is not configured, not a person
+    /// who should be refused. Answering `PAM_AUTH_ERR` here would lock
+    /// everyone out of sudo over a missing file.
+    #[tokio::test]
+    async fn a_missing_transport_config_is_unavailable() {
+        let directory =
+            std::env::temp_dir().join(format!("oshioki-auth-noconf-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let (device, _) = auth_test_device();
+        seed_registry(&directory, vec![device]);
+
+        let error =
+            execute_auth_request_at(auth_request(), Duration::from_secs(5), &directory, None)
+                .await
+                .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(
+            display_error(&error).contains("read the transport configuration"),
+            "{error:#}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A corrupt device registry is a host-local fault with the same rule.
+    #[tokio::test]
+    async fn a_corrupt_registry_is_unavailable() {
+        let directory = auth_config_dir("badregistry");
+        std::fs::write(directory.join("devices.json"), b"{not json").unwrap();
+
+        let error =
+            execute_auth_request_at(auth_request(), Duration::from_secs(5), &directory, None)
+                .await
+                .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(
+            display_error(&error).contains("read the device registry"),
+            "{error:#}"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A registry that parses but does not validate is unavailable too.
+    #[tokio::test]
+    async fn an_invalid_registry_is_unavailable() {
+        let directory = auth_config_dir("invalidregistry");
+        std::fs::write(
+            directory.join("devices.json"),
+            br#"{"version":1,"devices":[{"version":1,"kind":"secure_enclave","fingerprint":"","credential_id":"","credential_public_key":"","box_public_key":"","label":"","api_token_hash":"","sign_count":0,"active":true}]}"#,
+        )
+        .unwrap();
+
+        let error =
+            execute_auth_request_at(auth_request(), Duration::from_secs(5), &directory, None)
+                .await
+                .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A missing `hook.json` must not be able to fail an authentication. It
+    /// only ever fed the approval link, which this lane does not print yet,
+    /// so the request still reaches the transport and fails there — as a
+    /// transport failure, which is unavailable, not a denial.
+    #[tokio::test]
+    async fn a_missing_hook_config_still_reaches_the_transport() {
+        let directory = auth_config_dir("nohookconfig");
+        assert!(!directory.join("hook.json").exists());
+        let (browser, _) = webauthn_test_device();
+        seed_registry(&directory, vec![browser]);
+
+        let error =
+            execute_auth_request_at(auth_request(), Duration::from_secs(2), &directory, None)
+                .await
+                .unwrap_err();
+        // The socket does not exist and no NATS URL is configured, so the
+        // wait ends at the transport rather than at a config read.
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        let detail = display_error(&error);
+        assert!(detail.contains("no agent on"), "{detail}");
+        assert!(!detail.contains("hook.json"), "{detail}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // --- PAM text that cannot be carried ----------------------------------
+
+    /// A tty carrying control bytes or exceeding the protocol bound is
+    /// display context this helper drops. It must not become exit 1: the
+    /// terminal name says nothing about whether to authenticate.
+    #[test]
+    fn an_unusable_tty_is_dropped_rather_than_refused() {
+        for tty in ["/dev/pts/\u{0007}evil", &"x".repeat(MAX_AUTH_TTY_BYTES + 1)] {
+            let raw = serde_json::json!({
+                "pam_protocol_version": 2,
+                "principal": {"name": "root"},
+                "invoking": {"name": "alice"},
+                "service": "sudo",
+                "tty": tty,
+                "process_pid": 1,
+            });
+            let pam = parse_pam_request(raw.to_string().as_bytes()).unwrap();
+            let request = build_auth_request(&pam, &identities()).unwrap();
+            request.validate().unwrap();
+            assert_eq!(request.trusted.tty, None, "{tty:?}");
+        }
+    }
+
+    /// Identity text the protocol cannot carry is a module this helper
+    /// cannot work with, so it is unavailable. It is never a success, and it
+    /// is not a denial either: nobody made that decision.
+    #[test]
+    fn identity_text_the_protocol_rejects_is_unavailable() {
+        let raw = serde_json::json!({
+            "pam_protocol_version": 2,
+            "principal": {"name": "ro\u{0007}ot"},
+            "invoking": {"name": "alice"},
+            "service": "sudo",
+            "process_pid": 1,
+        });
+        let pam = parse_pam_request(raw.to_string().as_bytes()).unwrap();
+        let error = build_auth_request(&pam, &identities()).unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(
+            display_error(&error).contains("build the authentication request"),
+            "{error:#}"
+        );
+    }
+
+    /// The module is documented to send only these two services. Re-checking
+    /// here means a caller that skipped that check cannot widen the boundary.
+    #[test]
+    fn only_the_sudo_services_are_answered() {
+        for service in ["sudo", "sudo-i"] {
+            let raw = format!(
+                r#"{{"pam_protocol_version":2,"principal":{{"name":"root"}},"invoking":{{"name":"alice"}},"service":"{service}","process_pid":1}}"#
+            );
+            assert_eq!(parse_pam_request(raw.as_bytes()).unwrap().service, service);
+        }
+        for service in ["su", "login", "sshd", "sudo ", "SUDO", ""] {
+            let raw = serde_json::json!({
+                "pam_protocol_version": 2,
+                "principal": {"name": "root"},
+                "invoking": {"name": "alice"},
+                "service": service,
+                "process_pid": 1,
+            });
+            let error = parse_pam_request(raw.to_string().as_bytes()).unwrap_err();
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_UNAVAILABLE,
+                "{service:?}"
+            );
+        }
+    }
+
+    /// The request outlives the transport deadline by the configured
+    /// headroom, so a decision signed in the last millisecond of the wait is
+    /// still verifiable when it gets back rather than being called expired.
+    #[test]
+    fn the_request_expiry_has_headroom_over_the_transport_deadline() {
+        let request = auth_request();
+        let lifetime = request.expires_at - request.issued_at;
+        assert_eq!(
+            lifetime,
+            i64::try_from((AUTH_TIMEOUT + AUTH_EXPIRY_HEADROOM).as_secs()).unwrap()
+        );
+        assert!(lifetime > i64::try_from(AUTH_TIMEOUT.as_secs()).unwrap());
+    }
+
+    /// A name every host has resolves, and the resolved ids are what reach
+    /// the trusted context.
+    #[test]
+    fn a_known_user_name_resolves_to_its_uid() {
+        let raw = r#"{"pam_protocol_version":2,"principal":{"name":"root"},"invoking":{"name":"root"},"service":"sudo","process_pid":1}"#;
+        let pam = parse_pam_request(raw.as_bytes()).unwrap();
+        let identities = resolve_identities(&pam, Duration::from_secs(5)).unwrap();
+        assert_eq!(identities.pam_uid, 0);
+        assert_eq!(identities.invoking_uid, 0);
+        assert_eq!(identities.invoking_user.as_deref(), Some("root"));
     }
 }

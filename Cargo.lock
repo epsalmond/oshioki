@@ -1402,6 +1402,7 @@ dependencies = [
  "sha2",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

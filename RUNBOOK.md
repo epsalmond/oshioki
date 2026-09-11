@@ -328,6 +328,40 @@ The installer restores the prior `sudo.conf` automatically if validation
 fails. Production integration must also stop its server and NATS resources,
 restore routing, and confirm ordinary sudo behavior.
 
+## Authentication lane upgrade
+
+Contextual sudo authentication (`oshioki authenticate`, the PAM helper verb)
+publishes on `oshioki.auth.<host>`, a separate subject tree from command
+approval's `oshioki.request.<host>`. Two things in a NATS deployment predate
+it and are **not** updated automatically:
+
+1. The `OSHIOKI` stream's subject list. A stream created for
+   `oshioki.request.>` alone silently discards everything published on
+   `oshioki.auth.>`.
+2. The durable `oshioki-server-v1` consumer's filter. `get_or_create_consumer`
+   returns an existing durable exactly as it is and never rewrites its
+   configuration, so a consumer created before this lane existed keeps its old
+   single filter no matter what the binary asks for.
+
+The server logs a warning at startup naming this section when the running consumer's
+filters do not match the build. To fix a deployment (NATS 2.10 or newer):
+
+```sh
+nats stream update OSHIOKI --subjects 'oshioki.request.>,oshioki.auth.>'
+# The durable's filter cannot be widened in place; recreate it. Do this while
+# no request is in flight: pending deliveries are lost with the consumer.
+nats consumer rm OSHIOKI oshioki-server-v1
+# The server recreates it with both filters on its next start.
+systemctl restart oshioki-server
+```
+
+Verify with `nats consumer info OSHIOKI oshioki-server-v1`: the filter list
+must show both `oshioki.request.>` and `oshioki.auth.>`.
+
+Nothing consumes `oshioki.auth.>` yet — the server's JetStream handler still
+rejects any envelope that is not a command request — so this step prepares the
+transport ahead of that work rather than enabling authentication on its own.
+
 ## Logs
 
 The hook writes approval progress, warnings, and errors to stderr. It sends

@@ -9,7 +9,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use oshioki_protocol::{ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1};
+use oshioki_protocol::{
+    ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1, auth_v1::AuthDecisionV1,
+};
 
 use crate::{
     Ack, AckFuture, BoxFuture, HookProgress, HookTransport, InboundMessage, InboundStream,
@@ -33,6 +35,8 @@ pub struct JetStreamMessageStub {
 struct MockState {
     /// Verdicts queued by the test for `HookTransport::request_decision`.
     hook_verdicts: VecDeque<Result<DecisionV1>>,
+    /// Verdicts queued by the test for `request_authentication`.
+    hook_auth_verdicts: VecDeque<Result<AuthDecisionV1>>,
     /// Submissions queued by the test for `publish_enrollment_intent`.
     hook_submissions: VecDeque<Result<EnrollmentSubmissionV1>>,
     /// Requests queued by the test for `ServerTransport::requests`.
@@ -58,6 +62,12 @@ impl MockTransport {
     /// Queues one verdict for the next `request_decision` call.
     pub fn push_verdict(&self, decision: DecisionV1) {
         self.lock().hook_verdicts.push_back(Ok(decision));
+    }
+
+    /// Queues one authentication verdict for the next
+    /// `request_authentication` call.
+    pub fn push_auth_verdict(&self, decision: AuthDecisionV1) {
+        self.lock().hook_auth_verdicts.push_back(Ok(decision));
     }
 
     /// Queues one submission for the next enrollment round trip.
@@ -105,6 +115,33 @@ impl HookTransport for MockTransport {
             .hook_verdicts
             .pop_front()
             .unwrap_or_else(|| Err(anyhow!("mock transport timed out: no queued verdict")));
+        Box::pin(async move {
+            progress(HookProgress::WaitingForApproval);
+            outcome
+        })
+    }
+
+    fn request_authentication(
+        &self,
+        host: &str,
+        _request_id: &str,
+        payload: Vec<u8>,
+        _timeout: std::time::Duration,
+        _has_browser_recipient: bool,
+        progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
+    ) -> BoxFuture<'_, AuthDecisionV1> {
+        let outcome = {
+            let mut state = self.lock();
+            // Recorded on the real subject so a test can assert the hook
+            // published on the authentication lane, not the command lane.
+            state
+                .published
+                .push((format!("oshioki.auth.{host}"), payload));
+            state
+                .hook_auth_verdicts
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow!("mock transport timed out: no queued verdict")))
+        };
         Box::pin(async move {
             progress(HookProgress::WaitingForApproval);
             outcome
@@ -255,6 +292,66 @@ mod tests {
         assert_eq!(transport.revoked(), ["fp-1"]);
         assert_eq!(transport.activations(), [activation]);
         assert_eq!(transport.published(), [("a.b".to_string(), b"x".to_vec())]);
+    }
+
+    /// The authentication lane is its own round trip: the request is
+    /// recorded on `oshioki.auth.<host>`, never on the command subject, and
+    /// the queued `AuthDecisionV1` comes back typed. A command verdict
+    /// queued for `request_decision` can never satisfy it.
+    #[tokio::test]
+    async fn mock_carries_an_authentication_verdict_on_its_own_subject() {
+        use oshioki_protocol::auth_v1::{AUTH_WIRE_VERSION, AuthApproveNativeV1};
+
+        let transport = MockTransport::new();
+        let approval = AuthApproveNativeV1 {
+            version: AUTH_WIRE_VERSION,
+            request_id: "11111111-1111-4111-8111-111111111111".into(),
+            device_fingerprint: "fp-1".into(),
+            signature: "c2ln".into(),
+        };
+        transport.push_auth_verdict(AuthDecisionV1::AuthenticateNative(approval.clone()));
+        let decision = transport
+            .request_authentication(
+                "host-1",
+                &approval.request_id,
+                b"sealed".to_vec(),
+                std::time::Duration::from_secs(1),
+                false,
+                std::sync::Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, AuthDecisionV1::AuthenticateNative(approval));
+        assert_eq!(
+            transport.published(),
+            [("oshioki.auth.host-1".to_string(), b"sealed".to_vec())]
+        );
+    }
+
+    /// An empty authentication queue fails the wait instead of hanging it,
+    /// and a command verdict queued on the other lane does not fill it.
+    #[tokio::test]
+    async fn mock_authentication_without_a_queued_verdict_fails() {
+        let transport = MockTransport::new();
+        transport.push_verdict(DecisionV1::Deny(oshioki_protocol::DenyV1 {
+            version: VERSION_V1,
+            request_id: "req-1".into(),
+            device_fingerprint: "fp-1".into(),
+            signature: None,
+        }));
+        assert!(
+            transport
+                .request_authentication(
+                    "host-1",
+                    "req-1",
+                    Vec::new(),
+                    std::time::Duration::from_secs(1),
+                    false,
+                    std::sync::Arc::new(|_| {}),
+                )
+                .await
+                .is_err()
+        );
     }
 
     /// The enrollment round trip records the intent on the real subject and

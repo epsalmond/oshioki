@@ -28,7 +28,7 @@ services:
         nats --server nats://nats:4222 --user oshioki --password test-only
         stream info OSHIOKI >/dev/null 2>&1 ||
         nats --server nats://nats:4222 --user oshioki --password test-only
-        stream add OSHIOKI --subjects 'oshioki.request.>' --storage memory
+        stream add OSHIOKI --subjects 'oshioki.request.>,oshioki.auth.>' --storage memory
         --retention limits --discard old --max-age 10m --defaults
 
   server:
