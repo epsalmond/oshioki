@@ -646,7 +646,7 @@ async fn cmd_check(plugin_protocol_version: Option<u8>) -> Result<()> {
         bail!("plugin/hook protocol handshake failed");
     }
     let request = build_request(&parse_sudo_stdin()?)?;
-    execute_request_at(request, APPROVAL_TIMEOUT, check_config_dir(), false).await
+    execute_request_at(request, APPROVAL_TIMEOUT, check_config_dir(), true).await
 }
 
 async fn execute_request(request: RequestV1, timeout: Duration) -> Result<()> {
@@ -937,14 +937,14 @@ async fn nats_fallback(
             "sudo decision deadline exceeded before the NATS verdict wait",
         ));
     }
-    if options.announce_url {
+    if options.announce_url && options.has_browser_recipient {
         let config = load_hook_config_from(directory)?;
-        println!(
+        eprintln!(
             "Approval URL (expires in {} seconds):\n  {}",
             remaining.as_secs(),
-            approval_url(&config.server_base_url, &request.request_id)
+            terminal_approval_url(&config.server_base_url, &request.request_id)
         );
-        io::stdout().flush()?;
+        io::stderr().flush()?;
     }
     transport
         .request_decision(
@@ -1274,6 +1274,10 @@ async fn apply_decision(
 
 fn approval_url(server_base_url: &str, request_id: &str) -> String {
     format!("{server_base_url}/r/{request_id}")
+}
+
+fn terminal_approval_url(server_base_url: &str, request_id: &str) -> String {
+    escape_for_terminal(&approval_url(server_base_url, request_id))
 }
 
 /// The system configuration and its enrollment state are root-owned. A
@@ -2376,6 +2380,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_approval_url_escapes_terminal_controls() {
+        assert_eq!(
+            terminal_approval_url("https://host.example/\u{001b}[2K", "request-1"),
+            "https://host.example/\\u{001b}[2K/r/request-1"
+        );
+    }
+
     fn enrollment_config(origin: &str) -> HookConfigV1 {
         HookConfigV1 {
             version: VERSION_V1,
@@ -2832,6 +2844,23 @@ mod tests {
 
     fn test_progress() -> std::sync::Arc<dyn Fn(HookProgress) + Send + Sync> {
         std::sync::Arc::new(|_| {})
+    }
+
+    fn which_nats_server() -> Result<PathBuf, ()> {
+        let path = std::env::var_os("PATH").ok_or(())?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("nats-server"))
+            .find(|candidate| candidate.is_file())
+            .ok_or(())
+    }
+
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[tokio::test]
@@ -3427,6 +3456,59 @@ mod tests {
         );
         assert!(!text.contains("NATS_PASS"), "{text}");
         serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Native-only NATS approvals do not need the browser hook configuration.
+    /// Keeping this path independent matters because a native installation can
+    /// be configured before its browser origin exists.
+    #[tokio::test]
+    async fn native_nats_fallback_does_not_require_browser_config() {
+        let Ok(server_bin) = which_nats_server() else {
+            eprintln!("nats-server not on PATH; skipping");
+            return;
+        };
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let url = format!("nats://127.0.0.1:{port}");
+        let child = std::process::Command::new(&server_bin)
+            .args(["-a", "127.0.0.1", "-p", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn nats-server");
+        let _server = KillOnDrop(child);
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "nats-server never became ready"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let dir = socket_test_dir("native-no-browser-config");
+        std::fs::write(dir.join("config.env"), format!("NATS_URL={url}\n")).unwrap();
+        let request = build_synthetic_request();
+        let error = nats_fallback(
+            &dir,
+            &request,
+            b"{}".to_vec(),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            &url,
+            NatsFallbackOptions {
+                announce_url: true,
+                has_browser_recipient: false,
+            },
+            test_progress(),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(!text.contains("hook.json"), "{text}");
+        assert!(text.contains("daemon acknowledgement timeout"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The real sudo check now prints the browser approval URL on stderr, where the
+  approval plugin forwards hook diagnostics, while keeping the command's
+  stdout reserved for the approved command's output.
 - `scripts/oshioki-phone-setup` generates NATS permission lists that now
   include `oshioki.ack.*` and `oshioki.delivery.*` for both the hook and
   server users. PR #57 (0.1.4) added the `oshioki.delivery.<request_id>`
