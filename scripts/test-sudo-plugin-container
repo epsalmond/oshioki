@@ -20,6 +20,8 @@ SKIP_BUILD="${OSHIOKI_E2E_SKIP_BUILD:-0}"
 KEEP_ARTIFACTS="${OSHIOKI_E2E_KEEP_ARTIFACTS:-0}"
 ORIGIN_VALUE="${OSHIOKI_ORIGIN:-https://sudo.test}"
 RP_ID_VALUE="${OSHIOKI_RP_ID:-sudo.test}"
+# One valid-verdict sudo run, plus two hostile-caller-environment runs below.
+REQUEST_COUNT=3
 
 SHARE="$(mktemp -d -t oshioki-test.XXXXXX)"
 SHARE="$(cd "$SHARE" && pwd -P)"
@@ -177,6 +179,7 @@ if [ "$IN_CONTAINER" = "1" ]; then
   OSHIOKI_ORIGIN="$ORIGIN_VALUE" \
   OSHIOKI_RP_ID="$RP_ID_VALUE" \
   TIMEOUT=180 \
+  REQUEST_COUNT="$REQUEST_COUNT" \
     python3 "$SHARE/test-sudo-plugin-subscriber.py" \
       >"$SHARE/subscriber.log" 2>&1 &
   SUBSCRIBER_PID=$!
@@ -191,6 +194,7 @@ else
     -e OSHIOKI_ORIGIN="$ORIGIN_VALUE" \
     -e OSHIOKI_RP_ID="$RP_ID_VALUE" \
     -e TIMEOUT=180 \
+    -e REQUEST_COUNT="$REQUEST_COUNT" \
     -v "$SHARE":/share \
     "$PY_IMAGE" \
     bash -c 'pip -q install cryptography && exec python3 /share/test-sudo-plugin-subscriber.py' \
@@ -304,6 +308,64 @@ if [ "$sudo_elapsed" -gt 10 ]; then
   echo "[inner] FAIL: immediate verdict took ${sudo_elapsed}s" >&2
   exit 1
 fi
+
+# --- Hostile caller environment ---
+# sudoers env_reset strips all of this from run_envp before the command
+# executes, so it is expected and correct that none of it reaches the
+# executed command's environment. The point of this case is submit_envp:
+# the plugin's open() receives the caller's whole pre-env_reset environment,
+# and issue #76 was a bug in how that raw environment was parsed, not in
+# what env_reset lets through. A multi-line value, invalid UTF-8, an
+# oversized entry, and a hostile bash function export must not make sudo
+# abort with "error initializing approval plugin" (the #76 symptom), and
+# must not leak into the approval payload the hook builds and seals.
+echo "[inner] running sudo as $EXPECTED_USER with a hostile caller environment"
+hostile_started=$SECONDS
+if runuser -u "$EXPECTED_USER" -- env \
+    "CI_COMMIT_MESSAGE=$(printf 'subject\n\nbody line')" \
+    "BASH_FUNC_hostile%%=() {  echo hi
+}" \
+    "LATIN1=$(printf 'caf\xe9')" \
+    "OSHIOKI_SESSION=$(printf 'bad\x07label')" \
+    "BIG=$(head -c 60000 /dev/zero | tr '\0' x)" \
+    sudo -n "$EXPECTED_CMD" "${ARGS[@]}"; then
+  hostile_status=0
+else
+  hostile_status=$?
+fi
+hostile_elapsed=$((SECONDS - hostile_started))
+echo "[inner] hostile-env sudo returned $hostile_status"
+printf '%s\n' "$hostile_status" >"$SHARE_DIR/sudo-hostile.status"
+
+if [ "$hostile_status" -ne 0 ]; then
+  echo "[inner] FAIL: sudo -n rejected the hostile caller environment (likely the #76 'error initializing approval plugin' symptom)" >&2
+  exit 1
+fi
+
+# A third run: the same junk, but with a well-formed OSHIOKI_SESSION beside
+# it. The label must survive; the junk still must not.
+echo "[inner] running sudo as $EXPECTED_USER with a hostile caller environment plus a valid session label"
+labeled_started=$SECONDS
+if runuser -u "$EXPECTED_USER" -- env \
+    "CI_COMMIT_MESSAGE=$(printf 'subject\n\nbody line')" \
+    "BASH_FUNC_hostile%%=() {  echo hi
+}" \
+    "LATIN1=$(printf 'caf\xe9')" \
+    "BIG=$(head -c 60000 /dev/zero | tr '\0' x)" \
+    "OSHIOKI_SESSION=ci-hostile" \
+    sudo -n "$EXPECTED_CMD" "${ARGS[@]}"; then
+  labeled_status=0
+else
+  labeled_status=$?
+fi
+labeled_elapsed=$((SECONDS - labeled_started))
+echo "[inner] hostile-env-with-label sudo returned $labeled_status"
+printf '%s\n' "$labeled_status" >"$SHARE_DIR/sudo-labeled.status"
+
+if [ "$labeled_status" -ne 0 ]; then
+  echo "[inner] FAIL: sudo -n rejected the hostile caller environment with a valid OSHIOKI_SESSION label" >&2
+  exit 1
+fi
 INNER
 } >"$INNER_SCRIPT"
 chmod +x "$INNER_SCRIPT"
@@ -399,5 +461,68 @@ then
   exit 1
 fi
 
-TEST_SUCCEEDED=1
 echo "* PASS: valid immediate verdict approved in $(cat "$SHARE/sudo.elapsed")s and payload binds user=$EXPECTED_USER uid=$EXPECTED_UID command=$EXPECTED_CMD argv=(${ARGS[*]})"
+
+# --- Hostile caller environment ---
+# sudo -n succeeding (checked inside sudo-inner.sh; a non-zero inner exit
+# already failed run_sudo above) proves open() survived the #76 symptom. The
+# rest of this proves the captured approval payload is clean: no junk bytes
+# crossed from submit_envp into what the hook seals and publishes, and the
+# valid OSHIOKI_SESSION label in the third run did cross (as session.*), the
+# same as the plugin's own unit tests assert of the raw payload string.
+for _ in $(seq 1 60); do
+  [ -f "$SHARE/approved_request.2.json" ] && [ -f "$SHARE/approved_request.3.json" ] && break
+  sleep 1
+done
+
+if [ ! -f "$SHARE/approved_request.2.json" ] || [ ! -f "$SHARE/approved_request.3.json" ]; then
+  echo "FAIL: subscriber never captured both hostile-caller-environment approval payloads" >&2
+  echo "--- sudo log ---" >&2
+  cat "$SHARE/sudo-run.log" >&2 || true
+  echo "--- subscriber log ---" >&2
+  if [ "$IN_CONTAINER" = "1" ]; then
+    tail -40 "$SHARE/subscriber.log" >&2 || true
+  else
+    run_docker logs "$SUB_NAME" 2>&1 | tail -40 >&2 || true
+  fi
+  exit 1
+fi
+
+echo "* hostile payload (junk env, no label):"
+cat "$SHARE/approved_request.2.json"
+echo
+echo "* hostile payload (junk env, valid label):"
+cat "$SHARE/approved_request.3.json"
+echo
+
+JUNK_PAYLOAD="$(cat "$SHARE/approved_request.2.json")"
+LABELED_PAYLOAD="$(cat "$SHARE/approved_request.3.json")"
+
+for needle in "CI_COMMIT_MESSAGE" "BASH_FUNC" "caf" "session."; do
+  case "$JUNK_PAYLOAD" in
+    *"$needle"*)
+      echo "FAIL: junk-env approval payload contains '$needle' — submit_envp junk leaked into the sealed payload" >&2
+      exit 1
+      ;;
+  esac
+done
+
+case "$LABELED_PAYLOAD" in
+  *"session.OSHIOKI_SESSION=ci-hostile"*) ;;
+  *)
+    echo "FAIL: labeled-run approval payload missing session.OSHIOKI_SESSION=ci-hostile" >&2
+    exit 1
+    ;;
+esac
+
+for needle in "CI_COMMIT_MESSAGE" "BASH_FUNC" "caf"; do
+  case "$LABELED_PAYLOAD" in
+    *"$needle"*)
+      echo "FAIL: labeled-run approval payload contains '$needle' — submit_envp junk leaked into the sealed payload" >&2
+      exit 1
+      ;;
+  esac
+done
+
+TEST_SUCCEEDED=1
+echo "* PASS: hostile caller environment (multi-line, non-UTF-8, oversized, BASH_FUNC entries) did not deny sudo -n and did not leak into the approval payload; a valid OSHIOKI_SESSION label alongside the same junk still reached the payload as session.OSHIOKI_SESSION=ci-hostile"

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/test-sudo-plugin-container` now drives `sudo -n` through a
+  deliberately hostile caller environment (a multi-line value, invalid
+  UTF-8, an oversized entry, and a `BASH_FUNC_*` export) after the existing
+  valid-verdict run, asserting that none of it reaches the approval payload
+  the hook seals, and that a well-formed `OSHIOKI_SESSION` alongside the same
+  junk still does. The previous real-sudo container test only ran sudo under
+  `runuser` with a sterile environment, so it would never have caught #76.
+
 ### Fixed
 
 - The approval plugin's `open()` callback no longer fails when the invoking
