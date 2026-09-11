@@ -15,6 +15,17 @@
 //! helper process group and lets the stack fall back to a password.  A timeout
 //! is never a hard authentication failure.
 //!
+//! Cancellation includes the terminal's own `Ctrl-C`.  The helper runs in its
+//! own process group, so a terminal `SIGINT` is delivered to sudo and never to
+//! the helper — and sudo *blocks* `SIGINT` and `SIGQUIT` for the whole
+//! authentication phase, catching them only inside its own password prompt, so
+//! a blocked signal interrupts nothing and simply becomes pending.  The module
+//! therefore watches its own pending set, which costs one `sigpending` read
+//! per poll interval and changes nothing about sudo's signal state.  See
+//! `terminal_cancel_requested`.  Any *other* interrupted syscall in the pump loop is
+//! cancellation too, after re-checking whether the helper's own exit
+//! (`SIGCHLD`) caused the wakeup; see `interrupt_is_cancellation`.
+//!
 //! The module never reads `PAM_AUTHTOK`, never prompts, never accepts module
 //! arguments as a helper-path override, and never starts a nested PAM or sudo
 //! operation.
@@ -703,6 +714,18 @@ impl ChildGuard {
     /// unreaped the kernel keeps its PID, and therefore the helper's process
     /// group ID, reserved; that is the only window in which `kill(-pgid)` is
     /// guaranteed to reach the helper tree and nothing else.
+    ///
+    /// Only `WEXITED` is requested, so a leader that has been *stopped*
+    /// (`SIGSTOP`, `SIGTSTP`) is reported as still running: the module keeps
+    /// waiting and the helper deadline eventually classifies it as
+    /// unavailable and kills the group, which is the right answer — a
+    /// suspended helper has not authenticated anything.
+    ///
+    /// `EINTR` is returned to the caller rather than reported as "not
+    /// exited". `waitid` with `WNOHANG` does not block, so an interrupted one
+    /// means a signal arrived, and the pump loop owns that classification;
+    /// answering `false` here would swallow exactly the keystroke this module
+    /// promises never to swallow.
     fn leader_exited(&self) -> io::Result<bool> {
         debug_assert!(
             !self.leader_reaped,
@@ -722,11 +745,8 @@ impl ChildGuard {
             )
         };
         if status == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINTR) {
-                return Ok(false);
-            }
-            return Err(error);
+            // Interrupted waits are reported, not retried; see above.
+            return Err(io::Error::last_os_error());
         }
         // SAFETY: waitid either filled the value or left the zeroed bytes,
         // which POSIX defines as "no state change" for WNOHANG.
@@ -893,12 +913,25 @@ fn spawn_and_pump_helper(path: &str, request: &[u8], timeout: Duration) -> Helpe
         // Own process group, deliberately NOT a new session.  setsid()
         // would detach the helper from sudo's controlling terminal, so it
         // would never see SIGHUP on hangup and could not use the terminal
-        // for future progress output.  A separate process group still
-        // lets the parent kill(-pgid) the whole helper tree, while
-        // terminal SIGINT keeps its normal meaning for sudo itself: the
-        // Ctrl-C path terminates the helper through the parent-death
-        // mechanisms below rather than by racing the module's own
-        // bounded cleanup.
+        // for future progress output.  A separate process group is what
+        // lets the parent kill(-pgid) the whole helper tree, including
+        // grandchildren the module never learned about, on both Linux and
+        // macOS.
+        //
+        // The cost is that a terminal SIGINT goes to sudo's foreground
+        // group and never reaches the helper, so Ctrl-C cannot cancel by
+        // killing the helper directly.  terminal_cancel_requested closes
+        // that gap in the parent instead.  Leaving the helper in sudo's foreground
+        // group would not have delivered SIGINT for free anyway: sudo
+        // blocks and ignores it during authentication, and both the
+        // blocked mask and an ignored disposition survive fork and
+        // execve, so the helper would inherit the same deafness unless it
+        // were reset here.  It would also give up the
+        // guaranteed group kill above, hand the helper every other
+        // terminal signal (SIGTSTP could suspend it mid-authentication),
+        // turn cancellation into a signal-killed helper (a hard
+        // PAM_AUTH_ERR under the existing exit rules), and still depend
+        // on the helper choosing to die.
         // SAFETY: setpgid with both arguments zero only affects this child.
         if unsafe { libc::setpgid(0, 0) } == -1 {
             return Err(io::Error::last_os_error());
@@ -989,6 +1022,15 @@ fn spawn_and_pump_helper(path: &str, request: &[u8], timeout: Duration) -> Helpe
     let mut stdin = Some(stdin);
 
     loop {
+        // The operator pressed Ctrl-C (or Ctrl-\). sudo blocks the signal
+        // here, so it lands in the pending set instead of interrupting
+        // anything; this names the interrupt rather than inferring one from a
+        // wakeup. Checked first, so cancellation beats every other reason to
+        // leave the loop; POLL_INTERVAL bounds how long that takes.
+        if terminal_cancel_requested() {
+            guard.abort();
+            return HelperOutcome::Unavailable;
+        }
         if Instant::now() >= deadline {
             // Kill the group now rather than at scope exit, so the helper
             // tree is gone before this call returns to the PAM stack.
@@ -999,12 +1041,24 @@ fn spawn_and_pump_helper(path: &str, request: &[u8], timeout: Duration) -> Helpe
         if let Some(input) = stdin.as_ref()
             && request_offset < request.len()
         {
-            if let Err(error) = write_available(input.as_raw_fd(), request, &mut request_offset) {
-                if error.raw_os_error() == Some(libc::EPIPE) {
-                    sigpipe.mark_generated();
+            match write_available(input.as_raw_fd(), request, &mut request_offset) {
+                Ok(()) => {}
+                // A signal landed in the request write.  The bytes written so
+                // far are recorded in `request_offset`, so the only question
+                // is whether this was cancellation.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    if interrupt_is_cancellation(&guard) {
+                        guard.abort();
+                        return HelperOutcome::Unavailable;
+                    }
                 }
-                guard.abort();
-                return HelperOutcome::Failure;
+                Err(error) => {
+                    if error.raw_os_error() == Some(libc::EPIPE) {
+                        sigpipe.mark_generated();
+                    }
+                    guard.abort();
+                    return HelperOutcome::Failure;
+                }
             }
         }
         if request_offset == request.len() {
@@ -1013,9 +1067,25 @@ fn spawn_and_pump_helper(path: &str, request: &[u8], timeout: Duration) -> Helpe
             stdin.take();
         }
 
-        let Ok(exited) = guard.leader_exited() else {
-            guard.abort();
-            return HelperOutcome::Failure;
+        let exited = match guard.leader_exited() {
+            Ok(exited) => exited,
+            // The wait itself was interrupted, so the loop has no answer about
+            // the leader and a signal has arrived. `interrupt_is_cancellation`
+            // re-asks; it can only answer `false` by observing `Ok(true)`, so
+            // that branch means the leader really has exited and the exit
+            // handling below is correct. A second `EINTR` from a syscall that
+            // cannot block is cancellation rather than an endless retry.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if interrupt_is_cancellation(&guard) {
+                    guard.abort();
+                    return HelperOutcome::Unavailable;
+                }
+                true
+            }
+            Err(_) => {
+                guard.abort();
+                return HelperOutcome::Failure;
+            }
         };
         if exited {
             // The leader is an unreaped zombie, so it still holds the process
@@ -1041,44 +1111,98 @@ fn spawn_and_pump_helper(path: &str, request: &[u8], timeout: Duration) -> Helpe
             );
         }
 
-        if read_available(
-            &mut stdout,
-            &mut stdout_bytes,
-            MAX_HELPER_STDOUT_BYTES,
-            &mut stdout_open,
-        )
-        .is_err()
-            || read_available(
+        let reads = [
+            read_available(
+                &mut stdout,
+                &mut stdout_bytes,
+                MAX_HELPER_STDOUT_BYTES,
+                &mut stdout_open,
+            ),
+            read_available(
                 &mut stderr,
                 &mut stderr_bytes,
                 MAX_HELPER_STDERR_BYTES,
                 &mut stderr_open,
-            )
-            .is_err()
-        {
+            ),
+        ];
+        let mut read_interrupted = false;
+        for read in reads {
+            match read {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => read_interrupted = true,
+                Err(_) => {
+                    guard.abort();
+                    return HelperOutcome::Failure;
+                }
+            }
+        }
+        if read_interrupted && interrupt_is_cancellation(&guard) {
             guard.abort();
-            return HelperOutcome::Failure;
+            return HelperOutcome::Unavailable;
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        // An interrupted poll is a normal wakeup: the loop re-checks the
-        // deadline and the child. Any other poll error means the module can no
-        // longer supervise the helper, so the group is killed immediately and
-        // the call falls back to a password.
-        if poll_fds(
+        // This is where the module spends essentially all of its waiting time,
+        // so it is where a terminal interrupt almost always lands.  An
+        // interrupted poll is cancellation unless the helper's own exit caused
+        // it.  Any other poll error means the module can no longer supervise
+        // the helper, so the group is killed immediately and the call falls
+        // back to a password.
+        match poll_fds(
             stdin.as_ref().map(AsRawFd::as_raw_fd),
             &stdout,
             stdout_open,
             &stderr,
             stderr_open,
             remaining.min(POLL_INTERVAL),
-        )
-        .is_err()
-        {
-            guard.abort();
-            return HelperOutcome::Unavailable;
+        ) {
+            Ok(PollWake::Ready) => {}
+            Ok(PollWake::Interrupted) => {
+                if interrupt_is_cancellation(&guard) {
+                    guard.abort();
+                    return HelperOutcome::Unavailable;
+                }
+            }
+            Err(_) => {
+                guard.abort();
+                return HelperOutcome::Unavailable;
+            }
         }
     }
+}
+
+/// What an interrupted syscall in the pump loop means for the helper.
+///
+/// `terminal_cancel_requested` is the precise channel for `Ctrl-C`; this is
+/// the backstop for every *other* signal that can interrupt the loop.  The module cannot
+/// ask which one was delivered: `sigpending` reports only *blocked* signals,
+/// and the rest are consumed by sudo's own handlers.  All it knows is that a
+/// syscall returned `EINTR`, which during PAM means sudo caught something
+/// without `SA_RESTART`.
+///
+/// One benign interrupt *is* identifiable: `SIGCHLD` raised by the helper's
+/// own exit, which sudo does catch in this phase.  Re-checking the leader here
+/// excludes it, and the loop then carries on to read the exit status normally.
+/// `waitid` is re-run rather than trusting the check earlier in the iteration,
+/// because the exit can have happened in between.  This answers `false` only
+/// for `Ok(true)`, so callers may read a `false` as "the leader has exited";
+/// a `waitid` that is itself interrupted answers `true` (cancel) rather than
+/// looping.
+///
+/// Anything else is treated as cancellation.  Measured on a stock Ubuntu sudo,
+/// the signals it catches during authentication are `SIGHUP`, `SIGUSR1`,
+/// `SIGUSR2`, `SIGALRM`, `SIGTERM`, `SIGCHLD` and `SIGTSTP`; all but
+/// `SIGCHLD`, which is handled above, mean this sudo is going away, being
+/// suspended, or timing out, and none of them is a reason to keep holding the
+/// terminal on a device prompt.  `SIGWINCH` is not among them — it is left at
+/// its default and never interrupts anything — so a terminal resize cannot
+/// cancel.  Being wrong in this direction costs one password prompt, never a
+/// success and never a hard failure.
+///
+/// A `waitid` that fails outright is cancellation too: a module that can no
+/// longer supervise its helper must not keep holding the terminal.
+fn interrupt_is_cancellation(guard: &ChildGuard) -> bool {
+    !matches!(guard.leader_exited(), Ok(true))
 }
 
 /// Drain the pipes of a helper whose leader has already been killed off and
@@ -1107,10 +1231,24 @@ fn finish_helper(
     // output read, or a valid success would be reported as a failure.
     let drain_deadline = Instant::now() + HELPER_DRAIN_GRACE;
     while (*stdout_open || *stderr_open) && Instant::now() < drain_deadline {
-        if read_available(stdout, stdout_bytes, MAX_HELPER_STDOUT_BYTES, stdout_open).is_err()
-            || read_available(stderr, stderr_bytes, MAX_HELPER_STDERR_BYTES, stderr_open).is_err()
-        {
-            return HelperOutcome::Failure;
+        let reads = [
+            read_available(stdout, stdout_bytes, MAX_HELPER_STDOUT_BYTES, stdout_open),
+            read_available(stderr, stderr_bytes, MAX_HELPER_STDERR_BYTES, stderr_open),
+        ];
+        for read in reads {
+            match read {
+                Ok(()) => {}
+                // Interrupted reads are retried here, not reported. The pump
+                // loop reports them because a signal there may be the
+                // operator cancelling; by this point the leader is reaped and
+                // the outcome is already decided, so the only thing an EINTR
+                // could do is turn a helper that already succeeded into a hard
+                // authentication failure. The surrounding loop retries within
+                // the drain grace, so it cannot spin unbounded: a signal
+                // storm keeps it hot for at most the drain grace.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return HelperOutcome::Failure,
+            }
         }
         if (*stdout_open || *stderr_open)
             && poll_fds(
@@ -1172,18 +1310,35 @@ fn read_available<R: Read>(
                 output.extend_from_slice(&buffer[..read]);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            // Reported, not retried.  These descriptors are non-blocking, so
+            // an interrupted read is rare, but swallowing it here would hide
+            // a signal the pump loop has to classify. Bytes already appended
+            // to `output` are kept.  The post-exit drain in `finish_helper`
+            // retries instead: see the comment there for why the two callers
+            // must differ.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
             Err(error) => return Err(error),
         }
     }
 }
 
+/// How a `poll` wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollWake {
+    /// The timeout expired or a descriptor became ready.
+    Ready,
+    /// A signal was delivered to this thread. The caller classifies it; see
+    /// `interrupt_is_cancellation`.
+    Interrupted,
+}
+
 /// Wait for helper pipe activity.
 ///
-/// `EINTR` is reported as a plain wakeup, not an error: a signal delivered to
-/// the PAM process (sudo's own SIGINT handling, for example) must make the
-/// caller re-check its deadline and the child, never spin or ignore the
-/// condition. Every other `poll` failure is returned to the caller.
+/// `EINTR` is reported distinctly rather than as an error or a plain wakeup:
+/// during PAM, sudo catches signals without `SA_RESTART`, so an interrupted
+/// `poll` is the module's only evidence that the operator (or the terminal)
+/// signalled sudo while the helper was being waited on. Every other `poll`
+/// failure is returned to the caller as an error.
 fn poll_fds<O: AsRawFd, E: AsRawFd>(
     stdin_fd: Option<RawFd>,
     stdout: &O,
@@ -1191,7 +1346,7 @@ fn poll_fds<O: AsRawFd, E: AsRawFd>(
     stderr: &E,
     stderr_open: bool,
     timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<PollWake> {
     let mut fds = [
         libc::pollfd {
             fd: -1,
@@ -1242,11 +1397,11 @@ fn poll_fds<O: AsRawFd, E: AsRawFd>(
     if ready == -1 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EINTR) {
-            return Ok(());
+            return Ok(PollWake::Interrupted);
         }
         return Err(error);
     }
-    Ok(())
+    Ok(PollWake::Ready)
 }
 
 fn write_available(fd: RawFd, request: &[u8], offset: &mut usize) -> io::Result<()> {
@@ -1269,7 +1424,9 @@ fn write_available(fd: RawFd, request: &[u8], offset: &mut usize) -> io::Result<
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(code) if code == libc::EINTR => {}
+            // Reported to the caller instead of retried, for the reason given
+            // on `read_available`: the pump loop owns signal classification.
+            Some(code) if code == libc::EINTR => return Err(error),
             Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => return Ok(()),
             _ => return Err(error),
         }
@@ -1288,6 +1445,68 @@ fn set_nonblocking(fd: c_int) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Signals the terminal uses to cancel. `SIGINT` is `Ctrl-C`; `SIGQUIT` is
+/// `Ctrl-\`.
+const CANCEL_SIGNALS: [c_int; 2] = [libc::SIGINT, libc::SIGQUIT];
+
+/// Has the terminal asked to cancel this authentication?
+///
+/// The mechanism is `sigpending`, and the reason is what sudo actually does in
+/// its authentication phase, which was measured rather than assumed. While the
+/// module waits, `/proc/<sudo>/status` reports:
+///
+/// ```text
+/// SigBlk: 0000000000000006   <- SIGINT and SIGQUIT blocked
+/// SigIgn: 0000000000000006   <- and ignored
+/// SigCgt: ...a01             <- and not caught
+/// ```
+///
+/// sudo blocks and ignores both signals for the whole phase and installs
+/// catching handlers only inside `tgetpass`, around its own password prompt —
+/// which is why a stock stack ends at `Ctrl-C` but this module's wait did not.
+/// Two consequences follow, and together they decide the design:
+///
+/// * **`EINTR` never happens.** A blocked signal interrupts nothing, so a rule
+///   that only watched for interrupted syscalls would see nothing at all while
+///   the operator typed `Ctrl-C`. That is the defect this replaces.
+/// * **`sigpending` sees everything.** Linux deliberately does not discard a
+///   *blocked* signal even when its disposition is `SIG_IGN`, because the
+///   handler may change before it is unblocked, so a typed `Ctrl-C` sits in
+///   the process-pending set for exactly as long as sudo holds it blocked —
+///   which is the whole of this wait.
+///
+/// `sigpending` is a read. Nothing is installed, nothing is consumed, and
+/// nothing about sudo's own signal state changes: the signal is still pending
+/// when the module returns, and sudo applies its own disposition to it on
+/// unblock exactly as it would have. A module loaded into someone else's
+/// process should not be installing handlers or swallowing signals, and this
+/// does neither.
+///
+/// **Any** pending `SIGINT` or `SIGQUIT` cancels, including one that was
+/// already pending when the wait began. There is deliberately no baseline
+/// sample to subtract: standard signals do not queue, so a second `Ctrl-C`
+/// merges into a bit that is already set and nothing ever *transitions*.
+/// Ignoring a pre-existing pending signal would therefore make every later
+/// keystroke invisible for the whole 90-second budget — the original defect,
+/// reintroduced through the back door. Cancelling on a signal someone else
+/// left pending costs one password prompt, which is exactly the error budget
+/// this module already declares for unavailability; missing a real `Ctrl-C`
+/// costs the operator their terminal.
+fn terminal_cancel_requested() -> bool {
+    let mut pending = MaybeUninit::<libc::sigset_t>::zeroed();
+    // SAFETY: sigpending writes only into the zeroed set.
+    if unsafe { libc::sigpending(pending.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: the call above succeeded and filled the set.
+    let pending = unsafe { pending.assume_init() };
+    CANCEL_SIGNALS.into_iter().any(|signal| {
+        // SAFETY: pending is an initialized set and the signal numbers are
+        // constants.
+        unsafe { libc::sigismember(&raw const pending, signal) == 1 }
+    })
 }
 
 struct SigpipeGuard {
@@ -1529,6 +1748,15 @@ mod tests {
     use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// A thread handle carried to a signalling thread. `pthread_t` is a
+    /// pointer on macOS and so not `Send`; the target thread is alive for the
+    /// whole of each test that uses this, because it is the thread that joins
+    /// the sender.
+    struct ThreadHandle(libc::pthread_t);
+    // SAFETY: the handle is only used with pthread_kill, and only while the
+    // thread it names is parked in a helper wait.
+    unsafe impl Send for ThreadHandle {}
 
     /// Serializes helper-script writes against helper spawns.
     ///
@@ -1845,6 +2073,425 @@ mod tests {
         cleanup(&directory);
     }
 
+    /// Applies sudo's measured authentication-phase signal state for one
+    /// signal — ignored process-wide and blocked on this thread — and puts
+    /// everything back on drop, consuming a pending instance first so the
+    /// mask can be released safely.
+    ///
+    /// Restoration lives in `Drop` deliberately: a failing assertion in the
+    /// middle of a test must not leave the rest of the suite, or the test
+    /// runner, with a changed disposition, a changed mask, or an
+    /// undeliverable signal parked in the pending set.
+    struct BlockedAndIgnored {
+        signal: c_int,
+        previous_action: libc::sigaction,
+        previous_mask: libc::sigset_t,
+        blocked: libc::sigset_t,
+    }
+
+    impl BlockedAndIgnored {
+        fn apply(signal: c_int) -> Self {
+            // SAFETY: every value is stack-local and initialized before use;
+            // the mask change is thread-local.
+            unsafe {
+                let mut previous_action = MaybeUninit::<libc::sigaction>::zeroed();
+                let mut action = MaybeUninit::<libc::sigaction>::zeroed();
+                let action_ptr = action.as_mut_ptr();
+                (*action_ptr).sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&raw mut (*action_ptr).sa_mask);
+                (*action_ptr).sa_flags = 0;
+                assert_eq!(
+                    libc::sigaction(signal, action_ptr, previous_action.as_mut_ptr()),
+                    0,
+                    "ignore the signal for the duration of this test"
+                );
+                let mut blocked = MaybeUninit::<libc::sigset_t>::zeroed().assume_init();
+                libc::sigemptyset(&raw mut blocked);
+                libc::sigaddset(&raw mut blocked, signal);
+                // The guard exists before the mask is touched, and is seeded
+                // with this thread's *current* mask. A panic from the assert
+                // below therefore still unwinds through a Drop that restores
+                // the disposition, instead of leaking SIG_IGN into the rest of
+                // the suite.
+                let mut current_mask = MaybeUninit::<libc::sigset_t>::zeroed().assume_init();
+                libc::sigemptyset(&raw mut current_mask);
+                let _ =
+                    libc::pthread_sigmask(libc::SIG_SETMASK, ptr::null(), &raw mut current_mask);
+                let mut guard = Self {
+                    signal,
+                    previous_action: previous_action.assume_init(),
+                    previous_mask: current_mask,
+                    blocked,
+                };
+                let mut previous_mask = MaybeUninit::<libc::sigset_t>::zeroed().assume_init();
+                assert_eq!(
+                    libc::pthread_sigmask(
+                        libc::SIG_BLOCK,
+                        &raw const blocked,
+                        &raw mut previous_mask
+                    ),
+                    0,
+                    "block the signal on this thread"
+                );
+                guard.previous_mask = previous_mask;
+                guard
+            }
+        }
+
+        /// Make the signal pending on this thread without delivering it.
+        fn raise_on_this_thread(&self) {
+            // SAFETY: this thread blocks the signal, so it can only become
+            // pending; `Drop` consumes it.
+            unsafe {
+                libc::pthread_kill(libc::pthread_self(), self.signal);
+            }
+        }
+    }
+
+    impl Drop for BlockedAndIgnored {
+        fn drop(&mut self) {
+            // SAFETY: the pending instance is consumed before the mask is
+            // released, then the saved disposition and mask are restored
+            // exactly as they were.
+            unsafe {
+                let mut pending = MaybeUninit::<libc::sigset_t>::zeroed();
+                if libc::sigpending(pending.as_mut_ptr()) == 0
+                    && libc::sigismember(pending.as_ptr(), self.signal) == 1
+                {
+                    let mut signal = 0;
+                    let _ = libc::sigwait(&raw const self.blocked, &raw mut signal);
+                }
+                libc::sigaction(
+                    self.signal,
+                    &raw const self.previous_action,
+                    ptr::null_mut(),
+                );
+                libc::pthread_sigmask(
+                    libc::SIG_SETMASK,
+                    &raw const self.previous_mask,
+                    ptr::null_mut(),
+                );
+            }
+        }
+    }
+
+    /// Installs a handler for one signal and restores the previous action on
+    /// drop, so a panicking assertion cannot leak it into other tests.
+    struct HandlerFor {
+        signal: c_int,
+        previous: libc::sigaction,
+    }
+
+    impl HandlerFor {
+        /// `flags` deliberately omits `SA_RESTART`, so a blocking syscall
+        /// reports `EINTR` the way sudo's own PAM-phase handlers do.
+        fn install(signal: c_int, handler: extern "C" fn(c_int)) -> Self {
+            // SAFETY: the fields written below are the only ones sigaction
+            // reads, and the mask is initialized by sigemptyset.
+            unsafe {
+                let mut previous = MaybeUninit::<libc::sigaction>::zeroed();
+                let mut action = MaybeUninit::<libc::sigaction>::zeroed();
+                let action_ptr = action.as_mut_ptr();
+                (*action_ptr).sa_sigaction = handler as *const () as usize;
+                libc::sigemptyset(&raw mut (*action_ptr).sa_mask);
+                (*action_ptr).sa_flags = 0;
+                assert_eq!(
+                    libc::sigaction(signal, action_ptr, previous.as_mut_ptr()),
+                    0,
+                    "install the test handler"
+                );
+                Self {
+                    signal,
+                    previous: previous.assume_init(),
+                }
+            }
+        }
+    }
+
+    impl Drop for HandlerFor {
+        fn drop(&mut self) {
+            // SAFETY: previous is the disposition this guard replaced.
+            unsafe {
+                libc::sigaction(self.signal, &raw const self.previous, ptr::null_mut());
+            }
+        }
+    }
+
+    /// A helper script that records a grandchild's PID and then sleeps, so a
+    /// cancelled wait can be asserted to have killed the whole tree.
+    fn sleeping_helper_with_grandchild(
+        directory: &Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let pidfile = directory.join("grandchild.pid");
+        let path = write_script(
+            directory,
+            &format!(
+                "sh -c 'echo $$ >\"$0\"; exec sleep 300' '{pidfile}' &\n                 while [ ! -s '{pidfile}' ]; do sleep 0.02; done\n                 cat >/dev/null\nsleep 300",
+                pidfile = pidfile.display()
+            ),
+        );
+        (path, pidfile)
+    }
+
+    /// Asserts the recorded grandchild is gone, waiting a bounded time for the
+    /// kill to be reaped.
+    fn assert_descendant_died(pidfile: &Path, what: &str) {
+        let recorded = fs::read_to_string(pidfile).expect("grandchild recorded its pid");
+        let pid: libc::pid_t = recorded.trim().parse().expect("numeric pid");
+        assert!(pid > 1);
+        let mut alive = true;
+        for _ in 0..500 {
+            if !process_is_alive(pid) {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!alive, "descendant {pid} survived {what}");
+    }
+
+    /// The real sudo case: `SIGINT` is *blocked* (and ignored) by the
+    /// surrounding process, so nothing is delivered and no syscall returns
+    /// `EINTR` — the keystroke only becomes pending. The wait must still end
+    /// as `Unavailable`, promptly, with the helper tree dead.
+    ///
+    /// `pthread_kill` targets the pumping thread so the signal cannot be taken
+    /// by another test thread. Signal state is process-wide, so this runs
+    /// under the exclusive spawn lock.
+    #[test]
+    fn a_blocked_and_ignored_sigint_still_cancels_the_helper_wait() {
+        let directory = test_dir();
+        let (path, pidfile) = sleeping_helper_with_grandchild(&directory);
+
+        let exclusive = SPAWN.write().unwrap_or_else(PoisonError::into_inner);
+        let signals = BlockedAndIgnored::apply(libc::SIGINT);
+
+        // SAFETY: pthread_self has no pointer arguments; the handle is used
+        // only while this thread is inside the wait below.
+        let target = ThreadHandle(unsafe { libc::pthread_self() });
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            // SAFETY: the target thread blocks SIGINT, so this only makes it
+            // pending; the guard consumes it.
+            unsafe {
+                libc::pthread_kill(target.0, libc::SIGINT);
+            }
+        });
+
+        let started = Instant::now();
+        let result = run_helper_at(path.to_str().unwrap(), &request(), Duration::from_secs(120));
+        let elapsed = started.elapsed();
+        signaller.join().unwrap();
+        drop(signals);
+        drop(exclusive);
+
+        assert_eq!(result, HelperOutcome::Unavailable);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the cancelled wait took {elapsed:?}"
+        );
+        assert_descendant_died(&pidfile, "a cancelled helper wait");
+        cleanup(&directory);
+    }
+
+    /// A signal that lands in the *drain* window must not turn a successful
+    /// helper into an authentication failure.
+    ///
+    /// The pump loop and the post-exit drain deliberately treat `EINTR`
+    /// differently: the loop reports it, because there a signal may be the
+    /// operator cancelling; the drain retries it, because by then the leader
+    /// is reaped and the only thing an interrupted read could still do is
+    /// destroy a decision that has already been made.
+    ///
+    /// `finish_helper` is driven directly, as in the drain test above, for two
+    /// reasons. Going through `run_helper_at` would let the pump loop absorb
+    /// the signals first (correctly, as cancellation) and the drain would
+    /// never see one; and it kills the helper's process group before draining,
+    /// so nothing would still be holding the pipes open. Here a background
+    /// `sleep` inherits the pipes and keeps the drain looping for a few tens
+    /// of milliseconds, well inside the 100 ms grace.
+    ///
+    /// The descriptors are left *blocking*, which is what makes the interrupt
+    /// deterministic: a blocking read is interrupted by a signal, where the
+    /// non-blocking descriptors the pump loop installs would usually return
+    /// `EAGAIN` first. A real `EINTR` here is therefore rare — which is
+    /// exactly why the branch has to be right rather than relied upon, and
+    /// why it needs a test that can force it.
+    ///
+    /// Reverting the drain to report `EINTR` makes this fail with
+    /// `HelperOutcome::Failure`, the hard `PAM_AUTH_ERR` the split exists to
+    /// prevent.
+    #[test]
+    fn a_signal_during_the_output_drain_does_not_fail_a_successful_helper() {
+        extern "C" fn noop(_signal: c_int) {}
+
+        let exclusive = SPAWN.write().unwrap_or_else(PoisonError::into_inner);
+        let mut command = Command::new("/bin/sh");
+        command
+            // The leader exits at once; the background sleep inherits stdout
+            // and stderr and holds them open, so the drain actually loops.
+            .arg("-c")
+            .arg("sleep 0.05 & exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: setpgid with both arguments zero only affects this child,
+        // and keeps ChildGuard's group operations away from the test runner.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn drain probe");
+        let (_read, write) = liveness_pipe().expect("liveness pipe");
+        let mut guard = ChildGuard::new(child, write);
+        let mut stdout = guard.child.stdout.take().expect("stdout");
+        let mut stderr = guard.child.stderr.take().expect("stderr");
+        // Deliberately left blocking; see the doc comment.
+        let status = guard.reap().expect("reap drain probe");
+
+        let handler = HandlerFor::install(libc::SIGUSR1, noop);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // SAFETY: pthread_self has no pointer arguments; the handle is used
+        // only while this thread is inside the drain below, which joins the
+        // signaller before returning.
+        let target = ThreadHandle(unsafe { libc::pthread_self() });
+        let signaller = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                for _ in 0..75 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    // SAFETY: the target thread is live for the whole loop and
+                    // the handler installed above is a no-op.
+                    unsafe {
+                        libc::pthread_kill(target.0, libc::SIGUSR1);
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let result = finish_helper(
+            &mut guard,
+            status,
+            &mut stdout,
+            &mut stdout_bytes,
+            &mut stdout_open,
+            &mut stderr,
+            &mut stderr_bytes,
+            &mut stderr_open,
+            true,
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        signaller.join().unwrap();
+        drop(handler);
+        drop(exclusive);
+
+        assert_eq!(
+            result,
+            HelperOutcome::Success,
+            "a signal in the drain window destroyed a successful helper \
+             (stdout_open={stdout_open} stderr_open={stderr_open})"
+        );
+    }
+
+    /// A cancellation signal that is *already* pending when the wait starts
+    /// must cancel too.
+    ///
+    /// Standard signals do not queue: a second `Ctrl-C` merges into a bit that
+    /// is already set, so nothing transitions. Any rule that waited for a
+    /// transition would make every later keystroke invisible for the whole
+    /// 90-second budget, which is the original defect wearing a disguise. The
+    /// wait must therefore end on its first loop iteration.
+    ///
+    /// The helper here is a plain sleep with no grandchild: cancellation is so
+    /// immediate that a helper tree would not have finished building itself,
+    /// so the descendant kill is left to the two tests around this one.
+    #[test]
+    fn a_signal_already_pending_when_the_wait_starts_still_cancels() {
+        let (path, directory) = script("sleep 300");
+
+        let exclusive = SPAWN.write().unwrap_or_else(PoisonError::into_inner);
+        let signals = BlockedAndIgnored::apply(libc::SIGINT);
+        // Pending before the wait begins, exactly as a keystroke during an
+        // earlier phase of the same PAM call would be.
+        signals.raise_on_this_thread();
+
+        let started = Instant::now();
+        let result = run_helper_at(path.to_str().unwrap(), &request(), Duration::from_secs(120));
+        let elapsed = started.elapsed();
+        drop(signals);
+        drop(exclusive);
+
+        assert_eq!(result, HelperOutcome::Unavailable);
+        // The pending check is the first statement in the pump loop, so this
+        // is spawn cost and nothing else. The bound is loose only to survive a
+        // loaded build machine; it is four orders of magnitude below the
+        // 120-second budget the wait was given.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a pre-pending cancellation took {elapsed:?}"
+        );
+        cleanup(&directory);
+    }
+
+    /// The backstop rule: a signal the surrounding process *catches* (rather
+    /// than blocks) interrupts the pump loop's syscalls, and an interrupted
+    /// wait is cancellation too.
+    ///
+    /// sudo catches several signals in this phase, so this covers them without
+    /// depending on which. `SIGUSR1` with a no-op handler installed without
+    /// `SA_RESTART`, delivered to the pumping thread with `pthread_kill`,
+    /// produces exactly the `EINTR` they would. Dispositions are process-wide,
+    /// so it runs under the exclusive spawn lock and the handler is removed by
+    /// a guard.
+    #[test]
+    fn a_caught_signal_during_the_helper_wait_cancels_as_unavailable() {
+        extern "C" fn noop(_signal: c_int) {}
+
+        let directory = test_dir();
+        let (path, pidfile) = sleeping_helper_with_grandchild(&directory);
+
+        let exclusive = SPAWN.write().unwrap_or_else(PoisonError::into_inner);
+        let handler = HandlerFor::install(libc::SIGUSR1, noop);
+
+        // SAFETY: pthread_self has no pointer arguments; the handle is used
+        // only while this thread is inside the wait below.
+        let target = ThreadHandle(unsafe { libc::pthread_self() });
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            // SAFETY: the pumping thread is parked in the wait below and is
+            // joined with it, so the handle is live.
+            unsafe {
+                libc::pthread_kill(target.0, libc::SIGUSR1);
+            }
+        });
+
+        let started = Instant::now();
+        let result = run_helper_at(path.to_str().unwrap(), &request(), Duration::from_secs(120));
+        let elapsed = started.elapsed();
+        signaller.join().unwrap();
+        drop(handler);
+        drop(exclusive);
+
+        assert_eq!(result, HelperOutcome::Unavailable);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the interrupted wait took {elapsed:?}"
+        );
+        assert_descendant_died(&pidfile, "an interrupted helper wait");
+        cleanup(&directory);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn the_helper_inherits_the_liveness_pipe_and_nothing_else() {
@@ -1973,6 +2620,7 @@ mod tests {
         set_nonblocking(stderr.as_raw_fd()).expect("nonblocking stderr");
         let status = guard.reap().expect("reap drain probe");
 
+        let started = Instant::now();
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let mut stdout_open = true;
@@ -1988,7 +2636,12 @@ mod tests {
             &mut stderr_open,
             true,
         );
-        assert_eq!(result, HelperOutcome::Success);
+        assert_eq!(
+            result,
+            HelperOutcome::Success,
+            "drained in {:?} of a {HELPER_DRAIN_GRACE:?} grace; stdout_open={stdout_open} stderr_open={stderr_open}",
+            started.elapsed()
+        );
         assert!(!stdout_open && !stderr_open);
     }
 

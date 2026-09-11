@@ -848,6 +848,19 @@ async fn execute_request_at(
                 )));
             }
         },
+        // DELIBERATELY DIFFERENT FROM THE AUTHENTICATION LANE. On this lane an
+        // agent that acknowledges has taken responsibility for a command
+        // approval, and a connection that then disappears fails closed: the
+        // command is simply not run, which costs nothing but a retry. The
+        // authentication lane cannot do that — exit 1 there denies sudo under
+        // `default=die` with no password fallback — so it classifies the same
+        // event as a transport fault. See `await_auth_decision`.
+        // The message is the outcome's own text verbatim, so this lane's
+        // stderr and audit lines are byte-for-byte what they were before the
+        // outcome was split out.
+        SocketOutcome::Dropped { error, .. } => {
+            return Err(anyhow::anyhow!("{error}"));
+        }
     };
     apply_decision(
         decision,
@@ -1010,6 +1023,12 @@ enum SocketOutcome {
     /// back to NATS while the deadline allows, or denies at once when no
     /// NATS fallback is configured.
     Silent(SocketSilence),
+    /// An agent acknowledged the request and then the connection went away
+    /// without a verdict: EOF, a reset, or a closed socket. No bytes claiming
+    /// to be a decision ever arrived, so this is a transport fault and not
+    /// evidence about the request. The two lanes classify it differently and
+    /// each does so at its own call site.
+    Dropped { path: PathBuf, error: String },
 }
 
 /// How a configured socket produced no verdict. The distinction decides the
@@ -1028,9 +1047,14 @@ enum SocketSilence {
 ///
 /// Only a missing or unreachable socket, or an agent that hangs up before
 /// acknowledging falls back: in those cases no agent took responsibility for
-/// the request. A verdict, a malformed reply, a post-ack hangup, or the
-/// deadline expiring while an agent holds the request is final and fails
-/// closed on error.
+/// the request. A verdict, a malformed reply, or the deadline expiring while
+/// an agent holds the request is final and fails closed on error.
+///
+/// A post-ack hangup is reported as `Dropped` rather than decided here. It is
+/// the one post-ack outcome in which no bytes arrived at all, so it carries no
+/// evidence either way, and the two lanes answer it differently: see the
+/// `SocketOutcome::Dropped` arms in `execute_request_at` and
+/// `await_auth_decision`.
 #[allow(clippy::too_many_lines)]
 async fn try_agent_socket(
     directory: &Path,
@@ -1104,8 +1128,12 @@ async fn try_agent_socket(
     }
     let ack_wait = remaining.min(DAEMON_ACK_TIMEOUT);
     let bytes = match tokio::time::timeout(ack_wait, read_frame(&mut reader)).await {
-        Ok(Ok(Some(bytes))) => bytes,
-        Ok(Ok(None)) => {
+        Ok(Ok(Frame::Payload(bytes))) => bytes,
+        // Before an acknowledgement, a clean hangup and a half-sent frame mean
+        // the same thing: nothing took responsibility for the request, so the
+        // caller may still fall back. This is the pre-#68 boundary and is
+        // deliberately unchanged.
+        Ok(Ok(Frame::Eof | Frame::Truncated)) => {
             return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
                 path,
                 error: "agent closed before acknowledging".into(),
@@ -1143,17 +1171,39 @@ async fn try_agent_socket(
         ));
     }
     let bytes = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
-        Ok(Ok(Some(bytes))) => bytes,
-        Ok(Ok(None)) => {
-            // Once an agent has sent AliveV1 it owns this request. An EOF
-            // before a verdict is therefore an unexpected cancellation and
-            // must deny; an ordinary timeout below remains unavailable so an
-            // unanswered request can expire normally.
+        Ok(Ok(Frame::Payload(bytes))) => bytes,
+        Ok(Ok(Frame::Eof)) => {
+            // The agent acknowledged and then the connection ended without
+            // sending any part of a verdict. Nothing claiming to be a decision
+            // was ever received, so the caller decides what that means for its
+            // lane.
+            return Ok(SocketOutcome::Dropped {
+                path,
+                error: "agent closed after acknowledging without a verdict".to_owned(),
+            });
+        }
+        Ok(Ok(Frame::Truncated)) => {
+            // Bytes arrived and did not form a frame. That is malformed input,
+            // not a silent disconnect, so it keeps the #68 treatment and fails
+            // closed on both lanes.
             return Err(anyhow::anyhow!(
-                "agent closed after acknowledging without a verdict"
+                "agent sent a truncated decision frame after acknowledging"
             ));
         }
-        Ok(Err(error)) => return Err(error),
+        Ok(Err(error)) => {
+            // A transport-level read failure (ECONNRESET, EPIPE, a socket
+            // closed under us) is the same event as the EOF above: the
+            // connection went away. A framing error is not — those bytes
+            // arrived and did not decode, which stays a hard failure.
+            let Some(io_error) = error.downcast_ref::<io::Error>() else {
+                return Err(error);
+            };
+            let detail = io_error.to_string();
+            return Ok(SocketOutcome::Dropped {
+                path,
+                error: detail,
+            });
+        }
         Err(_) => {
             return Err(approval_unavailable(
                 "sudo decision deadline exceeded waiting for the local agent",
@@ -1174,23 +1224,52 @@ fn agent_socket_from(directory: &Path) -> Result<Option<PathBuf>> {
         .map(PathBuf::from))
 }
 
-/// Read one length-delimited frame. A peer that hangs up before delivering
-/// one has not answered, so the caller treats that as no answer.
-async fn read_frame(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<Option<Vec<u8>>> {
+/// How one framed read ended.
+enum Frame {
+    /// A complete frame.
+    Payload(Vec<u8>),
+    /// The peer hung up cleanly on a frame boundary, having sent nothing at
+    /// all of the next frame. No bytes arrived, so this carries no evidence.
+    Eof,
+    /// The peer hung up part-way through a frame: a partial length prefix, or
+    /// a payload shorter than the length it announced. Bytes *did* arrive and
+    /// did not form a frame, which is a protocol fault rather than a silent
+    /// disconnect.
+    Truncated,
+}
+
+/// Read one length-delimited frame.
+///
+/// The three outcomes are kept apart because the callers need them apart: a
+/// clean hangup before a verdict is a transport fault on the authentication
+/// lane, while a half-delivered frame is malformed input and must keep failing
+/// closed. The distinction is made by reading the length prefix a chunk at a
+/// time, since `read_exact` cannot say how much of it arrived before the EOF.
+async fn read_frame(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<Frame> {
     let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
-    match reader.read_exact(&mut prefix).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let mut filled = 0;
+    while filled < prefix.len() {
+        let read = reader.read(&mut prefix[filled..]).await?;
+        if read == 0 {
+            // Nothing at all of this frame is a clean hangup; anything less
+            // than a whole prefix is a truncated one.
+            return Ok(if filled == 0 {
+                Frame::Eof
+            } else {
+                Frame::Truncated
+            });
+        }
+        filled += read;
     }
     let len = oshioki_protocol::socket_v1::decode_frame_len(prefix)?;
     let mut payload = vec![0u8; len];
     match reader.read_exact(&mut payload).await {
         Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        // The peer announced a length and then did not deliver it.
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(Frame::Truncated),
         Err(error) => return Err(error.into()),
     }
-    Ok(Some(payload))
+    Ok(Frame::Payload(payload))
 }
 
 /// Applies one decision to a request. Invalid decisions fail closed.
@@ -1872,6 +1951,38 @@ async fn await_auth_decision(
                     "daemon not responding on {} ({error})",
                     path.display()
                 ))
+            }
+            // An agent acknowledged and then the connection went away without
+            // a verdict. On this lane that must not become exit 1: a PAM stack
+            // written as `default=die` turns a hard failure into "sudo is
+            // denied and there is no password prompt", so a dropped socket
+            // would lock the operator out over an agent crash or a restart.
+            // A connection that disappears is a transport fault, so it is
+            // unavailable and the stack keeps its password path.
+            //
+            // The #68 boundary is untouched: this arm is only reached for a
+            // hangup on a frame boundary, with not one byte of a verdict sent
+            // (`Frame::Eof`). Bytes that arrive and do not produce a valid
+            // `AuthDecisionV1` are evidence and still fail closed — a
+            // truncated frame inside `read_frame`, and a malformed or
+            // cross-lane decision at the `SocketOutcome::Verdict` decode
+            // above.
+            //
+            // NATS is not tried afterwards. An agent that answered the socket
+            // is the transport this host is using, and re-publishing would
+            // spend the rest of the PAM deadline on a lane this deployment
+            // does not use; the prompt answer is the password prompt.
+            SocketOutcome::Dropped { path, error } => {
+                eprintln!(
+                    "Transport failed: socket {}: {}",
+                    sanitize_terminal_text(&path.display().to_string()),
+                    sanitize_terminal_text(&error)
+                );
+                return Err(approval_unavailable(format!(
+                    "{error} on {} — abandoning authentication request {}",
+                    path.display(),
+                    request.request_id
+                )));
             }
         };
     let Some(nats_url) = nats_url else {
@@ -3770,7 +3881,9 @@ mod tests {
                     _ => panic!("stub sent a deny"),
                 }
             }
-            SocketOutcome::Unconfigured | SocketOutcome::Silent(_) => {
+            SocketOutcome::Unconfigured
+            | SocketOutcome::Silent(_)
+            | SocketOutcome::Dropped { .. } => {
                 panic!("stub verdict was ignored")
             }
         }
@@ -3877,7 +3990,9 @@ mod tests {
                 SocketOutcome::Verdict(bytes) => {
                     serde_json::from_slice::<DecisionV1>(&bytes).unwrap()
                 }
-                SocketOutcome::Unconfigured | SocketOutcome::Silent(_) => {
+                SocketOutcome::Unconfigured
+                | SocketOutcome::Silent(_)
+                | SocketOutcome::Dropped { .. } => {
                     panic!("replacement socket verdict was ignored")
                 }
             };
@@ -5370,6 +5485,166 @@ mod auth_tests {
         .unwrap_err();
         assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
         assert!(display_error(&error).contains("expired"), "{error:#}");
+    }
+
+    // --- a dropped socket after an acknowledgement ------------------------
+
+    /// A config directory whose only transport is the given socket. No NATS,
+    /// so nothing can rescue the socket result and the classification of the
+    /// socket event is what the test observes.
+    fn auth_socket_dir(name: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("oshioki-auth-{name}-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("config.env"),
+            format!(
+                "OSHIOKI_AGENT_SOCKET={}\n",
+                directory.join("agent.sock").display()
+            ),
+        )
+        .unwrap();
+        let (device, _) = auth_test_device();
+        seed_registry(&directory, vec![device]);
+        directory
+    }
+
+    /// Acknowledges the authentication request, then optionally writes some
+    /// trailing bytes, then hangs up. With `after_ack` empty this is the
+    /// "acked and dropped the connection" fault; with bytes it is a peer that
+    /// actually said something before leaving.
+    async fn auth_ack_then(listener: tokio::net::UnixListener, after_ack: Vec<u8>) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let length = oshioki_protocol::socket_v1::decode_frame_len(prefix).unwrap();
+        let mut request = vec![0u8; length];
+        stream.read_exact(&mut request).await.unwrap();
+        let envelope: oshioki_protocol::AuthEnvelopeV1 = serde_json::from_slice(&request).unwrap();
+        let alive = oshioki_protocol::AliveV1::for_request(&envelope.request_id);
+        let frame = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+            .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        if !after_ack.is_empty() {
+            stream.write_all(&after_ack).await.unwrap();
+        }
+        stream.flush().await.unwrap();
+        drop(stream);
+    }
+
+    /// The defect this covers: an agent that acknowledges and then drops the
+    /// connection used to be exit 1, which under a `default=die` PAM stack
+    /// denies sudo with no password prompt at all. A connection that goes away
+    /// is a transport fault — no decision bytes were ever produced — so it is
+    /// unavailable and the stack falls back to a password.
+    #[tokio::test]
+    async fn an_acknowledged_socket_that_drops_is_unavailable() {
+        let directory = auth_socket_dir("ack-drop");
+        let listener = tokio::net::UnixListener::bind(directory.join("agent.sock")).unwrap();
+        let serve = tokio::spawn(auth_ack_then(listener, Vec::new()));
+        let started = std::time::Instant::now();
+        let error =
+            execute_auth_request_at(auth_request(), Duration::from_secs(30), &directory, None)
+                .await
+                .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "the drop must not wait out the deadline"
+        );
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        assert!(
+            display_error(&error).contains("closed after acknowledging"),
+            "{error:#}"
+        );
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The #68 boundary, on the other side of the same event: bytes that
+    /// arrive and do not decode as an `AuthDecisionV1` are evidence of a
+    /// broken or hostile peer and stay a hard failure, even though the same
+    /// connection is dropped immediately afterwards.
+    #[tokio::test]
+    async fn garbage_after_an_acknowledgement_still_fails_closed() {
+        let directory = auth_socket_dir("ack-garbage");
+        let listener = tokio::net::UnixListener::bind(directory.join("agent.sock")).unwrap();
+        let garbage = oshioki_protocol::socket_v1::encode_frame(b"{not a decision").unwrap();
+        let serve = tokio::spawn(auth_ack_then(listener, garbage));
+        let error =
+            execute_auth_request_at(auth_request(), Duration::from_secs(30), &directory, None)
+                .await
+                .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(
+            display_error(&error).contains("decode socket authentication decision"),
+            "{error:#}"
+        );
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A frame that starts and does not finish is malformed input, not a
+    /// dropped connection: bytes arrived and did not form a decision. It must
+    /// stay on the closed-fail side of the #68 boundary even though the
+    /// connection also goes away immediately afterwards.
+    #[tokio::test]
+    async fn a_truncated_frame_after_an_acknowledgement_still_fails_closed() {
+        for (name, trailing) in [
+            ("partial-prefix", vec![0u8, 0u8]),
+            ("missing-payload", vec![0u8, 0u8, 0u8, 32u8]),
+            ("short-payload", vec![0u8, 0u8, 0u8, 32u8, b'{', b'}']),
+        ] {
+            let directory = auth_socket_dir(&format!("ack-truncated-{name}"));
+            let listener = tokio::net::UnixListener::bind(directory.join("agent.sock")).unwrap();
+            let serve = tokio::spawn(auth_ack_then(listener, trailing));
+            let error =
+                execute_auth_request_at(auth_request(), Duration::from_secs(30), &directory, None)
+                    .await
+                    .unwrap_err();
+            assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED, "{name}");
+            assert!(
+                display_error(&error).contains("truncated decision frame"),
+                "{name}: {error:#}"
+            );
+            serve.await.unwrap();
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+    }
+
+    /// A legacy command-approval decision delivered over the authentication
+    /// socket is a cross-lane decision: bytes that arrived and are wrong. It
+    /// must not be softened into the transport-fault class by the connection
+    /// closing straight afterwards.
+    #[tokio::test]
+    async fn a_legacy_decision_after_an_acknowledgement_still_fails_closed() {
+        let directory = auth_socket_dir("ack-legacy");
+        let (device, signing) = auth_test_device();
+        let request = auth_request();
+        let raw = request.raw_json().unwrap();
+        let challenge = oshioki_protocol::approve_challenge(&raw);
+        let signature: p256::ecdsa::Signature = signing.sign(&challenge);
+        let legacy = DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
+            version: VERSION_V1,
+            request_id: request.request_id.clone(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_der()),
+        });
+        let frame =
+            oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&legacy).unwrap())
+                .unwrap();
+        let listener = tokio::net::UnixListener::bind(directory.join("agent.sock")).unwrap();
+        let serve = tokio::spawn(auth_ack_then(listener, frame));
+        let error = execute_auth_request_at(request, Duration::from_secs(30), &directory, None)
+            .await
+            .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(
+            display_error(&error).contains("decode socket authentication decision"),
+            "{error:#}"
+        );
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     // --- liveness ---------------------------------------------------------
