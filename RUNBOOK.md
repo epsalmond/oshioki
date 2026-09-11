@@ -112,13 +112,13 @@ Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 Outside a repo checkout the installer needs its inputs pointed at the
 installed files: set `HOOK_BIN` and `PLUGIN_BIN` to the installed hook and
 plugin and `OSHIOKI_CHECKSUMS` to the shipped `SHA256SUMS`, whose entries
-are keyed by file name. For a Homebrew install at `$(brew --prefix)`:
+are keyed by file name. For a Homebrew install at `$(brew --prefix oshioki)`:
 
 ```bash
-sudo HOOK_BIN="$(brew --prefix)/bin/oshioki" \
-  PLUGIN_BIN="$(brew --prefix)/libexec/oshioki.dylib" \
-  OSHIOKI_CHECKSUMS="$(brew --prefix)/libexec/SHA256SUMS" \
-  "$(brew --prefix)/bin/install-oshioki-hook" --prelaunch \
+sudo HOOK_BIN="$(brew --prefix oshioki)/bin/oshioki" \
+  PLUGIN_BIN="$(brew --prefix oshioki)/libexec/oshioki.dylib" \
+  OSHIOKI_CHECKSUMS="$(brew --prefix oshioki)/libexec/SHA256SUMS" \
+  "$(brew --prefix oshioki)/bin/install-oshioki-hook" --prelaunch \
   --config-file /etc/oshioki/install.env
 ```
 
