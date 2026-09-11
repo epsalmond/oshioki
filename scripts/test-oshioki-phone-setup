@@ -239,6 +239,52 @@ class PhoneSetupTests(unittest.TestCase):
         self.assertIn('"oshioki.request.>"', text)
         self.assertIn('"$JS.ACK.>"', text)
 
+    def _user_block(self, text: str, user: str) -> str:
+        # Isolate one user's stanza so assertions below check the
+        # subject is granted to the *correct* role, not merely present
+        # somewhere in the file. The last user in the list has no
+        # trailing comma after its closing brace, so look for either.
+        marker = f'user: "{user}"'
+        start = text.index(marker)
+        candidates = [index for index in (text.find("},", start), text.find("}\n  ]", start)) if index != -1]
+        end = min(candidates)
+        return text[start:end]
+
+    def test_local_nats_permissions_grant_delivery_receipt_subjects(self) -> None:
+        # Regression test for the DeliveryV1 permission gap (PR #57 added
+        # oshioki.ack.<id> and oshioki.delivery.<id>; this script's
+        # generated nats.conf must grant them to both roles, matching
+        # transport/src/nats.rs and server/src).
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        credentials = {
+            "hook_user": "oshioki-hook",
+            "hook_pass": "hook-secret",
+            "server_user": "oshioki-server",
+            "server_pass": "server-secret",
+        }
+        config = phone._nats_config(state, credentials, 14222)
+        text = config.read_text(encoding="utf-8")
+
+        hook_block = self._user_block(text, "oshioki-hook")
+        hook_subscribe_start = hook_block.index("subscribe:")
+        hook_subscribe_block = hook_block[hook_subscribe_start:]
+        self.assertIn('"oshioki.ack.>"', hook_subscribe_block)
+        self.assertIn('"oshioki.delivery.>"', hook_subscribe_block)
+
+        server_block = self._user_block(text, "oshioki-server")
+        server_publish_start = server_block.index("publish:")
+        server_subscribe_start = server_block.index("subscribe:")
+        server_publish_block = server_block[server_publish_start:server_subscribe_start]
+        self.assertIn('"oshioki.ack.>"', server_publish_block)
+        self.assertIn('"oshioki.delivery.>"', server_publish_block)
+        # The server relays a native enrollment submission back to the
+        # hook waiting on its reply_subject via an outbox row
+        # (server/src/db.rs) that the outbox worker publishes
+        # (server/src/main.rs); that grant must stay in the server's
+        # publish permissions or `sudo oshioki enroll` never completes.
+        self.assertIn('"oshioki.enrollment.submission.>"', server_publish_block)
+
     def test_command_shims_and_script_path_remain_lexically_stable(self) -> None:
         target = self.root / "Cellar" / "tool"
         target.parent.mkdir(parents=True)

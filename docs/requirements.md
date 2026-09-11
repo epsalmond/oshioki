@@ -15,6 +15,10 @@ Production must provide:
 - Publish and subscribe permissions for `oshioki.ack.*`. Native agents and
   the authenticated browser acknowledgement endpoint publish liveness
   messages before a human decision.
+- Publish and subscribe permissions for `oshioki.delivery.*`. The server
+  publishes a durable delivery receipt for a request routed to a pinned
+  WebAuthn recipient, and the hook subscribes to report that the request
+  reached the browser while it waits for a decision.
 - Publish and subscribe permissions for `oshioki.device.>` (revocations and
   their confirmations). These apply to the `nats` transport; other transports
   document their own.
