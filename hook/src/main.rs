@@ -1772,7 +1772,7 @@ fn build_request(values: &[(String, String)]) -> Result<RequestV1> {
         command,
         argv,
         pid_chain: pid_chain(),
-        session: session_label(values, uid),
+        session: session_label(values),
         env,
         issued_at,
         expires_at: issued_at + 90,
@@ -1781,45 +1781,29 @@ fn build_request(values: &[(String, String)]) -> Result<RequestV1> {
     Ok(request)
 }
 
-/// Resolves the caller's session label from the bound request values and
-/// the invoking user's uid. First match wins; any step that does not apply
-/// or fails falls through to the next one rather than erroring the request:
+/// Resolves the caller's session label from the bound request values.
 ///
-/// 1. An `OSHIOKI_SESSION` environment entry (`env.OSHIOKI_SESSION` in the
-///    bound values), already documented in `docs/configuration.md`.
-/// 2. Claude Code: `env.CLAUDE_PID` names a pid; `$HOME/.claude/sessions/<pid>.json`
-///    (the invoking user's `$HOME`, looked up from their uid via the passwd
-///    database rather than this process's own environment, which sudo has
-///    already scrubbed and which may belong to a different user entirely)
-///    holds `{"sessionId":...,"name":...}`. When `env.CLAUDE_CODE_SESSION_ID`
-///    is also present it must match `sessionId`, guarding against a stale or
-///    unrelated session file at a reused pid. `name` is used as the label.
+/// The one supported mechanism: an `OSHIOKI_SESSION` entry from the
+/// invoking user's original environment, bound by the plugin under the
+/// `session.` prefix (distinct from `env.*`, which is the post-`env_reset`
+/// environment the command actually executes with — see `gather_context`
+/// in `plugin/src/lib.rs`). Documented in `docs/configuration.md`, along
+/// with recipes for setting it from a coding agent, tmux, or an ssh client.
 ///
-/// Other coding agents can add a step the same shape: an env var naming a
-/// pid or session id, and a per-user file to resolve it against.
+/// `None` when absent, empty, or invalid; the agent's own fallbacks
+/// (`pid_chain`, then tty) apply in that case — see `session_name_for` in
+/// `agent/src/main.rs`.
 ///
 /// The label is bounded and trimmed to satisfy `RequestV1::validate`; an
 /// overlong or empty result after trimming is treated as no match.
-fn session_label(values: &[(String, String)], uid: u32) -> Option<String> {
+fn session_label(values: &[(String, String)]) -> Option<String> {
     let last_value = |key: &str| {
         values
             .iter()
             .rev()
             .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
     };
-    if let Some(value) = last_value("env.OSHIOKI_SESSION") {
-        if let Some(label) = normalize_session_label(value) {
-            return Some(label);
-        }
-    }
-    if let Some(pid) = last_value("env.CLAUDE_PID") {
-        if let Some(label) =
-            claude_code_session_label(pid, last_value("env.CLAUDE_CODE_SESSION_ID"), uid)
-        {
-            return Some(label);
-        }
-    }
-    None
+    last_value("session.OSHIOKI_SESSION").and_then(normalize_session_label)
 }
 
 /// Bounds and trims a candidate session label to the limits
@@ -1835,54 +1819,6 @@ fn normalize_session_label(value: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_owned())
-}
-
-/// Reads `$HOME/.claude/sessions/<pid>.json` for the invoking user (`uid`,
-/// resolved via the passwd database, never this process's own environment)
-/// and returns its `name` field, first verifying `sessionId` matches
-/// `expected_session_id` when both are present. Any missing file, parse
-/// failure, or mismatch yields `None` silently — this is a best-effort
-/// label, not a trust boundary.
-fn claude_code_session_label(
-    pid: &str,
-    expected_session_id: Option<&str>,
-    uid: u32,
-) -> Option<String> {
-    let home = user_home_dir(uid)?;
-    claude_code_session_label_at(&home, pid, expected_session_id)
-}
-
-/// The home-directory-independent half of [`claude_code_session_label`],
-/// split out so tests can point it at a temporary directory instead of a
-/// real account's home.
-fn claude_code_session_label_at(
-    home: &Path,
-    pid: &str,
-    expected_session_id: Option<&str>,
-) -> Option<String> {
-    let path = home.join(".claude").join("sessions").join(format!("{pid}.json"));
-    let contents = std::fs::read(path).ok()?;
-    let file: serde_json::Value = serde_json::from_slice(&contents).ok()?;
-    if let Some(expected) = expected_session_id {
-        let actual = file.get("sessionId").and_then(serde_json::Value::as_str);
-        if actual != Some(expected) {
-            return None;
-        }
-    }
-    let name = file.get("name").and_then(serde_json::Value::as_str)?;
-    normalize_session_label(name)
-}
-
-/// The invoking user's home directory, looked up by uid through the passwd
-/// database. This process's own `HOME` environment variable is not a valid
-/// substitute: sudo scrubs the plugin's environment before the hook ever
-/// runs, and what remains (if anything) belongs to whichever account is
-/// running the hook binary, not necessarily the invoking user.
-fn user_home_dir(uid: u32) -> Option<PathBuf> {
-    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-        .ok()
-        .flatten()
-        .map(|user| user.dir)
 }
 
 fn build_synthetic_request() -> RequestV1 {
@@ -3629,138 +3565,50 @@ mod tests {
         .expect("signed approval must approve");
     }
 
-    fn write_claude_session_file(home: &Path, pid: &str, body: &str) {
-        let dir = home.join(".claude").join("sessions");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{pid}.json")), body).unwrap();
-    }
-
-    fn temp_home(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "oshioki-session-label-{label}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// The ordinary case: a session file whose `sessionId` matches the
-    /// caller-supplied one, so its `name` is used.
+    /// The one supported mechanism: a `session.OSHIOKI_SESSION` bound value
+    /// (the plugin's prefix for a label pulled from the caller's
+    /// pre-`env_reset` environment) becomes the resolved session label.
     #[test]
-    fn claude_code_session_label_reads_name_on_matching_session_id() {
-        let home = temp_home("match");
-        write_claude_session_file(
-            &home,
-            "44930",
-            r#"{"pid":44930,"sessionId":"abc-123","name":"oshioki-1b","nameSource":"derived"}"#,
-        );
-        assert_eq!(
-            claude_code_session_label_at(&home, "44930", Some("abc-123")),
-            Some("oshioki-1b".into())
-        );
-        let _ = std::fs::remove_dir_all(&home);
+    fn session_label_reads_bound_session_prefix() {
+        let values = vec![("session.OSHIOKI_SESSION".into(), "explicit-session".into())];
+        assert_eq!(session_label(&values), Some("explicit-session".into()));
     }
 
-    /// A session id mismatch (a stale file at a reused pid) yields no
-    /// label rather than an incorrect one.
+    /// `env.OSHIOKI_SESSION` — the post-`env_reset` environment the command
+    /// actually executes with — is never read as a session label; only the
+    /// `session.` prefix the plugin binds from `submit_envp` counts. A
+    /// stray `env.OSHIOKI_SESSION` (e.g. from `env_keep` or a command that
+    /// sets it explicitly) must not be mistaken for the caller's label.
     #[test]
-    fn claude_code_session_label_rejects_session_id_mismatch() {
-        let home = temp_home("mismatch");
-        write_claude_session_file(
-            &home,
-            "44930",
-            r#"{"pid":44930,"sessionId":"abc-123","name":"oshioki-1b"}"#,
-        );
-        assert_eq!(
-            claude_code_session_label_at(&home, "44930", Some("different-session")),
-            None
-        );
-        let _ = std::fs::remove_dir_all(&home);
+    fn session_label_ignores_env_prefixed_oshioki_session() {
+        let values = vec![("env.OSHIOKI_SESSION".into(), "not-a-label".into())];
+        assert_eq!(session_label(&values), None);
     }
 
-    /// Without an expected session id to check, the name is trusted as-is
-    /// (the `CLAUDE_CODE_SESSION_ID` env entry is optional on the wire).
+    /// An empty `session.OSHIOKI_SESSION` value does not win; the resolver
+    /// falls through to nothing (the agent's own fallbacks then apply).
     #[test]
-    fn claude_code_session_label_accepts_missing_expected_id() {
-        let home = temp_home("noexpected");
-        write_claude_session_file(
-            &home,
-            "44930",
-            r#"{"pid":44930,"sessionId":"abc-123","name":"oshioki-1b"}"#,
-        );
-        assert_eq!(
-            claude_code_session_label_at(&home, "44930", None),
-            Some("oshioki-1b".into())
-        );
-        let _ = std::fs::remove_dir_all(&home);
+    fn session_label_treats_empty_value_as_absent() {
+        let values = vec![("session.OSHIOKI_SESSION".into(), String::new())];
+        assert_eq!(session_label(&values), None);
     }
 
-    /// No session file at all (not a Claude Code session, or the pid is
-    /// stale) is not an error — just no label.
+    /// No `session.OSHIOKI_SESSION` entry at all yields no label.
     #[test]
-    fn claude_code_session_label_missing_file_yields_none() {
-        let home = temp_home("missing");
-        assert_eq!(
-            claude_code_session_label_at(&home, "999999", Some("abc-123")),
-            None
-        );
-        let _ = std::fs::remove_dir_all(&home);
+    fn session_label_absent_yields_none() {
+        let values: Vec<(String, String)> = vec![];
+        assert_eq!(session_label(&values), None);
     }
 
-    /// A name longer than the 64-character bound `RequestV1::validate`
-    /// enforces is rejected here rather than truncated, so the resolver
-    /// never hands the caller a clipped label under a different meaning.
+    /// When `session.OSHIOKI_SESSION` is bound more than once, the last
+    /// value wins, matching every other bound-value lookup in the hook.
     #[test]
-    fn claude_code_session_label_rejects_overlong_name() {
-        let home = temp_home("overlong");
-        let long_name = "x".repeat(65);
-        write_claude_session_file(
-            &home,
-            "44930",
-            &format!(r#"{{"pid":44930,"sessionId":"abc-123","name":"{long_name}"}}"#),
-        );
-        assert_eq!(
-            claude_code_session_label_at(&home, "44930", Some("abc-123")),
-            None
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// Malformed JSON in the session file fails silently, same as a missing
-    /// file: this is a best-effort label, not a trust boundary.
-    #[test]
-    fn claude_code_session_label_malformed_json_yields_none() {
-        let home = temp_home("malformed");
-        write_claude_session_file(&home, "44930", "not json");
-        assert_eq!(
-            claude_code_session_label_at(&home, "44930", Some("abc-123")),
-            None
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// `session_label` prefers `OSHIOKI_SESSION` over a Claude Code session
-    /// file when both are present.
-    #[test]
-    fn session_label_prefers_oshioki_session_env_over_claude_code() {
+    fn session_label_last_value_wins_on_duplicate() {
         let values = vec![
-            ("env.OSHIOKI_SESSION".into(), "explicit-session".into()),
-            ("env.CLAUDE_PID".into(), "44930".into()),
+            ("session.OSHIOKI_SESSION".into(), "first".into()),
+            ("session.OSHIOKI_SESSION".into(), "second".into()),
         ];
-        assert_eq!(
-            session_label(&values, nix::unistd::getuid().as_raw()),
-            Some("explicit-session".into())
-        );
-    }
-
-    /// An empty `OSHIOKI_SESSION` value does not win; the resolver falls
-    /// through (to nothing, here, since there is no usable `CLAUDE_PID`
-    /// session file for this uid in the test environment).
-    #[test]
-    fn session_label_treats_empty_oshioki_session_as_absent() {
-        let values = vec![("env.OSHIOKI_SESSION".into(), String::new())];
-        assert_eq!(session_label(&values, nix::unistd::getuid().as_raw()), None);
+        assert_eq!(session_label(&values), Some("second".into()));
     }
 
     /// `normalize_session_label` trims whitespace, rejects control
@@ -3773,20 +3621,5 @@ mod tests {
         assert_eq!(normalize_session_label(&"x".repeat(64)), Some("x".repeat(64)));
         assert_eq!(normalize_session_label(&"x".repeat(65)), None);
         assert_eq!(normalize_session_label("bad\u{0007}name"), None);
-    }
-
-    /// The invoking user's `$HOME` is resolved through the passwd database
-    /// by uid: the current process's own uid must resolve to some home
-    /// directory. `claude_code_session_label` (unlike the `_at` helper
-    /// these other tests use) goes through this exact lookup, never through
-    /// this process's own `HOME` environment variable — sudo has already
-    /// scrubbed it and it need not belong to the invoking user at all.
-    #[test]
-    fn user_home_dir_resolves_the_current_uid() {
-        let real_uid = nix::unistd::getuid().as_raw();
-        assert!(
-            user_home_dir(real_uid).is_some(),
-            "current uid must resolve a home"
-        );
     }
 }

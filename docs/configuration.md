@@ -37,7 +37,53 @@ credentials supplied by that deployment.
 
 | Variable | Notes |
 |---|---|
-| `OSHIOKI_SESSION` | Set this yourself, e.g. `export OSHIOKI_SESSION=claude` in a shell or a Ghostty window's startup, to label that session. The plugin captures it like any other environment variable and signs it as part of the request, but the label itself is resolved on the host by the hook (not read from this process's own environment at approval time) and carried on the signed request's `session` field. The Touch ID sheet's reason text (see [mac-approvals.md](mac-approvals.md)) uses it, when set, to show which session a sudo request came from, ahead of falling back to a named process in `pid_chain` or the tty. A Claude Code session is labelled automatically with no configuration: the hook reads `$HOME/.claude/sessions/<pid>.json` (via `CLAUDE_PID`, verified against `CLAUDE_CODE_SESSION_ID` when both are set) and uses its `name`, the session's title shown in the terminal tab and set by `/rename`. `OSHIOKI_SESSION` always overrides this when set. Environment variables do not cross `ssh`, so `ssh host sudo …` run from a Mac session needs `SendEnv OSHIOKI_SESSION` in the client's `ssh_config` and `AcceptEnv OSHIOKI_SESSION` in the host's `sshd_config` to carry a label across — or the sudo call should originate on the host directly, where the Claude Code resolver can see the local session file. |
+| `OSHIOKI_SESSION` | The one supported way to label a sudo session. Set it in the invoking user's own environment — e.g. `export OSHIOKI_SESSION=claude` — and the plugin reads it in sudo's `open()` callback, before sudoers `env_reset` strips it from the environment the command actually executes with. It is signed into the request as a `session.OSHIOKI_SESSION` entry, kept distinct from the (post-`env_reset`) `env.*` entries, and the hook resolves it onto the signed request's `session` field. Bounded to 64 printable, non-control characters after trimming; anything outside that is treated as unset. The Touch ID sheet's reason text (see [mac-approvals.md](mac-approvals.md)) shows it, when set, ahead of falling back to a named process in `pid_chain` or the tty. See "Setting `OSHIOKI_SESSION`" below for recipes. |
+
+### Setting `OSHIOKI_SESSION`
+
+Oshioki ships no agent-specific session lookup of its own. The recipes
+below are hints for wiring `OSHIOKI_SESSION` up yourself in your own shell
+configuration — user-side setup, not product behavior.
+
+**Claude Code.** Add to `~/.zshenv` (non-interactive shells spawned by the
+Bash tool read it; Claude Code exports `CLAUDE_PID` and writes a registry
+file at `~/.claude/sessions/<pid>.json` whose `name` field follows
+`/rename`):
+
+```sh
+if [[ -n $CLAUDE_PID && -r ~/.claude/sessions/$CLAUDE_PID.json ]]; then
+  export OSHIOKI_SESSION=$(jq -r .name ~/.claude/sessions/$CLAUDE_PID.json 2>/dev/null)
+fi
+```
+
+The bash equivalent goes in `~/.bashrc`, or a file named by `BASH_ENV` for
+non-interactive shells. Without `jq`, a Python one-liner reads the same
+field:
+
+```sh
+OSHIOKI_SESSION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("name",""))' ~/.claude/sessions/$CLAUDE_PID.json 2>/dev/null)
+export OSHIOKI_SESSION
+```
+
+**tmux**, from a shell running inside it:
+
+```sh
+export OSHIOKI_SESSION=$(tmux display-message -p '#S:#W')
+```
+
+(`#{session_name}:#{window_name}`.)
+
+**ssh.** Environment variables do not cross `ssh` by default, so
+`ssh host sudo …` needs `SendEnv OSHIOKI_SESSION` in the client's
+`ssh_config` and `AcceptEnv OSHIOKI_SESSION` in the host's `sshd_config` to
+carry a label across — or the sudo call should originate on the host
+directly.
+
+**Terminal window titles are not a usable source.** The XTWINOPS title
+report (`CSI 21 t`) is disabled or unimplemented in most terminals, because
+answering it lets a remote peer type into the shell by injecting a crafted
+title back, and an agent-spawned shell typically has no tty to query one
+from in any case.
 
 ## Native agent (`oshioki-agent` binary)
 

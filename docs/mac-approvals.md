@@ -9,13 +9,13 @@ so its reason text shows the session, user, host, and command — e.g.
 `claude: eric@nas sudo systemctl restart oshioki-server` — truncated with
 "…" to fit, dropping the session prefix first when space is tight. The
 session name comes from the signed request's `session` field, which the hook
-resolves on the host: an `OSHIOKI_SESSION` environment variable, or — with no
-configuration needed — a Claude Code session's title, read from
-`$HOME/.claude/sessions/<pid>.json` for the invoking user. An older hook that
-predates this field, or a request with no resolvable label, falls back to a
-named process in the caller's `pid_chain` (`claude`, `codex`, `tmux`, and
-similar; shells and `sudo` itself are skipped), then the tty basename, in
-that order; see [configuration.md](configuration.md) for `OSHIOKI_SESSION`.
+resolves on the host from an `OSHIOKI_SESSION` entry in the invoking user's
+own environment — see [configuration.md](configuration.md) for how the
+plugin captures that (before sudoers `env_reset` strips it) and recipes for
+setting it. An older hook that predates this field, or a request with no
+resolvable label, falls back to a named process in the caller's `pid_chain`,
+rendered as `comm[pid]` (e.g. `claude[44930]`, `codex[51002]`, `tmux[...]`;
+shells and `sudo` itself are skipped), then the tty basename, in that order.
 Truncation
 only ever shortens the display text — the full request is still verified
 against the signed bytes independently of what the sheet shows.

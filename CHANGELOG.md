@@ -10,11 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `RequestV1` carries an optional `session` field: the hook resolves the
-  caller's session label on the host (an `OSHIOKI_SESSION` environment
-  entry, or — with zero configuration — a Claude Code session's title from
-  `$HOME/.claude/sessions/<pid>.json` for the invoking user) and signs it as
-  part of the request, rather than the agent guessing from `pid_chain` or
-  the tty alone. Bounded to 64 printable, non-control characters.
+  caller's session label on the host from an `OSHIOKI_SESSION` entry in
+  the invoking user's own environment, and signs it as part of the
+  request, rather than the agent guessing from `pid_chain` or the tty
+  alone. The plugin reads `OSHIOKI_SESSION` from sudo's `open()` callback
+  (the invoking user's environment before sudoers `env_reset` strips it),
+  not from `check()`'s `run_envp` — `env_reset` (the sudoers default)
+  removes it before the command executes, so a hook that only saw
+  `run_envp` never saw the variable at all on a real host. The label
+  crosses into the hook payload as `session.OSHIOKI_SESSION`, kept
+  separate from the `env.*` entries that carry the post-`env_reset`
+  execution environment. No agent-specific lookup ships in the product;
+  `docs/configuration.md` documents `OSHIOKI_SESSION` as the one supported
+  mechanism, with recipes (Claude Code, tmux, ssh) labelled as user-side
+  shell configuration. Bounded to 64 printable, non-control characters.
   Compatibility: the field is `#[serde(default, skip_serializing_if =
   "Option::is_none")]`, so it serializes to nothing when absent and old
   signatures keep verifying unchanged; no type in this protocol sets
@@ -28,7 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Touch ID sheet shows the session name and command again instead of the
   request id and hash. The session name prefers the request's resolved
-  `session` field over the agent's own `pid_chain`/tty guesswork.
+  `session` field over the agent's own `pid_chain`/tty guesswork, and the
+  `pid_chain` fallback now renders as `comm[pid]` (e.g. `claude[44930]`) so
+  two concurrent agent sessions on the same host are distinguishable.
 - The browser approval page (`/r/<id>`) shows a Session row when the
   request carries one.
 

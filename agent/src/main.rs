@@ -1088,10 +1088,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 /// process table. First match wins:
 ///
 /// 1. The request's `session` field, which the hook resolves on the host
-///    (an `OSHIOKI_SESSION` environment entry, or a coding agent's own
-///    session label — see `session_label` in `hook/src/main.rs`). Absent
-///    when the hook predates this field (0.1.4 and earlier), in which case
-///    the remaining rules apply exactly as before.
+///    from an `OSHIOKI_SESSION` entry in the caller's original environment
+///    — see `session_label` in `hook/src/main.rs`. Absent when the hook
+///    predates this field (0.1.4 and earlier), in which case the remaining
+///    rules apply exactly as before.
 /// 2. An `OSHIOKI_SESSION` environment entry, which a user can export in a
 ///    shell or terminal tab to label it (documented in `docs/configuration.md`).
 ///    Kept as a fallback for an old hook that bound the environment but
@@ -1100,7 +1100,9 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 ///    `"pid:comm"` pairs (see `pid_chain_darwin`/`pid_chain_linux` in
 ///    `hook/src/main.rs`), so a process name like `claude`, `codex`, or
 ///    `tmux` is usable directly; shells and `sudo` itself are skipped as
-///    uninteresting.
+///    uninteresting. Rendered as `comm[pid]` (e.g. `claude[44930]`) so two
+///    concurrent agent sessions on the same host are distinguishable, while
+///    staying short enough for the reason's character budget.
 /// 4. The tty's basename (e.g. `ttys004`), if the request carries one.
 ///
 /// `None` when nothing resolves, in which case the reason drops the prefix
@@ -1117,13 +1119,11 @@ fn session_name_for(request: &oshioki_protocol::RequestV1) -> Option<String> {
     {
         return Some(escape_for_terminal(&entry.value));
     }
-    if let Some(name) = request
-        .pid_chain
-        .iter()
-        .filter_map(|entry| entry.split_once(':').map(|(_, comm)| comm))
-        .find(|comm| is_interesting_session_process(comm))
-    {
-        return Some(escape_for_terminal(name));
+    if let Some((pid, comm)) = request.pid_chain.iter().find_map(|entry| {
+        let (pid, comm) = entry.split_once(':')?;
+        is_interesting_session_process(comm).then_some((pid, comm))
+    }) {
+        return Some(escape_for_terminal(&format!("{comm}[{pid}]")));
     }
     if let Some(tty) = &request.tty {
         if let Some(basename) = tty.rsplit('/').next().filter(|value| !value.is_empty()) {
@@ -1659,8 +1659,9 @@ mod tests {
     }
 
     /// Without an `OSHIOKI_SESSION` entry, the nearest interesting
-    /// `pid_chain` ancestor names the session; shells and `sudo` itself are
-    /// skipped as uninteresting.
+    /// `pid_chain` ancestor names the session, rendered as `comm[pid]` so
+    /// two concurrent agent sessions are distinguishable; shells and `sudo`
+    /// itself are skipped as uninteresting.
     #[test]
     fn reason_falls_back_to_interesting_pid_chain_ancestor() {
         let mut request = request_for_reason();
@@ -1670,7 +1671,7 @@ mod tests {
             "50:claude".into(),
             "1:launchd".into(),
         ];
-        assert!(approval_reason(&request).starts_with("claude: "));
+        assert!(approval_reason(&request).starts_with("claude[50]: "));
     }
 
     /// With no session env and no interesting `pid_chain` entry, the tty
