@@ -213,12 +213,33 @@ rollback_armed=0
 # the backstop for die and set -e exits inside the window.
 restore_sudo_backups() {
   [ "$rollback_armed" -eq 1 ] || return 0
+  # Roll back in the reverse order of migration: restore sudo.conf (and its
+  # approval plugin) while the blanket rule is still absent, then restore the
+  # verified sudoers rule. This keeps an interrupted rollback fail-closed.
   if [ -n "$backup" ] && [ -f "$backup" ]; then
-    cp -p "$backup" "$SUDO_CONF"; rm -f "$backup"
+    if ! cp -p "$backup" "$SUDO_CONF"; then
+      echo "install-oshioki-hook: rollback could not restore sudo.conf; leaving the sudoers rule absent" >&2
+      return 1
+    fi
+    if ! rm -f "$backup"; then
+      echo "install-oshioki-hook: rollback could not remove its sudo.conf backup; leaving the sudoers rule absent" >&2
+      return 1
+    fi
   fi
   # rm first: the drop-in is 0440, so overwriting it in place fails.
   if [ -n "$dropin_backup" ] && [ -f "$dropin_backup" ]; then
-    rm -f "$SUDOERS_FILE"; cp -p "$dropin_backup" "$SUDOERS_FILE"; rm -f "$dropin_backup"
+    if ! rm -f "$SUDOERS_FILE"; then
+      echo "install-oshioki-hook: rollback could not remove the current sudoers rule" >&2
+      return 1
+    fi
+    if ! cp -p "$dropin_backup" "$SUDOERS_FILE"; then
+      echo "install-oshioki-hook: rollback could not restore the sudoers rule" >&2
+      return 1
+    fi
+    if ! rm -f "$dropin_backup"; then
+      echo "install-oshioki-hook: rollback could not remove its sudoers backup" >&2
+      return 1
+    fi
     # Keep repeated EXIT-trap cleanup idempotent: a second pass must not
     # mistake this restored file for a newly-created drop-in.
     dropin_original_present=1
@@ -228,24 +249,51 @@ restore_sudo_backups() {
   backup=""; dropin_backup=""; rollback_armed=0
 }
 drop_sudo_backups() {
-  [ -z "$backup" ] || rm -f "$backup"
-  [ -z "$dropin_backup" ] || rm -f "$dropin_backup"
+  local old_backup="$backup" old_dropin_backup="$dropin_backup" cleanup_failed=0
+  # The managed state is complete before this cleanup starts. Disarm and
+  # clear the rollback inputs first; a cleanup error or signal must never
+  # restore only one of the two privilege artifacts.
   backup=""; dropin_backup=""; dropin_original_present=0; rollback_armed=0
+  if [ -n "$old_backup" ] && ! rm -f "$old_backup"; then
+    echo "install-oshioki-hook: could not remove its sudo.conf rollback backup" >&2
+    cleanup_failed=1
+  fi
+  if [ -n "$old_dropin_backup" ] && ! rm -f "$old_dropin_backup"; then
+    echo "install-oshioki-hook: could not remove its sudoers rollback backup" >&2
+    cleanup_failed=1
+  fi
+  return "$cleanup_failed"
 }
 capture_dropin_backup() {
   # Arm rollback before any managed sudo state is changed. The EXIT trap is
   # intentionally inert after drop_sudo_backups disarms a successful window.
+  local tmp
   rollback_armed=1
   dropin_backup=""
   if [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ]; then
     dropin_original_present=1
-    if [ -f "$SUDOERS_FILE" ] && [ ! -L "$SUDOERS_FILE" ] && owned_sudoers_dropin_user >/dev/null 2>&1; then
-      dropin_backup="$(mktemp "${SUDOERS_FILE}.backup.XXXXXX")"
-      cp -p "$SUDOERS_FILE" "$dropin_backup"
+    owned_sudoers_dropin_user >/dev/null 2>&1 ||
+      die "refusing to modify unverified sudoers drop-in: $SUDOERS_FILE"
+    tmp="$(mktemp "${SUDOERS_FILE}.backup.XXXXXX")" ||
+      die "could not create a sudoers rollback backup"
+    if ! cp -p "$SUDOERS_FILE" "$tmp"; then
+      rm -f "$tmp"
+      die "could not back up the sudoers rule"
     fi
+    dropin_backup="$tmp"
   else
     dropin_original_present=0
   fi
+}
+capture_sudo_conf_backup() {
+  local suffix="${1:-rollback}" tmp
+  tmp="$(mktemp "${SUDO_CONF}.${suffix}.XXXXXX")" ||
+    die "could not create a sudo.conf rollback backup"
+  if ! cp -p "$SUDO_CONF" "$tmp"; then
+    rm -f "$tmp"
+    die "could not back up sudo.conf"
+  fi
+  backup="$tmp"
 }
 
 # Before replacing an installed hook or plugin, take the managed sudo
@@ -265,27 +313,33 @@ has_managed_state() {
 prepare_upgrade() {
   has_managed_state || return 0
   if [ "$DRY_RUN" -eq 1 ]; then
+    # Show the same safety order as the real transition: blanket rule first,
+    # then the legacy approval plugin.
+    remove_sudoers_dropin
     [ -f "$SUDO_CONF" ] && {
       grep -Fq "$BEGIN_MARK" "$SUDO_CONF" ||
       grep -Fq "$END_MARK" "$SUDO_CONF" ||
       has_our_plugin;
     } && echo "DRY: remove the managed Oshioki plugin block from $SUDO_CONF"
-    remove_sudoers_dropin
     validate_sudo
     return 0
   fi
 
   if [ -f "$SUDO_CONF" ]; then
-    backup="$(mktemp "${SUDO_CONF}.upgrade-rollback.XXXXXX")"
-    cp -p "$SUDO_CONF" "$backup"
     capture_dropin_backup
-    rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
+    capture_sudo_conf_backup upgrade-rollback
   else
     # A drop-in can survive after an administrator removed sudo.conf. Keep its
     # verified backup while normal sudo is checked, then restore it on error.
     capture_dropin_backup
   fi
+  # Remove the blanket permission before removing the plugin that used to
+  # protect it. A failure to identify or remove the rule therefore leaves the
+  # legacy approval path intact.
   remove_sudoers_dropin
+  if [ -f "$SUDO_CONF" ]; then
+    rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
+  fi
   if ! validate_sudo; then
     restore_sudo_backups
     die "normal sudo validation failed before replacing the hook and plugin"
@@ -454,7 +508,23 @@ regular_or_absent "$STATE_DIR/config.env"; regular_or_absent "$STATE_DIR/hook.js
 
 if [ "$DRY_RUN" -eq 0 ]; then
   mkdir "$LOCK_DIR" 2>/dev/null || die "another installer holds $LOCK_DIR"
-  trap 'restore_sudo_backups; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
+  cleanup_install() {
+    # Do not allow a signal during rollback to re-enter this cleanup.
+    trap - HUP INT TERM
+    restore_sudo_backups || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  }
+  handle_signal() {
+    local status="$1"
+    # Exit invokes cleanup_install through EXIT and cannot resume the forward
+    # migration at the point where the signal arrived.
+    trap - HUP INT TERM
+    exit "$status"
+  }
+  trap cleanup_install EXIT
+  trap 'handle_signal 129' HUP
+  trap 'handle_signal 130' INT
+  trap 'handle_signal 143' TERM
 fi
 
 rewrite_block() {
@@ -523,14 +593,15 @@ if [ "$MODE" = disable-prelaunch ]; then
     fi
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    if [ "$partial_block" -eq 1 ]; then echo "DRY: remove exact Oshioki plugin directive from $SUDO_CONF"; else echo "DRY: remove exact managed block from $SUDO_CONF"; fi
+    # Keep the reviewable plan in the same order as the real cleanup.
     remove_sudoers_dropin
+    if [ "$partial_block" -eq 1 ]; then echo "DRY: remove exact Oshioki plugin directive from $SUDO_CONF"; else echo "DRY: remove exact managed block from $SUDO_CONF"; fi
     exit 0
   fi
-  backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
   capture_dropin_backup
-  if [ "$partial_block" -eq 1 ]; then rewrite_partial_block "$SUDO_CONF" "$SUDO_CONF"; else rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"; fi
+  capture_sudo_conf_backup
   remove_sudoers_dropin
+  if [ "$partial_block" -eq 1 ]; then rewrite_partial_block "$SUDO_CONF" "$SUDO_CONF"; else rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"; fi
   if ! validate_sudo; then
     restore_sudo_backups
     die "sudo -V failed after disable; restored prior configuration"
@@ -614,7 +685,16 @@ registry_has_active_devices() {
   grep -Eq '"active":[[:space:]]*true' "$STATE_DIR/devices.json" 2>/dev/null
 }
 if [ "$DRY_RUN" -eq 1 ]; then
-  if registry_has_active_devices; then echo "DRY: enable exact managed block in $SUDO_CONF"; plan_sudoers_dropin "$(sudoers_user)"; elif [ -f "$SUDO_CONF" ] && grep -qF "$BEGIN_MARK" "$SUDO_CONF"; then echo "DRY: remove exact managed block from $SUDO_CONF (no active approval devices)"; remove_sudoers_dropin; else echo "DRY: skip enabling $SUDO_CONF (no active approval devices)"; remove_sudoers_dropin; fi
+  if registry_has_active_devices; then
+    echo "DRY: enable exact managed block in $SUDO_CONF"
+    plan_sudoers_dropin "$(sudoers_user)"
+  elif [ -f "$SUDO_CONF" ] && grep -qF "$BEGIN_MARK" "$SUDO_CONF"; then
+    remove_sudoers_dropin
+    echo "DRY: remove exact managed block from $SUDO_CONF (no active approval devices)"
+  else
+    remove_sudoers_dropin
+    echo "DRY: skip enabling $SUDO_CONF (no active approval devices)"
+  fi
   validate_sudo; exit 0
 fi
 if ! registry_has_active_devices; then
@@ -622,10 +702,10 @@ if ! registry_has_active_devices; then
   # An enabled block with an empty registry fails every sudo closed,
   # including the sudo that would pin the first device: take it back out.
   if [ -f "$SUDO_CONF" ] && grep -qF "$BEGIN_MARK" "$SUDO_CONF"; then
-    backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
     capture_dropin_backup
-    rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
+    capture_sudo_conf_backup
     remove_sudoers_dropin
+    rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
     if ! validate_sudo; then
       restore_sudo_backups
       die "sudo -V failed; restored prior configuration"
@@ -636,8 +716,8 @@ if ! registry_has_active_devices; then
   fi
 else
 [ -f "$SUDO_CONF" ] || install -m 0644 -o root -g "$ROOT_GROUP" /dev/null "$SUDO_CONF"
-backup="$(mktemp "${SUDO_CONF}.rollback.XXXXXX")"; cp -p "$SUDO_CONF" "$backup"
 capture_dropin_backup
+capture_sudo_conf_backup
 rewrite_block enable "$SUDO_CONF" "$SUDO_CONF"
 install_sudoers_dropin "$(sudoers_user)"
 if ! validate_sudo; then

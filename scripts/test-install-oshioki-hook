@@ -35,7 +35,7 @@ cp /usr/bin/true "$TEST_ROOT/service/target/release/$BUILD_PLUGIN"
   printf '%s  %s\n' "$(sha256_file "$BUILD_PLUGIN")" "$BUILD_PLUGIN" >> SHA256SUMS
 )
 
-for wrapper in id chown install sudo file stat; do
+for wrapper in id chown install sudo file stat cp mv rm; do
   : > "$TEST_ROOT/fake-bin/$wrapper"
 done
 cat > "$TEST_ROOT/fake-bin/id" <<'SH'
@@ -84,6 +84,86 @@ case "${1:-} ${2:-}" in
   *) exec /usr/bin/stat "$@" ;;
 esac
 SH
+cat > "$TEST_ROOT/fake-bin/cp" <<'SH'
+#!/usr/bin/env bash
+args=("$@")
+source="${args[${#args[@]}-2]}"
+destination="${args[${#args[@]}-1]}"
+if [ "${FAIL_SUDO_CONF_BACKUP:-0}" = 1 ] &&
+   [ "$source" = "${FAIL_SUDO_CONF_BACKUP_SOURCE:-}" ] &&
+   [[ "$destination" == *rollback.* ]]; then
+  exit 1
+fi
+if [ "${FAIL_SUDOERS_BACKUP:-0}" = 1 ] &&
+   [ "$source" = "${FAIL_SUDOERS_BACKUP_SOURCE:-}" ] &&
+   [[ "$destination" == *.backup.* ]]; then
+  exit 1
+fi
+if [ "${FAIL_PLUGIN_RESTORE:-0}" = 1 ] &&
+   [ "$destination" = "${FAIL_PLUGIN_RESTORE_DEST:-}" ] &&
+   [[ "$source" == *upgrade-rollback.* ]]; then
+  exit 1
+fi
+if [ -n "${INSTALL_TRACE:-}" ]; then
+  printf 'cp:%s:%s\n' "$source" "$destination" >> "$INSTALL_TRACE"
+fi
+exec /bin/cp "$@"
+SH
+cat > "$TEST_ROOT/fake-bin/mv" <<'SH'
+#!/usr/bin/env bash
+args=("$@")
+destination="${args[${#args[@]}-1]}"
+if [ "${FAIL_SUDO_CONF_MOVE:-0}" = 1 ] &&
+   [ "$destination" = "${FAIL_SUDO_CONF_MOVE_DEST:-}" ] &&
+   [ ! -e "${FAIL_SUDO_CONF_MOVE_MARKER:-}" ]; then
+  : > "${FAIL_SUDO_CONF_MOVE_MARKER}"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+cat > "$TEST_ROOT/fake-bin/rm" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${INSTALL_TRACE:-}" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      */sudoers.d/oshioki) printf 'rm:%s\n' "$arg" >> "$INSTALL_TRACE" ;;
+    esac
+  done
+fi
+for arg in "$@"; do
+  case "$arg" in
+    */sudoers.d/oshioki)
+      if [ "${FAIL_REMOVE_SUDOERS_ONCE:-0}" = 1 ] &&
+         [ ! -e "${FAIL_REMOVE_SUDOERS_MARKER:-}" ]; then
+        : > "${FAIL_REMOVE_SUDOERS_MARKER}"
+        exit 1
+      fi
+      if [ "${SIGNAL_AFTER_REMOVE:-0}" = 1 ] &&
+         [ ! -e "${SIGNAL_AFTER_REMOVE_MARKER:-}" ]; then
+        /bin/rm "$@" || exit 1
+        : > "${SIGNAL_AFTER_REMOVE_MARKER}"
+        kill -TERM "$PPID"
+        exit 0
+      fi
+      ;;
+    */sudo.conf.upgrade-rollback.*)
+      if [ "${SIGNAL_DURING_BACKUP_CLEANUP:-0}" = 1 ] &&
+         [ ! -e "${SIGNAL_DURING_BACKUP_CLEANUP_MARKER:-}" ]; then
+        /bin/rm "$@" || exit 1
+        : > "${SIGNAL_DURING_BACKUP_CLEANUP_MARKER}"
+        kill -TERM "$PPID"
+        exit 0
+      fi
+      ;;
+    */sudoers.d/oshioki.backup.*)
+      if [ "${FAIL_DROPIN_BACKUP_CLEANUP:-0}" = 1 ]; then
+        exit 1
+      fi
+      ;;
+  esac
+done
+exec /bin/rm "$@"
+SH
 cat > "$TEST_ROOT/fake-bin/visudo" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "${VISUDO_CALLS:-/dev/null}"
@@ -112,6 +192,23 @@ run_installer() {
     NATS_PASS="${INSTALL_NATS_PASS-${NATS_PASS:-test-only}}" \
     FAKE_STAT_OWNER="${FAKE_STAT_OWNER:-0}" FAKE_STAT_MODE="${FAKE_STAT_MODE:-600}" \
     FAIL_INSTALL_TARGET="${FAIL_INSTALL_TARGET:-}" \
+    FAIL_REMOVE_SUDOERS_ONCE="${FAIL_REMOVE_SUDOERS_ONCE:-0}" \
+    FAIL_REMOVE_SUDOERS_MARKER="$root/remove-sudoers.marker" \
+    FAIL_SUDO_CONF_MOVE="${FAIL_SUDO_CONF_MOVE:-0}" \
+    FAIL_SUDO_CONF_MOVE_DEST="$root/sudo.conf" \
+    FAIL_SUDO_CONF_MOVE_MARKER="$root/sudo-conf-move.marker" \
+    FAIL_PLUGIN_RESTORE="${FAIL_PLUGIN_RESTORE:-0}" \
+    FAIL_PLUGIN_RESTORE_DEST="$root/sudo.conf" \
+    FAIL_SUDO_CONF_BACKUP="${FAIL_SUDO_CONF_BACKUP:-0}" \
+    FAIL_SUDO_CONF_BACKUP_SOURCE="$root/sudo.conf" \
+    FAIL_SUDOERS_BACKUP="${FAIL_SUDOERS_BACKUP:-0}" \
+    FAIL_SUDOERS_BACKUP_SOURCE="$root/sudoers.d/oshioki" \
+    FAIL_DROPIN_BACKUP_CLEANUP="${FAIL_DROPIN_BACKUP_CLEANUP:-0}" \
+    SIGNAL_AFTER_REMOVE="${SIGNAL_AFTER_REMOVE:-0}" \
+    SIGNAL_AFTER_REMOVE_MARKER="$root/signal-after-remove.marker" \
+    SIGNAL_DURING_BACKUP_CLEANUP="${SIGNAL_DURING_BACKUP_CLEANUP:-0}" \
+    SIGNAL_DURING_BACKUP_CLEANUP_MARKER="$root/signal-during-backup-cleanup.marker" \
+    INSTALL_TRACE="${INSTALL_TRACE:-}" \
     "$TEST_ROOT/service/scripts/install-oshioki-hook" "$@"
 }
 
@@ -211,6 +308,132 @@ if FAIL_SUDO=1 run_installer "$UPGRADE_VALIDATE" --prelaunch >"$UPGRADE_VALIDATE
 [ "$(sha256_file "$UPGRADE_VALIDATE/sbin/oshioki")" = "$upgrade_hook_hash" ] || fail "sudo validation failure replaced the hook"
 grep -Fq '# BEGIN oshioki' "$UPGRADE_VALIDATE/sudo.conf" || fail "sudo validation failure did not restore the plugin block"
 grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$UPGRADE_VALIDATE/sudoers.d/oshioki" || fail "sudo validation failure did not restore the drop-in"
+
+# An unknown file at the reserved sudoers path is never touched. The check
+# happens before the legacy plugin is removed, so an administrator's rule
+# cannot be stranded behind a partial migration.
+UNKNOWN_UPGRADE="$TEST_ROOT/unknown-upgrade"; mkdir -p "$UNKNOWN_UPGRADE/state" "$UNKNOWN_UPGRADE/sudoers.d"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$UNKNOWN_UPGRADE/state/devices.json"
+printf '#includedir %s\n' "$UNKNOWN_UPGRADE/sudoers.d" > "$UNKNOWN_UPGRADE/sudoers"
+printf '%s\n' '# BEGIN oshioki' "Plugin approval_exec $UNKNOWN_UPGRADE/plugin/$PLUGIN_NAME" '# END oshioki' > "$UNKNOWN_UPGRADE/sudo.conf"
+printf 'administrator ALL=(ALL) NOPASSWD: /usr/bin/id\n' > "$UNKNOWN_UPGRADE/sudoers.d/oshioki"
+unknown_conf_hash="$(sha256_file "$UNKNOWN_UPGRADE/sudo.conf")"
+unknown_dropin_hash="$(sha256_file "$UNKNOWN_UPGRADE/sudoers.d/oshioki")"
+if run_installer "$UNKNOWN_UPGRADE" --prelaunch >"$UNKNOWN_UPGRADE/fail.log" 2>&1; then fail "accepted an unverified upgrade drop-in"; fi
+grep -Fq 'refusing to modify unverified sudoers drop-in' "$UNKNOWN_UPGRADE/fail.log" || fail "unknown upgrade drop-in rejection was not explained"
+[ "$(sha256_file "$UNKNOWN_UPGRADE/sudo.conf")" = "$unknown_conf_hash" ] || fail "unknown upgrade changed the legacy plugin"
+[ "$(sha256_file "$UNKNOWN_UPGRADE/sudoers.d/oshioki")" = "$unknown_dropin_hash" ] || fail "unknown upgrade changed the administrator rule"
+
+# A failed sudo.conf backup must not leave a partial backup registered for
+# rollback. The original plugin and blanket rule remain untouched.
+BACKUP_INTERRUPT="$TEST_ROOT/backup-interrupt"; mkdir -p "$BACKUP_INTERRUPT/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$BACKUP_INTERRUPT/state/devices.json"
+printf '#includedir %s\n' "$BACKUP_INTERRUPT/sudoers.d" > "$BACKUP_INTERRUPT/sudoers"
+run_installer --sudo-user testuser "$BACKUP_INTERRUPT" --prelaunch >"$BACKUP_INTERRUPT/first.log" 2>&1
+backup_conf_hash="$(sha256_file "$BACKUP_INTERRUPT/sudo.conf")"
+backup_dropin_hash="$(sha256_file "$BACKUP_INTERRUPT/sudoers.d/oshioki")"
+if FAIL_SUDO_CONF_BACKUP=1 run_installer "$BACKUP_INTERRUPT" --prelaunch >"$BACKUP_INTERRUPT/fail.log" 2>&1; then fail "accepted a failed sudo.conf backup"; fi
+grep -Fq 'could not back up sudo.conf' "$BACKUP_INTERRUPT/fail.log" || fail "sudo.conf backup failure was not reported"
+[ "$(sha256_file "$BACKUP_INTERRUPT/sudo.conf")" = "$backup_conf_hash" ] || fail "failed sudo.conf backup changed the plugin"
+[ "$(sha256_file "$BACKUP_INTERRUPT/sudoers.d/oshioki")" = "$backup_dropin_hash" ] || fail "failed sudo.conf backup changed the blanket rule"
+
+# The same invariant applies when the sudoers backup itself fails: no
+# partially copied rule is eligible for rollback.
+DROPIN_BACKUP_INTERRUPT="$TEST_ROOT/dropin-backup-interrupt"; mkdir -p "$DROPIN_BACKUP_INTERRUPT/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$DROPIN_BACKUP_INTERRUPT/state/devices.json"
+printf '#includedir %s\n' "$DROPIN_BACKUP_INTERRUPT/sudoers.d" > "$DROPIN_BACKUP_INTERRUPT/sudoers"
+run_installer --sudo-user testuser "$DROPIN_BACKUP_INTERRUPT" --prelaunch >"$DROPIN_BACKUP_INTERRUPT/first.log" 2>&1
+dropin_backup_conf_hash="$(sha256_file "$DROPIN_BACKUP_INTERRUPT/sudo.conf")"
+dropin_backup_rule_hash="$(sha256_file "$DROPIN_BACKUP_INTERRUPT/sudoers.d/oshioki")"
+if FAIL_SUDOERS_BACKUP=1 run_installer "$DROPIN_BACKUP_INTERRUPT" --prelaunch >"$DROPIN_BACKUP_INTERRUPT/fail.log" 2>&1; then fail "accepted a failed sudoers backup"; fi
+grep -Fq 'could not back up the sudoers rule' "$DROPIN_BACKUP_INTERRUPT/fail.log" || fail "sudoers backup failure was not reported"
+[ "$(sha256_file "$DROPIN_BACKUP_INTERRUPT/sudo.conf")" = "$dropin_backup_conf_hash" ] || fail "failed sudoers backup changed the plugin"
+[ "$(sha256_file "$DROPIN_BACKUP_INTERRUPT/sudoers.d/oshioki")" = "$dropin_backup_rule_hash" ] || fail "failed sudoers backup changed the blanket rule"
+
+# A real TERM after the owned rule has been removed must terminate the
+# installer. EXIT cleanup restores the plugin before the blanket rule; it
+# must not return to rewrite_block and leave an unprotected rule.
+SIGNAL_REMOVE="$TEST_ROOT/signal-remove"; mkdir -p "$SIGNAL_REMOVE/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SIGNAL_REMOVE/state/devices.json"
+printf '#includedir %s\n' "$SIGNAL_REMOVE/sudoers.d" > "$SIGNAL_REMOVE/sudoers"
+run_installer --sudo-user testuser "$SIGNAL_REMOVE" --prelaunch >"$SIGNAL_REMOVE/first.log" 2>&1
+if SIGNAL_AFTER_REMOVE=1 run_installer "$SIGNAL_REMOVE" --prelaunch >"$SIGNAL_REMOVE/signal.log" 2>&1; then fail "ignored TERM after sudoers removal"; fi
+grep -Fq '# BEGIN oshioki' "$SIGNAL_REMOVE/sudo.conf" || fail "signal cleanup did not restore the plugin"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$SIGNAL_REMOVE/sudoers.d/oshioki" || fail "signal cleanup did not restore the blanket rule"
+
+# A cleanup failure between the sudo.conf and sudoers backup removals must
+# leave the migrated state disabled, since rollback has already been disarmed.
+CLEANUP_FAILURE="$TEST_ROOT/cleanup-failure"; mkdir -p "$CLEANUP_FAILURE/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$CLEANUP_FAILURE/state/devices.json"
+printf '#includedir %s\n' "$CLEANUP_FAILURE/sudoers.d" > "$CLEANUP_FAILURE/sudoers"
+run_installer --sudo-user testuser "$CLEANUP_FAILURE" --prelaunch >"$CLEANUP_FAILURE/first.log" 2>&1
+if FAIL_DROPIN_BACKUP_CLEANUP=1 run_installer "$CLEANUP_FAILURE" --prelaunch >"$CLEANUP_FAILURE/fail.log" 2>&1; then fail "accepted a backup cleanup failure"; fi
+grep -Fq 'could not remove its sudoers rollback backup' "$CLEANUP_FAILURE/fail.log" || fail "backup cleanup failure was not reported"
+if grep -Fq '# BEGIN oshioki' "$CLEANUP_FAILURE/sudo.conf"; then fail "backup cleanup failure restored the plugin"; fi
+[ ! -e "$CLEANUP_FAILURE/sudoers.d/oshioki" ] || fail "backup cleanup failure restored the blanket rule"
+
+# TERM in the same interval is also safe: the handler exits through EXIT
+# after cleanup disarmed rollback, so neither old artifact is restored.
+SIGNAL_CLEANUP="$TEST_ROOT/signal-cleanup"; mkdir -p "$SIGNAL_CLEANUP/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SIGNAL_CLEANUP/state/devices.json"
+printf '#includedir %s\n' "$SIGNAL_CLEANUP/sudoers.d" > "$SIGNAL_CLEANUP/sudoers"
+run_installer --sudo-user testuser "$SIGNAL_CLEANUP" --prelaunch >"$SIGNAL_CLEANUP/first.log" 2>&1
+if SIGNAL_DURING_BACKUP_CLEANUP=1 run_installer "$SIGNAL_CLEANUP" --prelaunch >"$SIGNAL_CLEANUP/signal.log" 2>&1; then fail "ignored TERM during backup cleanup"; fi
+if grep -Fq '# BEGIN oshioki' "$SIGNAL_CLEANUP/sudo.conf"; then fail "backup cleanup signal restored the plugin"; fi
+[ ! -e "$SIGNAL_CLEANUP/sudoers.d/oshioki" ] || fail "backup cleanup signal restored the blanket rule"
+
+# If removing the owned blanket rule is interrupted, the legacy plugin must
+# still be present. The injected rm failure occurs before rewrite_block.
+REMOVE_INTERRUPT="$TEST_ROOT/remove-interrupt"; mkdir -p "$REMOVE_INTERRUPT/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$REMOVE_INTERRUPT/state/devices.json"
+printf '#includedir %s\n' "$REMOVE_INTERRUPT/sudoers.d" > "$REMOVE_INTERRUPT/sudoers"
+run_installer --sudo-user testuser "$REMOVE_INTERRUPT" --prelaunch >"$REMOVE_INTERRUPT/first.log" 2>&1
+remove_conf_hash="$(sha256_file "$REMOVE_INTERRUPT/sudo.conf")"
+if FAIL_REMOVE_SUDOERS_ONCE=1 run_installer "$REMOVE_INTERRUPT" --prelaunch >"$REMOVE_INTERRUPT/fail.log" 2>&1; then fail "accepted an interrupted sudoers removal"; fi
+[ "$(sha256_file "$REMOVE_INTERRUPT/sudo.conf")" = "$remove_conf_hash" ] || fail "interrupted sudoers removal removed the legacy plugin"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$REMOVE_INTERRUPT/sudoers.d/oshioki" || fail "interrupted sudoers removal lost the blanket rule"
+
+# If rewriting sudo.conf fails after the blanket rule has been removed,
+# rollback restores the plugin first and then the verified blanket rule.
+ROLLBACK_ORDER="$TEST_ROOT/rollback-order"; mkdir -p "$ROLLBACK_ORDER/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$ROLLBACK_ORDER/state/devices.json"
+printf '#includedir %s\n' "$ROLLBACK_ORDER/sudoers.d" > "$ROLLBACK_ORDER/sudoers"
+run_installer --sudo-user testuser "$ROLLBACK_ORDER" --prelaunch >"$ROLLBACK_ORDER/first.log" 2>&1
+: > "$ROLLBACK_ORDER/trace"
+if FAIL_SUDO_CONF_MOVE=1 INSTALL_TRACE="$ROLLBACK_ORDER/trace" run_installer "$ROLLBACK_ORDER" --prelaunch >"$ROLLBACK_ORDER/fail.log" 2>&1; then fail "accepted a failed sudo.conf rewrite"; fi
+grep -Fq '# BEGIN oshioki' "$ROLLBACK_ORDER/sudo.conf" || fail "rewrite failure did not restore the legacy plugin"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$ROLLBACK_ORDER/sudoers.d/oshioki" || fail "rewrite failure did not restore the blanket rule"
+plugin_restore_line="$(awk -F: -v destination="$ROLLBACK_ORDER/sudo.conf" '$1 == "cp" && $NF == destination { print NR; exit }' "$ROLLBACK_ORDER/trace")"
+dropin_restore_line="$(awk -F: -v destination="$ROLLBACK_ORDER/sudoers.d/oshioki" '$1 == "cp" && $NF == destination { print NR; exit }' "$ROLLBACK_ORDER/trace")"
+[ -n "$plugin_restore_line" ] || fail "rollback trace did not restore sudo.conf"
+[ -n "$dropin_restore_line" ] || fail "rollback trace did not restore the sudoers rule"
+[ "$plugin_restore_line" -lt "$dropin_restore_line" ] || fail "rollback restored the blanket rule before the legacy plugin"
+
+# The dry plan is reviewable before any live change and presents the same
+# ordering as the real transition.
+DRY_ORDER="$TEST_ROOT/dry-order"; mkdir -p "$DRY_ORDER/state" "$DRY_ORDER/sudoers.d"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$DRY_ORDER/state/devices.json"
+printf '#includedir %s\n' "$DRY_ORDER/sudoers.d" > "$DRY_ORDER/sudoers"
+printf '%s\n' '# BEGIN oshioki' "Plugin approval_exec $DRY_ORDER/plugin/$PLUGIN_NAME" '# END oshioki' > "$DRY_ORDER/sudo.conf"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$DRY_ORDER/sudoers.d/oshioki"
+run_installer --sudo-user testuser "$DRY_ORDER" --prelaunch --dry-run >"$DRY_ORDER/dry.log" 2>&1
+dry_dropin_line="$(grep -nF "DRY: remove $DRY_ORDER/sudoers.d/oshioki" "$DRY_ORDER/dry.log" | head -n1 | cut -d: -f1)"
+dry_plugin_line="$(grep -nF "DRY: remove the managed Oshioki plugin block from $DRY_ORDER/sudo.conf" "$DRY_ORDER/dry.log" | head -n1 | cut -d: -f1)"
+[ -n "$dry_dropin_line" ] || fail "dry plan omitted sudoers removal"
+[ -n "$dry_plugin_line" ] || fail "dry plan omitted plugin removal"
+[ "$dry_dropin_line" -lt "$dry_plugin_line" ] || fail "dry plan listed plugin removal before sudoers removal"
+
+# If restoring the legacy plugin itself fails, rollback must stop with the
+# blanket rule absent. This is the recoverable state for a failed migration:
+# normal administrator policy remains available without an unprotected grant.
+PLUGIN_ROLLBACK_FAIL="$TEST_ROOT/plugin-rollback-fail"; mkdir -p "$PLUGIN_ROLLBACK_FAIL/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$PLUGIN_ROLLBACK_FAIL/state/devices.json"
+printf '#includedir %s\n' "$PLUGIN_ROLLBACK_FAIL/sudoers.d" > "$PLUGIN_ROLLBACK_FAIL/sudoers"
+run_installer --sudo-user testuser "$PLUGIN_ROLLBACK_FAIL" --prelaunch >"$PLUGIN_ROLLBACK_FAIL/first.log" 2>&1
+if FAIL_SUDO=1 FAIL_PLUGIN_RESTORE=1 run_installer "$PLUGIN_ROLLBACK_FAIL" --prelaunch >"$PLUGIN_ROLLBACK_FAIL/fail.log" 2>&1; then fail "accepted a failed plugin rollback"; fi
+grep -Fq 'rollback could not restore sudo.conf' "$PLUGIN_ROLLBACK_FAIL/fail.log" || fail "plugin rollback failure was not reported"
+if grep -Fq '# BEGIN oshioki' "$PLUGIN_ROLLBACK_FAIL/sudo.conf"; then fail "plugin rollback failure left the legacy plugin active"; fi
+[ ! -e "$PLUGIN_ROLLBACK_FAIL/sudoers.d/oshioki" ] || fail "plugin rollback failure restored the blanket rule"
 
 # If copying the plugin is interrupted after the hook copy, the disabled
 # state is retained: neither half of the old/new pair is re-enabled.
