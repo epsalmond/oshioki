@@ -599,6 +599,13 @@ helper_path_secure() {
   # No setuid and no setgid: the module runs the helper from sudo's already
   # privileged PAM process and must never grant it privilege of its own.
   case "${mode:0:1}" in 2|3|4|5|6|7) return 1 ;; esac
+  # At least one execute bit. The module's own path check rejects a helper
+  # with `mode & 0o111 == 0` as insecure, and on Linux under `default=die`
+  # that refusal fails every sudo before a password prompt is ever drawn --
+  # so precheck and status must refuse it here, where there is still somewhere
+  # to print a fix. Mirror the module's test exactly rather than demanding
+  # only the owner bit.
+  [ "$((8#$mode & 8#111))" -ne 0 ] || return 1
   directory="$(dirname "$helper")"
   while :; do
     path_is_root_owned_and_tight "$directory" || return 1
@@ -1388,9 +1395,9 @@ if [ "$MODE" = contextual-pam-status ]; then
 
   # 5. the helper the module execs, and every parent on its path.
   if helper_path_secure; then
-    pam_status_ok "helper: $SBIN_DIR/oshioki root-owned, not writable by others, not setuid"
+    pam_status_ok "helper: $SBIN_DIR/oshioki root-owned, executable, not writable by others, not setuid"
   else
-    pam_status_bad "helper: $SBIN_DIR/oshioki is missing, not root-owned, writable by others, or setuid"
+    pam_status_bad "helper: $SBIN_DIR/oshioki is missing, not root-owned, not executable, writable by others, or setuid; the module refuses it and every sudo then fails without a password prompt (fix: install -o root -g root -m 0755 the hook binary at $SBIN_DIR/oshioki)"
   fi
 
   # 6. something that can actually answer an authentication.
@@ -1448,7 +1455,7 @@ if [ "$MODE" = contextual-pam ]; then
   safe_directory "$PAM_D"
   classify_pam_services "$security_dir"
   helper_path_secure ||
-    die "helper $SBIN_DIR/oshioki is missing or on an unsafe path; install the hook before migrating"
+    die "helper $SBIN_DIR/oshioki is missing, not executable, or on an unsafe path; install the hook (root-owned, mode 0755, on a root-owned path) before migrating"
   assert_common_auth_clean ||
     die "$PAM_D/common-auth already references liboshioki_pam; refusing to touch this host"
   pam_trace "pam:prereq-ok"
