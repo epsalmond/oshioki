@@ -44,12 +44,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
-      - run: cargo build --locked --release -p oshioki-hook -p oshioki-server -p oshioki-plugin
+      # The oshioki-pam workspace member links libpam.
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
+      - run: cargo build --locked --release -p oshioki-hook -p oshioki-server -p oshioki-plugin -p oshioki-pam
       - run: |
           mkdir -p stage
           install -m 0755 target/release/oshioki target/release/oshioki-server stage/
           install -m 0644 target/release/liboshioki_plugin.so stage/
-          (cd stage && sha256sum oshioki liboshioki_plugin.so > SHA256SUMS)
+          install -m 0644 target/release/liboshioki_pam.so stage/
+          (cd stage && sha256sum oshioki liboshioki_plugin.so liboshioki_pam.so > SHA256SUMS)
           ./packaging/build-deb stage "${{ needs.gate.outputs.version }}" \
             "oshioki_${{ needs.gate.outputs.version }}_amd64.deb"
       - uses: actions/upload-artifact@v4
@@ -66,7 +69,7 @@ jobs:
       - run: scripts/build-darwin-artifact dist
       - run: |
           tar -czf "oshioki-macos-arm64-${{ needs.gate.outputs.version }}.tar.gz" -C dist \
-            oshioki oshioki.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json SHA256SUMS
+            oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: mac
