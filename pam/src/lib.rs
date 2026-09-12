@@ -2295,6 +2295,57 @@ mod tests {
         (path, pidfile)
     }
 
+    const GRANDCHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// Read a complete, usable PID from the helper's readiness file.
+    fn recorded_grandchild_pid(pidfile: &Path) -> Option<libc::pid_t> {
+        let recorded = fs::read_to_string(pidfile).ok()?;
+        let pid: libc::pid_t = recorded.trim().parse().ok()?;
+        (pid > 1).then_some(pid)
+    }
+
+    /// Wait only for helper startup readiness. A missing or malformed file
+    /// does not suppress cancellation: callers still signal after this bound,
+    /// then fail clearly without pretending to have checked a nonexistent
+    /// descendant.
+    fn wait_for_grandchild_pid(pidfile: &Path) -> bool {
+        let deadline = Instant::now() + GRANDCHILD_STARTUP_TIMEOUT;
+        while Instant::now() < deadline {
+            if recorded_grandchild_pid(pidfile).is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        recorded_grandchild_pid(pidfile).is_some()
+    }
+
+    /// Signal a helper wait once its grandchild PID is ready, or after the
+    /// bounded startup window if the helper never reaches that point. The
+    /// timestamp is sent immediately before the signal so cancellation
+    /// latency excludes startup time.
+    fn signal_after_grandchild_ready(
+        target: &ThreadHandle,
+        signal: c_int,
+        pidfile: std::path::PathBuf,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<(Instant, bool)>,
+    ) {
+        let target = target.0;
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let signaller = std::thread::spawn(move || {
+            let ready = wait_for_grandchild_pid(&pidfile);
+            let sent_at = Instant::now();
+            sent.send((sent_at, ready))
+                .expect("report signal timestamp");
+            // SAFETY: the target thread is alive until it joins this sender,
+            // and the signal is handled or blocked by the test below.
+            let status = unsafe { libc::pthread_kill(target, signal) };
+            assert_eq!(status, 0, "signal the helper-wait thread");
+        });
+        (signaller, received)
+    }
+
     /// Asserts the recorded grandchild is gone, waiting a bounded time for the
     /// kill to be reaped.
     fn assert_descendant_died(pidfile: &Path, what: &str) {
@@ -2330,27 +2381,27 @@ mod tests {
         // SAFETY: pthread_self has no pointer arguments; the handle is used
         // only while this thread is inside the wait below.
         let target = ThreadHandle(unsafe { libc::pthread_self() });
-        let signaller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            // SAFETY: the target thread blocks SIGINT, so this only makes it
-            // pending; the guard consumes it.
-            unsafe {
-                libc::pthread_kill(target.0, libc::SIGINT);
-            }
-        });
+        let (signaller, signal_info) =
+            signal_after_grandchild_ready(&target, libc::SIGINT, pidfile.clone());
 
-        let started = Instant::now();
         let result = run_helper_at(path.to_str().unwrap(), &request(), Duration::from_secs(120));
-        let elapsed = started.elapsed();
+        let (signalled_at, ready) = signal_info.recv().expect("signal timestamp");
         signaller.join().unwrap();
         drop(signals);
         drop(exclusive);
 
         assert_eq!(result, HelperOutcome::Unavailable);
         assert!(
-            elapsed < Duration::from_secs(2),
-            "the cancelled wait took {elapsed:?}"
+            signalled_at.elapsed() < Duration::from_secs(2),
+            "the cancelled wait took {:?} after the signal",
+            signalled_at.elapsed()
         );
+        if !ready {
+            cleanup(&directory);
+            panic!(
+                "helper did not record a valid grandchild PID within {GRANDCHILD_STARTUP_TIMEOUT:?}; cancellation was sent"
+            );
+        }
         assert_descendant_died(&pidfile, "a cancelled helper wait");
         cleanup(&directory);
     }
@@ -2597,27 +2648,27 @@ mod tests {
         // SAFETY: pthread_self has no pointer arguments; the handle is used
         // only while this thread is inside the wait below.
         let target = ThreadHandle(unsafe { libc::pthread_self() });
-        let signaller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            // SAFETY: the pumping thread is parked in the wait below and is
-            // joined with it, so the handle is live.
-            unsafe {
-                libc::pthread_kill(target.0, libc::SIGUSR1);
-            }
-        });
+        let (signaller, signal_info) =
+            signal_after_grandchild_ready(&target, libc::SIGUSR1, pidfile.clone());
 
-        let started = Instant::now();
         let result = run_helper_at(path.to_str().unwrap(), &request(), Duration::from_secs(120));
-        let elapsed = started.elapsed();
+        let (signalled_at, ready) = signal_info.recv().expect("signal timestamp");
         signaller.join().unwrap();
         drop(handler);
         drop(exclusive);
 
         assert_eq!(result, HelperOutcome::Unavailable);
         assert!(
-            elapsed < Duration::from_secs(2),
-            "the interrupted wait took {elapsed:?}"
+            signalled_at.elapsed() < Duration::from_secs(2),
+            "the interrupted wait took {:?} after the signal",
+            signalled_at.elapsed()
         );
+        if !ready {
+            cleanup(&directory);
+            panic!(
+                "helper did not record a valid grandchild PID within {GRANDCHILD_STARTUP_TIMEOUT:?}; cancellation was sent"
+            );
+        }
         assert_descendant_died(&pidfile, "an interrupted helper wait");
         cleanup(&directory);
     }
