@@ -176,6 +176,10 @@ sudo install-oshioki-hook --contextual-pam-status
 sudo install-oshioki-hook --disable-contextual-pam
 ```
 
+`--prelaunch-status` on a host that is on the contextual PAM lane reports the
+lane and exits 0: the approval plugin is intentionally not enabled there, and
+`--contextual-pam-status` is the check that applies.
+
 `--contextual-pam-status` exits non-zero unless every line reads `OK`.
 It finds the manifest to verify the installed module against the same way
 the install does: `target/release/SHA256SUMS` in a repo checkout, the keg's

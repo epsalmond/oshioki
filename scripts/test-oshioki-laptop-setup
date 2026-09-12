@@ -83,7 +83,26 @@ case "$mode --dry-run=$dry" in
     # marker stands in for the registry here.
     if [ -f "$AGENT_STATE/pinned" ] || [ "${DEVICES_ACTIVE:-0}" = 1 ]; then : > "$PLUGIN_ENABLED_FILE"; fi
     ;;
-  "--prelaunch-status --dry-run=0") [ -f "$PLUGIN_ENABLED_FILE" ] ;;
+  "--prelaunch-status --dry-run=0")
+    # Mirrors the real installer: a host on the contextual PAM lane has no
+    # plugin block by design and says so instead of reporting disabled.
+    if [ -n "${PAM_LANE_FILE:-}" ] && [ -f "$PAM_LANE_FILE" ]; then
+      echo "contextual PAM lane active; the approval plugin is intentionally not enabled (see --contextual-pam-status)"
+      exit 0
+    fi
+    [ -f "$PLUGIN_ENABLED_FILE" ]
+    ;;
+  "--contextual-pam --dry-run=1") echo "DRY: PAM migration plan" ;;
+  "--contextual-pam --dry-run=0")
+    [ -n "${PAM_MODULE_BIN:-}" ] || { echo "fake installer got no PAM_MODULE_BIN" >&2; exit 1; }
+    : > "$PAM_LANE_FILE"
+    rm -f "$PLUGIN_ENABLED_FILE"
+    echo "contextual PAM enabled"
+    ;;
+  "--contextual-pam-status --dry-run=0")
+    [ -f "$PAM_LANE_FILE" ] || { echo "FAIL  pam entries: absent" >&2; exit 1; }
+    echo "OK    pam entries: sudo_local=present"
+    ;;
   *) echo "fake installer saw unexpected call: $mode dry=$dry" >&2; exit 1 ;;
 esac
 SH
@@ -265,6 +284,8 @@ run_setup() {
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
     APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
     PLUGIN_ENABLED_FILE="$TEST_ROOT/plugin-enabled" \
+    PAM_LANE_FILE="$TEST_ROOT/pam-lane" \
+    PAM_MODULE_BIN="${PAM_MODULE_BIN:-$TEST_ROOT/stage/liboshioki_pam.so}" \
     CALL_LOG="$TEST_ROOT/calls.log" \
     HOLDER_PIDS="$TEST_ROOT/holder-pids" \
     SUDO="$TEST_ROOT/fake-bin/sudo" \
@@ -358,6 +379,24 @@ fi
 if [ "$(uname -s)" = Darwin ]; then
   grep -Fq 'agent socket is live' "$TEST_ROOT/fresh.log" || fail "verify never completed"
 fi
+
+# --contextual-pam runs the migration and, on a host already on the lane,
+# still reaches it: the final verify asks --prelaunch-status, which reports
+# the lane rather than calling the install disabled. Before that, the verify
+# exited non-zero and the migration never ran.
+: > "$TEST_ROOT/pam-lane"
+: > "$AGENT_STATE/agent.json"
+: > "$TEST_ROOT/stage/liboshioki_pam.so"
+DEVICES_ACTIVE=1 run_setup --yes --contextual-pam >"$TEST_ROOT/ctxpam.log" 2>&1 ||
+  { sed -n '1,40p' "$TEST_ROOT/ctxpam.log" >&2; fail "--contextual-pam on a lane host did not finish"; }
+grep -Fq 'contextual PAM lane active' "$TEST_ROOT/ctxpam.log" ||
+  fail "the verify step did not report the lane"
+grep -Fq 'contextual PAM migration requested' "$TEST_ROOT/ctxpam.log" ||
+  fail "--contextual-pam never reached the migration"
+grep -Fq 'OK    pam entries' "$TEST_ROOT/ctxpam.log" ||
+  fail "--contextual-pam never ran its own status"
+rm -f "$TEST_ROOT/pam-lane" "$TEST_ROOT/stage/liboshioki_pam.so"
+: > "$TEST_ROOT/plugin-enabled"
 
 # A session with no unlocked login keychain is named as such, before the
 # setup mistakes it for a missing identity and enrols a second device.

@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name, since the tarball renames it and verification is by file name. An
   explicit variable still wins, and an unbuilt checkout still fails by naming
   `target/release`.
+- `install-oshioki-hook --prelaunch-status` names the contextual PAM lane
+  instead of reporting `disabled` on a host that is on it. A lane host has no
+  plugin block in `sudo.conf` by design, and `--prelaunch` says so as it
+  installs; answering `disabled` was a true statement about the plugin and a
+  false one about the install. It made `oshioki-laptop-setup
+  --contextual-pam` fail its own final verify and exit before it ever reached
+  the migration it was asked for. Off the lane the answer is unchanged.
 - `oshioki enroll` bounds its wait on the approval transport, the way `check`
   and `authenticate` already did. It prints nothing until the enrollment
   intent has been published, so a NATS host that blackholes rather than

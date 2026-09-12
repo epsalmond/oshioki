@@ -1256,6 +1256,17 @@ validate_visudo() {
 }
 
 if [ "$MODE" = prelaunch-status ]; then
+  # A host on the contextual PAM lane has no plugin block in sudo.conf by
+  # design: --prelaunch installs the artifacts there and says it is leaving
+  # the lane alone. Answering "disabled" is a true statement about the
+  # plugin and a false one about the install, and it is what made
+  # `oshioki-laptop-setup --contextual-pam` fail its own final verify before
+  # it ever reached the migration. Name the lane and point at the status
+  # command that applies to it.
+  if pam_lane_active; then
+    echo "contextual PAM lane active; the approval plugin is intentionally not enabled (see --contextual-pam-status)"
+    exit 0
+  fi
   [ -f "$SUDO_CONF" ] || { echo "disabled"; exit 1; }
   validate_block "$SUDO_CONF"
   begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"

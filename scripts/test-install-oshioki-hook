@@ -1513,6 +1513,28 @@ fi
 grep -Fq 'cannot resolve symlink' "$KEG_HOST/readlink.log" ||
   fail "a failing readlink was not reported: $(head -1 "$KEG_HOST/readlink.log")"
 
+# A host on the contextual PAM lane answers --prelaunch-status by naming the
+# lane, not by calling the install disabled. The plugin block is absent
+# there on purpose, and reporting "disabled" made oshioki-laptop-setup
+# --contextual-pam fail its own final verify before it reached the
+# migration.
+LANE_STATUS="$TEST_ROOT/pam-lane-prelaunch-status"
+setup_legacy_host "$LANE_STATUS" ubuntu-24.04
+run_installer --sudo-user testuser "$LANE_STATUS" --contextual-pam >"$LANE_STATUS/install.log" 2>&1 ||
+  fail "lane fixture could not install"
+run_installer --sudo-user testuser "$LANE_STATUS" --prelaunch-status >"$LANE_STATUS/status.log" 2>&1 ||
+  { sed -n '1,5p' "$LANE_STATUS/status.log" >&2; fail "prelaunch-status called a contextual PAM host disabled"; }
+grep -Fq 'contextual PAM lane active' "$LANE_STATUS/status.log" ||
+  fail "prelaunch-status did not name the contextual PAM lane: $(head -1 "$LANE_STATUS/status.log")"
+# Disabling the lane puts the ordinary answer back.
+run_installer --sudo-user testuser "$LANE_STATUS" --disable-contextual-pam >"$LANE_STATUS/disable.log" 2>&1 ||
+  { sed -n '1,5p' "$LANE_STATUS/disable.log" >&2; fail "lane fixture could not be disabled"; }
+if run_installer --sudo-user testuser "$LANE_STATUS" --prelaunch-status >"$LANE_STATUS/after.log" 2>&1; then
+  fail "prelaunch-status reported enabled with no plugin block and no lane"
+fi
+grep -Fq disabled "$LANE_STATUS/after.log" ||
+  fail "prelaunch-status off the lane did not report disabled: $(head -1 "$LANE_STATUS/after.log")"
+
 # The brew user's bare lane: a keg laid out exactly as the formula lays it
 # out -- hook and scripts in bin, plugin under its installed name and the
 # module and SHA256SUMS in libexec -- driven through a /opt/homebrew/bin
