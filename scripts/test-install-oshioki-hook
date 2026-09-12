@@ -1720,4 +1720,43 @@ fi
 cmp -s "$MAC_GONE/pristine/sudo_local" "$MAC_GONE/pam.d/sudo_local" ||
   fail "macOS: disable did not restore sudo_local byte for byte"
 
+# A sudo_local the installer created itself holds nothing but our header once
+# the block is stripped, so disable removes the file rather than leaving an
+# empty one behind.
+MAC_CREATED_DISABLE="$TEST_ROOT/pam-macos-created-disable"
+setup_darwin_host "$MAC_CREATED_DISABLE" macos-15-no-sudo-local
+run_darwin_installer --sudo-user testuser "$MAC_CREATED_DISABLE" --contextual-pam \
+  >"$MAC_CREATED_DISABLE/install.log" 2>&1 ||
+  fail "macOS: created-sudo_local disable setup could not install"
+[ -f "$MAC_CREATED_DISABLE/pam.d/sudo_local" ] ||
+  fail "macOS: created-sudo_local setup wrote no sudo_local"
+INSTALL_TRACE="$MAC_CREATED_DISABLE/trace" \
+  run_darwin_installer "$MAC_CREATED_DISABLE" --disable-contextual-pam \
+  >"$MAC_CREATED_DISABLE/log" 2>&1 ||
+  { sed -n '1,20p' "$MAC_CREATED_DISABLE/log" >&2; fail "macOS: created-sudo_local disable failed"; }
+[ ! -e "$MAC_CREATED_DISABLE/pam.d/sudo_local" ] ||
+  fail "macOS: disable left behind the comment-only sudo_local the installer created"
+grep -q '^pam:disable:file-removed:sudo_local$' "$MAC_CREATED_DISABLE/trace" ||
+  fail "macOS: the disable trace records no sudo_local removal"
+cmp -s "$MAC_CREATED_DISABLE/pristine/sudo" "$MAC_CREATED_DISABLE/pam.d/sudo" ||
+  fail "macOS: created-sudo_local disable edited /etc/pam.d/sudo"
+
+# One administrator line in the same created file makes it theirs: disable
+# strips only our own block and the file stays.
+MAC_ADOPTED="$TEST_ROOT/pam-macos-adopted-sudo-local"
+setup_darwin_host "$MAC_ADOPTED" macos-15-no-sudo-local
+run_darwin_installer --sudo-user testuser "$MAC_ADOPTED" --contextual-pam \
+  >"$MAC_ADOPTED/install.log" 2>&1 ||
+  fail "macOS: adopted-sudo_local setup could not install"
+printf 'auth       sufficient     pam_tid.so\n' >> "$MAC_ADOPTED/pam.d/sudo_local"
+run_darwin_installer "$MAC_ADOPTED" --disable-contextual-pam >"$MAC_ADOPTED/log" 2>&1 ||
+  { sed -n '1,20p' "$MAC_ADOPTED/log" >&2; fail "macOS: adopted-sudo_local disable failed"; }
+[ -f "$MAC_ADOPTED/pam.d/sudo_local" ] ||
+  fail "macOS: disable removed a sudo_local carrying administrator content"
+grep -Fxq 'auth       sufficient     pam_tid.so' "$MAC_ADOPTED/pam.d/sudo_local" ||
+  fail "macOS: disable did not preserve the administrator pam_tid line"
+if grep -Fq liboshioki_pam "$MAC_ADOPTED/pam.d/sudo_local"; then
+  fail "macOS: disable left our module referenced in an adopted sudo_local"
+fi
+
 echo "test-install-oshioki-hook: PASS"

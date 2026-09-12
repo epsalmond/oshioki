@@ -504,6 +504,10 @@ validate_block() {
 # ---------------------------------------------------------------------------
 PAM_BEGIN_MARK='# BEGIN oshioki pam'
 PAM_END_MARK='# END oshioki pam'
+# The only line this installer ever puts in a PAM service file it created
+# itself (macOS sudo_local, which a stock host may not have). write_pam_block
+# writes it and the disable path recognises it, so the two cannot drift.
+PAM_CREATED_HEADER='# sudo_local: created by install-oshioki-hook --contextual-pam'
 PAM_D="${PAM_D:-/etc/pam.d}"
 PAM_MODULE_BIN="${PAM_MODULE_BIN:-}"
 PAM_MULTIARCH_FILE="${OSHIOKI_PAM_MULTIARCH:-/usr/share/oshioki/pam-multiarch}"
@@ -942,8 +946,8 @@ write_pam_block() {
         }
       ' "$file" > "$tmp" || { rm -f "$tmp"; die "could not rewrite $file"; }
     else
-      printf '# sudo_local: created by install-oshioki-hook --contextual-pam\n%s\n%s\n%s\n' \
-        "$PAM_BEGIN_MARK" "$line" "$PAM_END_MARK" > "$tmp"
+      printf '%s\n%s\n%s\n%s\n' \
+        "$PAM_CREATED_HEADER" "$PAM_BEGIN_MARK" "$line" "$PAM_END_MARK" > "$tmp"
     fi
   else
     [ -f "$file" ] || { rm -f "$tmp"; die "missing PAM service file: $file"; }
@@ -988,6 +992,22 @@ remove_pam_block() {
     { rm -f "$tmp"; die "could not rewrite $file"; }
   pam_match_trailing_newline "$file" "$tmp" || { rm -f "$tmp" "$tmp.notrail"; die "could not rewrite $file"; }
   chmod 0644 "$tmp"; chown "root:$ROOT_GROUP" "$tmp"; mv -f "$tmp" "$file"
+}
+
+# True when nothing is left in $1 but the header this installer wrote and
+# blank lines -- i.e. the file exists only because a first install created it
+# (macOS sudo_local) and stripping our block emptied it of meaning. Any other
+# line, comment or not, means an administrator owns the file and it stays.
+pam_file_is_ours_and_empty() {
+  local file="$1" line
+  [ -f "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$PAM_CREATED_HEADER") ;;
+      *) [ -z "${line//[[:space:]]/}" ] || return 1 ;;
+    esac
+  done < "$file"
+  return 0
 }
 
 pam_backups=""
@@ -1750,6 +1770,15 @@ EOF
   # other way round.
   validate_sudo || die "sudo -V failed after removing the PAM entries; the module is still installed"
   pam_trace "pam:disable:sudo-validated"
+  # A first install on macOS creates sudo_local; stripping the block back out
+  # would otherwise leave behind a file containing nothing but the header the
+  # installer itself wrote. Remove what we created, and only that.
+  for service in $PAM_SERVICES; do
+    if pam_file_is_ours_and_empty "$PAM_D/$service"; then
+      rm -f "$PAM_D/$service" || die "could not remove $PAM_D/$service"
+      pam_trace "pam:disable:file-removed:$service"
+    fi
+  done
   # Someone else's reference to our module is not ours to strand. Unlinking
   # the file while any service still names it is exactly the
   # referenced-but-missing state this ordering exists to prevent.
