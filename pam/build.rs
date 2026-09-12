@@ -29,14 +29,40 @@
 /// architecture the tap bottles.
 const DEFAULT_INSTALL_NAME: &str = "/opt/homebrew/opt/oshioki/libexec/liboshioki_pam.dylib";
 
+/// Rejects an override that would not survive the linker command line. The
+/// value is spliced into `-Wl,-install_name,<name>`: a comma there splits
+/// into extra ld64 arguments, and a newline ends the `cargo:` directive and
+/// starts whatever the rest of the value spells. A relative path would link
+/// silently and only fail later, in Homebrew's fixup.
+fn checked_install_name(var: &str, name: &str) -> String {
+    assert!(!name.is_empty(), "{var} is empty; unset it or give a path");
+    assert!(
+        name.starts_with('/'),
+        "{var} must be an absolute path, got {name:?}"
+    );
+    assert!(
+        !name.contains(','),
+        "{var} must not contain a comma: it would split into further linker \
+         arguments. Got {name:?}"
+    );
+    assert!(
+        !name.contains(['\n', '\r']),
+        "{var} must not contain a newline: it would inject cargo directives. \
+         Got {name:?}"
+    );
+    name.to_owned()
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=OSHIOKI_PAM_INSTALL_NAME");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
-    let name = std::env::var("OSHIOKI_PAM_INSTALL_NAME")
-        .unwrap_or_else(|_| DEFAULT_INSTALL_NAME.to_owned());
+    let name = match std::env::var("OSHIOKI_PAM_INSTALL_NAME") {
+        Ok(name) => checked_install_name("OSHIOKI_PAM_INSTALL_NAME", &name),
+        Err(_) => DEFAULT_INSTALL_NAME.to_owned(),
+    };
     // cdylib-only: a plain `rustc-link-arg` would also reach the test
     // harness binary, and `-install_name` on an executable is an error.
     // rustc emits its own `-install_name` first; ld64 takes the last one.

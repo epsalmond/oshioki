@@ -135,6 +135,12 @@ shipped bytes survive. `otool -D` on either file must print its own
 `libexec` path; if it prints anything else the next bottle will fail
 verification again.
 
+That id travels with the release tarball, so a module installed from it at
+`/usr/local/lib/pam/liboshioki_pam.dylib` also reports the Homebrew `opt`
+path under `otool -D`. Expected, and inert: sudo and OpenPAM both `dlopen`
+by the absolute path they were given, and `LC_ID_DYLIB` only names a library
+for things that link against it. Nothing links against a PAM module.
+
 Never run the migration without a recovery path already open: a second root
 shell (`sudo -i`) held for the whole run, and a verified console or `pkexec`
 fallback, both established *before* the first `--contextual-pam`. Inspect and
