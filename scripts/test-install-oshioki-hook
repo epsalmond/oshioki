@@ -266,6 +266,7 @@ run_installer() {
     PAM_D="$root/pam.d" PAM_SECURITY_DIR="${PAM_SECURITY_DIR-$root/security}" \
     PAM_MODULE_BIN="${PAM_MODULE_BIN-$TEST_ROOT/service/target/release/$PAM_MODULE_ARTIFACT}" \
     OSHIOKI_PAM_MULTIARCH="${OSHIOKI_PAM_MULTIARCH:-$root/absent-multiarch}" \
+    OSHIOKI_INSTALL_FAULT_INJECTION="${OSHIOKI_INSTALL_FAULT_INJECTION:-1}" \
     FAIL_PAM_MODULE_INSTALL="${FAIL_PAM_MODULE_INSTALL:-0}" \
     FAIL_PAM_SELFTEST="${FAIL_PAM_SELFTEST:-0}" \
     FAIL_PAM_EDIT="${FAIL_PAM_EDIT:-}" \
@@ -1038,6 +1039,19 @@ if INSTALL_TRACE="$FAULT_SIGNAL/trace" SIGNAL_AFTER_PAM_EDIT=1 \
 fi
 assert_rollback_chain "$FAULT_SIGNAL/trace" 'TERM between edits'
 assert_legacy_restored "$FAULT_SIGNAL" 'TERM between edits'
+
+# The fault-injection names are inert without the explicit opt-in, so an
+# environment that happens to carry FAIL_PAM_MODULE_INSTALL into a real root
+# installer cannot abort or signal the migration.
+NO_FAULT_OPTIN="$TEST_ROOT/pam-fault-optin-absent"
+setup_legacy_host "$NO_FAULT_OPTIN" ubuntu-24.04
+OSHIOKI_INSTALL_FAULT_INJECTION=0 INSTALL_TRACE="$NO_FAULT_OPTIN/trace" \
+  FAIL_PAM_MODULE_INSTALL=1 FAIL_PAM_SELFTEST=1 FAIL_PAM_EDIT=sudo SIGNAL_AFTER_PAM_EDIT=1 \
+  run_installer --sudo-user testuser "$NO_FAULT_OPTIN" --contextual-pam \
+  >"$NO_FAULT_OPTIN/log" 2>&1 ||
+  { sed -n '1,40p' "$NO_FAULT_OPTIN/log" >&2; fail "fault names were honoured without the opt-in"; }
+grep -q '^pam:edit:sudo$' "$NO_FAULT_OPTIN/trace" ||
+  fail "the migration did not complete with the fault names set but not opted in"
 
 # --- disable ordering -----------------------------------------------------
 DISABLE="$TEST_ROOT/pam-disable"

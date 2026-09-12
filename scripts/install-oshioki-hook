@@ -1434,10 +1434,23 @@ if [ "$MODE" = contextual-pam ]; then
   # Test-only fault injection, in the same class as SKIP_NODEVER above. Each
   # name marks one step of the migration so the rollback chain can be
   # asserted from the outside; none of them is a supported operator control.
-  FAIL_PAM_MODULE_INSTALL="${FAIL_PAM_MODULE_INSTALL:-0}"
-  FAIL_PAM_SELFTEST="${FAIL_PAM_SELFTEST:-0}"
-  FAIL_PAM_EDIT="${FAIL_PAM_EDIT:-}"
-  SIGNAL_AFTER_PAM_EDIT="${SIGNAL_AFTER_PAM_EDIT:-0}"
+  # This installer runs as root, so the four names below are only read at all
+  # when OSHIOKI_INSTALL_FAULT_INJECTION=1 is set explicitly -- one opt-in
+  # that the test harness sets and nothing else does. Without it they are
+  # forced inert here regardless of what the environment carried in, so a
+  # stray FAIL_PAM_* or SIGNAL_AFTER_PAM_EDIT can neither abort a real
+  # migration nor make it signal itself.
+  if [ "${OSHIOKI_INSTALL_FAULT_INJECTION:-0}" = 1 ]; then
+    FAIL_PAM_MODULE_INSTALL="${FAIL_PAM_MODULE_INSTALL:-0}"
+    FAIL_PAM_SELFTEST="${FAIL_PAM_SELFTEST:-0}"
+    FAIL_PAM_EDIT="${FAIL_PAM_EDIT:-}"
+    SIGNAL_AFTER_PAM_EDIT="${SIGNAL_AFTER_PAM_EDIT:-0}"
+  else
+    FAIL_PAM_MODULE_INSTALL=0
+    FAIL_PAM_SELFTEST=0
+    FAIL_PAM_EDIT=""
+    SIGNAL_AFTER_PAM_EDIT=0
+  fi
 
   # --- Step 1: prerequisites. Nothing on this host has changed yet, so a
   # refusal here is total and costs the administrator nothing.
