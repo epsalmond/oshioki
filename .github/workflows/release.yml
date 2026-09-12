@@ -44,6 +44,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
+      # The oshioki-pam workspace member links libpam.
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
       - run: cargo build --locked --release -p oshioki-hook -p oshioki-server -p oshioki-plugin -p oshioki-pam
       - run: |
           mkdir -p stage
