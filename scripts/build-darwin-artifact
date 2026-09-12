@@ -11,7 +11,7 @@ TARGET="aarch64-apple-darwin"
 cd "$ROOT"
 # The agent links Security.framework and LocalAuthentication through
 # oshioki-enclave, so it builds here and nowhere else.
-cargo build --locked --release --target "$TARGET" -p oshioki-hook -p oshioki-plugin -p oshioki-agent -p oshioki-server
+cargo build --locked --release --target "$TARGET" -p oshioki-hook -p oshioki-plugin -p oshioki-agent -p oshioki-server -p oshioki-pam
 mkdir -p "$OUTPUT"
 install -m 0755 "target/$TARGET/release/oshioki" "$OUTPUT/oshioki"
 install -m 0755 "target/$TARGET/release/liboshioki_plugin.dylib" "$OUTPUT/oshioki.dylib"
@@ -23,6 +23,23 @@ install -m 0755 "target/$TARGET/release/liboshioki_plugin.dylib" "$OUTPUT/oshiok
 # absolute path, so the install name itself is never used at load time.
 install_name_tool -id oshioki.dylib "$OUTPUT/oshioki.dylib"
 codesign --force --sign - "$OUTPUT/oshioki.dylib"
+# The PAM module keeps its own name here: install-oshioki-hook looks the
+# artifact up in SHA256SUMS under exactly liboshioki_pam.dylib before it will
+# install it, and the macOS auth line names the same file.
+install -m 0644 "target/$TARGET/release/liboshioki_pam.dylib" "$OUTPUT/liboshioki_pam.dylib"
+# Unlike the plugin, this one gets its final absolute install name: sudo
+# dlopens the plugin by path, but OpenPAM resolves a module through the
+# dyld cache first, and a stale CI build path there is the difference between
+# loading our module and loading nothing. The installer places the file at
+# exactly this path.
+install_name_tool -id /usr/local/lib/pam/liboshioki_pam.dylib "$OUTPUT/liboshioki_pam.dylib"
+# Ad hoc for now, same as the plugin above, and for the same reason: nothing
+# in the current lane verifies a team signature. A release lane that signs
+# with a Developer ID substitutes the identity here and adds --options
+# runtime --timestamp, exactly as scripts/mac/bundle-agent does for the agent
+# binary and its bundle (see its signing block), followed by
+# `codesign --verify --strict`.
+codesign --force --sign - "$OUTPUT/liboshioki_pam.dylib"
 install -m 0755 "target/$TARGET/release/oshioki-agent" "$OUTPUT/oshioki-agent"
 install -m 0755 "target/$TARGET/release/oshioki-server" "$OUTPUT/oshioki-server"
 install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$OUTPUT/install-oshioki-hook"
@@ -33,6 +50,7 @@ mode_of() { if stat -f '%Lp' "$1" >/dev/null 2>&1; then stat -f '%Lp' "$1"; else
 hash_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 hook_hash="$(hash_of "$OUTPUT/oshioki")"
 plugin_hash="$(hash_of "$OUTPUT/oshioki.dylib")"
+pam_hash="$(hash_of "$OUTPUT/liboshioki_pam.dylib")"
 agent_hash="$(hash_of "$OUTPUT/oshioki-agent")"
 installer_hash="$(hash_of "$OUTPUT/install-oshioki-hook")"
 setup_hash="$(hash_of "$OUTPUT/oshioki-laptop-setup")"
@@ -40,16 +58,19 @@ server_hash="$(hash_of "$OUTPUT/oshioki-server")"
 phone_setup_hash="$(hash_of "$OUTPUT/oshioki-phone-setup")"
 toolchain="$(rustc --version --verbose | tr '\n' ';')"
 cat > "$OUTPUT/manifest.json" <<EOF
-{"schema_version":1,"target":"$TARGET","revision":"$REVISION","toolchain":"$toolchain","files":[{"name":"oshioki","mode":"$(mode_of "$OUTPUT/oshioki")","sha256":"$hook_hash","media_type":"application/vnd.oshioki.hook.v1"},{"name":"oshioki.dylib","mode":"$(mode_of "$OUTPUT/oshioki.dylib")","sha256":"$plugin_hash","media_type":"application/vnd.oshioki.plugin.v1"},{"name":"oshioki-agent","mode":"$(mode_of "$OUTPUT/oshioki-agent")","sha256":"$agent_hash","media_type":"application/vnd.oshioki.agent.v1"},{"name":"install-oshioki-hook","mode":"$(mode_of "$OUTPUT/install-oshioki-hook")","sha256":"$installer_hash","media_type":"application/vnd.oshioki.installer.v1"},{"name":"oshioki-laptop-setup","mode":"$(mode_of "$OUTPUT/oshioki-laptop-setup")","sha256":"$setup_hash","media_type":"application/vnd.oshioki.setup.v1"},{"name":"oshioki-server","mode":"$(mode_of "$OUTPUT/oshioki-server")","sha256":"$server_hash","media_type":"application/vnd.oshioki.server.v1"},{"name":"oshioki-phone-setup","mode":"$(mode_of "$OUTPUT/oshioki-phone-setup")","sha256":"$phone_setup_hash","media_type":"application/vnd.oshioki.phone-setup.v1"}]}
+{"schema_version":1,"target":"$TARGET","revision":"$REVISION","toolchain":"$toolchain","files":[{"name":"oshioki","mode":"$(mode_of "$OUTPUT/oshioki")","sha256":"$hook_hash","media_type":"application/vnd.oshioki.hook.v1"},{"name":"oshioki.dylib","mode":"$(mode_of "$OUTPUT/oshioki.dylib")","sha256":"$plugin_hash","media_type":"application/vnd.oshioki.plugin.v1"},{"name":"liboshioki_pam.dylib","mode":"$(mode_of "$OUTPUT/liboshioki_pam.dylib")","sha256":"$pam_hash","media_type":"application/vnd.oshioki.pam.v1"},{"name":"oshioki-agent","mode":"$(mode_of "$OUTPUT/oshioki-agent")","sha256":"$agent_hash","media_type":"application/vnd.oshioki.agent.v1"},{"name":"install-oshioki-hook","mode":"$(mode_of "$OUTPUT/install-oshioki-hook")","sha256":"$installer_hash","media_type":"application/vnd.oshioki.installer.v1"},{"name":"oshioki-laptop-setup","mode":"$(mode_of "$OUTPUT/oshioki-laptop-setup")","sha256":"$setup_hash","media_type":"application/vnd.oshioki.setup.v1"},{"name":"oshioki-server","mode":"$(mode_of "$OUTPUT/oshioki-server")","sha256":"$server_hash","media_type":"application/vnd.oshioki.server.v1"},{"name":"oshioki-phone-setup","mode":"$(mode_of "$OUTPUT/oshioki-phone-setup")","sha256":"$phone_setup_hash","media_type":"application/vnd.oshioki.phone-setup.v1"}]}
 EOF
 (
   cd "$OUTPUT"
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; fi
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; fi
 )
-for artifact in oshioki oshioki.dylib oshioki-agent oshioki-server; do
+for artifact in oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server; do
   file "$OUTPUT/$artifact" | grep -q 'arm64'
 done
 nm -gU "$OUTPUT/oshioki.dylib" | grep -Eq '(_)?approval_exec$'
+# A PAM module with no pam_sm_authenticate is a module OpenPAM will load and
+# then ignore.
+nm -gU "$OUTPUT/liboshioki_pam.dylib" | grep -Eq '(_)?pam_sm_authenticate$'
 # The agent is useless without the enclave; a build that dropped the framework
 # would still run and only fail at the first signature.
 otool -L "$OUTPUT/oshioki-agent" | grep -q 'LocalAuthentication'

@@ -2,8 +2,8 @@ use std::{path::Path, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use oshioki_protocol::{
-    DecisionV1, DeliveryV1, DeviceKindV1, DevicePublicRecordV1, EnrollmentStatusV1,
-    EnrollmentSubmissionV1, RequestEnvelopeV1, native_credential_id,
+    AuthDecisionV1, AuthEnvelopeV1, DecisionV1, DeliveryV1, DeviceKindV1, DevicePublicRecordV1,
+    EnrollmentStatusV1, EnrollmentSubmissionV1, RequestEnvelopeV1, native_credential_id,
 };
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::Serialize;
@@ -472,6 +472,240 @@ impl Store {
         Ok(InsertResult::Inserted)
     }
 
+    /// Stores one contextual sudo authentication envelope.
+    ///
+    /// Deliberately a separate table from `requests` rather than a type
+    /// column on it: the two lanes answer different questions, and keeping
+    /// their rows apart is what makes a legacy approval posted against an
+    /// authentication id — or the reverse — a plain "no such request"
+    /// instead of a lookup that half succeeds. Raw bytes and their hash are
+    /// kept exactly as `ingest_request` keeps them: the sealed body is what
+    /// a device signs, and the server never re-serializes it.
+    pub fn ingest_auth_request(
+        &self,
+        raw: &[u8],
+        envelope: &AuthEnvelopeV1,
+        now: i64,
+    ) -> Result<InsertResult> {
+        if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
+            bail!("oversized authentication envelope");
+        }
+        envelope
+            .validate_at(now)
+            .context("validate authentication envelope")?;
+        let hash = Sha256::digest(raw).to_vec();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old_hash = transaction
+            .query_row(
+                "SELECT envelope_hash FROM auth_requests WHERE id=?1",
+                [&envelope.request_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        if let Some(old_hash) = old_hash {
+            if old_hash == hash {
+                return Ok(InsertResult::Identical);
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO tombstones(kind, object_id, payload_hash, expires_at) VALUES ('auth_request_conflict', ?1, ?2, ?3)",
+                params![
+                    envelope.request_id,
+                    hash,
+                    envelope
+                        .expires_at
+                        .min(now.saturating_add(SERVER_REQUEST_RETENTION_SECS))
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok(InsertResult::Conflict);
+        }
+        transaction.execute(
+            "INSERT INTO auth_requests(id, envelope_hash, envelope_json, host, issued_at, expires_at, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+            params![
+                envelope.request_id,
+                hash,
+                raw,
+                envelope.host,
+                envelope.issued_at,
+                envelope.expires_at,
+                now,
+            ],
+        )?;
+        for body in &envelope.sealed {
+            transaction.execute(
+                "INSERT INTO auth_sealed_bodies(request_id, fingerprint, body_json) VALUES (?1, ?2, ?3)",
+                params![
+                    envelope.request_id,
+                    body.device_fingerprint,
+                    serde_json::to_vec(body)?
+                ],
+            )?;
+        }
+        // Same rule as the command lane: a delivery receipt is a relay
+        // commitment for an enrolled browser recipient, never evidence that
+        // a browser opened anything. The authenticated AliveV1 POST remains
+        // the only signal that says a browser did.
+        let has_active_browser = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM auth_sealed_bodies b
+                 JOIN devices d ON d.fingerprint=b.fingerprint
+                 WHERE b.request_id=?1 AND d.active=1
+                   AND COALESCE(json_extract(d.public_record_json, '$.kind'), 'webauthn')='webauthn'
+             )",
+            [&envelope.request_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if has_active_browser {
+            let delivery = serde_json::to_vec(&DeliveryV1::for_request(&envelope.request_id))?;
+            transaction.execute(
+                "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at)
+                 VALUES ('delivery', ?1, ?2, ?3, unixepoch())",
+                params![
+                    envelope.request_id,
+                    format!("oshioki.delivery.{}", envelope.request_id),
+                    delivery
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(InsertResult::Inserted)
+    }
+
+    /// The sealed authentication body addressed to the device holding this
+    /// API token, while the request is still answerable.
+    pub fn sealed_auth_request_for_token(
+        &self,
+        request_id: &str,
+        token: &[u8],
+        now: i64,
+    ) -> Result<Option<SealedRequest>> {
+        let token_hash = Sha256::digest(token).to_vec();
+        self.lock()?.query_row(
+            "SELECT CAST(b.body_json AS TEXT), r.expires_at FROM auth_requests r
+             JOIN auth_sealed_bodies b ON b.request_id=r.id
+             JOIN devices d ON d.fingerprint=b.fingerprint
+             WHERE r.id=?1 AND r.state='pending' AND r.expires_at>?2 AND d.active=1 AND d.api_token_hash=?3",
+            params![request_id, now, token_hash],
+            |row| Ok(SealedRequest { body_json: row.get(0)?, expires_at: row.get(1)? }),
+        ).optional().map_err(Into::into)
+    }
+
+    /// Records one authentication assertion and queues it for the verdict
+    /// subject the hook is waiting on.
+    ///
+    /// There is no denial counterpart, here or anywhere on this lane: an
+    /// authentication either produces a hardware assertion or nothing at
+    /// all, and the host then asks for a password.
+    pub fn queue_auth_decision(
+        &self,
+        request_id: &str,
+        fingerprint: &str,
+        decision: &AuthDecisionV1,
+        now: i64,
+    ) -> Result<InsertResult> {
+        let raw = serde_json::to_vec(decision)?;
+        let hash = Sha256::digest(&raw).to_vec();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = transaction
+            .query_row(
+                "SELECT state, expires_at, decision_hash FROM auth_requests WHERE id=?1",
+                [request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((state, expires_at, old_hash)) = row else {
+            bail!("unknown authentication request")
+        };
+        if expires_at <= now {
+            bail!("expired authentication request");
+        }
+        // Ownership on this lane also means assurance: only a hardware kind
+        // may answer an authentication. The hook re-checks this against its
+        // own pinned registry before it accepts anything, but a software
+        // device must not even be able to occupy the request by answering
+        // first. `kind` is stored as its wire spelling inside
+        // `public_record_json`; records written before native devices
+        // existed carry no field and are WebAuthn, as elsewhere.
+        let owns = transaction
+            .query_row(
+                "SELECT 1 FROM auth_sealed_bodies b JOIN devices d ON d.fingerprint=b.fingerprint
+             WHERE b.request_id=?1 AND b.fingerprint=?2 AND d.active=1
+               AND COALESCE(json_extract(d.public_record_json, '$.kind'), 'webauthn')
+                   IN ('webauthn', 'secure-enclave')",
+                params![request_id, fingerprint],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !owns {
+            bail!("device does not own authentication request");
+        }
+        if state != "pending" {
+            return Ok(if old_hash.as_deref() == Some(hash.as_slice()) {
+                InsertResult::Identical
+            } else {
+                InsertResult::Conflict
+            });
+        }
+        transaction.execute(
+            "UPDATE auth_requests SET state='resolved', decision_hash=?2, resolved_at=unixepoch() WHERE id=?1 AND state='pending'",
+            params![request_id, hash],
+        )?;
+        transaction.execute(
+            "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at)
+             VALUES ('auth_decision', ?1, ?2, ?3, unixepoch())",
+            params![request_id, format!("oshioki.verdict.{request_id}"), raw],
+        )?;
+        transaction.commit()?;
+        Ok(InsertResult::Inserted)
+    }
+
+    /// The retained copy of a queued authentication assertion. Kept in its
+    /// own outbox kind, so a command verdict can never be read back as an
+    /// authentication or the other way round.
+    pub fn recorded_auth_verdict(&self, request_id: &str) -> Result<Option<Vec<u8>>> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT payload FROM outbox WHERE kind='auth_decision' AND dedupe_key=?1 ORDER BY id DESC LIMIT 1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn auth_request_lifecycle(
+        &self,
+        request_id: &str,
+        now: i64,
+    ) -> Result<Option<RequestLifecycle>> {
+        let row = self
+            .lock()?
+            .query_row(
+                "SELECT state, expires_at FROM auth_requests WHERE id=?1",
+                [request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(state, expires_at)| {
+            if state == "pending" && expires_at > now {
+                RequestLifecycle::Pending
+            } else {
+                RequestLifecycle::Gone
+            }
+        }))
+    }
+
     pub fn queue_notification(
         &self,
         request_id: &str,
@@ -649,6 +883,10 @@ impl Store {
             "DELETE FROM requests WHERE created_at < ?1",
             [now.saturating_sub(SERVER_REQUEST_RETENTION_SECS)],
         )?;
+        connection.execute(
+            "DELETE FROM auth_requests WHERE created_at < ?1",
+            [now.saturating_sub(SERVER_REQUEST_RETENTION_SECS)],
+        )?;
         connection.execute("DELETE FROM tombstones WHERE expires_at < ?1", [now])?;
         connection.execute(
             "DELETE FROM outbox WHERE sent_at IS NOT NULL AND sent_at < ?1",
@@ -664,6 +902,11 @@ impl Store {
     }
 }
 
+/// The schema, applied on every open. It is additive only and stays at
+/// `user_version = 1`: every statement is `CREATE ... IF NOT EXISTS`, so an
+/// existing database gains the authentication tables on the next start
+/// without a version step, and a server rolled back to an older build still
+/// reads the command lane exactly as it did before.
 const MIGRATION_V1: &str = r"
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS devices (
@@ -687,6 +930,17 @@ CREATE TABLE IF NOT EXISTS sealed_bodies (
   fingerprint TEXT NOT NULL, body_json BLOB NOT NULL,
   PRIMARY KEY(request_id, fingerprint)
 );
+CREATE TABLE IF NOT EXISTS auth_requests (
+  id TEXT PRIMARY KEY, envelope_hash BLOB NOT NULL, envelope_json BLOB NOT NULL,
+  host TEXT NOT NULL, issued_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL, state TEXT NOT NULL, decision_hash BLOB,
+  created_at INTEGER NOT NULL, resolved_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS auth_sealed_bodies (
+  request_id TEXT NOT NULL REFERENCES auth_requests(id) ON DELETE CASCADE,
+  fingerprint TEXT NOT NULL, body_json BLOB NOT NULL,
+  PRIMARY KEY(request_id, fingerprint)
+);
 CREATE TABLE IF NOT EXISTS tombstones (
   kind TEXT NOT NULL, object_id TEXT NOT NULL, payload_hash BLOB NOT NULL,
   expires_at INTEGER NOT NULL, PRIMARY KEY(kind, object_id, payload_hash)
@@ -699,6 +953,8 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS requests_expiry_idx ON requests(expires_at);
 CREATE INDEX IF NOT EXISTS requests_created_idx ON requests(created_at);
+CREATE INDEX IF NOT EXISTS auth_requests_expiry_idx ON auth_requests(expires_at);
+CREATE INDEX IF NOT EXISTS auth_requests_created_idx ON auth_requests(created_at);
 CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox(sent_at, id);
 PRAGMA user_version = 1;
 COMMIT;
@@ -798,6 +1054,151 @@ mod tests {
                 ciphertext: encode_base64url(&[6; 32]),
             }],
         }
+    }
+
+    /// The schema a server carried before the authentication lane existed:
+    /// the command-lane statements verbatim, with no `auth_*` tables.
+    const COMMAND_ONLY_SCHEMA_V1: &str = r"
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS devices (
+  fingerprint TEXT PRIMARY KEY, credential_id TEXT NOT NULL UNIQUE,
+  api_token_hash BLOB NOT NULL UNIQUE, public_record_json TEXT NOT NULL,
+  active INTEGER NOT NULL CHECK(active IN (0,1)), updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS enrollments (
+  id TEXT PRIMARY KEY, secret_hash BLOB NOT NULL, status TEXT NOT NULL,
+  expires_at INTEGER NOT NULL, reply_subject TEXT NOT NULL, submission_hash BLOB, submission_json BLOB,
+  fingerprint TEXT REFERENCES devices(fingerprint), updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS requests (
+  id TEXT PRIMARY KEY, envelope_hash BLOB NOT NULL, envelope_json BLOB NOT NULL,
+  host TEXT NOT NULL, user TEXT NOT NULL, issued_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL, state TEXT NOT NULL, decision_hash BLOB,
+  created_at INTEGER NOT NULL, resolved_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS sealed_bodies (
+  request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+  fingerprint TEXT NOT NULL, body_json BLOB NOT NULL,
+  PRIMARY KEY(request_id, fingerprint)
+);
+CREATE TABLE IF NOT EXISTS tombstones (
+  kind TEXT NOT NULL, object_id TEXT NOT NULL, payload_hash BLOB NOT NULL,
+  expires_at INTEGER NOT NULL, PRIMARY KEY(kind, object_id, payload_hash)
+);
+CREATE TABLE IF NOT EXISTS outbox (
+  id INTEGER PRIMARY KEY, kind TEXT NOT NULL, dedupe_key TEXT NOT NULL,
+  subject TEXT NOT NULL, payload BLOB NOT NULL, created_at INTEGER NOT NULL,
+  sent_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(kind, dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS requests_expiry_idx ON requests(expires_at);
+CREATE INDEX IF NOT EXISTS requests_created_idx ON requests(created_at);
+CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox(sent_at, id);
+PRAGMA user_version = 1;
+COMMIT;
+";
+
+    fn table_names(store: &Store) -> Vec<String> {
+        let connection = store.lock().unwrap();
+        let mut statement = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn auth_envelope(fingerprint: &str, id: &str, now: i64) -> AuthEnvelopeV1 {
+        AuthEnvelopeV1 {
+            message_type: oshioki_protocol::AUTH_ENVELOPE_TYPE.into(),
+            version: oshioki_protocol::AUTH_WIRE_VERSION,
+            request_id: id.into(),
+            host: "nas".into(),
+            issued_at: now - 1,
+            expires_at: now + 60,
+            sealed: vec![SealedDeviceBodyV1 {
+                device_fingerprint: fingerprint.to_owned(),
+                ephemeral_pub: encode_base64url(&[4; 32]),
+                nonce: encode_base64url(&[5; 12]),
+                ciphertext: encode_base64url(&[6; 32]),
+            }],
+        }
+    }
+
+    /// A database written by a server that predates the authentication lane
+    /// gains the new tables on the next open, keeps every command-lane row
+    /// it already held, and stays at schema version 1. Opening it twice more
+    /// changes nothing: the migration is additive and idempotent.
+    #[test]
+    fn an_existing_database_gains_the_authentication_tables_in_place() {
+        let path = temporary_database();
+        remove_database(&path);
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(COMMAND_ONLY_SCHEMA_V1).unwrap();
+            let names: Vec<String> = old
+                .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(!names.iter().any(|name| name.starts_with("auth_")));
+        }
+        // The shared `envelope` helper is issued at 20 and expires at 110,
+        // so the clock here sits inside its window as the other tests' does.
+        let now = 30;
+        // A command-lane row written against the old schema.
+        {
+            let store = Store::open(&path).unwrap();
+            let device = device(b"token-before-the-auth-lane-000000");
+            store.put_device(&device).unwrap();
+            let envelope = envelope(&device.fingerprint);
+            store
+                .ingest_request(&serde_json::to_vec(&envelope).unwrap(), &envelope, now)
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        store.ready().unwrap();
+        let names = table_names(&store);
+        assert!(names.iter().any(|name| name == "auth_requests"));
+        assert!(names.iter().any(|name| name == "auth_sealed_bodies"));
+        // The pre-existing row survived the migration untouched.
+        assert_eq!(
+            store.request_lifecycle("request-1", now).unwrap(),
+            Some(RequestLifecycle::Pending)
+        );
+        // And the new lane works on the upgraded database.
+        let device = store
+            .active_device(&device(b"token-before-the-auth-lane-000000").fingerprint)
+            .unwrap()
+            .unwrap();
+        let auth = auth_envelope(&device.fingerprint, "auth-upgraded", now);
+        assert_eq!(
+            store
+                .ingest_auth_request(&serde_json::to_vec(&auth).unwrap(), &auth, now)
+                .unwrap(),
+            InsertResult::Inserted
+        );
+        drop(store);
+        // Re-opening applies the same batch again and changes nothing.
+        let reopened = Store::open(&path).unwrap();
+        reopened.ready().unwrap();
+        assert_eq!(table_names(&reopened), names);
+        assert_eq!(
+            reopened.request_lifecycle("request-1", now).unwrap(),
+            Some(RequestLifecycle::Pending)
+        );
+        assert_eq!(
+            reopened
+                .auth_request_lifecycle("auth-upgraded", now)
+                .unwrap(),
+            Some(RequestLifecycle::Pending)
+        );
+        drop(reopened);
+        remove_database(&path);
     }
 
     #[test]

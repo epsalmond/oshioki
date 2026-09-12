@@ -8,7 +8,11 @@ packaging, and rollout. For how the pieces fit together, see
 
 Production must provide:
 
-- An `OSHIOKI` JetStream stream for `oshioki.request.>`.
+- NATS 2.10 or newer. The durable `oshioki-server-v1` consumer filters on
+  two subject trees at once, which older servers do not support.
+- An `OSHIOKI` JetStream stream carrying both `oshioki.request.>` and
+  `oshioki.auth.>`. An existing stream created for `oshioki.request.>` alone
+  must be updated; see "Authentication lane upgrade" in `RUNBOOK.md`.
 - The durable `oshioki-server-v1` consumer permissions.
 - Publish and subscribe permissions for `oshioki.verdict.*` and
   `oshioki.enrollment.*`.

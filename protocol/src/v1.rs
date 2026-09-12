@@ -254,7 +254,11 @@ impl RequestEnvelopeV1 {
     }
 }
 
-fn validate_request_timing(issued_at: i64, expires_at: i64, now: i64) -> Result<(), Error> {
+pub(crate) fn validate_request_timing(
+    issued_at: i64,
+    expires_at: i64,
+    now: i64,
+) -> Result<(), Error> {
     let oldest_issued_at = now.saturating_sub(MAX_REQUEST_ISSUANCE_SKEW_SECS);
     let newest_issued_at = now.saturating_add(MAX_REQUEST_ISSUANCE_SKEW_SECS);
     if issued_at < oldest_issued_at || issued_at > newest_issued_at {
@@ -884,7 +888,7 @@ pub(crate) fn valid_id(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
-fn valid_fingerprint(value: &str) -> bool {
+pub(crate) fn valid_fingerprint(value: &str) -> bool {
     decode_base64url(value).is_ok_and(|bytes| bytes.len() == 16)
 }
 

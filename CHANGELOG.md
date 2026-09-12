@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Contextual sudo authentication through PAM, as an opt-in alternative to the
+  approval plugin and its blanket `NOPASSWD` sudoers rule: a new
+  `oshioki-pam` module (`liboshioki_pam.so`, `liboshioki_pam.dylib`) that asks
+  the enrolled device from inside sudo's own PAM stack, the hook's
+  `authenticate` verb and the NATS authentication lane behind it, and
+  `scripts/install-oshioki-hook` modes `--contextual-pam`,
+  `--disable-contextual-pam` and `--contextual-pam-status` to migrate, roll
+  back and inspect a host. The `.deb` ships the module and the multiarch
+  triplet it was built for and migrates on `OSHIOKI_CONTEXTUAL_PAM=1` in
+  `/etc/oshioki/install.env`; `oshioki-laptop-setup --contextual-pam` is the
+  macOS equivalent. Once a host is on the PAM lane it stays there:
+  `--prelaunch` refreshes the hook without re-enabling the approval plugin or
+  the blanket rule, and `--contextual-pam` swaps in a newer module in place
+  (staged, self-tested, renamed) while leaving the PAM entries untouched.
+  `scripts/test-pam-acceptance` drives the lane end to end in a container,
+  including the password fallback and the uninstall path.
+
 ### Fixed
 
 - The real sudo check now prints the browser approval URL on stderr, where the

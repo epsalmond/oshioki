@@ -1,0 +1,497 @@
+# Oshioki PAM foundation
+
+This crate is the PAM-to-helper boundary for the opt-in contextual sudo
+authentication lane. `scripts/install-oshioki-hook --contextual-pam` provides
+the staged installation, stock-stack fingerprinting, upgrade, rollback, and
+status workflow. It edits only the service-specific sudo PAM files; it does
+not modify `common-auth` or invoke `pam-auth-update`.
+
+The migration remains deliberately narrow: the installer refuses customised
+layouts and requires a verified hardware-backed device before it replaces the
+legacy approval lane. The helper verb and module contract described below are
+the ones shipped by the matching release artifacts.
+
+## PAM boundary
+
+The module exports the standard `pam_sm_authenticate` and `pam_sm_setcred`
+entry points for Linux-PAM and macOS OpenPAM. `pam_sm_setcred` has no
+credential side effect and returns success. The module accepts only these PAM
+services:
+
+| PAM service | Support |
+| --- | --- |
+| `sudo` | supported by the boundary |
+| `sudo-i` | supported by the boundary |
+| anything else | rejected with `PAM_SERVICE_ERR` |
+
+Authentication also requires the PAM process to have effective UID 0. The
+module never reads `PAM_AUTHTOK`, prompts through the PAM conversation, or
+starts another PAM or sudo operation. PAM module arguments are ignored and
+cannot replace the fixed helper path.
+
+The principal is `PAM_USER`, the account sudo is authenticating. The invoking
+identity is `PAM_RUSER`; it is kept separate because sudo can authenticate a
+different account under `rootpw`, `targetpw`, or `runaspw`. The module sends
+both **names** and does not resolve them itself. Name resolution is NSS work:
+`getpwnam_r` can block for an unbounded time on a stalled directory service,
+and it would run before the module's helper deadline exists. The helper already
+runs as root, so it resolves both names inside its own bounded budget and
+decides what an unknown name means. The module does not substitute an
+environment value, `getuid()`, or `PAM_USER` for `PAM_RUSER`. Missing, empty,
+or invalid identity text still makes device authentication unavailable or fail
+according to the specific validation result.
+
+The current boundary captures `PAM_SERVICE`, optional `PAM_TTY`, and the PAM
+process PID. It does not currently capture `PAM_RHOST`. The submitted process
+argument vector is advisory context: it is UTF-8 text from the module process,
+with explicit availability and truncation flags. It is not a verified final
+sudo command, executable, argument vector, or environment.
+
+## Private helper interface
+
+The module always starts:
+
+```text
+/usr/local/sbin/oshioki authenticate --pam-protocol-version 2 --pam-liveness-fd N
+```
+
+The path and argument list are private implementation details. No PAM option
+can override them. `N` is the only non-standard descriptor the helper
+inherits: the read end of a pipe whose write end is held solely by this PAM
+call. Readability or EOF on that descriptor means the PAM call, or the whole
+sudo process, is gone, and the helper must exit and take its own descendants
+with it. That is the portable half of the cancellation contract; on Linux the
+module additionally arms `PR_SET_PDEATHSIG(SIGKILL)` in the child so the
+helper leader dies with the PAM thread even when no destructor runs.
+
+Before starting the helper, the module requires `/`, `/usr`, `/usr/local`, and
+`/usr/local/sbin` to be root-owned and free of group/other write permission.
+The helper must also be a root-owned executable regular file with no
+group/other write permission **and no setuid or setgid bit**. A
+credential-changing `execve` clears `PR_SET_PDEATHSIG` on Linux, which would
+silently disable the parent-death half of the cancellation contract above, so
+such a helper is rejected rather than run. These are local `lstat` calls on a
+fixed path.
+They involve no network or directory service, and they deliberately run
+**before** the helper deadline starts, so they are not covered by it.
+
+The child runs with working directory `/`, an empty environment, and only its
+standard pipes plus the liveness descriptor retained. It calls `setpgid(0, 0)`,
+not `setsid()`: its own process group is what lets the module kill the whole
+helper tree with `kill(-pgid)`, while staying in sudo's session keeps the
+controlling terminal reachable for a future progress channel and keeps hangup
+signals meaningful. The cost of that separate group is that a terminal
+`SIGINT` goes to sudo's foreground group and never reaches the helper; the
+cancellation rule below closes that gap in the module instead. Unrelated descriptors are removed in the forked child
+between fork and exec, so no pre-spawn snapshot is taken and a descriptor
+opened concurrently with the spawn cannot be missed. Linux uses
+`close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`; macOS asks the kernel for the exact
+open list with `proc_pidinfo(PROC_PIDLISTFDS)` into a fixed stack buffer,
+because allocating after fork is not async-signal-safe. Both fall back to a
+scan bounded by the **hard** `RLIMIT_NOFILE` (clamped to 2^20), so an
+already-open descriptor above a lowered soft limit is still covered.
+Descriptors are marked close-on-exec rather than closed, which keeps Rust's
+private exec-error pipe usable until exec succeeds.
+
+The module writes one UTF-8 JSON request to standard input and closes the
+pipe to frame the request. The current fields are:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `pam_protocol_version` | number | Always `2` for this private boundary. |
+| `principal` | `{name}` | `PAM_USER`; the helper resolves it. |
+| `invoking` | `{name}` | `PAM_RUSER`; the helper resolves it. |
+| `service` | string | `PAM_SERVICE`, currently `sudo` or `sudo-i`. |
+| `tty` | string or `null` | Non-empty `PAM_TTY`, when available. |
+| `process_pid` | number | PID of the PAM process collecting the request. |
+| `submitted_argv` | `{available, truncated, values}` | Advisory UTF-8 arguments observed by the PAM process. |
+
+An example request is:
+
+```json
+{"pam_protocol_version":2,"principal":{"name":"alice"},"invoking":{"name":"alice"},"service":"sudo","tty":"/dev/ttys001","process_pid":123,"submitted_argv":{"available":false,"truncated":false,"values":[]}}
+```
+
+Version 2 replaced version 1's resolved `uid` fields with names only, for the
+reason given above. There is no version 1 helper in the shipping binary, so no
+compatibility shim exists for it.
+
+The request and helper output are bounded. Names and service text are capped
+at 256 and 32 bytes respectively; other PAM text is capped at 4096 bytes.
+The submitted arguments are capped at 64 values and 4096 aggregate raw bytes.
+The serialized request is capped at 16 KiB, measured **after** JSON escaping:
+a legitimate Unix argument of control bytes expands about six times when
+escaped, so the raw argv cap alone cannot bound the request. The module
+therefore serializes, measures, and drops advisory arguments from the end
+until the request fits with 1 KiB of headroom, setting `truncated` as it does
+so. `available` keeps its captured meaning (the argv was readable), so a fully
+trimmed request is `available: true, truncated: true, values: []`.
+Authentication never fails merely because the process argument vector was
+large. Helper stdout is capped at 16 KiB and stderr at 8 KiB.
+
+The helper has no JSON response body. Its stdout may contain only ASCII
+whitespace. Any other stdout bytes, an over-limit stream, an I/O error, an
+invalid helper path, or a non-success security check is not an authentication
+success. Helper stderr is consumed within its bound and currently discarded;
+it is not forwarded to the terminal or system log by this module.
+
+## Result and retry contract
+
+The helper exit status is the decision channel:
+
+| Helper result | PAM result | Meaning |
+| --- | --- | --- |
+| exit `0` | `PAM_SUCCESS` | Device authentication accepted. |
+| exit `2` | `PAM_AUTHINFO_UNAVAIL` | Device authentication is unavailable; the surrounding PAM stack may continue its normal password path. |
+| any other exit, signal, malformed output, or security failure | `PAM_AUTH_ERR` (Linux and macOS) | Device authentication did not succeed. On macOS, the surrounding stock password provider remains available. |
+
+The hard-failure control is platform-dependent because the two PAM
+implementations express the result differently. On Linux the installer writes a bracket control
+(`auth [success=done authinfo_unavail=ignore module_unknown=ignore ignore=ignore default=die]`),
+so `PAM_AUTH_ERR` falls under `default=die` and denies the command. OpenPAM
+has no bracket controls: the macOS entry is
+`auth sufficient /usr/local/lib/pam/liboshioki_pam.dylib` in
+`/etc/pam.d/sudo_local`. Under `sufficient`, `PAM_AUTH_ERR` is recorded and
+the stack continues into `pam_opendirectory`, so a correct typed password can
+authorise the command. This is the intended macOS fallback: the module's hard
+fault is never `PAM_SUCCESS`, and only the ordinary password conversation may
+complete authentication. The unavailable path is unchanged on both platforms.
+
+Supervised validation on macOS 15.7.5 showed that returning `PAM_ABORT` (26)
+also continued through the `sufficient` entry instead of aborting the chain.
+The test temporarily removed every executable bit from the fixed helper
+(mode `0644`), observed the stock `PAM_PASSWORD_FALLBACK` prompt, and
+supplied no password; sudo exited non-zero. The helper mode was restored to
+`0755` immediately. The module therefore maps hard faults to plain
+`PAM_AUTH_ERR` on macOS, preserving the documented password fallback and
+making the OpenPAM asymmetry explicit. The unit test
+`a_hard_fault_maps_to_ordinary_auth_error` verifies that hard faults remain
+distinct from both `PAM_SUCCESS` and `PAM_AUTHINFO_UNAVAIL`; it cannot replace
+the live OpenPAM observation.
+
+Any failure to start the helper, and the bounded 90-second helper deadline,
+are classified as unavailable, never as a hard authentication failure. That
+covers a missing executable, a permission error, and transient conditions such
+as the `ETXTBSY` window of a package upgrade or a temporary resource shortage:
+none of them are evidence about the operator, and treating them as denials
+would lock people out of sudo. Whether the helper path is acceptable at all is
+a separate decision, made by the path checks above.
+
+The deadline starts when the helper is spawned and covers every part of the
+exchange that can block on the helper: the request write, both output reads,
+and the wait for exit. Once the helper's leader exits, its output is drained
+under a short grace period measured from that exit rather than from the
+deadline, so a helper that succeeds in the last millisecond of its budget is
+still read and still succeeds. It is a helper deadline, not a whole-call
+bound: the
+preceding PAM item reads and the local path stats are outside it, and the
+module therefore does not claim a bound on the entire `pam_sm_authenticate`
+call. On expiry the module closes the liveness pipe and kills the helper
+process group; when the leader exits normally it kills the group and the
+liveness write end is released when the call's guard drops. Either way the
+helper tree does not outlive the call. The group is always signalled while the
+leader is still an unreaped zombie, because a reaped leader's process-group ID
+can be recycled and the signal could then reach an unrelated group;
+final stack fallback behavior still depends on the administrator's sudo PAM
+controls. The `authenticate` helper verb ships in the hook and has consumers
+(see the schema section below), so these mappings describe an enabled product
+flow, not a private foundation contract.
+
+## Cancellation
+
+The terminal user can abort a sudo that is waiting on a device with `Ctrl-C`,
+and that abort is cancellation: `PAM_AUTHINFO_UNAVAIL`, never a success and
+never a hard failure. The surrounding stack then takes its normal password
+path, exactly as it would for a helper timeout, so the operator's *next*
+`Ctrl-C`, at the password prompt, ends sudo the same way it ends a stock one.
+The delay is bounded by the module's poll interval — 25 ms — plus the cost of
+killing and reaping the helper tree, because the pending set is sampled once
+per iteration.
+
+The module cannot be signalled directly. The helper is in its own process
+group, so the terminal delivers `SIGINT` only to sudo. What sudo does with it
+was measured on Linux and read out of upstream source for macOS; the two are
+labelled separately below. sudo's `verify_user()`
+(`plugins/sudoers/auth/sudo_auth.c`) blocks `SIGINT` and `SIGQUIT` for the
+whole authentication phase — "we treat authentication as a critical section".
+It unblocks them only inside `auth_getpass()`, and **the PAM method never
+reaches that call**: PAM is a `FLAG_STANDALONE` method, so `verify_user` hands
+the prompt straight to `sudo_pam_verify` and `auth_getpass` is skipped. Both
+signals therefore stay blocked for the entire PAM conversation, this module's
+wait included. That code has no platform conditionals, so it is the same on
+Linux and macOS. The *disposition* under that block depends on what sudo
+inherited:
+
+* **A terminal sudo catches both.** `init_signals()` (`src/signal.c`) installs
+  `sudo_handler` for `SIGINT` and `SIGQUIT`. *Measured* on sudo 1.9.15p5,
+  Ubuntu, with sudo started from a foreground pty:
+
+  ```text
+  SigIgn: ...1001000   SIGINT, SIGQUIT not ignored
+  SigCgt: ...00016a07  both caught (bits 1 and 3)
+  ```
+
+* **A sudo started as a shell's background job inherits `SIG_IGN`**, and
+  `init_signals()` deliberately does not overwrite an inherited `SIG_IGN`. The
+  same binary then reports
+
+  ```text
+  SigIgn: ...0001006   SIGINT, SIGQUIT (and sudo's own SIGPIPE) ignored
+  SigCgt: ...0016a01   neither of them caught
+  ```
+
+Both masks are Linux readings: macOS has no `/proc`, so the corresponding
+macOS statement is *inferred* from upstream sudo source (1.9.13p2, the version
+`sudo --version` reports on macOS 15.7.5) on the assumption that Apple's build
+does not patch `init_signals()` or `verify_user()`. The signal *behaviour* on
+macOS — what follows — is measured with a C probe, not inferred.
+
+Two consequences follow, and together they decide the design:
+
+* **`EINTR` never happens.** A blocked signal interrupts no syscall, so a rule
+  that only watched for interrupted syscalls would observe nothing at all
+  while the operator typed `Ctrl-C`.
+* **`sigpending` sees it.** A blocked signal with a catching disposition is
+  left pending by both Linux and XNU, so a typed `Ctrl-C` sits in the pending
+  set for exactly as long as sudo holds it blocked — the whole of this wait.
+  sudo's own `user_interrupted()` is the same `sigpending` read, on both
+  platforms.
+
+### The one case macOS cannot see
+
+Linux keeps a blocked signal pending even when its disposition is `SIG_IGN`,
+because the handler may change before the unblock. **XNU does not**: it
+discards the signal at generation instead. Measured on macOS 15.7.5 with a C
+probe — block `SIGINT`, set `SIG_IGN`, then `pthread_kill`, `raise` and
+`kill(getpid())` — `sigpending` reports nothing in all three cases, while the
+same probe with a catching or default disposition reports the signal pending.
+
+So on macOS, cancellation is observable in the case that matters: a terminal
+sudo catches `SIGINT`, the keystroke is left pending, and the module sees it
+within one poll interval.
+
+The blind spot is narrower than "macOS". It is exactly one combination:
+a `Ctrl-C` **during this module's own wait**, in a sudo that **inherited
+`SIG_IGN`** for `SIGINT` — a sudo started as a shell's background job, or from
+a script that ignores `SIGINT`. It does not extend to the password prompt that
+follows, because `tgetpass()` installs a catching handler for `SIGINT` and
+`SIGQUIT` unconditionally, whatever sudo inherited, so a `Ctrl-C` there is
+pending on XNU too and sudo's own `user_interrupted()` sees it on the next
+loop. Within that one combination the loss is the kernel's, not this module's:
+no module-side mechanism can observe a signal the kernel never recorded, and
+sudo's `user_interrupted()` — the same `sigpending` read — is blind to it for
+the same reason. It is also the combination with no interactive `Ctrl-C` to
+miss. On Linux every case is covered.
+
+The blocked-and-caught test therefore runs on both platforms; the
+blocked-and-ignored cancellation test is `cfg(target_os = "linux")`, and a
+macOS-only test asserts the discard directly, so a future XNU that stopped
+discarding would fail the suite rather than pass unnoticed.
+
+So the module samples its own pending set once per poll interval and treats a
+pending `SIGINT` or `SIGQUIT` as cancellation: it aborts the helper process
+group and returns unavailable. `sigpending` is a read. Nothing is installed,
+nothing is consumed, and sudo's signal state is untouched — the signal is
+still pending when the module returns and sudo applies its own disposition to
+it on unblock, exactly as it would have.
+
+**Any** pending cancellation signal counts, including one that was already
+pending when the wait began, and there is deliberately no baseline sample to
+subtract. Standard signals do not queue: a second `Ctrl-C` merges into a bit
+that is already set, so nothing ever *transitions*. A rule that waited for a
+transition would make every later keystroke invisible for the whole
+90-second budget — the original defect, reintroduced through the back door.
+Cancelling on a signal someone else left pending costs one password prompt,
+which is precisely the error budget this module already declares for
+unavailability; missing a real `Ctrl-C` costs the operator their terminal.
+
+A second, weaker rule covers the signals sudo catches in this phase *and does
+not block*. Measured on the same stack, `SigCgt` (`...16a07`) covers `SIGHUP`,
+`SIGUSR1`, `SIGUSR2`, `SIGALRM`, `SIGTERM` and `SIGCHLD` — as well as `SIGINT`
+and `SIGQUIT`, which are blocked and so handled by the pending-set rule above;
+for those, **every interrupted
+syscall in the helper pump loop is also cancellation**. `poll`, the bounded
+request write, the output reads, and the `waitid` that asks whether the leader
+has exited all report `EINTR` upward rather than retrying or answering "not
+yet", so no signal can be swallowed by a retry.
+
+One benign interrupt is excluded: `SIGCHLD` raised by the helper's *own* exit.
+Before cancelling, the module re-checks whether the leader has exited, and if
+it has, the loop continues and reads the exit status normally, so a successful
+helper is never turned into a cancellation by its own death.
+
+Everything else in that list means this sudo is going away or timing out.
+`SIGTSTP` is *not* in the list, and the omission is deliberate: `verify_user()`
+sets `SIGTSTP` back to `SIG_DFL` for the authentication phase ("enable suspend
+during password entry"), and neither measured mask has bit 19. So **`Ctrl-Z`
+during a device wait stops sudo normally** — the process, and this module's
+thread with it, is suspended by the kernel rather than cancelled, and nothing
+here ever sees it as an interrupted syscall. A stopped sudo resumes on `fg`;
+its helper deadline, which is wall-clock, keeps running while it is stopped and
+will classify the wait as unavailable if the operator takes long enough.
+`SIGWINCH` is *not* in the list either — sudo leaves it at its default in this
+phase, so a terminal resize cannot cancel. Being wrong in this direction costs one password prompt, never a
+success and never a hard failure.
+
+A leader that has been *stopped* rather than exited is not a special case:
+the module asks `waitid` only about exits, so a suspended helper reads as
+still running and the helper deadline eventually classifies it as unavailable
+and kills the group, which is the right answer for a helper that has not
+authenticated anything.
+
+Two alternatives were rejected. **Installing the module's own `SIGINT` handler**
+for the length of the wait would work (the signal would be delivered on
+unblock, or caught outright), but a PAM module loaded into someone else's
+process should not be taking over the host's signals and then handing them
+back; `sigpending` answers the same question by reading state that already
+exists. **Leaving the helper in sudo's foreground process group** so the signal
+reaches it directly would not even deliver: sudo *blocks* `SIGINT` here, and
+the blocked mask survives both `fork` and `execve` whatever the disposition is,
+so the helper would inherit the same deafness unless it reset its own mask.
+(Dispositions are the weaker half of that inheritance: a caught handler resets
+to `SIG_DFL` across `execve`, and only `SIG_IGN` survives it.) It would also give up
+the guaranteed `kill(-pgid)` of grandchildren the module never learned about
+(the only portable mechanism on macOS, which has no `PR_SET_PDEATHSIG`), hand
+the helper every other terminal signal including a `SIGTSTP` that could suspend
+it mid-authentication, and turn cancellation into a signal-killed helper, which
+the exit rules above classify as a hard `PAM_AUTH_ERR`.
+
+## Denials and evidence
+
+There is no remote Deny action or signed denial result in this boundary. A
+helper that returns unavailable represents cancellation, dismissal, timeout,
+or unavailable transport once the Authenticate verb is implemented. Invalid
+signatures, wrong identity, wrong purpose, replay, expiry, malformed data,
+and other security failures must not be converted into a successful
+authentication.
+
+The line between the two is whether decision bytes arrived. An agent that
+acknowledges a request over the local socket and then drops the connection —
+a crash, a restart, a killed connection — produced no decision at all, so on
+the authentication lane the helper exits 2 and the password path stays open.
+A stack written as `default=die` would otherwise turn an agent restart into a
+sudo that is denied with no password prompt. Bytes that do arrive and fail to
+decode as an authentication decision remain a hard failure, including a legacy
+command-approval decision delivered on the authentication lane: those are
+evidence of a broken or hostile peer, and a dropped connection is not. A
+*truncated* frame — a partial length prefix, or a payload shorter than the
+length it announced — is on the hard-failure side for the same reason as
+garbage bytes, so an agent that emits one stray byte and then hangs up costs
+the operator the password path, where a clean hangup on a frame boundary does
+not. The legacy command-approval lane deliberately keeps its own rule, where a
+post-ack hangup fails closed and the command is simply not run.
+
+The module stores a small state record on each PAM handle. It prevents a
+password retry on the same handle from creating a duplicate device request,
+and it binds the record to principal name, invoking name, service, TTY, and
+process PID. A call whose context differs from the record starts a fresh
+attempt rather than inheriting the earlier result, so a handle reused for a
+different principal is a new transaction. Only `unavailable` is replayed to
+later calls on the same handle and context; success and failure both answer
+`PAM_AUTH_ERR` on a repeat. This is per-transaction bookkeeping, not an
+Oshioki authentication cache: a previous device success is not reused as a
+later PAM success, and state is released when PAM cleans up the handle.
+
+## Validation status
+
+The current foundation has direct tests for the private JSON shape and bounds,
+the serialized-size trimming of advisory argv, the supported service and
+identity fields in that private schema, helper exit classification, malformed
+stdout, missing or insecure helper paths, the ownership and mode rule for each
+path component (including a root-owned but group/world-writable path), the
+90-second default budget, bounded and deterministically blocked writes,
+bounded output, SIGPIPE handling, cancellation by a caught signal, and the
+exported PAM ABI. The path rule table also covers setuid and setgid
+rejection.
+
+Seven of these exercise the process boundary directly: a helper timeout is
+asserted to kill a grandchild the module never knew about; a *successful*
+helper is asserted to do the same, which is what proves the group is signalled
+before the leader is reaped (a debug assertion in `kill_group` enforces the
+same invariant); the spawned helper is asserted to inherit the liveness
+descriptor and no unrelated inheritable descriptor; a request larger than any
+pipe buffer is asserted to hit the deadline and return unavailable rather than
+blocking; and output is asserted to be drained even when the helper deadline
+has already passed.
+
+The seventh is cancellation, and it reproduces sudo's measured state rather
+than a convenient one: `SIGINT` ignored process-wide and blocked on the
+pumping thread, raised with `pthread_kill` so it can only become pending. The
+wait is asserted to end as unavailable within two seconds with the helper's
+grandchild dead. A second test covers the weaker `EINTR` rule with a no-op
+`SIGUSR1` handler installed without `SA_RESTART`. A third raises the signal
+*before* the wait starts and asserts it still cancels, which is what keeps the
+no-baseline rule above from being quietly re-broken. Signal state is
+process-wide, so all three hold the suite's exclusive spawn lock and restore
+the previous disposition, mask, and pending signal from a `Drop` guard, so a
+failing assertion cannot leak any of it into the rest of the suite.
+
+The handle state machine (state ownership per handle, context change resetting
+the record, retry suppression, unavailable reuse, and success never being
+reused) is driven through a small `PamAccess` seam over `pam_get_item`,
+`pam_get_data`, and `pam_set_data`, with an in-process fake handle. These
+tests do not drive real PAM identity callbacks.
+
+On Linux with `libpam0g-dev` installed, the focused module checks pass with
+the toolchain selected by this repository's `rust-toolchain.toml`:
+
+```sh
+cargo test -p oshioki-pam              # 31 tests
+cargo clippy -p oshioki-pam --all-targets -- -D warnings
+cargo fmt -p oshioki-pam -- --check
+cargo build -p oshioki-pam             # exports pam_sm_authenticate, pam_sm_setcred
+```
+
+The macOS-only paths (the `pam.2` link name, `proc_pidinfo` descriptor
+listing, and the pipe-only parent-death channel) are type-checked with
+`cargo check -p oshioki-pam --target aarch64-apple-darwin` and clippy for the
+same target. Supervised validation on macOS 15.7.5 (build 24G624) also loaded
+the module through stock `sudo_local`, accepted a Secure Enclave approval, and
+confirmed ordinary password fallback after the device lane was unavailable.
+This live observation complements the unit and ABI evidence; it does not
+replace it for future macOS versions.
+
+The `authenticate` helper verb exists in the hook: it reads this schema,
+seals a request to the enrolled hardware devices, and verifies the returned
+assertion. It now has consumers. The helper publishes on
+`oshioki.auth.<host>`; the agent subscribes to `oshioki.auth.>` alongside
+`oshioki.request.>` and answers with a Secure Enclave assertion, and the
+server's durable handler stores an authentication envelope in its own lane
+and serves it at `/a/<id>` for a `WebAuthn` browser. Neither lane has a
+refusal: cancelling sends nothing, and sudo falls back to a password at the
+helper's deadline. Supervised NAS/Linux and Mac runs exercised the native
+Secure Enclave lane, status checks, rollback, and ordinary password recovery
+against real sudo/PAM stacks. On both real hosts, terminal Ctrl-C during the
+device wait exposed the stock password prompt; the second interrupt exited
+without running the command. Helper-tree cleanup is covered by the module and
+container acceptance tests; the browser lane remains a separate acceptance
+path.
+
+The following acceptance work remains open:
+
+- the browser-mediated WebAuthn authentication flow end to end against a real
+  browser; native Secure Enclave approval was exercised on the NAS and Mac
+  hosts in this pass;
+- broader stock sudo/PAM coverage on Linux and macOS, including account,
+  session, MFA, lockout, smart-card, and alternate password-stack variants;
+  this pass covered the Mac `sudo_local`/`pam_tid` coexistence and ordinary
+  password fallback on both real hosts;
+- advanced/custom timestamp variants, `sudo -K`, `sudo -v`, alternate
+  principals, and administrator-selected `noninteractive_auth`; baseline
+  same-TTY timestamp reuse and `sudo -k`/`sudo -n` invalidation were verified
+  on both real hosts;
+- additional stock service layouts, refusal of customised layouts, staged
+  module/config installation, upgrade, uninstall, and rollback. The Linux
+  half is driven by `scripts/install-oshioki-hook --contextual-pam` and
+  covered by `scripts/test-install-oshioki-hook` and
+  `scripts/test-pam-acceptance`; supervised Mac coverage now includes
+  `sudo_local`, `pam_tid` coexistence, code signing, and the measured
+  `PAM_ABORT` asymmetry;
+- diagnostic and progress forwarding. The current helper stderr channel is
+  bounded and discarded, so no approval link or progress display should be
+  inferred from this crate;
+- repeat supervised Linux, Mac, and NAS validation after future artifact
+  changes, with the retained recovery path used in this pass.
+
+Until those remaining items are complete, keep the migration opt-in and do not
+present this foundation as universal support for every host PAM layout.

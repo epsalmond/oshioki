@@ -24,8 +24,9 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, SignerKind, parse_enrollment_url, remaining_until};
 use oshioki_protocol::{
-    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, AliveV1, DecisionV1, RequestEnvelopeV1,
-    allow_plaintext_nats, check_nats_url, escape_for_terminal, nats_url_is_tls,
+    ALLOW_PLAINTEXT_NATS_ENV, AUTH_ENVELOPE_TYPE, ActivationV1, AliveV1, AuthDecisionV1,
+    AuthEnvelopeV1, AuthInvocationV1, AuthRequestV1, DecisionV1, DeviceKindV1, OpenedAuthRequestV1,
+    RequestEnvelopeV1, allow_plaintext_nats, check_nats_url, escape_for_terminal, nats_url_is_tls,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -516,9 +517,71 @@ async fn cmd_run(
     }
 }
 
+/// The merged inbound subscription: command approval and contextual sudo
+/// authentication arrive on separate subject trees and are dispatched by
+/// envelope type, not by the subject they came in on. The authentication
+/// half is absent on a device that may never answer one.
+type Lane = futures::stream::Select<async_nats::Subscriber, AuthLane>;
+
+/// The authentication half of [`Lane`]: one subscription, or none at all on
+/// a device that may never answer an authentication.
+type AuthLane =
+    futures::stream::Flatten<futures::stream::Iter<std::option::IntoIter<async_nats::Subscriber>>>;
+
+fn lane(requests: async_nats::Subscriber, authentications: Option<async_nats::Subscriber>) -> Lane {
+    futures::stream::select(requests, futures::stream::iter(authentications).flatten())
+}
+
+/// Reads only the envelope's `type` tag, so one delivery can be routed to a
+/// lane before anything decides how to parse the rest of it.
+///
+/// The legacy command envelope carries no `type` field at all, so `None`
+/// means the command lane and nothing else has to change to keep it working.
+#[derive(serde::Deserialize)]
+struct EnvelopeTypeV1 {
+    #[serde(rename = "type")]
+    message_type: Option<String>,
+}
+
+/// Routes one delivery to its lane. Anything carrying a `type` this agent
+/// does not implement is logged and dropped: answering an envelope whose
+/// meaning is unknown is exactly what must not happen.
+fn dispatch_nats_request(
+    payload: &[u8],
+    identity: &Arc<Identity>,
+    decider: &Arc<Decider>,
+    nats: Option<async_nats::Client>,
+    admission: &RequestAdmission,
+) {
+    match serde_json::from_slice::<EnvelopeTypeV1>(payload) {
+        Ok(EnvelopeTypeV1 { message_type: None }) => {}
+        Ok(EnvelopeTypeV1 {
+            message_type: Some(message_type),
+        }) => {
+            if message_type == AUTH_ENVELOPE_TYPE {
+                dispatch_nats_authentication(payload, identity, decider, nats, admission);
+            } else {
+                warn!(
+                    envelope_type = %escape_for_terminal(&message_type),
+                    "ignoring envelope of an unknown type"
+                );
+            }
+            return;
+        }
+        Err(error) => {
+            warn!(
+                error = %escape_for_terminal(&error.to_string()),
+                "ignoring malformed request"
+            );
+            return;
+        }
+    }
+    dispatch_nats_command(payload, identity, decider, nats, admission);
+}
+
 /// Decodes and admits one NATS delivery. Admission happens before opening the
 /// sealed body, so capacity drops do not spend crypto work or create tasks.
-fn dispatch_nats_request(
+fn dispatch_nats_command(
     payload: &[u8],
     identity: &Arc<Identity>,
     decider: &Arc<Decider>,
@@ -563,7 +626,7 @@ fn dispatch_nats_request(
     tokio::spawn(async move {
         let _permit = permit;
         if let Some(nats) = &nats
-            && let Err(error) = publish_alive(nats, &opened.request).await
+            && let Err(error) = publish_alive(nats, &opened.request.request_id).await
         {
             warn!(
                 request_id = %escape_for_terminal(&opened.request.request_id),
@@ -594,13 +657,284 @@ fn dispatch_nats_request(
     });
 }
 
+/// Decodes and admits one contextual sudo authentication delivery. It mirrors
+/// [`dispatch_nats_command`] with two differences that are the point of the
+/// lane: a software identity never answers, and there is no denial to
+/// publish — a skipped prompt publishes nothing and the host falls back to
+/// asking for a password.
+fn dispatch_nats_authentication(
+    payload: &[u8],
+    identity: &Arc<Identity>,
+    decider: &Arc<Decider>,
+    nats: Option<async_nats::Client>,
+    admission: &RequestAdmission,
+) {
+    let envelope: AuthEnvelopeV1 = match serde_json::from_slice(payload) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            warn!(
+                error = %escape_for_terminal(&error.to_string()),
+                "ignoring malformed authentication request"
+            );
+            return;
+        }
+    };
+    // Checked before admission and before any crypto: a software key cannot
+    // produce an assurance this lane accepts, so the honest answer is to say
+    // nothing and let the host ask for a password.
+    if !identity_may_authenticate(identity, &envelope.request_id) {
+        return;
+    }
+    let Some(permit) = admission.reserve() else {
+        warn!("discarding authentication request while agent work is at capacity");
+        return;
+    };
+    let opened = match identity.open_auth_request(&envelope) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(
+                request_id = %escape_for_terminal(&envelope.request_id),
+                error = %escape_for_terminal(&error.to_string()),
+                "ignoring authentication request"
+            );
+            return;
+        }
+    };
+    if !permit.claim(&auth_dedupe_key(&envelope.request_id)) {
+        warn!(
+            request_id = %escape_for_terminal(&envelope.request_id),
+            "discarding duplicate authentication request"
+        );
+        return;
+    }
+    let identity = Arc::clone(identity);
+    let decider = Arc::clone(decider);
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Some(nats) = &nats
+            && let Err(error) = publish_alive(nats, &opened.request.request_id).await
+        {
+            warn!(
+                request_id = %escape_for_terminal(&opened.request.request_id),
+                error = %escape_for_terminal(&error.to_string()),
+                "native liveness acknowledgement failed; authentication prompt suppressed"
+            );
+            return;
+        }
+        let result = match decide_authentication(&identity, &decider, &opened).await {
+            Ok(Some(decision)) => match nats {
+                Some(nats) => publish_authentication(&nats, &opened.request, decision).await,
+                None => Ok(()),
+            },
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            warn!(
+                request_id = %escape_for_terminal(&opened.request.request_id),
+                error = %escape_for_terminal(&error.to_string()),
+                "authentication decision failed"
+            );
+        }
+    });
+}
+
+/// The dedupe key for one authentication request.
+///
+/// Namespaced away from the command lane's bare request id. The two lanes
+/// mint ids independently, so a command envelope carrying the same id must
+/// not be able to consume an authentication's one-shot claim (or the other
+/// way round) and make the real request look like a replay.
+fn auth_dedupe_key(request_id: &str) -> String {
+    format!("auth:{request_id}")
+}
+
+/// Whether this identity's key may answer an authentication request at all.
+/// Only a hardware-backed signer may; a software one is refused here, with a
+/// log line, even if the envelope somehow named its fingerprint.
+fn identity_may_authenticate(identity: &Identity, request_id: &str) -> bool {
+    if identity.device_kind() == DeviceKindV1::SecureEnclave {
+        return true;
+    }
+    warn!(
+        request_id = %escape_for_terminal(request_id),
+        "ignoring authentication request: this device holds a software key, which cannot \
+         answer a sudo authentication"
+    );
+    false
+}
+
+/// Answers one opened authentication request. `Ok(None)` means no assertion
+/// was produced — the request expired, the operator skipped the prompt, or
+/// the sheet was dismissed — and the caller publishes nothing.
+///
+/// There is no negative answer to publish. A refusal on this lane is silence:
+/// the host's PAM stack then asks for a password, which is the outcome the
+/// operator wanted. A signed "no" would only add a way to turn a request
+/// nobody read into a failure nobody chose.
+async fn decide_authentication(
+    identity: &Arc<Identity>,
+    decider: &Decider,
+    opened: &OpenedAuthRequestV1,
+) -> Result<Option<AuthDecisionV1>> {
+    let request = &opened.request;
+    if request.expires_at <= now() {
+        bail!("authentication request already expired");
+    }
+    match decider {
+        #[cfg(target_os = "macos")]
+        Decider::TouchId(prompt) => mac::authenticate(prompt, identity, opened).await,
+        // Decision: `run --auto` does not answer this lane, in either
+        // direction. The flag exists so end-to-end tests can drive the
+        // command lane without a human, and its `deny` arm has no meaning
+        // here at all. Auto-authenticating sudo would hand every process on
+        // the host a passwordless root prompt, which is the one thing this
+        // lane exists to prevent; an unattended host falls back to the
+        // password path instead.
+        Decider::Auto(_) => {
+            warn!(
+                request_id = %escape_for_terminal(&request.request_id),
+                "ignoring authentication request: --auto never answers a sudo authentication"
+            );
+            Ok(None)
+        }
+        Decider::Prompt(prompter) => {
+            let summary = authentication_summary(request);
+            let Some(()) = prompter
+                .ask_authentication(&request.request_id, &summary, request.expires_at)
+                .await?
+            else {
+                info!(
+                    request_id = %escape_for_terminal(&request.request_id),
+                    host = %escape_for_terminal(&request.trusted.host),
+                    "authentication request was not answered"
+                );
+                return Ok(None);
+            };
+            Ok(Some(
+                identity.authenticate(opened, &authentication_reason(request))?,
+            ))
+        }
+    }
+}
+
+/// What the operator reads before authenticating: who is being authenticated
+/// for what, on which host, and the invocation that was submitted with the
+/// request.
+///
+/// The invocation is display context, never a claim about what sudo will
+/// finally run — PAM does not know that yet — so its status is shown as it
+/// is, including when it is missing or cut short.
+fn authentication_summary(request: &AuthRequestV1) -> String {
+    let trusted = &request.trusted;
+    format!(
+        "Authenticate sudo on {} for {} (invoked by {}, {}, tty {})\n  invocation: {}\n",
+        escape_for_terminal(&trusted.host),
+        escape_for_terminal(&trusted.pam_user),
+        escape_for_terminal(&invoking_user_label(request)),
+        escape_for_terminal(&trusted.service),
+        escape_for_terminal(trusted.tty.as_deref().unwrap_or("unknown")),
+        escape_for_terminal(&invocation_label(&request.submitted.invocation)),
+    )
+}
+
+/// Names the account that invoked sudo. The numeric UID is always shown: the
+/// name is a host-side lookup that can fail, and the number is what PAM
+/// actually captured.
+fn invoking_user_label(request: &AuthRequestV1) -> String {
+    match &request.trusted.invoking_user {
+        Some(name) => format!("{name}, uid {}", request.trusted.invoking_uid),
+        None => format!("uid {}", request.trusted.invoking_uid),
+    }
+}
+
+/// Renders the submitted invocation with its status intact. "unavailable" and
+/// "truncated:" are part of the text an operator reads, because a partial
+/// command line presented as a whole one would be a claim this lane cannot
+/// make.
+fn invocation_label(invocation: &AuthInvocationV1) -> String {
+    match invocation {
+        AuthInvocationV1::Available { command, argv, .. } => {
+            let rendered = quote_argv(argv);
+            if rendered.is_empty() {
+                command.clone()
+            } else {
+                rendered
+            }
+        }
+        AuthInvocationV1::Truncated {
+            command,
+            argv,
+            omitted_args,
+            ..
+        } => {
+            let rendered = quote_argv(argv);
+            let shown = if rendered.is_empty() {
+                command.clone().unwrap_or_else(|| "(none)".to_owned())
+            } else {
+                rendered
+            };
+            match omitted_args {
+                Some(count) => format!("truncated: {shown} (+{count} more arguments)"),
+                None => format!("truncated: {shown}"),
+            }
+        }
+        AuthInvocationV1::Unavailable => "unavailable".to_owned(),
+    }
+}
+
+/// What a signer backend that asks the operator puts on screen. The same
+/// character budget as the command lane's reason applies, and the same rule:
+/// nothing shown here can change what is verified, which is the exact bytes.
+fn authentication_reason(request: &AuthRequestV1) -> String {
+    let trusted = &request.trusted;
+    let head = format!(
+        "authenticate sudo: {}@{}",
+        escape_for_terminal(&trusted.pam_user),
+        escape_for_terminal(&trusted.host)
+    );
+    let room = MAX_APPROVAL_REASON_CHARS.saturating_sub(head.chars().count() + 1);
+    if room == 0 {
+        return truncate_chars(&head, MAX_APPROVAL_REASON_CHARS);
+    }
+    format!(
+        "{head} {}",
+        truncate_chars(
+            &escape_for_terminal(&invocation_label(&request.submitted.invocation)),
+            room
+        )
+    )
+}
+
+/// Publishes one authentication assertion on the shared verdict subject the
+/// hook waits on for this request id.
+async fn publish_authentication(
+    nats: &async_nats::Client,
+    request: &AuthRequestV1,
+    decision: AuthDecisionV1,
+) -> Result<()> {
+    nats.publish(
+        format!("oshioki.verdict.{}", request.request_id),
+        serde_json::to_vec(&decision)?.into(),
+    )
+    .await
+    .context("publish authentication decision")?;
+    nats.flush().await?;
+    info!(
+        request_id = %escape_for_terminal(&request.request_id),
+        host = %escape_for_terminal(&request.trusted.host),
+        pam_user = %escape_for_terminal(&request.trusted.pam_user),
+        "sudo authentication published"
+    );
+    Ok(())
+}
+
 /// Connect NATS and subscribe to requests, or return `None` when the network
 /// is unset so the agent answers socket requests only. An unreachable NATS
 /// is not an error: the client keeps connecting in the background and the
 /// subscription takes effect the moment it lands.
-async fn subscribe_requests(
-    identity: &Identity,
-) -> Result<Option<(async_nats::Client, async_nats::Subscriber)>> {
+async fn subscribe_requests(identity: &Identity) -> Result<Option<(async_nats::Client, Lane)>> {
     // Unset and unreachable are different states: the first is a
     // socket-only install answering exactly what it was told to, the second
     // is a network that has not come up yet.
@@ -634,11 +968,32 @@ async fn subscribe_requests(
         .subscribe("oshioki.request.>")
         .await
         .context("subscribe requests")?;
+    // Contextual sudo authentication rides its own subject tree, so a
+    // command approval and an authentication can never be confused for one
+    // another by routing alone. Both streams feed the one dispatcher below,
+    // which decides the lane from the envelope itself.
+    //
+    // A software identity does not subscribe at all: it can never produce an
+    // assurance this lane accepts, so carrying every host's authentication
+    // traffic to it only to refuse each one is waste. The socket path keeps
+    // its refusal regardless — the hook connects to this agent by name
+    // there, and silence would look like a transport fault rather than the
+    // answer it is.
+    let authentications = if identity.device_kind() == DeviceKindV1::SecureEnclave {
+        Some(
+            nats.subscribe("oshioki.auth.>")
+                .await
+                .context("subscribe authentications")?,
+        )
+    } else {
+        info!("this device holds a software key; not subscribing to sudo authentications");
+        None
+    };
     info!(
         fingerprint = %identity.fingerprint(),
         "NATS connection in progress; requests are answered once it is up"
     );
-    Ok(Some((nats, requests)))
+    Ok(Some((nats, lane(requests, authentications))))
 }
 
 /// Answer one opened request. `Ok(None)` means no verdict was produced —
@@ -758,13 +1113,10 @@ async fn publish(
 /// Publishes a liveness acknowledgement before the decider is invoked. It
 /// carries no signature and cannot authorize a request; the hook uses it only
 /// to distinguish a live native agent from an unavailable transport.
-async fn publish_alive(
-    nats: &async_nats::Client,
-    request: &oshioki_protocol::RequestV1,
-) -> Result<()> {
+async fn publish_alive(nats: &async_nats::Client, request_id: &str) -> Result<()> {
     nats.publish(
-        format!("oshioki.ack.{}", request.request_id),
-        serde_json::to_vec(&AliveV1::for_request(&request.request_id))?.into(),
+        format!("oshioki.ack.{request_id}"),
+        serde_json::to_vec(&AliveV1::for_request(request_id))?.into(),
     )
     .await
     .context("publish daemon acknowledgement")?;
@@ -893,6 +1245,25 @@ async fn handle_socket(
     else {
         return Ok(());
     };
+    // Same routing rule as the NATS lane: the envelope's own `type` decides,
+    // not the transport it arrived on. The command envelope carries no type
+    // tag, so nothing about the legacy path changes.
+    match serde_json::from_slice::<EnvelopeTypeV1>(&bytes)
+        .context("decode socket envelope")?
+        .message_type
+    {
+        None => {}
+        Some(message_type) if message_type == AUTH_ENVELOPE_TYPE => {
+            return handle_socket_authentication(&bytes, identity, decider, permit, writer).await;
+        }
+        Some(message_type) => {
+            warn!(
+                envelope_type = %escape_for_terminal(&message_type),
+                "ignoring socket envelope of an unknown type"
+            );
+            return Ok(());
+        }
+    }
     let envelope: RequestEnvelopeV1 =
         serde_json::from_slice(&bytes).context("decode socket envelope")?;
     let opened = match identity.open_request(&envelope) {
@@ -936,6 +1307,67 @@ async fn handle_socket(
     info!(
         request_id = %escape_for_terminal(&opened.request.request_id),
         "socket decision answered"
+    );
+    Ok(())
+}
+
+/// Answers one contextual sudo authentication over the local socket: the
+/// same acknowledge-then-answer shape as the command lane, with no denial
+/// frame. Hanging up without an assertion means this agent is not answering,
+/// and the hook falls back to NATS and then to the password path.
+async fn handle_socket_authentication(
+    bytes: &[u8],
+    identity: &Arc<Identity>,
+    decider: &Decider,
+    permit: RequestPermit,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    let envelope: AuthEnvelopeV1 =
+        serde_json::from_slice(bytes).context("decode socket authentication envelope")?;
+    if !identity_may_authenticate(identity, &envelope.request_id) {
+        return Ok(());
+    }
+    let opened = match identity.open_auth_request(&envelope) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            warn!(
+                request_id = %escape_for_terminal(&envelope.request_id),
+                error = %escape_for_terminal(&error.to_string()),
+                "ignoring socket authentication request"
+            );
+            return Ok(());
+        }
+    };
+    if !permit.claim(&auth_dedupe_key(&envelope.request_id)) {
+        warn!(
+            request_id = %escape_for_terminal(&envelope.request_id),
+            "discarding duplicate socket authentication request"
+        );
+        return Ok(());
+    }
+    let alive = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(
+        &AliveV1::for_request(&opened.request.request_id),
+    )?)?;
+    writer
+        .write_all(&alive)
+        .await
+        .context("write socket acknowledgement")?;
+    writer
+        .flush()
+        .await
+        .context("flush socket acknowledgement")?;
+    let Some(decision) = decide_authentication(identity, decider, &opened).await? else {
+        return Ok(());
+    };
+    let frame = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&decision)?)?;
+    writer
+        .write_all(&frame)
+        .await
+        .context("write socket authentication")?;
+    info!(
+        request_id = %escape_for_terminal(&opened.request.request_id),
+        "socket authentication answered"
     );
     Ok(())
 }
@@ -1250,6 +1682,41 @@ impl Prompter {
             }
         }
     }
+
+    /// Asks the terminal about one sudo authentication. The only answer is
+    /// the affirmative one: an empty line authenticates, and anything else —
+    /// a stray word, a dismissal, the deadline — skips.
+    ///
+    /// `Some(())` means authenticate; `None` means publish nothing, which on
+    /// this lane is how the host is told to ask for a password instead. There
+    /// is deliberately no way to answer "no" here: a refusal that travelled
+    /// as a message would be a way to fail an authentication the operator
+    /// never saw.
+    async fn ask_authentication(
+        &self,
+        request_id: &str,
+        summary: &str,
+        expires_at: i64,
+    ) -> Result<Option<()>> {
+        let mut lines = self.lines.lock().await;
+        let Some(remaining) = remaining_until(expires_at) else {
+            return Ok(None);
+        };
+        while lines.try_recv().is_ok() {}
+        print!(
+            "{}",
+            authentication_prompt_output(request_id, summary, io::stdout().is_terminal())
+        );
+        io::stdout().flush()?;
+        match tokio::time::timeout(remaining, lines.recv()).await {
+            Ok(Some(answer)) => Ok(answer.trim().is_empty().then_some(())),
+            Ok(None) => bail!("stdin closed"),
+            Err(_) => {
+                println!("\nauthentication request expired before it was answered");
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// What one terminal prompt may print. Stdout backs the persistent agent log
@@ -1265,6 +1732,27 @@ fn prompt_output(request_id: &str, summary: &str, stdout_is_terminal: bool) -> S
         format!(
             "request {} needs an answer, but stdout is not a terminal: \
              no request details are shown here\nApprove? [y/N] ",
+            escape_for_terminal(request_id)
+        )
+    }
+}
+
+/// What one authentication prompt may print. Same rule as the command lane:
+/// the summary is rendered only to a live terminal, because stdout is the
+/// persistent agent log under launchd and an authentication's context —
+/// account, service, tty, invocation — does not belong in it.
+fn authentication_prompt_output(
+    request_id: &str,
+    summary: &str,
+    stdout_is_terminal: bool,
+) -> String {
+    if stdout_is_terminal {
+        format!("{summary}[Enter to authenticate, anything else / timeout to skip] ")
+    } else {
+        format!(
+            "authentication request {} needs an answer, but stdout is not a terminal: \
+             no request details are shown here\n[Enter to authenticate, anything else / \
+             timeout to skip] ",
             escape_for_terminal(request_id)
         )
     }
@@ -1336,10 +1824,10 @@ mod mac {
         touchid::{AttemptError, Outcome, PromptCancel, ScreenLock, TouchIdPrompt},
     };
     use oshioki_enclave::SignError;
-    use oshioki_protocol::{DecisionV1, escape_for_terminal};
+    use oshioki_protocol::{AuthDecisionV1, DecisionV1, OpenedAuthRequestV1, escape_for_terminal};
     use tracing::{error, info};
 
-    use super::approval_reason_for_raw;
+    use super::{approval_reason_for_raw, authentication_reason};
 
     /// The login session's lock state, read fresh each time it is asked for.
     pub struct Screen;
@@ -1409,6 +1897,47 @@ mod mac {
         }
     }
 
+    /// Asks for one contextual sudo authentication with a Touch ID sheet.
+    ///
+    /// The same sheet, the same serialization, and the same deadline rules as
+    /// a command approval — with no negative outcome to report. A dismissed
+    /// sheet publishes nothing, and the host's PAM stack asks for a password.
+    pub async fn authenticate(
+        prompt: &TouchIdPrompt,
+        identity: &Arc<Identity>,
+        opened: &OpenedAuthRequestV1,
+    ) -> Result<Option<AuthDecisionV1>> {
+        let request = &opened.request;
+        let reason = authentication_reason(request);
+        let sign = {
+            let (identity, opened, reason) = (Arc::clone(identity), opened.clone(), reason.clone());
+            move || identity.authenticate(&opened, &reason).map_err(classify)
+        };
+        match prompt
+            .ask(&request.request_id, request.expires_at, sign)
+            .await
+        {
+            Ok(Outcome::Approved(decision)) => Ok(Some(decision)),
+            Ok(Outcome::Denied) => Ok(None),
+            Ok(Outcome::Expired) => {
+                info!(
+                    request_id = %escape_for_terminal(&request.request_id),
+                    host = %escape_for_terminal(&request.trusted.host),
+                    "authentication request expired unanswered"
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                error!(
+                    request_id = %escape_for_terminal(&request.request_id),
+                    error = %escape_for_terminal(&format!("{error:#}")),
+                    "the Secure Enclave would not sign; re-pair with `oshioki-agent pair`"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// A dismissed sheet is an answer; anything else is a broken key.
     fn classify(error: anyhow::Error) -> AttemptError {
         if matches!(error.downcast_ref::<SignError>(), Some(SignError::Canceled)) {
@@ -1423,9 +1952,10 @@ mod mac {
 mod tests {
     use super::{
         Cli, Decider, MAX_APPROVAL_REASON_CHARS, MAX_IN_FLIGHT_REQUESTS, Pairing, Prompter,
-        RequestAdmission, Verb, approval_reason, bind_socket, decide,
-        dispatch_nats_request, format_env, load_or_create_with, now,
-        prompt_output, quote_argv, runas_label, socket_path,
+        RequestAdmission, Verb, approval_reason, authentication_prompt_output,
+        authentication_reason, authentication_summary, bind_socket, decide, decide_authentication,
+        dispatch_nats_request, format_env, load_or_create_with, now, prompt_output, quote_argv,
+        runas_label, socket_path,
     };
     use clap::Parser as _;
     use oshioki_agent::SignerKind;
@@ -1538,6 +2068,193 @@ mod tests {
         );
         assert_eq!(admission.request_ids.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn auth_request_for_tests() -> oshioki_protocol::AuthRequestV1 {
+        oshioki_protocol::AuthRequestV1 {
+            message_type: oshioki_protocol::AUTH_REQUEST_TYPE.into(),
+            version: oshioki_protocol::AUTH_WIRE_VERSION,
+            request_id: "auth-1".into(),
+            nonce: encode_base64url(&[3; 16]),
+            issued_at: now(),
+            expires_at: now() + 70,
+            trusted: oshioki_protocol::TrustedAuthContextV1 {
+                host: "host.example".into(),
+                service: "sudo".into(),
+                pam_user: "root".into(),
+                pam_uid: 0,
+                invoking_uid: 1000,
+                invoking_user: Some("eric".into()),
+                tty: Some("/dev/pts/3".into()),
+            },
+            submitted: oshioki_protocol::SubmittedAuthContextV1 {
+                session: None,
+                agent_label: None,
+                invocation: oshioki_protocol::AuthInvocationV1::Truncated {
+                    command: None,
+                    argv: vec!["apt".into(), "upgrade".into()],
+                    cwd: None,
+                    omitted_args: Some(2),
+                },
+            },
+        }
+    }
+
+    fn auth_envelope_bytes(
+        identity: &oshioki_agent::Identity,
+        request: &oshioki_protocol::AuthRequestV1,
+    ) -> Vec<u8> {
+        let raw = request.raw_json().unwrap();
+        let sealed = oshioki_protocol::seal_v1(&raw, &identity.device_record("test")).unwrap();
+        let envelope = oshioki_protocol::AuthEnvelopeV1 {
+            message_type: oshioki_protocol::AUTH_ENVELOPE_TYPE.into(),
+            version: oshioki_protocol::AUTH_WIRE_VERSION,
+            request_id: request.request_id.clone(),
+            host: request.trusted.host.clone(),
+            issued_at: request.issued_at,
+            expires_at: request.expires_at,
+            sealed: vec![sealed],
+        };
+        envelope.validate().unwrap();
+        serde_json::to_vec(&envelope).unwrap()
+    }
+
+    /// A Linux agent holds a software key, so it is exactly the device that
+    /// must never answer an authentication — even when the envelope was
+    /// sealed to its own fingerprint. It never reaches admission, so it
+    /// spends no work and claims no request id.
+    #[tokio::test]
+    async fn a_software_agent_never_answers_an_authentication_envelope() {
+        let dir = socket_test_dir("auth-software");
+        let store = MemoryStore::new();
+        let identity = std::sync::Arc::new(
+            oshioki_agent::Identity::generate_to_with(
+                &dir.join("agent.json"),
+                oshioki_agent::SignerKind::Software,
+                &store,
+            )
+            .unwrap(),
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        let decider = std::sync::Arc::new(Decider::Prompt(Prompter::new(receiver)));
+        let admission = std::sync::Arc::new(RequestAdmission::new());
+        let payload = auth_envelope_bytes(&identity, &auth_request_for_tests());
+        dispatch_nats_request(&payload, &identity, &decider, None, &admission);
+        assert!(admission.request_ids.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An envelope type this build does not implement is dropped, not
+    /// guessed at, and the legacy lane it is not addressed to never sees it.
+    #[tokio::test]
+    async fn an_unknown_envelope_type_is_ignored() {
+        let dir = socket_test_dir("auth-unknown");
+        let store = MemoryStore::new();
+        let identity = std::sync::Arc::new(
+            oshioki_agent::Identity::generate_to_with(
+                &dir.join("agent.json"),
+                oshioki_agent::SignerKind::Software,
+                &store,
+            )
+            .unwrap(),
+        );
+        let (_sender, receiver) = mpsc::channel(1);
+        let decider = std::sync::Arc::new(Decider::Prompt(Prompter::new(receiver)));
+        let admission = std::sync::Arc::new(RequestAdmission::new());
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&auth_envelope_bytes(&identity, &auth_request_for_tests()))
+                .unwrap();
+        envelope["type"] = serde_json::json!("sudo_something_else");
+        dispatch_nats_request(
+            &serde_json::to_vec(&envelope).unwrap(),
+            &identity,
+            &decider,
+            None,
+            &admission,
+        );
+        assert!(admission.request_ids.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--auto` answers the command lane and nothing else. Auto-signing a
+    /// sudo authentication would hand the host a passwordless root prompt,
+    /// which is the outcome this lane exists to prevent.
+    #[tokio::test]
+    async fn auto_never_answers_an_authentication() {
+        let identity = std::sync::Arc::new(
+            oshioki_agent::Identity::from_material([0x11; 32], [0x22; 32], [0x33; 32]).unwrap(),
+        );
+        let request = auth_request_for_tests();
+        let opened = oshioki_protocol::OpenedAuthRequestV1 {
+            raw: request.raw_json().unwrap(),
+            request,
+        };
+        for answer in [true, false] {
+            assert!(
+                decide_authentication(&identity, &Decider::Auto(answer), &opened)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    /// The only affirmative answer is an empty line. Anything else, and the
+    /// deadline, publish nothing — which is how the host is told to ask for
+    /// a password instead.
+    #[tokio::test]
+    async fn only_an_empty_line_authenticates() {
+        for (answer, authenticates) in [("", true), ("y", false), ("n", false), ("no", false)] {
+            let (sender, receiver) = mpsc::channel(1);
+            let prompter = Prompter::new(receiver);
+            // Lines typed before the prompt appeared are discarded, so the
+            // answer has to arrive after the prompt is up, as at a terminal.
+            let asked = tokio::spawn(async move {
+                prompter
+                    .ask_authentication("auth-1", "summary\n", now() + 30)
+                    .await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sender.send(answer.to_owned()).await.unwrap();
+            let decided = asked.await.unwrap().unwrap();
+            assert_eq!(decided.is_some(), authenticates, "{answer:?}");
+        }
+    }
+
+    /// The prompt says what is being authenticated and offers exactly one
+    /// action. No refusal is offered because none can be sent.
+    #[test]
+    fn the_authentication_prompt_offers_only_the_affirmative() {
+        let summary = authentication_summary(&auth_request_for_tests());
+        assert!(summary.contains("Authenticate sudo on host.example for root"));
+        assert!(summary.contains("invoked by eric, uid 1000, sudo, tty /dev/pts/3"));
+        assert!(summary.contains("invocation: truncated: apt upgrade (+2 more arguments)"));
+        let prompt = authentication_prompt_output("auth-1", &summary, true);
+        assert!(prompt.contains("[Enter to authenticate, anything else / timeout to skip]"));
+        assert!(!prompt.to_lowercase().contains("deny"));
+        // Off a terminal, stdout is the agent log: the context stays out of it.
+        let logged = authentication_prompt_output("auth-1", &summary, false);
+        assert!(!logged.contains("host.example"));
+        assert!(logged.contains("auth-1"));
+    }
+
+    /// A missing invocation is shown as missing. Nothing on this lane may
+    /// present partial or absent context as the command sudo will run.
+    #[test]
+    fn an_unavailable_invocation_is_labelled_honestly() {
+        let mut request = auth_request_for_tests();
+        request.submitted.invocation = oshioki_protocol::AuthInvocationV1::Unavailable;
+        assert!(authentication_summary(&request).contains("invocation: unavailable"));
+        assert!(authentication_reason(&request).contains("unavailable"));
+        assert!(
+            authentication_reason(&request).starts_with("authenticate sudo: root@host.example")
+        );
+        let mut anonymous = auth_request_for_tests();
+        anonymous.trusted.invoking_user = None;
+        anonymous.trusted.tty = None;
+        let summary = authentication_summary(&anonymous);
+        assert!(summary.contains("invoked by uid 1000"));
+        assert!(summary.contains("tty unknown"));
     }
 
     fn request_for_reason() -> RequestV1 {
@@ -1701,7 +2418,10 @@ mod tests {
     fn reason_does_not_double_sudo() {
         let mut request = request_for_reason();
         request.argv = vec!["sudo".into(), "apt".into(), "update".into()];
-        assert_eq!(approval_reason(&request), "eric@host.example sudo apt update");
+        assert_eq!(
+            approval_reason(&request),
+            "eric@host.example sudo apt update"
+        );
     }
 
     /// Host and user are never truncated or dropped, even when the argv is
@@ -1740,7 +2460,12 @@ mod tests {
             value: "a-very-long-session-label-that-eats-the-budget".into(),
         }];
         request.command = "/usr/bin/find".into();
-        request.argv = vec!["find".into(), "/".into(), "-name".into(), "needle-".repeat(20)];
+        request.argv = vec![
+            "find".into(),
+            "/".into(),
+            "-name".into(),
+            "needle-".repeat(20),
+        ];
         let reason = approval_reason(&request);
         assert!(reason.chars().count() <= MAX_APPROVAL_REASON_CHARS);
         assert!(reason.starts_with("eric@host.example sudo "));

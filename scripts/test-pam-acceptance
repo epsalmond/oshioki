@@ -1,0 +1,1065 @@
+#!/usr/bin/env bash
+# test-pam-acceptance: disposable-container acceptance test for the contextual
+# PAM authentication lane (Oshioki issue #73).
+#
+# Every run builds the workspace release artifacts on the host and then does
+# all of its PAM, sudo and helper work inside a throwaway Ubuntu 24.04
+# container. Nothing here touches the host's PAM stack, sudoers, or installed
+# binaries, and nothing here touches git state.
+#
+# WHAT THIS PROVES
+#   * The real liboshioki_pam.so loads into a stock Ubuntu /etc/pam.d/sudo
+#     stack and is driven by real sudo through a real PTY, as both the `sudo`
+#     and the `sudo-i` service.
+#   * The module's fixed helper contract: it execs
+#     /usr/local/sbin/oshioki authenticate --pam-protocol-version 2
+#     --pam-liveness-fd N, and frames one v2 JSON request on the helper's
+#     stdin carrying names (not UIDs), the PAM service, and advisory argv.
+#   * The unavailable path is genuinely non-fatal: an unreachable transport, a
+#     missing helper, and a registry with no hardware device each fall through
+#     to pam_unix and a typed password still authorises the command.
+#   * The path-security rule: a group-writable helper is refused, and (per
+#     pam/README.md) that refusal is a hard PAM_AUTH_ERR, not unavailable.
+#   * Per-transaction bookkeeping: the helper runs once per PAM transaction
+#     across password retries, native sudo timestamps suppress it entirely,
+#     and `sudo -n` after `sudo -k` never reaches PAM.
+#   * Cancellation: ^C during the module's helper wait is honoured rather than
+#     absorbed. What is measured is end to end -- the first ^C ends the
+#     module's wait, the stack falls through to the stock pam_unix prompt, and
+#     a second ^C there ends sudo, all within 1.5 s of the first keystroke.
+#     The module's own cancellation latency is not separated out here; that
+#     bound (one poll interval) is asserted by the pam/ unit tests. Scenario 10
+#     runs a control first (the identical interrupt through the identical
+#     harness against the stock stack) so the module result can be attributed
+#     to the module rather than to the test rig.
+#   * No helper process survives sudo's exit -- on the normal path, after
+#     password retries, or after that ^C.
+#   * An agent that acknowledges the request and then drops the connection is
+#     a transport fault, not a denial: the hook exits 2, authinfo_unavail is
+#     ignored, and a typed password still authorises the command (scenario
+#     11). Under this stack's `default=die` an exit 1 there would deny sudo
+#     with no password prompt at all.
+#   * The shipped installer produces this stack from a legacy host, retiring
+#     the approval plugin and the blanket NOPASSWD rule in the same run, and
+#     writing the exact control line with `module_unknown=ignore` -- which
+#     scenario 12 then proves is what keeps a missing module from locking the
+#     host out of sudo entirely.
+#   * `--disable-contextual-pam` restores byte-identical stock PAM files and
+#     removes the module, entries first (scenario 13), and a customised sudo
+#     stack is refused with nothing modified (scenario 14).
+#
+# WHAT THIS DOES NOT PROVE
+#   * A hardware-backed authentication SUCCESS. Secure Enclave needs a
+#     supervised Mac and WebAuthn needs a browser; neither exists in this
+#     container, so no scenario here returns PAM_SUCCESS from the module. The
+#     success arm of the exit-0 contract is covered only by pam/ unit tests.
+#   * macOS / OpenPAM behaviour of any kind.
+#   * Debian packaging, or any macOS workflow. The Linux installer IS
+#     exercised -- the stack under test is produced by
+#     `install-oshioki-hook --contextual-pam` migrating off a legacy plugin +
+#     blanket-NOPASSWD host -- but `pam-auth-update` is never run and the
+#     module is placed in /etc/pam.d/sudo and sudo-i ONLY, never common-auth.
+#   * Rollback of a failed migration. The fault-injection cases for that live
+#     in scripts/test-install-oshioki-hook, against a fake root.
+#   * Server, browser, or NATS delivery of an authentication envelope. Only
+#     the local agent socket transport is exercised.
+#   * Any hardware device answering. Scenario 5's registry relabels the test
+#     agent's software key as secure-enclave purely so the hook has a
+#     recipient to seal to and reaches the transport; the agent still holds a
+#     software key and still refuses, which is what that case measures.
+#
+# Usage: scripts/test-pam-acceptance
+# Environment:
+#   IMAGE                          base image (default ubuntu:24.04)
+#   OSHIOKI_E2E_SKIP_BUILD=1       reuse existing release artifacts
+#   OSHIOKI_E2E_KEEP_ARTIFACTS=1   keep the artifact directory on success
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+FIXTURES="$WORKSPACE/tests/pam-acceptance"
+IMAGE="${IMAGE:-ubuntu:24.04}"
+KEEP_ARTIFACTS="${OSHIOKI_E2E_KEEP_ARTIFACTS:-0}"
+SHARE="$(mktemp -d -t oshioki-pam-acceptance.XXXXXX)"
+SHARE="$(cd "$SHARE" && pwd -P)"
+RUN_ID="${SHARE##*.}"
+CONTAINER="oshioki-pam-${RUN_ID}"
+SECRET_FILE="$SHARE/fixture-password"
+# Deliberately unlike the mktemp template, the container name, and every
+# other literal in this script: the leak check greps driver output for this
+# value, and a value that also appeared in the artifact path would make any
+# stray path in a log look like a leaked password.
+FIXTURE_SECRET='Pw-7d41c9e6-fixture-only'
+AGENT_STATE="$SHARE/agent-state"
+TEST_SUCCEEDED=0
+FAILURES=0
+PASSES=0
+
+cleanup() {
+    set +e
+    docker rm -f "$CONTAINER" >/dev/null 2>&1
+    rm -f "$SECRET_FILE"
+    if [ "$TEST_SUCCEEDED" -eq 1 ] && [ "$KEEP_ARTIFACTS" != 1 ]; then
+        rm -rf "$SHARE"
+    else
+        echo "* retained pam-acceptance artifacts: $SHARE" >&2
+    fi
+}
+trap cleanup EXIT
+
+# --- build ---------------------------------------------------------------
+if [ "${OSHIOKI_E2E_SKIP_BUILD:-0}" = 1 ]; then
+    for artifact in \
+        "$WORKSPACE/target/release/liboshioki_pam.so" \
+        "$WORKSPACE/target/release/oshioki" \
+        "$WORKSPACE/target/unattended/release/oshioki-agent"; do
+        [ -s "$artifact" ] || { echo "missing $artifact" >&2; exit 2; }
+    done
+else
+    echo '* release: building PAM module, hook, and unattended agent'
+    (cd "$WORKSPACE" && cargo build --release -p oshioki-pam -p oshioki-hook)
+    # `run --auto` only exists behind the `unattended` feature; it is built in
+    # its own target directory so target/release keeps matching its checksums.
+    (cd "$WORKSPACE" && cargo build --release -p oshioki-agent \
+        --features unattended --target-dir target/unattended)
+fi
+
+# --- host-side fixtures --------------------------------------------------
+# The fixture password exists only as a file. The shell never expands it into
+# an argument or an exported variable; the PTY driver reads the file and types
+# it after the prompt is on screen.
+printf 'fixture:%s\n' "$FIXTURE_SECRET" >"$SECRET_FILE"
+chmod 0400 "$SECRET_FILE"
+
+rm -rf "$AGENT_STATE"
+mkdir -p "$AGENT_STATE"
+chmod 0700 "$AGENT_STATE"
+"$WORKSPACE/target/unattended/release/oshioki-agent" \
+    --state "$AGENT_STATE" init --signer software >/dev/null
+"$WORKSPACE/target/unattended/release/oshioki-agent" \
+    --state "$AGENT_STATE" device-record --label pam-acceptance \
+    >"$SHARE/device-record.json"
+
+# Two registries, both built from the same real agent key.
+#
+#   software-only  the record exactly as the agent emits it. `auth_recipients`
+#                  filters to hardware kinds, so this registry has no eligible
+#                  recipient and the hook must refuse without publishing.
+#   hardware       the same public key relabelled `secure-enclave`, purely so
+#                  the hook has something to seal to and actually reaches the
+#                  transport. The agent still holds a software key and still
+#                  refuses the lane, which is the point of scenario 5.
+python3 - "$SHARE/device-record.json" "$SHARE/devices-software.json" \
+    "$SHARE/devices-hardware.json" <<'PY'
+import json, sys
+record_path, software_path, hardware_path = sys.argv[1:]
+with open(record_path, encoding="utf-8") as handle:
+    record = json.load(handle)
+with open(software_path, "w", encoding="utf-8") as handle:
+    json.dump({"version": 1, "devices": [record]}, handle)
+hardware = dict(record)
+hardware["kind"] = "secure-enclave"
+with open(hardware_path, "w", encoding="utf-8") as handle:
+    json.dump({"version": 1, "devices": [hardware]}, handle)
+PY
+
+cp "$FIXTURES/pty_sudo.py" "$SHARE/pty_sudo.py"
+cp "$FIXTURES/stall_agent.py" "$SHARE/stall_agent.py"
+# The stack under test is installed by the real installer, not by hand: the
+# whole point of scenarios 12-14 is that the shipped installer produces it.
+cp "$SCRIPT_DIR/install-oshioki-hook" "$SHARE/install-oshioki-hook"
+
+# --- container bootstrap -------------------------------------------------
+echo "* container: $CONTAINER ($IMAGE)"
+docker run -d --name "$CONTAINER" \
+    -v "$WORKSPACE/target/release:/run/oshioki-release:ro" \
+    -v "$WORKSPACE/target/unattended/release:/run/oshioki-unattended:ro" \
+    -v "$SHARE:/run/oshioki-test:rw" \
+    "$IMAGE" sleep infinity >/dev/null
+
+in_container() { docker exec "$CONTAINER" bash -ceu "$1"; }
+
+in_container '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq sudo passwd libpam-runtime libpam-modules python3 \
+        procps >/dev/null
+
+    # The module directory is NOT chosen here. install-oshioki-hook discovers
+    # it, and the test records what the installer decided so the scenarios can
+    # find the file.
+
+    # Observation store. Root-only: the request JSON is captured here and the
+    # fixture account must not be able to read or forge it.
+    install -d -o root -g root -m 0700 /run/oshioki-obs
+    install -d -o root -g root -m 0755 /etc/oshioki
+
+    # The real helper, plus a root-owned 0755 wrapper at the fixed path the
+    # module hard-codes. The wrapper records that it ran, with which argv, and
+    # tees the framed request to a root-only file before handing both to the
+    # real binary. It deliberately keeps every inherited descriptor, so the
+    # --pam-liveness-fd the module passes still reaches the real helper.
+    install -o root -g root -m 0755 /run/oshioki-release/oshioki /usr/local/sbin/oshioki.real
+    # `bash -p` is load-bearing. sudo runs its PAM stack with real uid still
+    # the invoking account and only the effective uid raised, and bash resets
+    # its effective uid to the real one on startup unless started privileged.
+    # Without -p this wrapper would silently hand the real helper an
+    # unprivileged process, the helper would refuse itself, and every scenario
+    # would look like a transport failure. PATH is set explicitly because the
+    # module hands the helper an empty environment.
+    cat >/usr/local/sbin/oshioki <<"WRAP"
+#!/bin/bash -p
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+obs=/run/oshioki-obs
+stamp="$(date +%s%N)-$$"
+printf "%s\t%s\n" "$stamp" "$*" >>"$obs/invocations"
+printf "%s\t%s\n" "$stamp" "$(id)" >>"$obs/ids"
+tee "$obs/request-$stamp.json" | /usr/local/sbin/oshioki.real "$@"
+rc=${PIPESTATUS[1]}
+printf "%s\t%s\n" "$stamp" "$rc" >>"$obs/exits"
+exit "$rc"
+WRAP
+    chmod 0755 /usr/local/sbin/oshioki
+    chown root:root /usr/local/sbin/oshioki
+    cp /usr/local/sbin/oshioki /run/oshioki-obs/oshioki.wrapper
+
+    install -o root -g root -m 0755 /run/oshioki-unattended/oshioki-agent /usr/local/sbin/oshioki-agent
+
+    # hook.json is not read on the socket authentication path, but the hook
+    # expects a valid one to exist for any lane that consults it.
+    cat >/etc/oshioki/hook.json <<"JSON"
+{"version":1,"origin":"https://sudo.test","rp_id":"sudo.test","server_base_url":"https://sudo.test"}
+JSON
+    chmod 0644 /etc/oshioki/hook.json
+
+    # Byte-exact "before" copies. Scenario 13 asserts that
+    # --disable-contextual-pam restores exactly these.
+    for service in sudo sudo-i; do
+        cp "/etc/pam.d/$service" "/run/oshioki-obs/$service.pam.orig"
+    done
+    cp /etc/pam.d/common-auth /run/oshioki-obs/common-auth.orig
+
+    useradd --create-home --shell /bin/bash fixture
+    chpasswd </run/oshioki-test/fixture-password
+
+    cat >/usr/local/bin/oshioki-nopass <<"NOP"
+#!/bin/sh
+echo "nopass-ran euid=$(id -u)"
+NOP
+    chmod 0755 /usr/local/bin/oshioki-nopass
+
+    cat >/etc/sudoers.d/oshioki-pam-acceptance <<"SUDOERS"
+Defaults timestamp_timeout=10
+fixture ALL=(root) PASSWD: ALL
+fixture ALL=(root) NOPASSWD: /usr/local/bin/oshioki-nopass
+SUDOERS
+    chmod 0440 /etc/sudoers.d/oshioki-pam-acceptance
+    visudo -c >/dev/null
+
+    # ---------------------------------------------------------------------
+    # The legacy state this host is migrating FROM: the approval plugin in
+    # sudo.conf and the blanket NOPASSWD drop-in. Writing it first is what
+    # makes the run exercise the migration path rather than a green-field
+    # install -- the installer has to take both of these out, in order,
+    # before the module exists.
+    # ---------------------------------------------------------------------
+    install -d -o root -g root -m 0755 /usr/local/libexec/sudo
+    printf "%s\n" "# BEGIN oshioki" \
+        "Plugin approval_exec /usr/local/libexec/sudo/oshioki.so" \
+        "# END oshioki" >/etc/sudo.conf
+    chmod 0644 /etc/sudo.conf
+    printf "fixture ALL=(ALL) NOSETENV: NOPASSWD: ALL\n" >/etc/sudoers.d/oshioki
+    chmod 0440 /etc/sudoers.d/oshioki
+    chown root:root /etc/sudoers.d/oshioki
+
+    # An active hardware-backed device: the installer refuses to migrate a
+    # host that has nothing capable of answering an authentication.
+    install -o root -g root -m 0600 /run/oshioki-test/devices-hardware.json /etc/oshioki/devices.json
+
+    # The installer verifies the module against a checksum manifest. The
+    # release mount is read-only, so the manifest is built next to it.
+    ( cd /run/oshioki-release && sha256sum liboshioki_pam.so ) >/run/oshioki-obs/SHA256SUMS
+
+    install -d -o root -g root -m 0755 /run/oshioki-installer/scripts
+    install -o root -g root -m 0755 /run/oshioki-test/install-oshioki-hook \
+        /run/oshioki-installer/scripts/install-oshioki-hook
+
+    OSHIOKI_CHECKSUMS=/run/oshioki-obs/SHA256SUMS \
+    PAM_MODULE_BIN=/run/oshioki-release/liboshioki_pam.so \
+        /run/oshioki-installer/scripts/install-oshioki-hook --contextual-pam
+
+    security_dir="$(dirname "$(dpkg-query -L libpam-modules | grep -E "/pam_unix[.]so$" | head -1)")"
+    printf "%s\n" "$security_dir" >/run/oshioki-test/security-dir
+    [ -f "$security_dir/liboshioki_pam.so" ] || {
+        echo "the installer did not place the module in $security_dir" >&2; exit 1; }
+
+    # Everything below is an assertion about what the INSTALLER produced.
+    for service in sudo sudo-i; do
+        grep -Fxq "auth [success=done authinfo_unavail=ignore module_unknown=ignore ignore=ignore default=die] liboshioki_pam.so" \
+            "/etc/pam.d/$service" || {
+            echo "/etc/pam.d/$service has no exact oshioki auth line" >&2; exit 1; }
+        [ "$(grep -c "^# BEGIN oshioki pam$" "/etc/pam.d/$service")" = 1 ] || {
+            echo "/etc/pam.d/$service block count is wrong" >&2; exit 1; }
+        sed "/^# BEGIN oshioki pam$/,/^# END oshioki pam$/d" "/etc/pam.d/$service" \
+            >/run/oshioki-obs/$service.stripped
+        cmp -s "/run/oshioki-obs/$service.stripped" "/run/oshioki-obs/$service.pam.orig" || {
+            echo "/etc/pam.d/$service changed outside the owned block" >&2; exit 1; }
+    done
+    cp /etc/pam.d/sudo /run/oshioki-obs/sudo.pam.test
+    cp /etc/pam.d/sudo-i /run/oshioki-obs/sudo-i.pam.test
+    if grep -Fq liboshioki_pam.so /etc/pam.d/common-auth; then
+        echo "the module leaked into common-auth" >&2
+        exit 1
+    fi
+    cmp -s /etc/pam.d/common-auth /run/oshioki-obs/common-auth.orig || {
+        echo "common-auth was modified" >&2; exit 1; }
+    # The legacy lane is gone in the same run: no double-authentication
+    # window, and no blanket NOPASSWD rule left behind.
+    [ ! -e /etc/sudoers.d/oshioki ] || {
+        echo "the migration left the blanket NOPASSWD rule in place" >&2; exit 1; }
+    if grep -q "^Plugin approval_exec " /etc/sudo.conf; then
+        echo "the migration left the legacy approval plugin configured" >&2; exit 1
+    fi
+    visudo -c >/dev/null
+' >"$SHARE/bootstrap.log" 2>&1 || {
+    echo 'FAIL: container bootstrap' >&2
+    cat "$SHARE/bootstrap.log" >&2
+    exit 1
+}
+echo "* bootstrap: module at $(cat "$SHARE/security-dir")/liboshioki_pam.so"
+
+# --- observation helpers -------------------------------------------------
+obs_reset() {
+    in_container 'rm -f /run/oshioki-obs/request-*.json /run/oshioki-obs/invocations /run/oshioki-obs/exits /run/oshioki-obs/ids
+                  : >/run/oshioki-obs/invocations; : >/run/oshioki-obs/exits; : >/run/oshioki-obs/ids' >/dev/null
+}
+obs_count() { in_container 'wc -l </run/oshioki-obs/invocations' | tr -d '[:space:]'; }
+obs_argv()  { in_container 'cut -f2- /run/oshioki-obs/invocations' 2>/dev/null || true; }
+obs_request() {
+    in_container 'set +e; f=$(ls -1 /run/oshioki-obs/request-*.json 2>/dev/null | head -1); [ -n "$f" ] && cat "$f"' \
+        2>/dev/null || true
+}
+# Any surviving helper process, wrapper or real binary. This walks /proc and
+# matches on the executable and the first cmdline word rather than grepping
+# `ps` output, so the process doing the checking can never match itself.
+obs_stray() {
+    in_container 'for entry in /proc/[0-9]*; do
+        exe=$(readlink "$entry/exe" 2>/dev/null) || continue
+        case "$exe" in */oshioki.real) printf "%s %s\n" "$entry" "$exe"; continue ;; esac
+        cmd=$(tr "\0" "\n" <"$entry/cmdline" 2>/dev/null | head -3 | tr "\n" " ") || continue
+        case "$cmd" in
+            "/bin/bash -p /usr/local/sbin/oshioki "*|"/usr/local/sbin/oshioki "*)
+                printf "%s %s\n" "$entry" "$cmd" ;;
+        esac
+    done' 2>/dev/null || true
+}
+set_config() { in_container "printf '%s\n' '$1' >/etc/oshioki/config.env; chmod 0644 /etc/oshioki/config.env" >/dev/null; }
+set_registry() {
+    in_container "install -o root -g root -m 0600 /run/oshioki-test/devices-$1.json /etc/oshioki/devices.json" >/dev/null
+}
+drop_timestamp() { in_container 'runuser -u fixture -- sudo -k' >/dev/null 2>&1 || true; }
+
+# Runs one sudo command through the host-side PTY driver against the
+# container. The password never appears in argv or the environment.
+pty_run() {
+    local log="$1"; shift
+    set +e
+    python3 "$SHARE/pty_sudo.py" --password-file "$SECRET_FILE" "$@" >"$log" 2>&1
+    local status=$?
+    set -e
+    if grep -Fq "$FIXTURE_SECRET" "$log"; then
+        # Literal replacement, not a regex. A bare `sed s///` would treat any
+        # metacharacter in the secret as syntax, which at best fails to redact
+        # and at worst rewrites the log around it; \Q..\E quotes the whole
+        # value. The secret reaches perl through the environment rather than
+        # argv, so it never appears in a process listing.
+        SECRET="$FIXTURE_SECRET" perl -i -pe 's/\Q$ENV{SECRET}\E/[redacted]/g' "$log"
+        echo 'FAIL: fixture password appeared in driver output' >&2
+        return 1
+    fi
+    return "$status"
+}
+pty_field() { sed -n "s/^$2=//p" "$1" | tail -1; }
+
+report_fail() {
+    local name="$1" detail="$2" log="${3:-}"
+    FAILURES=$((FAILURES + 1))
+    echo "* FAIL: $name -- $detail" >&2
+    [ -n "$log" ] && [ -f "$log" ] && sed -n '1,60p' "$log" >&2
+    return 0
+}
+report_pass() { PASSES=$((PASSES + 1)); echo "* PASS: $1 -- $2"; }
+
+# =========================================================================
+# Scenario 1: a NOPASSWD rule never reaches the module at all.
+# Expectation: no password prompt, command runs, and the helper wrapper logs
+# zero invocations -- sudo skips PAM authentication entirely for NOPASSWD.
+# =========================================================================
+scenario_nopasswd() {
+    local name=1-nopasswd
+    local log="$SHARE/$name.log"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    pty_run "$log" --expect-prompt no --no-password --timeout 20 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo -n /usr/local/bin/oshioki-nopass \
+        || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc count
+    rc="$(pty_field "$log" PTY_RC)"
+    count="$(obs_count)"
+    [ "$rc" = 0 ] || { report_fail "$name" "NOPASSWD command failed (rc=$rc)" "$log"; return; }
+    grep -Fq 'nopass-ran euid=0' "$log" || { report_fail "$name" 'command did not run as root' "$log"; return; }
+    [ "$count" = 0 ] || { report_fail "$name" "helper was invoked $count time(s) for a NOPASSWD rule"; return; }
+    report_pass "$name" "rc=$rc prompts=0 helper_invocations=$count"
+}
+
+# =========================================================================
+# Scenario 2: PASSWD rule with an unreachable transport.
+# Expectation: the module runs, execs the helper with the documented private
+# argv, frames one v2 request, the helper exits 2 quickly, authinfo_unavail is
+# ignored, pam_unix prompts, and the typed password authorises the command.
+# =========================================================================
+scenario_unreachable_transport() {
+    local name=2-transport-unreachable
+    local log="$SHARE/$name.log"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    pty_run "$log" --expect-prompt yes --timeout 60 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true \
+        || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc elapsed count argv request
+    rc="$(pty_field "$log" PTY_RC)"
+    elapsed="$(pty_field "$log" PTY_ELAPSED_MS)"
+    count="$(obs_count)"
+    argv="$(obs_argv)"
+    request="$(obs_request)"
+    printf '%s\n' "$request" >"$SHARE/$name.request.json"
+    [ "$rc" = 0 ] || { report_fail "$name" "password fallback did not authorise (rc=$rc)" "$log"; return; }
+    [ "$count" = 1 ] || { report_fail "$name" "expected 1 helper invocation, saw $count"; return; }
+    case "$argv" in
+        *"authenticate --pam-protocol-version 2 --pam-liveness-fd "[0-9]*) ;;
+        *) report_fail "$name" "helper argv did not match the private contract: $argv"; return ;;
+    esac
+    python3 - "$SHARE/$name.request.json" <<'PY' || { report_fail "$name" 'request JSON did not match the v2 schema'; return; }
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    request = json.load(handle)
+problems = []
+if request.get("pam_protocol_version") != 2:
+    problems.append(f"pam_protocol_version={request.get('pam_protocol_version')!r}")
+for field in ("principal", "invoking"):
+    value = request.get(field)
+    if not isinstance(value, dict) or set(value) != {"name"}:
+        problems.append(f"{field}={value!r} is not a names-only object")
+    elif "uid" in value:
+        problems.append(f"{field} carries a uid")
+if request.get("principal", {}).get("name") != "fixture":
+    problems.append(f"principal={request.get('principal')!r} (expected the authenticated account)")
+if request.get("invoking", {}).get("name") != "fixture":
+    problems.append(f"invoking={request.get('invoking')!r} (expected fixture)")
+if request.get("service") != "sudo":
+    problems.append(f"service={request.get('service')!r}")
+if not isinstance(request.get("process_pid"), int):
+    problems.append("process_pid is not a number")
+# Advisory only. The module reads its own process argv, so on a real sudo
+# stack this is normally available and untruncated; the contract this asserts
+# is the shape and the flags, not a particular command line.
+argv = request.get("submitted_argv")
+if not isinstance(argv, dict) or set(argv) != {"available", "truncated", "values"}:
+    problems.append(f"submitted_argv={argv!r}")
+elif not isinstance(argv["available"], bool) or not isinstance(argv["truncated"], bool) \
+        or not isinstance(argv["values"], list):
+    problems.append(f"submitted_argv flags are not booleans over a list: {argv!r}")
+elif argv["truncated"] and argv["values"]:
+    # Trimming drops values from the end, so a request that reports truncation
+    # must have lost something.
+    pass
+print("OBSERVED_PRINCIPAL=" + json.dumps(request.get("principal")))
+print("OBSERVED_INVOKING=" + json.dumps(request.get("invoking")))
+print("OBSERVED_SERVICE=" + str(request.get("service")))
+print("OBSERVED_ARGV=" + json.dumps(argv))
+print("OBSERVED_TTY=" + json.dumps(request.get("tty")))
+if problems:
+    print("PROBLEMS: " + "; ".join(problems), file=sys.stderr)
+    raise SystemExit(1)
+PY
+    report_pass "$name" "rc=$rc elapsed=${elapsed}ms helper_invocations=$count argv=[$argv]"
+}
+
+# =========================================================================
+# Scenario 3: the helper binary is absent.
+# Expectation: the module cannot start a helper, classifies that as
+# unavailable rather than a denial, and the password path still works.
+# =========================================================================
+scenario_helper_missing() {
+    local name=3-helper-missing
+    local log="$SHARE/$name.log"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    in_container 'mv /usr/local/sbin/oshioki /run/oshioki-obs/oshioki.stashed' >/dev/null
+    local driver=0
+    pty_run "$log" --expect-prompt yes --timeout 40 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true || driver=$?
+    in_container 'install -o root -g root -m 0755 /run/oshioki-obs/oshioki.wrapper /usr/local/sbin/oshioki; rm -f /run/oshioki-obs/oshioki.stashed' >/dev/null
+    [ "$driver" -eq 0 ] || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc count
+    rc="$(pty_field "$log" PTY_RC)"
+    count="$(obs_count)"
+    [ "$rc" = 0 ] || { report_fail "$name" "password fallback did not authorise (rc=$rc)" "$log"; return; }
+    [ "$count" = 0 ] || { report_fail "$name" "helper ran $count time(s) with the binary removed"; return; }
+    report_pass "$name" "rc=$rc prompts=$(pty_field "$log" PTY_PROMPT) helper_invocations=$count"
+}
+
+# =========================================================================
+# Scenario 4: the helper is present but group-writable (0775).
+# Expectation, per pam/README.md: the path check refuses the helper and that
+# refusal is PAM_AUTH_ERR, NOT unavailable -- an insecure helper path is a
+# security decision, not a transient condition. With default=die in the stack
+# sudo therefore fails without ever reaching pam_unix. The helper must not run.
+# =========================================================================
+scenario_helper_group_writable() {
+    local name=4-helper-group-writable
+    local log="$SHARE/$name.log"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    in_container 'chmod 0775 /usr/local/sbin/oshioki' >/dev/null
+    # The correct password is offered deliberately: PAM_AUTH_ERR under
+    # default=die must not be rescuable by a valid password, and that is only
+    # demonstrated by typing one.
+    local driver=0
+    pty_run "$log" --expect-prompt any --timeout 40 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true || driver=$?
+    in_container 'chmod 0755 /usr/local/sbin/oshioki' >/dev/null
+    [ "$driver" -eq 0 ] || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc prompts count
+    rc="$(pty_field "$log" PTY_RC)"
+    prompts="$(pty_field "$log" PTY_PROMPT)"
+    count="$(obs_count)"
+    [ "$count" = 0 ] || { report_fail "$name" "a group-writable helper was executed $count time(s)"; return; }
+    [ "$rc" != 0 ] || { report_fail "$name" 'a correct password rescued a group-writable helper; the stack did not die' "$log"; return; }
+    [ "$prompts" = 0 ] || {
+        report_fail "$name" "the stack fell through to pam_unix (prompts=$prompts); pam/README.md says an insecure helper path is PAM_AUTH_ERR" "$log"
+        return
+    }
+    report_pass "$name" "rc=$rc prompts=0 helper_invocations=0 (PAM_AUTH_ERR -> die; a correct password could not rescue it)"
+}
+
+# =========================================================================
+# Scenario 5: a real agent is listening and refuses the authentication lane.
+# Expectation: `run --auto` never answers a sudo authentication (and the
+# agent's software key is independently ineligible), so it logs a refusal and
+# publishes nothing and closes the connection without acknowledging, so the
+# hook sees a silent socket and falls back immediately rather than waiting out
+# its 75 s AUTH_TIMEOUT. The password path still works. The measured latency is
+# reported, and the case asserts it rather than assuming it: a refusal that
+# started costing a user 75 seconds of silence would be a regression.
+# =========================================================================
+scenario_agent_refuses() {
+    local name=5-agent-refuses
+    local log="$SHARE/$name.log"
+    local agent_log=/run/oshioki-obs/agent.log
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/agent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    in_container "rm -f /run/oshioki-obs/agent.sock $agent_log; : >$agent_log
+        install -d -m 0700 /run/oshioki-obs/agent-state
+        cp -a /run/oshioki-test/agent-state/. /run/oshioki-obs/agent-state/
+        setsid env RUST_LOG=info OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/agent.sock \
+            /usr/local/sbin/oshioki-agent run --state /run/oshioki-obs/agent-state --auto approve \
+            >$agent_log 2>&1 < /dev/null &
+        for _ in \$(seq 1 100); do
+            grep -Fq 'agent socket listening' $agent_log && break
+            sleep 0.1
+        done
+        grep -Fq 'agent socket listening' $agent_log" >/dev/null || {
+        report_fail "$name" 'the agent never bound its socket'
+        in_container "cat $agent_log" >&2 || true
+        return
+    }
+    # The socket must be reachable by the root helper; the agent created it.
+    in_container 'chmod 0666 /run/oshioki-obs/agent.sock' >/dev/null
+    # The helper deadline is 75 s and the module's is 90 s, so the driver must
+    # outlast both before it can call this a hang.
+    local driver=0
+    pty_run "$log" --expect-prompt yes --timeout 140 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true || driver=$?
+    in_container "cp $agent_log /run/oshioki-test/$name.agent.log; pkill -f 'oshioki-agent run' || true" >/dev/null 2>&1 || true
+    [ "$driver" -eq 0 ] || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc elapsed count refusal
+    rc="$(pty_field "$log" PTY_RC)"
+    elapsed="$(pty_field "$log" PTY_ELAPSED_MS)"
+    count="$(obs_count)"
+    refusal="$(grep -c -E 'ignoring authentication request' "$SHARE/$name.agent.log" 2>/dev/null || true)"
+    [ "$rc" = 0 ] || { report_fail "$name" "password fallback did not authorise (rc=$rc)" "$log"; return; }
+    [ "$count" = 1 ] || { report_fail "$name" "expected 1 helper invocation, saw $count"; return; }
+    [ "${refusal:-0}" -ge 1 ] || {
+        report_fail "$name" 'the agent logged no refusal of the authentication lane'
+        sed -n '1,40p' "$SHARE/$name.agent.log" >&2 || true
+        return
+    }
+    [ -z "$(obs_stray)" ] || { report_fail "$name" "a helper process survived: $(obs_stray)"; return; }
+    # A refusal is a closed socket observed at once; the measured cost is a
+    # few hundred milliseconds. The bound only has to sit far below the 75 s
+    # deadline to prove no deadline was waited out, and far above the
+    # measurement to survive a loaded host.
+    [ "$elapsed" -lt 5000 ] || {
+        report_fail "$name" "the refusal cost ${elapsed}ms; a refusing agent must answer at once, not wait out the 75s deadline" "$log"
+        return
+    }
+    report_pass "$name" "rc=$rc elapsed=${elapsed}ms helper_invocations=$count agent_refusals=$refusal (refusal is a closed socket, not a deadline wait)"
+}
+
+# =========================================================================
+# Scenario 6: the device registry holds only software keys.
+# Expectation: `auth_recipients` keeps hardware devices only, so the hook
+# refuses as unavailable BEFORE any transport work. This must be fast and it
+# must not publish anything; the password path still works.
+# =========================================================================
+scenario_software_only() {
+    local name=6-software-only
+    local log="$SHARE/$name.log"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry software
+    obs_reset
+    drop_timestamp
+    pty_run "$log" --expect-prompt yes --timeout 40 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true \
+        || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc elapsed count
+    rc="$(pty_field "$log" PTY_RC)"
+    elapsed="$(pty_field "$log" PTY_ELAPSED_MS)"
+    count="$(obs_count)"
+    [ "$rc" = 0 ] || { report_fail "$name" "password fallback did not authorise (rc=$rc)" "$log"; return; }
+    [ "$count" = 1 ] || { report_fail "$name" "expected 1 helper invocation, saw $count"; return; }
+    grep -Fq 'no active hardware authentication device' "$log" \
+        || echo "  note: the empty-recipient reason is not on the terminal (the module bounds and discards helper stderr, as documented)" >&2
+    report_pass "$name" "rc=$rc elapsed=${elapsed}ms helper_invocations=$count"
+    set_registry hardware
+}
+
+# =========================================================================
+# Scenario 7: two wrong passwords then the right one, in one sudo call.
+# Expectation: the module runs its helper once for the whole PAM transaction
+# (the handle record replays `unavailable` to pam_unix's retries rather than
+# raising a second device request), and no helper process outlives sudo.
+# =========================================================================
+scenario_password_retries() {
+    local name=7-password-retries
+    local log="$SHARE/$name.log"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    pty_run "$log" --expect-prompt yes --wrong-first 2 --timeout 60 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true \
+        || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc prompts count stray
+    rc="$(pty_field "$log" PTY_RC)"
+    prompts="$(pty_field "$log" PTY_PROMPT)"
+    count="$(obs_count)"
+    stray="$(obs_stray)"
+    [ "$rc" = 0 ] || { report_fail "$name" "the correct third password did not authorise (rc=$rc)" "$log"; return; }
+    [ "$prompts" -ge 3 ] || { report_fail "$name" "expected at least 3 prompts, saw $prompts" "$log"; return; }
+    [ "$count" = 1 ] || { report_fail "$name" "expected 1 helper invocation across $prompts prompts, saw $count"; return; }
+    [ -z "$stray" ] || { report_fail "$name" "a helper process survived sudo: $stray"; return; }
+    report_pass "$name" "rc=$rc prompts=$prompts helper_invocations=$count strays=0"
+}
+
+# =========================================================================
+# Scenario 8: native sudo timestamps.
+# Expectation: a second sudo inside the timestamp window skips PAM entirely,
+# so the helper count stays at 1; after `sudo -k`, `sudo -n` refuses before
+# PAM (default noninteractive_auth) and still does not invoke the helper.
+# =========================================================================
+scenario_timestamp() {
+    local name=8-timestamp
+    local log="$SHARE/$name.log"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    pty_run "$log" --expect-prompt yes --timeout 60 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sh -c \
+        'sudo /usr/bin/true && echo FIRST_OK; sudo /usr/bin/true && echo SECOND_OK; sudo -k; sudo -n /usr/bin/true || echo NONINTERACTIVE_REFUSED' \
+        || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local prompts count
+    prompts="$(pty_field "$log" PTY_PROMPT)"
+    count="$(obs_count)"
+    grep -Fq FIRST_OK "$log" || { report_fail "$name" 'the first sudo did not succeed' "$log"; return; }
+    grep -Fq SECOND_OK "$log" || { report_fail "$name" 'the timestamp-reusing sudo did not succeed' "$log"; return; }
+    grep -Fq NONINTERACTIVE_REFUSED "$log" || { report_fail "$name" 'sudo -n after sudo -k unexpectedly succeeded' "$log"; return; }
+    [ "$prompts" = 1 ] || { report_fail "$name" "expected exactly 1 password prompt across the sequence, saw $prompts" "$log"; return; }
+    [ "$count" = 1 ] || { report_fail "$name" "expected exactly 1 helper invocation across the sequence, saw $count: $(obs_argv)"; return; }
+    report_pass "$name" "prompts=$prompts helper_invocations=$count (second sudo and sudo -n bypassed PAM)"
+}
+
+# =========================================================================
+# Scenario 9: the sudo-i service.
+# Expectation: the module accepts sudo-i as well as sudo, the helper receives
+# service "sudo-i", and the unavailable result still falls through to a
+# password.
+# =========================================================================
+scenario_sudo_i() {
+    local name=9-sudo-i
+    local log="$SHARE/$name.log"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    pty_run "$log" --expect-prompt yes --timeout 60 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo -i /usr/bin/id -u \
+        || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc count service
+    rc="$(pty_field "$log" PTY_RC)"
+    count="$(obs_count)"
+    obs_request >"$SHARE/$name.request.json"
+    service="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["service"])' "$SHARE/$name.request.json" 2>/dev/null || echo '<unreadable>')"
+    [ "$rc" = 0 ] || { report_fail "$name" "sudo -i did not authorise (rc=$rc)" "$log"; return; }
+    [ "$count" = 1 ] || { report_fail "$name" "expected 1 helper invocation, saw $count"; return; }
+    [ "$service" = "sudo-i" ] || { report_fail "$name" "helper saw service=$service, expected sudo-i"; return; }
+    report_pass "$name" "rc=$rc helper_invocations=$count service=$service"
+}
+
+# =========================================================================
+# Scenario 10: ^C while the helper is waiting on an acknowledged request.
+#
+# A stand-in agent acknowledges the request and then stays silent, which holds
+# the module inside its helper wait. The case runs a control first -- the same
+# ^C, at the same point in the same harness, against the stock PAM stack with
+# the module removed -- so a difference can be attributed to the module rather
+# than to the test rig.
+#
+# Expectation (issue #73 acceptance criterion): ^C ends sudo promptly, no
+# helper process outlives it, and cancellation is never a success. The module
+# never receives the signal itself -- the helper runs in its own process group,
+# so the SIGINT goes to sudo, which blocks and ignores it for the whole
+# authentication phase -- so it watches its own pending set instead and reads a
+# newly pending SIGINT as cancellation. See the Cancellation section of
+# pam/README.md.
+#
+# Cancelling is PAM_AUTHINFO_UNAVAIL, which this stack is configured to
+# ignore, so the first ^C returns the module at once (about 10 ms, measured)
+# and the stack falls through to the stock pam_unix prompt -- which then needs
+# an interrupt of its own, exactly as it does in the control run. The case
+# therefore sends ^C repeatedly at one-second intervals and types nothing:
+# what it measures is that the pair of interrupts ends sudo at human speed
+# rather than being absorbed. No password is offered, so nothing but the
+# interrupts can end it.
+#
+# This was a recorded product defect until that rule landed in pam/src/lib.rs:
+# the first interrupt used to be echoed and then swallowed for the remainder
+# of the hook's 75 s deadline, and the stack only reached a password prompt at
+# 75 s, as though nothing had been typed.
+# =========================================================================
+scenario_sigint() {
+    local name=10-sigint
+    local log="$SHARE/$name.log"
+    local control_log="$SHARE/$name.control.log"
+
+    # --- control: stock stack, same harness, same interrupt ---------------
+    in_container 'cp /run/oshioki-obs/sudo.pam.orig /etc/pam.d/sudo' >/dev/null
+    drop_timestamp
+    local control_driver=0
+    pty_run "$control_log" --expect-prompt yes --no-password --sigint-after 4 --timeout 25 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true || control_driver=$?
+    in_container 'cp /run/oshioki-obs/sudo.pam.test /etc/pam.d/sudo' >/dev/null
+    [ "$control_driver" -eq 0 ] || { report_fail "$name" 'the control run failed; ^C delivery through this harness is unproven' "$control_log"; return; }
+    local control_rc control_elapsed
+    control_rc="$(pty_field "$control_log" PTY_RC)"
+    control_elapsed="$(pty_field "$control_log" PTY_ELAPSED_MS)"
+    [ "$control_rc" != 0 ] && [ "$control_elapsed" -lt 10000 ] || {
+        report_fail "$name" "the control did not honour ^C (rc=$control_rc elapsed=${control_elapsed}ms); the harness cannot attribute the module result"
+        return
+    }
+
+    # --- the module, holding a silent but acknowledged request ------------
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/stall.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    in_container 'rm -f /run/oshioki-obs/stall.sock /run/oshioki-obs/stall.ready /run/oshioki-obs/stall.log
+        setsid python3 /run/oshioki-test/stall_agent.py /run/oshioki-obs/stall.sock /run/oshioki-obs/stall.ready \
+            >/run/oshioki-obs/stall.log 2>&1 </dev/null &
+        for _ in $(seq 1 100); do [ -e /run/oshioki-obs/stall.ready ] && break; sleep 0.1; done
+        [ -e /run/oshioki-obs/stall.ready ]' >/dev/null || {
+        report_fail "$name" 'the stall listener never bound its socket'
+        in_container 'cat /run/oshioki-obs/stall.log' >&2 || true
+        return
+    }
+    # The first ^C goes in at SIGINT_AT, well after the acknowledgement, so the
+    # module is genuinely inside its helper wait. Three are sent a second
+    # apart: the first cancels the module, the second ends sudo at the
+    # pam_unix prompt it falls through to, and the third is spare.
+    local sigint_at=8 sigint_interval=1
+    local driver=0
+    pty_run "$log" --expect-prompt any --no-password --sigint-after "$sigint_at" \
+        --sigint-count 3 --sigint-interval "$sigint_interval" --timeout 140 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true || driver=$?
+    local acked
+    acked="$(in_container 'grep -c "sending no verdict" /run/oshioki-obs/stall.log || true' | tr -d '[:space:]')"
+    in_container "cp /run/oshioki-obs/stall.log /run/oshioki-test/$name.stall.log; pkill -f stall_agent.py || true" >/dev/null 2>&1 || true
+    [ "$driver" -eq 0 ] || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc elapsed stray
+    rc="$(pty_field "$log" PTY_RC)"
+    elapsed="$(pty_field "$log" PTY_ELAPSED_MS)"
+    [ "${acked:-0}" -ge 1 ] || { report_fail "$name" 'the helper never reached an acknowledged wait, so ^C did not land where intended'; return; }
+    # Give the parent-death signal a moment to be delivered and reaped.
+    in_container 'sleep 2' >/dev/null
+    stray="$(obs_stray)"
+    [ -z "$stray" ] || { report_fail "$name" "a helper process survived: $stray"; return; }
+    # Measured from the FIRST interrupt rather than from process start, so the
+    # assertion is about cancellation latency and not about when the case
+    # happened to type. Two interrupts are needed -- one to end the module's
+    # wait, one to end the pam_unix prompt it falls through to -- so the floor
+    # is one interval; 1500ms allows that plus half a second of container and
+    # scheduler jitter. The defect this replaces absorbed all three and held
+    # the terminal for the hook's whole 75 s deadline, i.e. about 67000ms by
+    # this measure, so nothing between the two numbers is ambiguous.
+    local since_interrupt=$((elapsed - sigint_at * 1000))
+    [ "$since_interrupt" -lt 1500 ] || {
+        report_fail "$name" "^C was sent at ${sigint_at}000ms and sudo ran for ${elapsed}ms, ${since_interrupt}ms past the interrupt (control: ${control_elapsed}ms); the interrupts were swallowed" "$log"
+        return
+    }
+    # Cancellation is not an authentication: it must not authorise the command.
+    [ "$rc" != 0 ] || { report_fail "$name" 'sudo succeeded after ^C; cancellation must never authenticate' "$log"; return; }
+    report_pass "$name" "^C at ${sigint_at}000ms ended sudo ${since_interrupt}ms later (total ${elapsed}ms, rc=$rc, interrupts=$(pty_field "$log" PTY_INTERRUPTS), control ${control_elapsed}ms) strays=0 acknowledged_waits=$acked"
+}
+
+# =========================================================================
+# Scenario 11: an agent that acknowledges the request and then drops the
+# connection.
+#
+# The same stall listener as scenario 10, with --close-after-ack: it speaks
+# the socket protocol as far as AliveV1 and then hangs up without a verdict.
+# That is what an agent crash, restart, or killed connection looks like to the
+# hook mid-request.
+#
+# Expectation: no decision bytes were ever produced, so this is a transport
+# fault and not evidence about the operator. The hook must exit 2
+# (authinfo_unavail), the stack must ignore that and reach pam_unix, and a
+# typed password must authorise the command -- promptly, without waiting out
+# the hook's 75 s deadline. An exit 1 here would meet `default=die` and deny
+# sudo with no password prompt at all.
+# =========================================================================
+scenario_ack_then_drop() {
+    local name=11-ack-then-drop
+    local log="$SHARE/$name.log"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/stall.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    in_container 'rm -f /run/oshioki-obs/stall.sock /run/oshioki-obs/stall.ready /run/oshioki-obs/stall.log
+        setsid python3 /run/oshioki-test/stall_agent.py --close-after-ack \
+            /run/oshioki-obs/stall.sock /run/oshioki-obs/stall.ready \
+            >/run/oshioki-obs/stall.log 2>&1 </dev/null &
+        for _ in $(seq 1 100); do [ -e /run/oshioki-obs/stall.ready ] && break; sleep 0.1; done
+        [ -e /run/oshioki-obs/stall.ready ]' >/dev/null || {
+        report_fail "$name" 'the dropping listener never bound its socket'
+        in_container 'cat /run/oshioki-obs/stall.log' >&2 || true
+        return
+    }
+    local driver=0
+    pty_run "$log" --expect-prompt yes --timeout 140 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true || driver=$?
+    local dropped
+    dropped="$(in_container 'grep -c "closing after acknowledging" /run/oshioki-obs/stall.log || true' | tr -d '[:space:]')"
+    in_container "cp /run/oshioki-obs/stall.log /run/oshioki-test/$name.stall.log; pkill -f stall_agent.py || true" >/dev/null 2>&1 || true
+    [ "$driver" -eq 0 ] || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc elapsed count stray
+    rc="$(pty_field "$log" PTY_RC)"
+    elapsed="$(pty_field "$log" PTY_ELAPSED_MS)"
+    count="$(obs_count)"
+    [ "${dropped:-0}" -ge 1 ] || { report_fail "$name" 'the listener never acknowledged and dropped, so the fault under test did not occur'; return; }
+    [ "$count" = 1 ] || { report_fail "$name" "expected 1 helper invocation, saw $count"; return; }
+    [ "$rc" = 0 ] || {
+        report_fail "$name" "password fallback did not authorise (rc=$rc); a dropped socket must be authinfo_unavail, not a denial" "$log"
+        return
+    }
+    # The drop is observed immediately, so the prompt must not wait out the
+    # 75 s hook deadline. The budget covers the PTY driver's prompt polling and
+    # the container round trip, not a deadline wait.
+    [ "$elapsed" -lt 20000 ] || {
+        report_fail "$name" "the dropped socket cost ${elapsed}ms; it must not make the user wait out the 75s deadline" "$log"
+        return
+    }
+    in_container 'sleep 1' >/dev/null
+    stray="$(obs_stray)"
+    [ -z "$stray" ] || { report_fail "$name" "a helper process survived: $stray"; return; }
+    report_pass "$name" "rc=$rc elapsed=${elapsed}ms helper_invocations=$count drops=$dropped strays=0 (exit 2 -> password fallback)"
+}
+
+# =========================================================================
+# Scenario 12: the module file is gone but the PAM entry is still there.
+#
+# This is the whole reason the installed control line carries
+# `module_unknown=ignore`. Without that token a removal-ordering bug, an
+# architecture mismatch, or a `dpkg --purge` race would meet `default=die` and
+# deny EVERY sudo on the host with no password prompt at all -- an
+# unrecoverable lockout from a missing file.
+#
+# Expectation: PAM cannot load the module, ignores it, and the ordinary
+# password path still authorises the command. The helper never runs.
+# =========================================================================
+scenario_missing_module() {
+    local name=12-missing-module
+    local log="$SHARE/$name.log"
+    local security_dir
+    security_dir="$(cat "$SHARE/security-dir")"
+    set_config 'OSHIOKI_AGENT_SOCKET=/run/oshioki-obs/absent.sock'
+    set_registry hardware
+    obs_reset
+    drop_timestamp
+    in_container "mv $security_dir/liboshioki_pam.so /run/oshioki-obs/liboshioki_pam.stashed" >/dev/null
+    local driver=0
+    pty_run "$log" --expect-prompt yes --timeout 40 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true || driver=$?
+    in_container "install -o root -g root -m 0644 /run/oshioki-obs/liboshioki_pam.stashed $security_dir/liboshioki_pam.so
+                  rm -f /run/oshioki-obs/liboshioki_pam.stashed" >/dev/null
+    [ "$driver" -eq 0 ] || { report_fail "$name" 'PTY driver rejected the case' "$log"; return; }
+    local rc prompts count
+    rc="$(pty_field "$log" PTY_RC)"
+    prompts="$(pty_field "$log" PTY_PROMPT)"
+    count="$(obs_count)"
+    [ "$count" = 0 ] || { report_fail "$name" "the helper ran $count time(s) with the module removed"; return; }
+    [ "$rc" = 0 ] || {
+        report_fail "$name" "a missing module denied sudo (rc=$rc); module_unknown=ignore is not doing its job" "$log"
+        return
+    }
+    [ "${prompts:-0}" != 0 ] || { report_fail "$name" 'no password prompt appeared; the stack did not fall through' "$log"; return; }
+    report_pass "$name" "rc=$rc prompts=$prompts helper_invocations=0 (module_unknown=ignore -> password path)"
+}
+
+# =========================================================================
+# Scenario 13: --disable-contextual-pam.
+#
+# Expectation: /etc/pam.d/sudo and sudo-i come back byte-identical to the
+# files the distribution shipped, the module file is gone, and the order was
+# PAM entries first. Uninstall that leaves a referenced-but-missing module, or
+# a "restored" file that is merely equivalent rather than identical, is a
+# failed uninstall.
+# =========================================================================
+scenario_disable() {
+    local name=13-disable
+    local log="$SHARE/$name.log"
+    local security_dir
+    security_dir="$(cat "$SHARE/security-dir")"
+    if ! in_container "INSTALL_TRACE=/run/oshioki-obs/disable.trace \
+            /run/oshioki-installer/scripts/install-oshioki-hook --disable-contextual-pam" \
+            >"$log" 2>&1; then
+        report_fail "$name" '--disable-contextual-pam exited non-zero' "$log"
+        return
+    fi
+    local identical=1 detail=""
+    for service in sudo sudo-i; do
+        if ! in_container "cmp -s /etc/pam.d/$service /run/oshioki-obs/$service.pam.orig" >/dev/null 2>&1; then
+            identical=0
+            detail="$detail $service"
+        fi
+    done
+    [ "$identical" = 1 ] || { report_fail "$name" "uninstall did not restore stock bytes for:$detail" "$log"; return; }
+    if in_container "test -e $security_dir/liboshioki_pam.so" >/dev/null 2>&1; then
+        report_fail "$name" 'uninstall left the module file behind'
+        return
+    fi
+    # The order is the safety property: entries out before the file goes.
+    local order
+    order="$(in_container 'grep -n "^pam:disable:" /run/oshioki-obs/disable.trace' 2>/dev/null || true)"
+    case "$order" in
+        *edit:sudo*) ;;
+        *) report_fail "$name" 'the disable trace records no PAM edit'; return ;;
+    esac
+    local edit_line unlink_line
+    edit_line="$(printf '%s\n' "$order" | grep 'pam:disable:edit:sudo$' | head -1 | cut -d: -f1)"
+    unlink_line="$(printf '%s\n' "$order" | grep 'pam:disable:module-removed:' | head -1 | cut -d: -f1)"
+    [ -n "$edit_line" ] && [ -n "$unlink_line" ] || { report_fail "$name" 'the disable trace is missing a step'; return; }
+    [ "$edit_line" -lt "$unlink_line" ] || { report_fail "$name" 'the module was unlinked before the PAM entries were removed'; return; }
+    # A stock host must still sudo.
+    drop_timestamp
+    pty_run "$SHARE/$name.sudo.log" --expect-prompt yes --timeout 40 -- \
+        docker exec -i -t "$CONTAINER" runuser -u fixture -- sudo /usr/bin/true \
+        || { report_fail "$name" 'PTY driver rejected the post-uninstall sudo' "$SHARE/$name.sudo.log"; return; }
+    local rc
+    rc="$(pty_field "$SHARE/$name.sudo.log" PTY_RC)"
+    [ "$rc" = 0 ] || { report_fail "$name" "password sudo failed after uninstall (rc=$rc)" "$SHARE/$name.sudo.log"; return; }
+    report_pass "$name" "stock-identical sudo and sudo-i, module removed, entries removed first, password sudo rc=$rc"
+}
+
+# =========================================================================
+# Scenario 14: a customised sudo stack.
+#
+# An administrator with their own auth policy in /etc/pam.d/sudo is not a
+# stack this installer understands. Inserting above @include common-auth would
+# land after their line and silently change what it means.
+#
+# Expectation: the installer refuses, exits non-zero, and leaves every file
+# byte-identical -- including no module on disk. Runs after scenario 13, so
+# the host starts from the stock state that scenario restored.
+# =========================================================================
+scenario_customised_stack_refused() {
+    local name=14-customised-stack
+    local log="$SHARE/$name.log"
+    local security_dir
+    security_dir="$(cat "$SHARE/security-dir")"
+    in_container 'awk "/^@include common-auth\$/ { print \"auth required pam_faillock.so preauth\" } { print }" \
+                    /run/oshioki-obs/sudo.pam.orig >/etc/pam.d/sudo
+                  cp /etc/pam.d/sudo /run/oshioki-obs/sudo.customised' >/dev/null
+    local rc=0
+    in_container "OSHIOKI_CHECKSUMS=/run/oshioki-obs/SHA256SUMS \
+        PAM_MODULE_BIN=/run/oshioki-release/liboshioki_pam.so \
+        /run/oshioki-installer/scripts/install-oshioki-hook --contextual-pam" >"$log" 2>&1 || rc=$?
+    local unchanged=1
+    in_container 'cmp -s /etc/pam.d/sudo /run/oshioki-obs/sudo.customised' >/dev/null 2>&1 || unchanged=0
+    in_container 'cmp -s /etc/pam.d/sudo-i /run/oshioki-obs/sudo-i.pam.orig' >/dev/null 2>&1 || unchanged=0
+    local module_absent=1
+    in_container "test ! -e $security_dir/liboshioki_pam.so" >/dev/null 2>&1 || module_absent=0
+    # Restore the stock file whatever happened, so a failure here does not
+    # poison anything that runs afterwards.
+    in_container 'cp /run/oshioki-obs/sudo.pam.orig /etc/pam.d/sudo' >/dev/null
+    [ "$rc" != 0 ] || { report_fail "$name" 'the installer accepted a customised sudo stack' "$log"; return; }
+    grep -Fq 'refusing a customised PAM stack' "$log" || { report_fail "$name" 'the refusal was not explained' "$log"; return; }
+    [ "$unchanged" = 1 ] || { report_fail "$name" 'the refusal modified a PAM file' "$log"; return; }
+    [ "$module_absent" = 1 ] || { report_fail "$name" 'the refusal installed the module anyway' "$log"; return; }
+    report_pass "$name" "rc=$rc, stack unmodified, no module installed"
+}
+
+# --- run -----------------------------------------------------------------
+# In scenario-number order, which is also the order the functions are defined
+# in above. Each scenario sets its own config, registry and timestamp state, so
+# the order carries no hidden dependency.
+scenario_nopasswd
+scenario_unreachable_transport
+scenario_helper_missing
+scenario_helper_group_writable
+scenario_agent_refuses
+scenario_software_only
+scenario_password_retries
+scenario_timestamp
+scenario_sudo_i
+scenario_sigint
+scenario_ack_then_drop
+# 12-14 are installer/uninstaller cases and 13 deliberately tears the stack
+# down, so they run last and in this order: 14 relies on 13 having restored
+# the stock files.
+scenario_missing_module
+scenario_disable
+scenario_customised_stack_refused
+
+echo
+echo "* captured v2 request (scenario 2):"
+sed -n '1,5p' "$SHARE/2-transport-unreachable.request.json" 2>/dev/null || true
+echo
+if [ "$FAILURES" -ne 0 ]; then
+    echo "* FAIL: $FAILURES of $((PASSES + FAILURES)) PAM acceptance scenarios failed" >&2
+    exit 1
+fi
+TEST_SUCCEEDED=1
+echo "* PASS: all $PASSES PAM acceptance scenarios (Ubuntu 24.04, real sudo + PAM + installer, issue #73)"

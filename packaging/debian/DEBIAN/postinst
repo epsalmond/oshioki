@@ -5,11 +5,36 @@
 # enables without starting, and the operator starts it once server.env exists.
 set -e
 
+INSTALLER="${OSHIOKI_INSTALLER:-/usr/share/oshioki/install-oshioki-hook}"
+INSTALL_ENV="${OSHIOKI_INSTALL_ENV:-/etc/oshioki/install.env}"
+# Same spelling and default as the installer's own PAM_D, so a test harness
+# or a packager overriding one overrides both.
+PAM_D="${PAM_D:-/etc/pam.d}"
+
 installer_hook() {
   HOOK_BIN=/usr/share/oshioki/oshioki \
   PLUGIN_BIN=/usr/share/oshioki/liboshioki_plugin.so \
+  PAM_MODULE_BIN=/usr/share/oshioki/liboshioki_pam.so \
   OSHIOKI_CHECKSUMS=/usr/share/oshioki/SHA256SUMS \
-    /usr/share/oshioki/install-oshioki-hook "$@"
+    "$INSTALLER" "$@"
+}
+
+# Whether this host is on the contextual PAM lane already. Host state, not
+# the config file, is what decides: an administrator who migrated by hand,
+# or a previous configure that migrated and then had the key removed, must
+# still get the module refreshed rather than silently re-plugged. Looser
+# than the exact auth line on purpose -- see pam_lane_active in the
+# installer, which uses the same rule.
+# Only the two service names this package's installer ever edits on Linux:
+# a `sudo.XXXXXX` left behind by a crashed edit is litter, not a live lane.
+pam_lane_active() {
+  for pam_service in sudo sudo-i; do
+    pam_file="$PAM_D/$pam_service"
+    [ -f "$pam_file" ] || continue
+    if grep -Fq '# BEGIN oshioki pam' "$pam_file" 2>/dev/null; then return 0; fi
+    if grep -Eq '^[[:space:]]*auth[[:space:]].*liboshioki_pam' "$pam_file" 2>/dev/null; then return 0; fi
+  done
+  return 1
 }
 
 case "$1" in
@@ -21,12 +46,18 @@ case "$1" in
     install -d -m 0750 -o oshioki -g oshioki /var/lib/oshioki
     install -d -m 0750 -o root -g root /etc/oshioki
 
-    if [ -f /etc/oshioki/install.env ]; then
-      installer_hook --prelaunch --config-file /etc/oshioki/install.env
+    if [ -f "$INSTALL_ENV" ]; then
+      # --prelaunch first, always: it writes the hook state (config.env,
+      # hook.json), installs /usr/local/sbin/oshioki, and validates
+      # $INSTALL_ENV itself (root-owned, 0600, no unknown keys) -- which the
+      # opt-in read at the end of this script relies on. On a host already
+      # on the contextual PAM lane it refreshes those artifacts without
+      # re-enabling the approval plugin or the blanket sudoers rule.
+      installer_hook --prelaunch --config-file "$INSTALL_ENV"
     else
-      echo "oshioki: hook not enabled (no /etc/oshioki/install.env)." >&2
+      echo "oshioki: hook not enabled (no $INSTALL_ENV)." >&2
       echo "oshioki: pre-seed that file (0600, root-owned) before installing," >&2
-      echo "oshioki: or create it now and run: /usr/share/oshioki/install-oshioki-hook --prelaunch --config-file /etc/oshioki/install.env" >&2
+      echo "oshioki: or create it now and run: $INSTALLER --prelaunch --config-file $INSTALL_ENV" >&2
     fi
 
     # Record enablement through the helper, not systemctl: it remembers what
@@ -40,6 +71,39 @@ case "$1" in
         systemctl try-restart oshioki-server.service || {
           echo "oshioki: upgraded but failed to restart oshioki-server; the old binary is still running" >&2
           exit 1
+        }
+      fi
+    fi
+
+    # The contextual PAM lane, last and never fatal. Last because everything
+    # above -- service user, state, hook, unit -- is what the lane runs on,
+    # and because a migration that cannot happen yet must not leave the
+    # package half-configured. Never fatal because the documented flow
+    # pre-seeds the opt-in before any device is paired: the installer then
+    # exits 0 with a "not yet" message, and the migration happens at the
+    # first configure after a device exists, or by hand.
+    #
+    # $INSTALL_ENV was validated by --prelaunch above before this reads it.
+    contextual_pam=0
+    if [ -f "$INSTALL_ENV" ] &&
+       [ "$(sed -n 's/^OSHIOKI_CONTEXTUAL_PAM=//p' "$INSTALL_ENV" | tail -n 1)" = 1 ]; then
+      contextual_pam=1
+    fi
+    # Host state wins over the file: an already-migrated host is opted in
+    # whatever $INSTALL_ENV says, so its module still gets refreshed.
+    if pam_lane_active; then
+      contextual_pam=1
+    fi
+    if [ "$contextual_pam" = 1 ]; then
+      if [ -f "$INSTALL_ENV" ]; then
+        installer_hook --contextual-pam --config-file "$INSTALL_ENV" || {
+          echo "oshioki: the contextual PAM migration did not complete; sudo is unchanged." >&2
+          echo "oshioki: re-run: $INSTALLER --contextual-pam --config-file $INSTALL_ENV" >&2
+        }
+      else
+        installer_hook --contextual-pam || {
+          echo "oshioki: the contextual PAM migration did not complete; sudo is unchanged." >&2
+          echo "oshioki: re-run: $INSTALLER --contextual-pam" >&2
         }
       fi
     fi

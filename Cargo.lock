@@ -1312,6 +1312,7 @@ dependencies = [
  "ciborium",
  "clap",
  "futures",
+ "libc",
  "nix",
  "oshioki-protocol",
  "oshioki-transport",
@@ -1327,6 +1328,15 @@ dependencies = [
  "url",
  "uuid",
  "x25519-dalek",
+]
+
+[[package]]
+name = "oshioki-pam"
+version = "0.1.6"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1393,6 +1403,7 @@ dependencies = [
  "sha2",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

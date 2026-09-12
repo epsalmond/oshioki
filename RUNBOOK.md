@@ -78,6 +78,60 @@ For socket mode (below), also add:
 OSHIOKI_AGENT_SOCKET=/Users/<you>/.config/oshioki/agent.sock
 ```
 
+To have the `.deb` migrate this host to the contextual PAM lane instead of
+leaving it on the approval plugin, add:
+
+```text
+OSHIOKI_CONTEXTUAL_PAM=1
+```
+
+Only the exact value `1` opts in; any other value, or no key at all, leaves
+the host on the plugin lane. The key is safe to pre-seed before any device
+exists: each `configure` runs `--prelaunch` first (it writes the hook binary,
+its configuration and the device registry that the migration needs) and
+`--contextual-pam` last, and the migration exits 0 with a "no active
+hardware-backed approval device yet" note until a hardware-backed device is
+pinned. The migration then happens at the first `configure` after that —
+`apt install --reinstall oshioki`, the next upgrade, or by hand:
+
+```bash
+sudo /usr/share/oshioki/install-oshioki-hook --contextual-pam \
+  --config-file /etc/oshioki/install.env
+```
+
+A migration that cannot complete never fails the package configuration; it
+prints the command to re-run. Once a host is on the PAM lane it stays there:
+`configure` reads the lane from the host (any PAM service file naming the
+module), so a later `--prelaunch` refreshes the hook and the module without
+re-enabling the approval plugin or the blanket `NOPASSWD` rule, even if the
+key is later removed from `install.env`. An upgrade that ships a new module
+swaps it in place — staged beside the live file, self-tested, then renamed —
+leaving the PAM entries untouched.
+
+On macOS the same opt-in is `oshioki-laptop-setup --contextual-pam` (or
+`OSHIOKI_CONTEXTUAL_PAM=1` in its environment), which runs the migration
+after the normal install and pairing.
+
+Never run the migration without a recovery path already open: a second root
+shell (`sudo -i`) held for the whole run, and a verified console or `pkexec`
+fallback, both established *before* the first `--contextual-pam`. Inspect and
+roll back with:
+
+```bash
+sudo /usr/share/oshioki/install-oshioki-hook --contextual-pam-status
+sudo /usr/share/oshioki/install-oshioki-hook --disable-contextual-pam
+```
+
+`--contextual-pam-status` exits non-zero unless every line reads `OK`.
+`--disable-contextual-pam` removes the PAM entries, re-proves `sudo -V`, and
+only then unlinks the module; it refuses to unlink a module any file under
+`/etc/pam.d` still names. `prerm` runs the same command during package
+removal — before it touches the plugin block or the sudoers drop-in, and it
+stops the removal if that command fails, so a host whose module is still live
+keeps the legacy artifacts it may need to reach `sudo`. `prerm` decides by
+looking for the marker or an `auth` line naming the module in any PAM service
+file under `/etc/pam.d`, so a hand-damaged entry is still cleaned up.
+
 Run the dry run and install against that file:
 
 ```bash
@@ -327,6 +381,45 @@ sudo -V
 The installer restores the prior `sudo.conf` automatically if validation
 fails. Production integration must also stop its server and NATS resources,
 restore routing, and confirm ordinary sudo behavior.
+
+## Authentication lane upgrade
+
+Contextual sudo authentication (`oshioki authenticate`, the PAM helper verb)
+publishes on `oshioki.auth.<host>`, a separate subject tree from command
+approval's `oshioki.request.<host>`. Two things in a NATS deployment predate
+it and are **not** updated automatically:
+
+1. The `OSHIOKI` stream's subject list. A stream created for
+   `oshioki.request.>` alone silently discards everything published on
+   `oshioki.auth.>`.
+2. The durable `oshioki-server-v1` consumer's filter. `get_or_create_consumer`
+   returns an existing durable exactly as it is and never rewrites its
+   configuration, so a consumer created before this lane existed keeps its old
+   single filter no matter what the binary asks for.
+
+The server logs a warning at startup naming this section when the running consumer's
+filters do not match the build. To fix a deployment (NATS 2.10 or newer):
+
+```sh
+nats stream update OSHIOKI --subjects 'oshioki.request.>,oshioki.auth.>'
+# The durable's filter cannot be widened in place; recreate it. Do this while
+# no request is in flight: pending deliveries are lost with the consumer.
+nats consumer rm OSHIOKI oshioki-server-v1
+# The server recreates it with both filters on its next start.
+systemctl restart oshioki-server
+```
+
+Verify with `nats consumer info OSHIOKI oshioki-server-v1`: the filter list
+must show both `oshioki.request.>` and `oshioki.auth.>`.
+
+This widening is required, not preparatory: the server already consumes
+`oshioki.auth.>`. Its JetStream handler routes on the envelope's own `type`
+tag (`server/src/main.rs`, the `envelope_type` match), hands an
+`AUTH_ENVELOPE_TYPE` envelope to `ingest_auth_envelope`, and serves the
+stored request to a `WebAuthn` browser at the `/a/:id` route
+(`authentication_page`). A consumer whose filters still list only
+`oshioki.request.>` therefore never delivers an authentication request, and
+every contextual sudo falls back to a password.
 
 ## Logs
 

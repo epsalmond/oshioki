@@ -6,6 +6,9 @@ const REGISTRATION_DOMAIN = enc.encode("oshioki/enroll/registration/v1\0");
 const PROOF_DOMAIN = enc.encode("oshioki/enroll/proof/v1\0");
 const TRANSCRIPT_DOMAIN = enc.encode("oshioki/enroll/transcript/v1\0");
 const APPROVE_DOMAIN = enc.encode("oshioki/approve/v1\0");
+// Contextual sudo authentication has its own challenge domain, so a command
+// approval signature can never satisfy an authentication verifier.
+const AUTH_CHALLENGE_DOMAIN = enc.encode("oshioki/authenticate/sudo/v1\0");
 
 function b64(bytes) {
   return sodium.to_base64(new Uint8Array(bytes), sodium.base64_variants.URLSAFE_NO_PADDING);
@@ -181,9 +184,100 @@ async function approval() {
   }, { once: true });
 }
 
+// Renders the submitted invocation with its status intact. A truncated or
+// missing command line is labelled as such: PAM does not know what sudo will
+// finally run, and nothing on this page may present partial context as if it
+// were the verified final command.
+function formatInvocation(invocation) {
+  if (!invocation || typeof invocation.status !== "string") throw new Error("invocation is invalid");
+  if (invocation.status === "unavailable") return "unavailable (not captured)";
+  if (!Array.isArray(invocation.argv)) throw new Error("invocation argv is invalid");
+  const argv = invocation.argv.map(quoteArgument).join("\n");
+  const command = typeof invocation.command === "string" ? invocation.command : "";
+  const body = argv || command || "(none)";
+  if (invocation.status === "available") return body;
+  if (invocation.status === "truncated") {
+    const omitted = Number.isInteger(invocation.omitted_args)
+      ? ` (+${invocation.omitted_args} more arguments omitted)`
+      : " (cut short)";
+    return `truncated: ${body}${omitted}`;
+  }
+  throw new Error("unknown invocation status");
+}
+// The invoking account, with its UID always shown: the name is a host-side
+// lookup that can fail, and the number is what PAM actually captured.
+function invokingLabel(trusted) {
+  return typeof trusted.invoking_user === "string" && trusted.invoking_user
+    ? `${trusted.invoking_user} / ${trusted.invoking_uid}`
+    : `uid ${trusted.invoking_uid}`;
+}
+
+async function authentication() {
+  await sodium.ready; const id = requestId(); let selected;
+  for (const device of await allDevices()) {
+    const response = await fetch(`/api/v1/auth/${id}`, { headers: { authorization: `Bearer ${device.apiToken}` } });
+    if (response.status === 401) continue; if (!response.ok) throw new Error(`request failed ${response.status}`);
+    selected = { device, payload: await response.json() }; break;
+  }
+  // No hardware credential in this browser profile means no authentication
+  // is possible here. Only a WebAuthn or Secure Enclave device may answer
+  // this lane, so the honest instruction is to go back to the terminal.
+  if (!selected) { text("status", "No enrolled security key in this browser can authenticate this request. Enter your password at the terminal instead."); return; }
+  if (!window.PublicKeyCredential || !navigator.credentials) { text("status", "This browser cannot use a security key. Enter your password at the terminal instead."); return; }
+  const sealed = selected.payload.sealed; const shared = sodium.crypto_scalarmult(unb64(selected.device.boxSecret), unb64(sealed.ephemeral_pub));
+  if (shared.every(value => value === 0)) throw new Error("invalid shared secret");
+  const raw = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, unb64(sealed.ciphertext), null, unb64(sealed.nonce), shared);
+  const request = JSON.parse(dec.decode(raw));
+  if (request.version !== 2 || request.type !== "sudo_authentication_request" || request.request_id !== id) throw new Error("authentication request mismatch");
+  const acknowledgement = await fetch(`/api/v1/auth/${id}/ack`, { method: "POST", headers: { authorization: `Bearer ${selected.device.apiToken}`, "content-type": "application/json" }, body: JSON.stringify({ type: "alive", version: 1, request_id: id }) });
+  if (!acknowledgement.ok) throw new Error(`acknowledgement failed ${acknowledgement.status}`);
+  const trusted = request.trusted; const submitted = request.submitted ?? {};
+  text("host", trusted.host); text("principal", `${trusted.pam_user} / ${trusted.pam_uid}`);
+  text("invoking-user", invokingLabel(trusted)); text("service", trusted.service);
+  text("tty", typeof trusted.tty === "string" && trusted.tty ? trusted.tty : "unknown");
+  if (submitted.session) { text("session", submitted.session); document.getElementById("session-label").hidden = false; document.getElementById("session").hidden = false; }
+  text("invocation", formatInvocation(submitted.invocation));
+  text("status", `Expires ${new Date(request.expires_at * 1000).toLocaleTimeString()}`);
+  for (const shown of ["request", "invocation-note", "actions", "cancel-note"]) document.getElementById(shown).hidden = false;
+  const headers = { authorization: `Bearer ${selected.device.apiToken}`, "content-type": "application/json" };
+  // One action, and it is affirmative. There is no refusal to send: closing
+  // the page sends nothing, and the host falls back to a password prompt.
+  //
+  // A dismissed or timed-out security key prompt is not a refusal either, so
+  // it must not consume the operator's only chance to answer: the button is
+  // re-armed and the request stays open until it expires on the host. The
+  // `sending` flag, not `{ once: true }`, is what keeps two assertions from
+  // being in flight at once.
+  const button = document.getElementById("authenticate");
+  let sending = false;
+  button.addEventListener("click", async () => {
+    if (sending) return;
+    sending = true; button.disabled = true;
+    try {
+      const challenge = await sha256(AUTH_CHALLENGE_DOMAIN, raw);
+      const assertion = await navigator.credentials.get({ publicKey: { challenge, rpId: location.hostname,
+        allowCredentials: [{ type: "public-key", id: unb64(selected.device.credentialId) }], userVerification: "required", timeout: 90000 } });
+      const body = { version: 2, request_id: id, device_fingerprint: selected.device.fingerprint, credential_id: b64(assertion.rawId),
+        authenticator_data: b64(assertion.response.authenticatorData), client_data_json: b64(assertion.response.clientDataJSON), signature: b64(assertion.response.signature) };
+      const response = await fetch(`/api/v1/auth/${id}/authenticate-webauthn`, { method: "POST", headers, body: JSON.stringify(body) });
+      if (!response.ok) throw new Error(`authentication failed ${response.status}`);
+      text("status", "Authentication sent."); document.getElementById("actions").hidden = true;
+    } catch (error) {
+      console.error(error);
+      text("status", "Authentication cancelled. Enter your password at the terminal, or try again.");
+      sending = false; button.disabled = false;
+    }
+  });
+}
+
 // Keep the formatter available to the small, DOM-free unit test as well as
 // the page. The approval flow still starts only in a browser document.
-if (typeof globalThis !== "undefined") globalThis.OshiokiApprovalReview = { formatEnvironment, quoteReviewString };
+if (typeof globalThis !== "undefined") globalThis.OshiokiApprovalReview = { formatEnvironment, quoteReviewString, formatInvocation };
 if (typeof document !== "undefined" && document.body) {
-  (document.body.dataset.page === "enroll" ? enrollment() : approval()).catch(failure);
+  const page = document.body.dataset.page;
+  let flow;
+  if (page === "enroll") flow = enrollment();
+  else if (page === "auth") flow = authentication();
+  else flow = approval();
+  flow.catch(failure);
 }

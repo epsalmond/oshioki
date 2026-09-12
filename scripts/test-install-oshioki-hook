@@ -29,13 +29,23 @@ esac
 PLUGIN_NAME="oshioki.${BUILD_PLUGIN##*.}"
 cp /usr/bin/true "$TEST_ROOT/service/target/release/oshioki"
 cp /usr/bin/true "$TEST_ROOT/service/target/release/$BUILD_PLUGIN"
+# The contextual-PAM modes only ever hash and copy this artifact; nothing in
+# the fake-root harness loads it, and the self-test is the fake helper.
+PAM_MODULE_ARTIFACT="liboshioki_pam.${BUILD_PLUGIN##*.}"
+printf 'fake pam module\n' > "$TEST_ROOT/service/target/release/$PAM_MODULE_ARTIFACT"
+# The macOS cases run under a faked `uname -s`, so they need the artifact the
+# Darwin branch names, whatever this host is.
+printf 'fake darwin pam module\n' > "$TEST_ROOT/service/target/release/liboshioki_pam.dylib"
 (
   cd "$TEST_ROOT/service/target/release"
   printf '%s  oshioki\n' "$(sha256_file oshioki)" > SHA256SUMS
   printf '%s  %s\n' "$(sha256_file "$BUILD_PLUGIN")" "$BUILD_PLUGIN" >> SHA256SUMS
+  printf '%s  %s\n' "$(sha256_file "$PAM_MODULE_ARTIFACT")" "$PAM_MODULE_ARTIFACT" >> SHA256SUMS
+  [ "$PAM_MODULE_ARTIFACT" = liboshioki_pam.dylib ] ||
+    printf '%s  liboshioki_pam.dylib\n' "$(sha256_file liboshioki_pam.dylib)" >> SHA256SUMS
 )
 
-for wrapper in id chown install sudo file stat; do
+for wrapper in id chown install sudo file stat cp mv rm uname; do
   : > "$TEST_ROOT/fake-bin/$wrapper"
 done
 cat > "$TEST_ROOT/fake-bin/id" <<'SH'
@@ -56,7 +66,15 @@ exec /usr/bin/install "${args[@]}"
 SH
 cat > "$TEST_ROOT/fake-bin/sudo" <<'SH'
 #!/usr/bin/env bash
+# FAIL_SUDO fails every validate_sudo call. FAIL_SUDO_ON_CALL fails exactly
+# the nth one, which is how the contextual migration's post-edit check is
+# failed without also failing the step-3 check that precedes it.
 [ "${FAIL_SUDO:-0}" = 1 ] && exit 1
+if [ -n "${FAIL_SUDO_ON_CALL:-}" ] && [ -n "${SUDO_CALL_COUNTER:-}" ]; then
+  printf 'x' >> "$SUDO_CALL_COUNTER"
+  calls="$(wc -c <"$SUDO_CALL_COUNTER" | tr -d '[:space:]')"
+  [ "$calls" = "$FAIL_SUDO_ON_CALL" ] && exit 1
+fi
 exit 0
 SH
 cat > "$TEST_ROOT/fake-bin/file" <<'SH'
@@ -72,17 +90,128 @@ exec /usr/bin/file "$@"
 SH
 cat > "$TEST_ROOT/fake-bin/stat" <<'SH'
 #!/usr/bin/env bash
+if [ -n "${FAKE_STAT_SPECIAL_PATH:-}" ] && [ "${3:-}" = "$FAKE_STAT_SPECIAL_PATH" ]; then
+  case "${1:-} ${2:-}" in
+    '-c %u'|'-f %u') echo "${FAKE_STAT_SPECIAL_OWNER:-0}"; exit 0 ;;
+    '-c %a'|'-f %Lp') echo "${FAKE_STAT_SPECIAL_MODE:-600}"; exit 0 ;;
+  esac
+fi
 case "${1:-} ${2:-}" in
   '-c %u'|'-f %u') echo "${FAKE_STAT_OWNER:-0}" ;;
   '-c %a'|'-f %Lp')
     # The installer sets the drop-in 0440 while everything else it checks is
     # 0600; model both so status sees what a real install leaves behind.
+    # The world-writable name is the one path_is_root_owned_and_tight must
+    # reject, and it is the only way to model a bad mode in a fake root the
+    # test user owns.
     case "${3:-}" in
       */sudoers.d/oshioki) echo 440 ;;
+      */loose/security) echo 777 ;;
+      # The helper the PAM module execs must carry an execute bit, or
+      # helper_path_secure refuses it; a real install leaves it 0755.
+      */sbin/oshioki) echo 755 ;;
       *) echo "${FAKE_STAT_MODE:-600}" ;;
     esac ;;
   *) exec /usr/bin/stat "$@" ;;
 esac
+SH
+cat > "$TEST_ROOT/fake-bin/cp" <<'SH'
+#!/usr/bin/env bash
+args=("$@")
+source="${args[${#args[@]}-2]}"
+destination="${args[${#args[@]}-1]}"
+if [ "${FAIL_SUDO_CONF_BACKUP:-0}" = 1 ] &&
+   [ "$source" = "${FAIL_SUDO_CONF_BACKUP_SOURCE:-}" ] &&
+   [[ "$destination" == *rollback.* ]]; then
+  exit 1
+fi
+if [ "${FAIL_SUDOERS_BACKUP:-0}" = 1 ] &&
+   [ "$source" = "${FAIL_SUDOERS_BACKUP_SOURCE:-}" ] &&
+   [[ "$destination" == *.backup.* ]]; then
+  exit 1
+fi
+if [ "${FAIL_PLUGIN_RESTORE:-0}" = 1 ] &&
+   [ "$destination" = "${FAIL_PLUGIN_RESTORE_DEST:-}" ] &&
+   [[ "$source" == *upgrade-rollback.* ]]; then
+  exit 1
+fi
+if [ -n "${INSTALL_TRACE:-}" ]; then
+  printf 'cp:%s:%s\n' "$source" "$destination" >> "$INSTALL_TRACE"
+fi
+exec /bin/cp "$@"
+SH
+cat > "$TEST_ROOT/fake-bin/mv" <<'SH'
+#!/usr/bin/env bash
+args=("$@")
+destination="${args[${#args[@]}-1]}"
+if [ "${FAIL_SUDO_CONF_MOVE:-0}" = 1 ] &&
+   [ "$destination" = "${FAIL_SUDO_CONF_MOVE_DEST:-}" ] &&
+   [ ! -e "${FAIL_SUDO_CONF_MOVE_MARKER:-}" ]; then
+  : > "${FAIL_SUDO_CONF_MOVE_MARKER}"
+  exit 1
+fi
+exec /bin/mv "$@"
+SH
+cat > "$TEST_ROOT/fake-bin/rm" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${INSTALL_TRACE:-}" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      */sudoers.d/oshioki) printf 'rm:%s\n' "$arg" >> "$INSTALL_TRACE" ;;
+    esac
+  done
+fi
+for arg in "$@"; do
+  if [ "${SIGNAL_DURING_PAM_COMMIT:-0}" = 1 ] &&
+     [[ "$arg" == *.oshioki-backup.* ]] &&
+     [ ! -e "${SIGNAL_DURING_PAM_COMMIT_MARKER:-}" ]; then
+    /bin/rm "$@" || exit 1
+    : > "$SIGNAL_DURING_PAM_COMMIT_MARKER"
+    kill -TERM "$PPID"
+    exit 0
+  fi
+  case "$arg" in
+    */sudoers.d/oshioki)
+      if [ "${FAIL_REMOVE_SUDOERS_ONCE:-0}" = 1 ] &&
+         [ ! -e "${FAIL_REMOVE_SUDOERS_MARKER:-}" ]; then
+        : > "${FAIL_REMOVE_SUDOERS_MARKER}"
+        exit 1
+      fi
+      if [ "${SIGNAL_AFTER_REMOVE:-0}" = 1 ] &&
+         [ ! -e "${SIGNAL_AFTER_REMOVE_MARKER:-}" ]; then
+        /bin/rm "$@" || exit 1
+        : > "${SIGNAL_AFTER_REMOVE_MARKER}"
+        kill -TERM "$PPID"
+        exit 0
+      fi
+      ;;
+    */sudo.conf.upgrade-rollback.*)
+      if [ "${SIGNAL_DURING_BACKUP_CLEANUP:-0}" = 1 ] &&
+         [ ! -e "${SIGNAL_DURING_BACKUP_CLEANUP_MARKER:-}" ]; then
+        /bin/rm "$@" || exit 1
+        : > "${SIGNAL_DURING_BACKUP_CLEANUP_MARKER}"
+        kill -TERM "$PPID"
+        exit 0
+      fi
+      ;;
+    */sudoers.d/oshioki.backup.*)
+      if [ "${FAIL_DROPIN_BACKUP_CLEANUP:-0}" = 1 ]; then
+        exit 1
+      fi
+      ;;
+  esac
+done
+exec /bin/rm "$@"
+SH
+# The macOS code paths key off `uname -s`. Faking it is the only way to
+# exercise the sudo_local write path, the pam_tid ordering rule, and the
+# stock-sudo fingerprint from a Linux CI host; everything those paths touch
+# in this harness is a plain file, so nothing platform-specific is required
+# beyond the name.
+cat > "$TEST_ROOT/fake-bin/uname" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${FAKE_UNAME_S:-}" ] && [ "${1:-}" = -s ]; then echo "$FAKE_UNAME_S"; exit 0; fi
+exec /usr/bin/uname "$@"
 SH
 cat > "$TEST_ROOT/fake-bin/visudo" <<'SH'
 #!/usr/bin/env bash
@@ -111,7 +240,40 @@ run_installer() {
     NATS_URL="${INSTALL_NATS_URL-nats://nats.test:4222}" \
     NATS_PASS="${INSTALL_NATS_PASS-${NATS_PASS:-test-only}}" \
     FAKE_STAT_OWNER="${FAKE_STAT_OWNER:-0}" FAKE_STAT_MODE="${FAKE_STAT_MODE:-600}" \
+    FAKE_STAT_SPECIAL_PATH="${FAKE_STAT_SPECIAL_PATH:-}" \
+    FAKE_STAT_SPECIAL_OWNER="${FAKE_STAT_SPECIAL_OWNER:-0}" \
+    FAKE_STAT_SPECIAL_MODE="${FAKE_STAT_SPECIAL_MODE:-600}" \
     FAIL_INSTALL_TARGET="${FAIL_INSTALL_TARGET:-}" \
+    FAIL_REMOVE_SUDOERS_ONCE="${FAIL_REMOVE_SUDOERS_ONCE:-0}" \
+    FAIL_REMOVE_SUDOERS_MARKER="$root/remove-sudoers.marker" \
+    FAIL_SUDO_CONF_MOVE="${FAIL_SUDO_CONF_MOVE:-0}" \
+    FAIL_SUDO_CONF_MOVE_DEST="$root/sudo.conf" \
+    FAIL_SUDO_CONF_MOVE_MARKER="$root/sudo-conf-move.marker" \
+    FAIL_PLUGIN_RESTORE="${FAIL_PLUGIN_RESTORE:-0}" \
+    FAIL_PLUGIN_RESTORE_DEST="$root/sudo.conf" \
+    FAIL_SUDO_CONF_BACKUP="${FAIL_SUDO_CONF_BACKUP:-0}" \
+    FAIL_SUDO_CONF_BACKUP_SOURCE="$root/sudo.conf" \
+    FAIL_SUDOERS_BACKUP="${FAIL_SUDOERS_BACKUP:-0}" \
+    FAIL_SUDOERS_BACKUP_SOURCE="$root/sudoers.d/oshioki" \
+    FAIL_DROPIN_BACKUP_CLEANUP="${FAIL_DROPIN_BACKUP_CLEANUP:-0}" \
+    SIGNAL_AFTER_REMOVE="${SIGNAL_AFTER_REMOVE:-0}" \
+    SIGNAL_AFTER_REMOVE_MARKER="$root/signal-after-remove.marker" \
+    SIGNAL_DURING_BACKUP_CLEANUP="${SIGNAL_DURING_BACKUP_CLEANUP:-0}" \
+    SIGNAL_DURING_BACKUP_CLEANUP_MARKER="$root/signal-during-backup-cleanup.marker" \
+    SIGNAL_DURING_PAM_COMMIT="${SIGNAL_DURING_PAM_COMMIT:-0}" \
+    SIGNAL_DURING_PAM_COMMIT_MARKER="$root/signal-during-pam-commit.marker" \
+    INSTALL_TRACE="${INSTALL_TRACE:-}" \
+    PAM_D="$root/pam.d" PAM_SECURITY_DIR="${PAM_SECURITY_DIR-$root/security}" \
+    PAM_MODULE_BIN="${PAM_MODULE_BIN-$TEST_ROOT/service/target/release/$PAM_MODULE_ARTIFACT}" \
+    OSHIOKI_PAM_MULTIARCH="${OSHIOKI_PAM_MULTIARCH:-$root/absent-multiarch}" \
+    OSHIOKI_INSTALL_FAULT_INJECTION="${OSHIOKI_INSTALL_FAULT_INJECTION:-1}" \
+    FAIL_PAM_MODULE_INSTALL="${FAIL_PAM_MODULE_INSTALL:-0}" \
+    FAIL_PAM_SELFTEST="${FAIL_PAM_SELFTEST:-0}" \
+    FAIL_PAM_EDIT="${FAIL_PAM_EDIT:-}" \
+    SIGNAL_AFTER_PAM_EDIT="${SIGNAL_AFTER_PAM_EDIT:-0}" \
+    FAIL_SUDO_ON_CALL="${FAIL_SUDO_ON_CALL:-}" \
+    SUDO_CALL_COUNTER="$root/sudo.calls" \
+    FAKE_UNAME_S="${FAKE_UNAME_S:-}" \
     "$TEST_ROOT/service/scripts/install-oshioki-hook" "$@"
 }
 
@@ -211,6 +373,132 @@ if FAIL_SUDO=1 run_installer "$UPGRADE_VALIDATE" --prelaunch >"$UPGRADE_VALIDATE
 [ "$(sha256_file "$UPGRADE_VALIDATE/sbin/oshioki")" = "$upgrade_hook_hash" ] || fail "sudo validation failure replaced the hook"
 grep -Fq '# BEGIN oshioki' "$UPGRADE_VALIDATE/sudo.conf" || fail "sudo validation failure did not restore the plugin block"
 grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$UPGRADE_VALIDATE/sudoers.d/oshioki" || fail "sudo validation failure did not restore the drop-in"
+
+# An unknown file at the reserved sudoers path is never touched. The check
+# happens before the legacy plugin is removed, so an administrator's rule
+# cannot be stranded behind a partial migration.
+UNKNOWN_UPGRADE="$TEST_ROOT/unknown-upgrade"; mkdir -p "$UNKNOWN_UPGRADE/state" "$UNKNOWN_UPGRADE/sudoers.d"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$UNKNOWN_UPGRADE/state/devices.json"
+printf '#includedir %s\n' "$UNKNOWN_UPGRADE/sudoers.d" > "$UNKNOWN_UPGRADE/sudoers"
+printf '%s\n' '# BEGIN oshioki' "Plugin approval_exec $UNKNOWN_UPGRADE/plugin/$PLUGIN_NAME" '# END oshioki' > "$UNKNOWN_UPGRADE/sudo.conf"
+printf 'administrator ALL=(ALL) NOPASSWD: /usr/bin/id\n' > "$UNKNOWN_UPGRADE/sudoers.d/oshioki"
+unknown_conf_hash="$(sha256_file "$UNKNOWN_UPGRADE/sudo.conf")"
+unknown_dropin_hash="$(sha256_file "$UNKNOWN_UPGRADE/sudoers.d/oshioki")"
+if run_installer "$UNKNOWN_UPGRADE" --prelaunch >"$UNKNOWN_UPGRADE/fail.log" 2>&1; then fail "accepted an unverified upgrade drop-in"; fi
+grep -Fq 'refusing to modify unverified sudoers drop-in' "$UNKNOWN_UPGRADE/fail.log" || fail "unknown upgrade drop-in rejection was not explained"
+[ "$(sha256_file "$UNKNOWN_UPGRADE/sudo.conf")" = "$unknown_conf_hash" ] || fail "unknown upgrade changed the legacy plugin"
+[ "$(sha256_file "$UNKNOWN_UPGRADE/sudoers.d/oshioki")" = "$unknown_dropin_hash" ] || fail "unknown upgrade changed the administrator rule"
+
+# A failed sudo.conf backup must not leave a partial backup registered for
+# rollback. The original plugin and blanket rule remain untouched.
+BACKUP_INTERRUPT="$TEST_ROOT/backup-interrupt"; mkdir -p "$BACKUP_INTERRUPT/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$BACKUP_INTERRUPT/state/devices.json"
+printf '#includedir %s\n' "$BACKUP_INTERRUPT/sudoers.d" > "$BACKUP_INTERRUPT/sudoers"
+run_installer --sudo-user testuser "$BACKUP_INTERRUPT" --prelaunch >"$BACKUP_INTERRUPT/first.log" 2>&1
+backup_conf_hash="$(sha256_file "$BACKUP_INTERRUPT/sudo.conf")"
+backup_dropin_hash="$(sha256_file "$BACKUP_INTERRUPT/sudoers.d/oshioki")"
+if FAIL_SUDO_CONF_BACKUP=1 run_installer "$BACKUP_INTERRUPT" --prelaunch >"$BACKUP_INTERRUPT/fail.log" 2>&1; then fail "accepted a failed sudo.conf backup"; fi
+grep -Fq 'could not back up sudo.conf' "$BACKUP_INTERRUPT/fail.log" || fail "sudo.conf backup failure was not reported"
+[ "$(sha256_file "$BACKUP_INTERRUPT/sudo.conf")" = "$backup_conf_hash" ] || fail "failed sudo.conf backup changed the plugin"
+[ "$(sha256_file "$BACKUP_INTERRUPT/sudoers.d/oshioki")" = "$backup_dropin_hash" ] || fail "failed sudo.conf backup changed the blanket rule"
+
+# The same invariant applies when the sudoers backup itself fails: no
+# partially copied rule is eligible for rollback.
+DROPIN_BACKUP_INTERRUPT="$TEST_ROOT/dropin-backup-interrupt"; mkdir -p "$DROPIN_BACKUP_INTERRUPT/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$DROPIN_BACKUP_INTERRUPT/state/devices.json"
+printf '#includedir %s\n' "$DROPIN_BACKUP_INTERRUPT/sudoers.d" > "$DROPIN_BACKUP_INTERRUPT/sudoers"
+run_installer --sudo-user testuser "$DROPIN_BACKUP_INTERRUPT" --prelaunch >"$DROPIN_BACKUP_INTERRUPT/first.log" 2>&1
+dropin_backup_conf_hash="$(sha256_file "$DROPIN_BACKUP_INTERRUPT/sudo.conf")"
+dropin_backup_rule_hash="$(sha256_file "$DROPIN_BACKUP_INTERRUPT/sudoers.d/oshioki")"
+if FAIL_SUDOERS_BACKUP=1 run_installer "$DROPIN_BACKUP_INTERRUPT" --prelaunch >"$DROPIN_BACKUP_INTERRUPT/fail.log" 2>&1; then fail "accepted a failed sudoers backup"; fi
+grep -Fq 'could not back up the sudoers rule' "$DROPIN_BACKUP_INTERRUPT/fail.log" || fail "sudoers backup failure was not reported"
+[ "$(sha256_file "$DROPIN_BACKUP_INTERRUPT/sudo.conf")" = "$dropin_backup_conf_hash" ] || fail "failed sudoers backup changed the plugin"
+[ "$(sha256_file "$DROPIN_BACKUP_INTERRUPT/sudoers.d/oshioki")" = "$dropin_backup_rule_hash" ] || fail "failed sudoers backup changed the blanket rule"
+
+# A real TERM after the owned rule has been removed must terminate the
+# installer. EXIT cleanup restores the plugin before the blanket rule; it
+# must not return to rewrite_block and leave an unprotected rule.
+SIGNAL_REMOVE="$TEST_ROOT/signal-remove"; mkdir -p "$SIGNAL_REMOVE/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SIGNAL_REMOVE/state/devices.json"
+printf '#includedir %s\n' "$SIGNAL_REMOVE/sudoers.d" > "$SIGNAL_REMOVE/sudoers"
+run_installer --sudo-user testuser "$SIGNAL_REMOVE" --prelaunch >"$SIGNAL_REMOVE/first.log" 2>&1
+if SIGNAL_AFTER_REMOVE=1 run_installer "$SIGNAL_REMOVE" --prelaunch >"$SIGNAL_REMOVE/signal.log" 2>&1; then fail "ignored TERM after sudoers removal"; fi
+grep -Fq '# BEGIN oshioki' "$SIGNAL_REMOVE/sudo.conf" || fail "signal cleanup did not restore the plugin"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$SIGNAL_REMOVE/sudoers.d/oshioki" || fail "signal cleanup did not restore the blanket rule"
+
+# A cleanup failure between the sudo.conf and sudoers backup removals must
+# leave the migrated state disabled, since rollback has already been disarmed.
+CLEANUP_FAILURE="$TEST_ROOT/cleanup-failure"; mkdir -p "$CLEANUP_FAILURE/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$CLEANUP_FAILURE/state/devices.json"
+printf '#includedir %s\n' "$CLEANUP_FAILURE/sudoers.d" > "$CLEANUP_FAILURE/sudoers"
+run_installer --sudo-user testuser "$CLEANUP_FAILURE" --prelaunch >"$CLEANUP_FAILURE/first.log" 2>&1
+if FAIL_DROPIN_BACKUP_CLEANUP=1 run_installer "$CLEANUP_FAILURE" --prelaunch >"$CLEANUP_FAILURE/fail.log" 2>&1; then fail "accepted a backup cleanup failure"; fi
+grep -Fq 'could not remove its sudoers rollback backup' "$CLEANUP_FAILURE/fail.log" || fail "backup cleanup failure was not reported"
+if grep -Fq '# BEGIN oshioki' "$CLEANUP_FAILURE/sudo.conf"; then fail "backup cleanup failure restored the plugin"; fi
+[ ! -e "$CLEANUP_FAILURE/sudoers.d/oshioki" ] || fail "backup cleanup failure restored the blanket rule"
+
+# TERM in the same interval is also safe: the handler exits through EXIT
+# after cleanup disarmed rollback, so neither old artifact is restored.
+SIGNAL_CLEANUP="$TEST_ROOT/signal-cleanup"; mkdir -p "$SIGNAL_CLEANUP/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$SIGNAL_CLEANUP/state/devices.json"
+printf '#includedir %s\n' "$SIGNAL_CLEANUP/sudoers.d" > "$SIGNAL_CLEANUP/sudoers"
+run_installer --sudo-user testuser "$SIGNAL_CLEANUP" --prelaunch >"$SIGNAL_CLEANUP/first.log" 2>&1
+if SIGNAL_DURING_BACKUP_CLEANUP=1 run_installer "$SIGNAL_CLEANUP" --prelaunch >"$SIGNAL_CLEANUP/signal.log" 2>&1; then fail "ignored TERM during backup cleanup"; fi
+if grep -Fq '# BEGIN oshioki' "$SIGNAL_CLEANUP/sudo.conf"; then fail "backup cleanup signal restored the plugin"; fi
+[ ! -e "$SIGNAL_CLEANUP/sudoers.d/oshioki" ] || fail "backup cleanup signal restored the blanket rule"
+
+# If removing the owned blanket rule is interrupted, the legacy plugin must
+# still be present. The injected rm failure occurs before rewrite_block.
+REMOVE_INTERRUPT="$TEST_ROOT/remove-interrupt"; mkdir -p "$REMOVE_INTERRUPT/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$REMOVE_INTERRUPT/state/devices.json"
+printf '#includedir %s\n' "$REMOVE_INTERRUPT/sudoers.d" > "$REMOVE_INTERRUPT/sudoers"
+run_installer --sudo-user testuser "$REMOVE_INTERRUPT" --prelaunch >"$REMOVE_INTERRUPT/first.log" 2>&1
+remove_conf_hash="$(sha256_file "$REMOVE_INTERRUPT/sudo.conf")"
+if FAIL_REMOVE_SUDOERS_ONCE=1 run_installer "$REMOVE_INTERRUPT" --prelaunch >"$REMOVE_INTERRUPT/fail.log" 2>&1; then fail "accepted an interrupted sudoers removal"; fi
+[ "$(sha256_file "$REMOVE_INTERRUPT/sudo.conf")" = "$remove_conf_hash" ] || fail "interrupted sudoers removal removed the legacy plugin"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$REMOVE_INTERRUPT/sudoers.d/oshioki" || fail "interrupted sudoers removal lost the blanket rule"
+
+# If rewriting sudo.conf fails after the blanket rule has been removed,
+# rollback restores the plugin first and then the verified blanket rule.
+ROLLBACK_ORDER="$TEST_ROOT/rollback-order"; mkdir -p "$ROLLBACK_ORDER/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$ROLLBACK_ORDER/state/devices.json"
+printf '#includedir %s\n' "$ROLLBACK_ORDER/sudoers.d" > "$ROLLBACK_ORDER/sudoers"
+run_installer --sudo-user testuser "$ROLLBACK_ORDER" --prelaunch >"$ROLLBACK_ORDER/first.log" 2>&1
+: > "$ROLLBACK_ORDER/trace"
+if FAIL_SUDO_CONF_MOVE=1 INSTALL_TRACE="$ROLLBACK_ORDER/trace" run_installer "$ROLLBACK_ORDER" --prelaunch >"$ROLLBACK_ORDER/fail.log" 2>&1; then fail "accepted a failed sudo.conf rewrite"; fi
+grep -Fq '# BEGIN oshioki' "$ROLLBACK_ORDER/sudo.conf" || fail "rewrite failure did not restore the legacy plugin"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$ROLLBACK_ORDER/sudoers.d/oshioki" || fail "rewrite failure did not restore the blanket rule"
+plugin_restore_line="$(awk -F: -v destination="$ROLLBACK_ORDER/sudo.conf" '$1 == "cp" && $NF == destination { print NR; exit }' "$ROLLBACK_ORDER/trace")"
+dropin_restore_line="$(awk -F: -v destination="$ROLLBACK_ORDER/sudoers.d/oshioki" '$1 == "cp" && $NF == destination { print NR; exit }' "$ROLLBACK_ORDER/trace")"
+[ -n "$plugin_restore_line" ] || fail "rollback trace did not restore sudo.conf"
+[ -n "$dropin_restore_line" ] || fail "rollback trace did not restore the sudoers rule"
+[ "$plugin_restore_line" -lt "$dropin_restore_line" ] || fail "rollback restored the blanket rule before the legacy plugin"
+
+# The dry plan is reviewable before any live change and presents the same
+# ordering as the real transition.
+DRY_ORDER="$TEST_ROOT/dry-order"; mkdir -p "$DRY_ORDER/state" "$DRY_ORDER/sudoers.d"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$DRY_ORDER/state/devices.json"
+printf '#includedir %s\n' "$DRY_ORDER/sudoers.d" > "$DRY_ORDER/sudoers"
+printf '%s\n' '# BEGIN oshioki' "Plugin approval_exec $DRY_ORDER/plugin/$PLUGIN_NAME" '# END oshioki' > "$DRY_ORDER/sudo.conf"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$DRY_ORDER/sudoers.d/oshioki"
+run_installer --sudo-user testuser "$DRY_ORDER" --prelaunch --dry-run >"$DRY_ORDER/dry.log" 2>&1
+dry_dropin_line="$(grep -nF "DRY: remove $DRY_ORDER/sudoers.d/oshioki" "$DRY_ORDER/dry.log" | head -n1 | cut -d: -f1)"
+dry_plugin_line="$(grep -nF "DRY: remove the managed Oshioki plugin block from $DRY_ORDER/sudo.conf" "$DRY_ORDER/dry.log" | head -n1 | cut -d: -f1)"
+[ -n "$dry_dropin_line" ] || fail "dry plan omitted sudoers removal"
+[ -n "$dry_plugin_line" ] || fail "dry plan omitted plugin removal"
+[ "$dry_dropin_line" -lt "$dry_plugin_line" ] || fail "dry plan listed plugin removal before sudoers removal"
+
+# If restoring the legacy plugin itself fails, rollback must stop with the
+# blanket rule absent. This is the recoverable state for a failed migration:
+# normal administrator policy remains available without an unprotected grant.
+PLUGIN_ROLLBACK_FAIL="$TEST_ROOT/plugin-rollback-fail"; mkdir -p "$PLUGIN_ROLLBACK_FAIL/state"
+printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$PLUGIN_ROLLBACK_FAIL/state/devices.json"
+printf '#includedir %s\n' "$PLUGIN_ROLLBACK_FAIL/sudoers.d" > "$PLUGIN_ROLLBACK_FAIL/sudoers"
+run_installer --sudo-user testuser "$PLUGIN_ROLLBACK_FAIL" --prelaunch >"$PLUGIN_ROLLBACK_FAIL/first.log" 2>&1
+if FAIL_SUDO=1 FAIL_PLUGIN_RESTORE=1 run_installer "$PLUGIN_ROLLBACK_FAIL" --prelaunch >"$PLUGIN_ROLLBACK_FAIL/fail.log" 2>&1; then fail "accepted a failed plugin rollback"; fi
+grep -Fq 'rollback could not restore sudo.conf' "$PLUGIN_ROLLBACK_FAIL/fail.log" || fail "plugin rollback failure was not reported"
+if grep -Fq '# BEGIN oshioki' "$PLUGIN_ROLLBACK_FAIL/sudo.conf"; then fail "plugin rollback failure left the legacy plugin active"; fi
+[ ! -e "$PLUGIN_ROLLBACK_FAIL/sudoers.d/oshioki" ] || fail "plugin rollback failure restored the blanket rule"
 
 # If copying the plugin is interrupted after the hook copy, the disabled
 # state is retained: neither half of the old/new pair is re-enabled.
@@ -477,4 +765,1020 @@ HOOK_BIN="$LINKED_ARTIFACTS/oshioki" PLUGIN_BIN="$LINKED_ARTIFACTS/$BUILD_PLUGIN
 
 STANDALONE="$TEST_ROOT/standalone"; run_installer "$STANDALONE" --standalone-e2e
 [ ! -e "$STANDALONE/sudoers.d" ] || fail "standalone created sudoers state"
+
+# =========================================================================
+# Contextual PAM authentication (issue #73)
+#
+# Every case below starts from the legacy state -- an installed approval
+# plugin plus the blanket NOPASSWD drop-in -- so the migration path is what
+# is exercised, not a green-field install. The PAM stack is a copy of a real
+# distribution fixture from tests/pam-layouts/; no PAM library is loaded and
+# no real /etc is touched.
+# =========================================================================
+PAM_LAYOUTS="$SCRIPT_DIR/../tests/pam-layouts"
+[ -d "$PAM_LAYOUTS" ] || fail "missing PAM layout fixtures at $PAM_LAYOUTS"
+PAM_AUTH_LINE='auth [success=done authinfo_unavail=ignore module_unknown=ignore ignore=ignore default=die] liboshioki_pam.so'
+
+# Legacy host: plugin block, blanket rule, installed helper, an active
+# hardware device, and a stock PAM stack from the named fixture.
+setup_legacy_host() {
+  local root="$1" layout="$2"
+  mkdir -p "$root/state" "$root/pam.d" "$root/security"
+  printf '{"version":1,"devices":[{"version":1,"kind":"secure-enclave","fingerprint":"x","active":true}]}\n' \
+    > "$root/state/devices.json"
+  printf '#includedir %s\n' "$root/sudoers.d" > "$root/sudoers"
+  run_installer --sudo-user testuser "$root" --prelaunch >"$root/legacy.log" 2>&1 ||
+    fail "could not build the legacy state for $layout"
+  grep -Fq '# BEGIN oshioki' "$root/sudo.conf" || fail "legacy setup wrote no plugin block"
+  grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$root/sudoers.d/oshioki" ||
+    fail "legacy setup wrote no blanket rule"
+  cp "$PAM_LAYOUTS/$layout/pam.d/"* "$root/pam.d/"
+  : > "$root/security/pam_unix.so"
+  # Byte-exact "before" copies for the untouched-on-refusal assertions.
+  mkdir -p "$root/pristine"
+  cp "$root/pam.d/"* "$root/pristine/"
+}
+pam_unchanged() {
+  local root="$1" name
+  for name in "$root/pristine/"*; do
+    cmp -s "$name" "$root/pam.d/$(basename "$name")" || return 1
+  done
+  return 0
+}
+
+# --- exact post-edit bytes, per stock distribution layout -----------------
+# The three assertions together pin the bytes: the block is exactly our three
+# lines, it sits immediately above the include it must precede, and deleting
+# it restores the administrator's file byte for byte.
+for layout in ubuntu-24.04 debian-12 debian-13; do
+  LAYOUT_ROOT="$TEST_ROOT/pam-$layout"
+  setup_legacy_host "$LAYOUT_ROOT" "$layout"
+  run_installer --sudo-user testuser "$LAYOUT_ROOT" --contextual-pam >"$LAYOUT_ROOT/log" 2>&1 ||
+    { sed -n '1,40p' "$LAYOUT_ROOT/log" >&2; fail "$layout refused a stock stack"; }
+  for service in sudo sudo-i; do
+    edited="$LAYOUT_ROOT/pam.d/$service"
+    [ "$(grep -c '^# BEGIN oshioki pam$' "$edited")" -eq 1 ] || fail "$layout/$service block count"
+    [ "$(grep -c '^# END oshioki pam$' "$edited")" -eq 1 ] || fail "$layout/$service end marker count"
+    grep -Fxq "$PAM_AUTH_LINE" "$edited" || fail "$layout/$service has no exact auth line"
+    [ "$(grep -A1 '^# END oshioki pam$' "$edited" | tail -1)" = '@include common-auth' ] ||
+      fail "$layout/$service block is not immediately above @include common-auth"
+    sed '/^# BEGIN oshioki pam$/,/^# END oshioki pam$/d' "$edited" > "$LAYOUT_ROOT/stripped.$service"
+    cmp -s "$LAYOUT_ROOT/stripped.$service" "$LAYOUT_ROOT/pristine/$service" ||
+      fail "$layout/$service changed something other than the owned block"
+  done
+  [ -f "$LAYOUT_ROOT/security/liboshioki_pam.so" ] || fail "$layout installed no module"
+  # The legacy lane is retired in the same run: no double-authentication
+  # window, and no blanket NOPASSWD rule left behind either.
+  if grep -Fq '# BEGIN oshioki' "$LAYOUT_ROOT/sudo.conf"; then fail "$layout left the legacy plugin"; fi
+  [ ! -e "$LAYOUT_ROOT/sudoers.d/oshioki" ] || fail "$layout left the blanket rule"
+  if grep -Fq liboshioki_pam "$LAYOUT_ROOT/pam.d/common-auth"; then fail "$layout leaked into common-auth"; fi
+done
+
+# Idempotency: a second run converges on the same bytes rather than stacking
+# a second block.
+IDEMPOTENT="$TEST_ROOT/pam-idempotent"
+setup_legacy_host "$IDEMPOTENT" ubuntu-24.04
+run_installer --sudo-user testuser "$IDEMPOTENT" --contextual-pam >"$IDEMPOTENT/first.log" 2>&1 ||
+  fail "idempotency setup failed"
+cp "$IDEMPOTENT/pam.d/sudo" "$IDEMPOTENT/after-first"
+run_installer --sudo-user testuser "$IDEMPOTENT" --contextual-pam >"$IDEMPOTENT/second.log" 2>&1 ||
+  fail "a re-run of --contextual-pam failed"
+cmp -s "$IDEMPOTENT/after-first" "$IDEMPOTENT/pam.d/sudo" || fail "a re-run changed /etc/pam.d/sudo"
+[ "$(grep -c '^# BEGIN oshioki pam$' "$IDEMPOTENT/pam.d/sudo")" -eq 1 ] || fail "a re-run duplicated the block"
+
+# `sudo-i` as `@include sudo` inherits the edit: skipped, never edited twice.
+INHERIT="$TEST_ROOT/pam-inherit"
+setup_legacy_host "$INHERIT" debian-13-sudo-i-include
+run_installer --sudo-user testuser "$INHERIT" --contextual-pam >"$INHERIT/log" 2>&1 ||
+  fail "refused an inheriting sudo-i layout"
+grep -Fxq "$PAM_AUTH_LINE" "$INHERIT/pam.d/sudo" || fail "inheriting layout did not edit sudo"
+cmp -s "$INHERIT/pristine/sudo-i" "$INHERIT/pam.d/sudo-i" || fail "an inherited sudo-i was edited"
+grep -Fq 'inherits the edit' "$INHERIT/log" || fail "inheritance was not reported"
+
+# --- refusals leave every file untouched ---------------------------------
+# refuse-indented-auth-* are the regression cases for a column-0 anchor:
+# Linux-PAM strips leading whitespace, so an indented auth line is a live
+# second factor and inserting `success=done` above @include common-auth would
+# land after it.
+for layout in refuse-extra-auth refuse-faillock refuse-two-common-auth refuse-foreign-module \
+              refuse-indented-auth-space refuse-indented-auth-tab \
+              refuse-uppercase-auth refuse-continuation; do
+  REFUSE_ROOT="$TEST_ROOT/pam-$layout"
+  setup_legacy_host "$REFUSE_ROOT" "$layout"
+  if run_installer --sudo-user testuser "$REFUSE_ROOT" --contextual-pam >"$REFUSE_ROOT/log" 2>&1; then
+    fail "$layout was accepted"
+  fi
+  grep -Fq 'refusing a customised PAM stack' "$REFUSE_ROOT/log" || fail "$layout refusal was not explained"
+  pam_unchanged "$REFUSE_ROOT" || fail "$layout refusal modified a PAM file"
+  [ ! -e "$REFUSE_ROOT/security/liboshioki_pam.so" ] || fail "$layout refusal installed the module"
+  # A refusal is total: the legacy lane it would have replaced is still there.
+  grep -Fq '# BEGIN oshioki' "$REFUSE_ROOT/sudo.conf" || fail "$layout refusal removed the legacy plugin"
+  grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$REFUSE_ROOT/sudoers.d/oshioki" ||
+    fail "$layout refusal removed the blanket rule"
+done
+
+# A security directory without pam_unix.so is not the directory PAM loads
+# from, whatever its path says.
+NOUNIX="$TEST_ROOT/pam-no-pam-unix"
+setup_legacy_host "$NOUNIX" ubuntu-24.04
+rm -f "$NOUNIX/security/pam_unix.so"
+if run_installer --sudo-user testuser "$NOUNIX" --contextual-pam >"$NOUNIX/log" 2>&1; then
+  fail "accepted a security directory with no pam_unix.so"
+fi
+grep -Fq 'no pam_unix.so' "$NOUNIX/log" || fail "missing pam_unix.so refusal"
+pam_unchanged "$NOUNIX" || fail "the pam_unix.so refusal modified a PAM file"
+
+# A packaged multiarch triplet that does not describe the discovered
+# directory is a hard refusal, never a warning.
+MULTIARCH="$TEST_ROOT/pam-multiarch"
+setup_legacy_host "$MULTIARCH" ubuntu-24.04
+printf 'sparc64-linux-gnu\n' > "$MULTIARCH/pam-multiarch"
+if OSHIOKI_PAM_MULTIARCH="$MULTIARCH/pam-multiarch" \
+   run_installer --sudo-user testuser "$MULTIARCH" --contextual-pam >"$MULTIARCH/log" 2>&1; then
+  fail "accepted a multiarch mismatch"
+fi
+grep -Fq 'does not match the discovered' "$MULTIARCH/log" || fail "missing multiarch mismatch refusal"
+pam_unchanged "$MULTIARCH" || fail "the multiarch refusal modified a PAM file"
+
+# No hardware-backed device is "not yet", not a failure: the .deb's opt-in
+# key is pre-seeded before any device is paired, so every postinst until
+# then would otherwise report an error. Nothing on the host is touched, and
+# the exit status has to be 0 for the package script to carry on.
+NODEVICE="$TEST_ROOT/pam-no-device"
+setup_legacy_host "$NODEVICE" ubuntu-24.04
+printf '{"version":1,"devices":[{"version":1,"kind":"software","active":true}]}\n' > "$NODEVICE/state/devices.json"
+run_installer --sudo-user testuser "$NODEVICE" --contextual-pam >"$NODEVICE/log" 2>&1 ||
+  fail "a software-only registry was an error rather than a skip"
+grep -Fq 'no active hardware-backed approval device yet' "$NODEVICE/log" || fail "missing device skip message"
+grep -Fq -- '--contextual-pam' "$NODEVICE/log" || fail "the skip does not name the command to re-run"
+pam_unchanged "$NODEVICE" || fail "the device skip modified a PAM file"
+[ ! -e "$NODEVICE/security/liboshioki_pam.so" ] || fail "the device skip installed the module"
+grep -Fq '# BEGIN oshioki' "$NODEVICE/sudo.conf" || fail "the device skip removed the legacy plugin"
+[ -e "$NODEVICE/sudoers.d/oshioki" ] || fail "the device skip removed the blanket rule"
+
+# A checksum that does not match the manifest never reaches the host.
+BADSUM="$TEST_ROOT/pam-bad-checksum"
+setup_legacy_host "$BADSUM" ubuntu-24.04
+printf 'tampered\n' > "$BADSUM/tampered.so"
+if PAM_MODULE_BIN="$BADSUM/tampered.so" \
+   run_installer --sudo-user testuser "$BADSUM" --contextual-pam >"$BADSUM/log" 2>&1; then
+  fail "accepted an unlisted PAM module artifact"
+fi
+pam_unchanged "$BADSUM" || fail "the checksum refusal modified a PAM file"
+
+# --- fault injection: the full rollback chain, in order ------------------
+# Every failure must land the host back on the legacy lane, and the order is
+# the property: PAM entries restored, then the module removed, then the
+# plugin, then the blanket rule. The reverse would hand back passwordless
+# sudo while the module was still referenced.
+assert_rollback_chain() {
+  local trace="$1" label="$2"
+  grep -q '^pam:rollback:restored:.*/pam.d/sudo$' "$trace" ||
+    fail "$label: no PAM restore in the trace"
+  local pam_line module_line plugin_line dropin_line
+  pam_line="$(grep -n '^pam:rollback:restored:.*/pam.d/sudo$' "$trace" | head -1 | cut -d: -f1)"
+  module_line="$(grep -n '^pam:rollback:restored:.*/liboshioki_pam\.' "$trace" | head -1 | cut -d: -f1)"
+  plugin_line="$(grep -n '^pam:rollback:plugin-restored:' "$trace" | head -1 | cut -d: -f1)"
+  dropin_line="$(grep -n '^pam:rollback:dropin-restored:' "$trace" | head -1 | cut -d: -f1)"
+  [ -n "$module_line" ] || fail "$label: the module was not rolled back"
+  [ -n "$plugin_line" ] || fail "$label: the legacy plugin was not restored"
+  [ -n "$dropin_line" ] || fail "$label: the blanket rule was not restored"
+  [ "$pam_line" -lt "$module_line" ] || fail "$label: the module was removed before the PAM entries"
+  [ "$module_line" -lt "$plugin_line" ] || fail "$label: the plugin came back before the module went"
+  [ "$plugin_line" -lt "$dropin_line" ] || fail "$label: the blanket rule came back before the plugin"
+}
+assert_legacy_restored() {
+  local root="$1" label="$2"
+  pam_unchanged "$root" || fail "$label: a PAM file was left edited"
+  [ ! -e "$root/security/liboshioki_pam.so" ] || fail "$label: the module was left installed"
+  grep -Fq '# BEGIN oshioki' "$root/sudo.conf" || fail "$label: the legacy plugin was not restored"
+  grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$root/sudoers.d/oshioki" ||
+    fail "$label: the blanket rule was not restored"
+}
+
+# A signal while committed rollback snapshots are being deleted must not run
+# the old cleanup trap halfway through the transition. The contextual PAM
+# lane must remain live, with neither legacy privilege artifact restored.
+COMMIT_INTERRUPT="$TEST_ROOT/pam-commit-window-interrupt"
+setup_legacy_host "$COMMIT_INTERRUPT" ubuntu-24.04
+if SIGNAL_DURING_PAM_COMMIT=1 run_installer --sudo-user testuser "$COMMIT_INTERRUPT" \
+   --contextual-pam >"$COMMIT_INTERRUPT/log" 2>&1; then
+  fail "a signal during the contextual commit window reported success"
+fi
+for service in sudo sudo-i; do
+  grep -Fxq "$PAM_AUTH_LINE" "$COMMIT_INTERRUPT/pam.d/$service" ||
+    fail "commit-window signal removed the contextual PAM block from $service"
+done
+[ -f "$COMMIT_INTERRUPT/security/liboshioki_pam.so" ] ||
+  fail "commit-window signal removed the contextual PAM module"
+if grep -Fq '# BEGIN oshioki' "$COMMIT_INTERRUPT/sudo.conf"; then
+  fail "commit-window signal restored the legacy approval plugin"
+fi
+[ ! -e "$COMMIT_INTERRUPT/sudoers.d/oshioki" ] ||
+  fail "commit-window signal restored the legacy blanket rule"
+
+# Step 4: the module copy fails. Nothing referenced it, so only the two
+# legacy artifacts need to come back -- but they must come back in order.
+FAULT_MODULE="$TEST_ROOT/pam-fault-module"
+setup_legacy_host "$FAULT_MODULE" ubuntu-24.04
+if INSTALL_TRACE="$FAULT_MODULE/trace" FAIL_PAM_MODULE_INSTALL=1 \
+   run_installer --sudo-user testuser "$FAULT_MODULE" --contextual-pam >"$FAULT_MODULE/log" 2>&1; then
+  fail "a failed module install reported success"
+fi
+grep -Fq 'could not install the PAM module' "$FAULT_MODULE/log" || fail "module install failure unexplained"
+assert_rollback_chain "$FAULT_MODULE/trace" 'module install failure'
+assert_legacy_restored "$FAULT_MODULE" 'module install failure'
+if grep -q '^pam:edit:' "$FAULT_MODULE/trace"; then fail "a PAM file was edited after a failed module install"; fi
+
+# Step 5: the self-test fails. The module is on disk but no PAM file has
+# been touched; the trace must show no edit at all.
+FAULT_SELFTEST="$TEST_ROOT/pam-fault-selftest"
+setup_legacy_host "$FAULT_SELFTEST" ubuntu-24.04
+if INSTALL_TRACE="$FAULT_SELFTEST/trace" FAIL_PAM_SELFTEST=1 \
+   run_installer --sudo-user testuser "$FAULT_SELFTEST" --contextual-pam >"$FAULT_SELFTEST/log" 2>&1; then
+  fail "a failed self-test reported success"
+fi
+grep -Fq 'self-test failed' "$FAULT_SELFTEST/log" || fail "self-test failure unexplained"
+grep -q '^pam:module-installed:' "$FAULT_SELFTEST/trace" || fail "the self-test ran before the module was staged"
+if grep -q '^pam:edit:' "$FAULT_SELFTEST/trace"; then fail "a PAM file was edited after a failed self-test"; fi
+assert_rollback_chain "$FAULT_SELFTEST/trace" 'self-test failure'
+assert_legacy_restored "$FAULT_SELFTEST" 'self-test failure'
+
+# Step 6: the second service fails after the first was edited. The first
+# edit must be undone from the snapshot, not patched.
+FAULT_EDIT="$TEST_ROOT/pam-fault-edit"
+setup_legacy_host "$FAULT_EDIT" ubuntu-24.04
+if INSTALL_TRACE="$FAULT_EDIT/trace" FAIL_PAM_EDIT=sudo-i \
+   run_installer --sudo-user testuser "$FAULT_EDIT" --contextual-pam >"$FAULT_EDIT/log" 2>&1; then
+  fail "a failed sudo-i edit reported success"
+fi
+grep -q '^pam:edit:sudo$' "$FAULT_EDIT/trace" || fail "the first service was never edited"
+assert_rollback_chain "$FAULT_EDIT/trace" 'sudo-i edit failure'
+assert_legacy_restored "$FAULT_EDIT" 'sudo-i edit failure'
+
+# Step 6: sudo -V fails at the post-edit check only. The step-3 check on the
+# same run must still have passed, or this would be testing the wrong window.
+FAULT_SUDO="$TEST_ROOT/pam-fault-sudo"
+setup_legacy_host "$FAULT_SUDO" ubuntu-24.04
+if INSTALL_TRACE="$FAULT_SUDO/trace" FAIL_SUDO_ON_CALL=2 \
+   run_installer --sudo-user testuser "$FAULT_SUDO" --contextual-pam >"$FAULT_SUDO/log" 2>&1; then
+  fail "a failed post-edit sudo -V reported success"
+fi
+grep -Fq 'sudo -V failed after the PAM edit' "$FAULT_SUDO/log" || fail "post-edit sudo failure unexplained"
+grep -q '^pam:edit:sudo-i$' "$FAULT_SUDO/trace" || fail "the post-edit check ran before both edits"
+assert_rollback_chain "$FAULT_SUDO/trace" 'post-edit sudo -V failure'
+assert_legacy_restored "$FAULT_SUDO" 'post-edit sudo -V failure'
+
+# A signal between the two PAM edits runs the same chain through the EXIT
+# trap rather than resuming a half-applied migration.
+FAULT_SIGNAL="$TEST_ROOT/pam-fault-signal"
+setup_legacy_host "$FAULT_SIGNAL" ubuntu-24.04
+if INSTALL_TRACE="$FAULT_SIGNAL/trace" SIGNAL_AFTER_PAM_EDIT=1 \
+   run_installer --sudo-user testuser "$FAULT_SIGNAL" --contextual-pam >"$FAULT_SIGNAL/log" 2>&1; then
+  fail "a TERM between PAM edits reported success"
+fi
+assert_rollback_chain "$FAULT_SIGNAL/trace" 'TERM between edits'
+assert_legacy_restored "$FAULT_SIGNAL" 'TERM between edits'
+
+# The fault-injection names are inert without the explicit opt-in, so an
+# environment that happens to carry FAIL_PAM_MODULE_INSTALL into a real root
+# installer cannot abort or signal the migration.
+NO_FAULT_OPTIN="$TEST_ROOT/pam-fault-optin-absent"
+setup_legacy_host "$NO_FAULT_OPTIN" ubuntu-24.04
+OSHIOKI_INSTALL_FAULT_INJECTION=0 INSTALL_TRACE="$NO_FAULT_OPTIN/trace" \
+  FAIL_PAM_MODULE_INSTALL=1 FAIL_PAM_SELFTEST=1 FAIL_PAM_EDIT=sudo SIGNAL_AFTER_PAM_EDIT=1 \
+  run_installer --sudo-user testuser "$NO_FAULT_OPTIN" --contextual-pam \
+  >"$NO_FAULT_OPTIN/log" 2>&1 ||
+  { sed -n '1,40p' "$NO_FAULT_OPTIN/log" >&2; fail "fault names were honoured without the opt-in"; }
+grep -q '^pam:edit:sudo$' "$NO_FAULT_OPTIN/trace" ||
+  fail "the migration did not complete with the fault names set but not opted in"
+
+# --- disable ordering -----------------------------------------------------
+DISABLE="$TEST_ROOT/pam-disable"
+setup_legacy_host "$DISABLE" ubuntu-24.04
+run_installer --sudo-user testuser "$DISABLE" --contextual-pam >"$DISABLE/install.log" 2>&1 ||
+  fail "disable setup could not install"
+INSTALL_TRACE="$DISABLE/trace" run_installer "$DISABLE" --disable-contextual-pam >"$DISABLE/log" 2>&1 ||
+  fail "--disable-contextual-pam failed"
+edit_line="$(grep -n '^pam:disable:edit:sudo$' "$DISABLE/trace" | head -1 | cut -d: -f1)"
+unlink_line="$(grep -n '^pam:disable:module-removed:' "$DISABLE/trace" | head -1 | cut -d: -f1)"
+[ -n "$edit_line" ] || fail "disable trace has no PAM edit step"
+[ -n "$unlink_line" ] || fail "disable trace has no module removal step"
+[ "$edit_line" -lt "$unlink_line" ] || fail "the module was unlinked before the PAM entries were removed"
+[ ! -e "$DISABLE/security/liboshioki_pam.so" ] || fail "disable left the module installed"
+for service in sudo sudo-i; do
+  cmp -s "$DISABLE/pristine/$service" "$DISABLE/pam.d/$service" ||
+    fail "disable did not restore a stock-identical $service"
+done
+
+# A disable whose PAM edit fails leaves the module in place and exits
+# non-zero -- never a referenced-but-missing module.
+DISABLE_FAIL="$TEST_ROOT/pam-disable-fail"
+setup_legacy_host "$DISABLE_FAIL" ubuntu-24.04
+run_installer --sudo-user testuser "$DISABLE_FAIL" --contextual-pam >"$DISABLE_FAIL/install.log" 2>&1 ||
+  fail "disable-failure setup could not install"
+chmod 0500 "$DISABLE_FAIL/pam.d"
+if INSTALL_TRACE="$DISABLE_FAIL/trace" run_installer "$DISABLE_FAIL" --disable-contextual-pam \
+     >"$DISABLE_FAIL/log" 2>&1; then
+  chmod 0755 "$DISABLE_FAIL/pam.d"
+  fail "a failed PAM edit during disable reported success"
+fi
+chmod 0755 "$DISABLE_FAIL/pam.d"
+[ -f "$DISABLE_FAIL/security/liboshioki_pam.so" ] ||
+  fail "a failed PAM edit during disable removed the module anyway"
+if grep -q '^pam:disable:module-removed:' "$DISABLE_FAIL/trace" 2>/dev/null; then
+  fail "the module was unlinked despite a failed PAM edit"
+fi
+
+# Disable must also work with sudo.conf absent, the way package removal
+# reaches it.
+DISABLE_NOCONF="$TEST_ROOT/pam-disable-noconf"
+setup_legacy_host "$DISABLE_NOCONF" ubuntu-24.04
+run_installer --sudo-user testuser "$DISABLE_NOCONF" --contextual-pam >"$DISABLE_NOCONF/install.log" 2>&1 ||
+  fail "sudo.conf-less disable setup could not install"
+rm -f "$DISABLE_NOCONF/sudo.conf"
+run_installer "$DISABLE_NOCONF" --disable-contextual-pam >"$DISABLE_NOCONF/log" 2>&1 ||
+  fail "--disable-contextual-pam failed without sudo.conf"
+[ ! -e "$DISABLE_NOCONF/security/liboshioki_pam.so" ] || fail "sudo.conf-less disable left the module"
+
+# --- status ---------------------------------------------------------------
+STATUS="$TEST_ROOT/pam-status"
+setup_legacy_host "$STATUS" ubuntu-24.04
+# Before the migration: the legacy lane is still up, so most lines fail.
+if run_installer --sudo-user testuser "$STATUS" --contextual-pam-status >"$STATUS/before.log" 2>&1; then
+  fail "status reported OK before the migration"
+fi
+grep -q '^FAIL  module: not installed' "$STATUS/before.log" || fail "status did not report a missing module"
+grep -q '^FAIL  pam entries: sudo=absent sudo-i=absent$' "$STATUS/before.log" || fail "status entry line before"
+grep -q '^FAIL  legacy artifacts: blanket-rule approval-plugin still present$' "$STATUS/before.log" ||
+  fail "status did not report both legacy artifacts"
+[ "$(grep -c '^\(OK\|FAIL\)  ' "$STATUS/before.log")" -eq 8 ] || fail "status did not print eight lines"
+
+run_installer --sudo-user testuser "$STATUS" --contextual-pam >"$STATUS/install.log" 2>&1 ||
+  fail "status setup could not install"
+run_installer --sudo-user testuser "$STATUS" --contextual-pam-status >"$STATUS/after.log" 2>&1 ||
+  { sed -n '1,20p' "$STATUS/after.log" >&2; fail "status did not report OK after a clean migration"; }
+[ "$(grep -c '^OK    ' "$STATUS/after.log")" -eq 8 ] || fail "status after migration is not eight OK lines"
+grep -q '^OK    pam entries: sudo=present sudo-i=present$' "$STATUS/after.log" || fail "status entry line after"
+grep -q '^OK    common-auth: clean' "$STATUS/after.log" || fail "status common-auth line"
+grep -q '^OK    legacy artifacts: none' "$STATUS/after.log" || fail "status legacy line after"
+
+# The degraded state `module_unknown=ignore` exists for: the entry is there,
+# the module is not. Status must say so rather than report enabled.
+rm -f "$STATUS/security/liboshioki_pam.so"
+if run_installer --sudo-user testuser "$STATUS" --contextual-pam-status >"$STATUS/gone.log" 2>&1; then
+  fail "status reported OK with the module file removed"
+fi
+grep -q '^FAIL  module: not installed' "$STATUS/gone.log" || fail "status did not notice the removed module"
+
+# An administrator editing the stack under us is loud.
+STATUS_CHANGED="$TEST_ROOT/pam-status-changed"
+setup_legacy_host "$STATUS_CHANGED" ubuntu-24.04
+run_installer --sudo-user testuser "$STATUS_CHANGED" --contextual-pam >"$STATUS_CHANGED/install.log" 2>&1 ||
+  fail "changed-stack status setup could not install"
+printf 'auth required pam_faillock.so preauth\n' >> "$STATUS_CHANGED/pam.d/sudo"
+if run_installer --sudo-user testuser "$STATUS_CHANGED" --contextual-pam-status >"$STATUS_CHANGED/log" 2>&1; then
+  fail "status accepted an administrator-modified stack"
+fi
+grep -q '^FAIL  stock fingerprint: sudo=CHANGED' "$STATUS_CHANGED/log" || fail "status did not flag the changed stack"
+
+# An inherited sudo-i is reported as inherited, not as a missing entry.
+STATUS_INHERIT="$TEST_ROOT/pam-status-inherit"
+setup_legacy_host "$STATUS_INHERIT" debian-13-sudo-i-include
+run_installer --sudo-user testuser "$STATUS_INHERIT" --contextual-pam >"$STATUS_INHERIT/install.log" 2>&1 ||
+  fail "inherited status setup could not install"
+run_installer --sudo-user testuser "$STATUS_INHERIT" --contextual-pam-status >"$STATUS_INHERIT/log" 2>&1 ||
+  { sed -n '1,20p' "$STATUS_INHERIT/log" >&2; fail "status failed on an inheriting layout"; }
+grep -q 'sudo-i=inherited-via-include' "$STATUS_INHERIT/log" || fail "status did not report inheritance"
+
+# A helper with no execute bit is refused by both lanes. The module's own
+# path check rejects `mode & 0o111 == 0`, and under `default=die` that
+# refusal fails every sudo before a password prompt is drawn -- so the
+# migration must never start and status must say the helper is bad.
+NOEXEC_HELPER="$TEST_ROOT/pam-helper-noexec"
+setup_legacy_host "$NOEXEC_HELPER" ubuntu-24.04
+if FAKE_STAT_SPECIAL_PATH="$NOEXEC_HELPER/sbin/oshioki" FAKE_STAT_SPECIAL_MODE=644 \
+   run_installer --sudo-user testuser "$NOEXEC_HELPER" --contextual-pam >"$NOEXEC_HELPER/log" 2>&1; then
+  fail "accepted a non-executable helper"
+fi
+grep -Fq 'is missing, not executable, or on an unsafe path' "$NOEXEC_HELPER/log" ||
+  fail "non-executable helper refusal was not explained"
+[ ! -e "$NOEXEC_HELPER/security/liboshioki_pam.so" ] ||
+  fail "non-executable helper refusal installed a module"
+pam_unchanged "$NOEXEC_HELPER" || fail "non-executable helper refusal changed a PAM file"
+if FAKE_STAT_SPECIAL_PATH="$NOEXEC_HELPER/sbin/oshioki" FAKE_STAT_SPECIAL_MODE=644 \
+   run_installer --sudo-user testuser "$NOEXEC_HELPER" --contextual-pam-status >"$NOEXEC_HELPER/status.log" 2>&1; then
+  fail "status reported OK with a non-executable helper"
+fi
+grep -q '^FAIL  helper: ' "$NOEXEC_HELPER/status.log" ||
+  fail "status did not flag the non-executable helper"
+
+# --- dry-run mirrors ------------------------------------------------------
+DRY="$TEST_ROOT/pam-dry"
+setup_legacy_host "$DRY" ubuntu-24.04
+run_installer --sudo-user testuser "$DRY" --contextual-pam --dry-run >"$DRY/log" 2>&1 ||
+  fail "the contextual dry run failed"
+grep -Fq "DRY: remove $DRY/sudoers.d/oshioki" "$DRY/log" || fail "dry run did not plan the blanket rule removal"
+grep -Fq "DRY: remove the managed Oshioki plugin block from $DRY/sudo.conf" "$DRY/log" ||
+  fail "dry run did not plan the plugin removal"
+grep -Fq "DRY: install " "$DRY/log" || fail "dry run did not plan the module install"
+grep -Fq "DRY: insert the exact oshioki pam block into $DRY/pam.d/sudo" "$DRY/log" ||
+  fail "dry run did not plan the sudo edit"
+grep -Fq "DRY: insert the exact oshioki pam block into $DRY/pam.d/sudo-i" "$DRY/log" ||
+  fail "dry run did not plan the sudo-i edit"
+pam_unchanged "$DRY" || fail "the dry run edited a PAM file"
+[ ! -e "$DRY/security/liboshioki_pam.so" ] || fail "the dry run installed the module"
+grep -Fq '# BEGIN oshioki' "$DRY/sudo.conf" || fail "the dry run removed the legacy plugin"
+[ -e "$DRY/sudoers.d/oshioki" ] || fail "the dry run removed the blanket rule"
+
+DRY_DISABLE="$TEST_ROOT/pam-dry-disable"
+setup_legacy_host "$DRY_DISABLE" ubuntu-24.04
+run_installer --sudo-user testuser "$DRY_DISABLE" --contextual-pam >"$DRY_DISABLE/install.log" 2>&1 ||
+  fail "dry-disable setup could not install"
+run_installer "$DRY_DISABLE" --disable-contextual-pam --dry-run >"$DRY_DISABLE/log" 2>&1 ||
+  fail "the disable dry run failed"
+grep -Fq "DRY: remove the exact oshioki pam block from $DRY_DISABLE/pam.d/sudo" "$DRY_DISABLE/log" ||
+  fail "disable dry run did not plan the sudo edit"
+grep -Fq "DRY: remove $DRY_DISABLE/security/liboshioki_pam.so" "$DRY_DISABLE/log" ||
+  fail "disable dry run did not plan the module removal"
+grep -Fxq "$PAM_AUTH_LINE" "$DRY_DISABLE/pam.d/sudo" || fail "the disable dry run edited a PAM file"
+[ -f "$DRY_DISABLE/security/liboshioki_pam.so" ] || fail "the disable dry run removed the module"
+
+# --- upgrade paths on an already-migrated host ---------------------------
+# `apt upgrade` re-runs postinst, which re-runs --prelaunch. On a migrated
+# host that must refresh the hook without putting the approval plugin or the
+# blanket NOPASSWD rule back: two authorization paths where the
+# administrator chose one is exactly what the migration removed.
+REPRELAUNCH="$TEST_ROOT/pam-prelaunch-on-migrated"
+setup_legacy_host "$REPRELAUNCH" ubuntu-24.04
+run_installer --sudo-user testuser "$REPRELAUNCH" --contextual-pam >"$REPRELAUNCH/install.log" 2>&1 ||
+  { sed -n '1,40p' "$REPRELAUNCH/install.log" >&2; fail "could not migrate the prelaunch-upgrade host"; }
+mkdir -p "$REPRELAUNCH/migrated"
+cp "$REPRELAUNCH/pam.d/"* "$REPRELAUNCH/migrated/"
+# Proof that the artifacts really are reinstalled rather than skipped.
+rm -f "$REPRELAUNCH/sbin/oshioki" "$REPRELAUNCH/state/config.env"
+run_installer --sudo-user testuser "$REPRELAUNCH" --prelaunch >"$REPRELAUNCH/log" 2>&1 ||
+  { sed -n '1,40p' "$REPRELAUNCH/log" >&2; fail "prelaunch failed on a migrated host"; }
+grep -Fq 'this host is on the contextual PAM lane' "$REPRELAUNCH/log" ||
+  fail "prelaunch on a migrated host did not say why it withheld the plugin lane"
+[ -x "$REPRELAUNCH/sbin/oshioki" ] || fail "prelaunch on a migrated host did not reinstall the hook"
+[ -f "$REPRELAUNCH/state/config.env" ] || fail "prelaunch on a migrated host did not rewrite config.env"
+if grep -Fq '# BEGIN oshioki' "$REPRELAUNCH/sudo.conf"; then
+  fail "prelaunch on a migrated host re-enabled the approval plugin"
+fi
+[ ! -e "$REPRELAUNCH/sudoers.d/oshioki" ] ||
+  fail "prelaunch on a migrated host re-installed the blanket NOPASSWD rule"
+for service in sudo sudo-i; do
+  cmp -s "$REPRELAUNCH/migrated/$service" "$REPRELAUNCH/pam.d/$service" ||
+    fail "prelaunch on a migrated host changed $service"
+done
+[ -f "$REPRELAUNCH/security/liboshioki_pam.so" ] || fail "prelaunch on a migrated host removed the module"
+# The dry run says the same thing and writes nothing.
+run_installer --sudo-user testuser "$REPRELAUNCH" --prelaunch --dry-run >"$REPRELAUNCH/dry.log" 2>&1 ||
+  fail "the prelaunch dry run failed on a migrated host"
+grep -Fq 'DRY: skip enabling' "$REPRELAUNCH/dry.log" ||
+  fail "the prelaunch dry run did not plan to skip the plugin lane"
+[ ! -e "$REPRELAUNCH/sudoers.d/oshioki" ] || fail "the prelaunch dry run wrote the blanket rule"
+
+# Crash litter is not a lane. A `sudo.XXXXXX` left behind by an interrupted
+# edit carries the whole block, and counting it would withhold the plugin
+# lane from that host forever.
+LITTER="$TEST_ROOT/pam-litter-not-a-lane"
+setup_legacy_host "$LITTER" ubuntu-24.04
+printf '%s\n' '# BEGIN oshioki pam' "$PAM_AUTH_LINE" '# END oshioki pam' > "$LITTER/pam.d/sudo.AbCdEf"
+run_installer --sudo-user testuser "$LITTER" --prelaunch >"$LITTER/log" 2>&1 ||
+  { sed -n '1,40p' "$LITTER/log" >&2; fail "prelaunch failed on a host with PAM edit litter"; }
+if grep -Fq 'this host is on the contextual PAM lane' "$LITTER/log"; then
+  fail "a leftover sudo.XXXXXX file was counted as a live PAM lane"
+fi
+grep -Fq '# BEGIN oshioki' "$LITTER/sudo.conf" || fail "litter host: the plugin block was not enabled"
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$LITTER/sudoers.d/oshioki" ||
+  fail "litter host: the blanket rule was not installed"
+
+# The registry's three "not yet" shapes are distinguished, and a corrupt one
+# is a refusal rather than a skip.
+NOTYET="$TEST_ROOT/pam-registry-states"
+setup_legacy_host "$NOTYET" ubuntu-24.04
+printf '{"version":1,"devices":[]}\n' > "$NOTYET/state/devices.json"
+run_installer --sudo-user testuser "$NOTYET" --contextual-pam >"$NOTYET/empty.log" 2>&1 ||
+  fail "an empty registry was an error rather than a skip"
+grep -Fq 'no approval device pinned yet' "$NOTYET/empty.log" ||
+  fail "an empty registry was not reported as such"
+rm -f "$NOTYET/state/devices.json"
+run_installer --sudo-user testuser "$NOTYET" --contextual-pam >"$NOTYET/absent.log" 2>&1 ||
+  fail "an absent registry was an error rather than a skip"
+grep -Fq 'no approval device pinned yet' "$NOTYET/absent.log" ||
+  fail "an absent registry was not reported as such"
+printf 'not a registry\n' > "$NOTYET/state/devices.json"
+if run_installer --sudo-user testuser "$NOTYET" --contextual-pam >"$NOTYET/corrupt.log" 2>&1; then
+  fail "a corrupt registry was treated as a skip"
+fi
+grep -Fq 'is not a device registry' "$NOTYET/corrupt.log" || fail "missing corrupt-registry refusal"
+pam_unchanged "$NOTYET" || fail "a registry-state case modified a PAM file"
+
+# A configured lane whose module has gone missing is loud, and with no
+# device to prove a replacement it is a refusal, not a quiet skip. On macOS,
+# a missing module under the sufficient entry continues to the stock password
+# provider rather than aborting the chain; it never authenticates by device.
+GONE="$TEST_ROOT/pam-module-missing"
+setup_legacy_host "$GONE" ubuntu-24.04
+run_installer --sudo-user testuser "$GONE" --contextual-pam >"$GONE/install.log" 2>&1 ||
+  { sed -n '1,40p' "$GONE/install.log" >&2; fail "could not migrate the missing-module host"; }
+rm -f "$GONE/security/$PAM_MODULE_ARTIFACT"
+run_installer --sudo-user testuser "$GONE" --contextual-pam >"$GONE/reinstall.log" 2>&1 ||
+  { sed -n '1,40p' "$GONE/reinstall.log" >&2; fail "a missing module was not reinstalled"; }
+grep -Fq 'the contextual PAM lane is configured but the module file is missing' "$GONE/reinstall.log" ||
+  fail "the missing module was not reported loudly"
+[ -f "$GONE/security/$PAM_MODULE_ARTIFACT" ] || fail "the missing module was not reinstalled"
+rm -f "$GONE/security/$PAM_MODULE_ARTIFACT"
+printf '{"version":1,"devices":[]}\n' > "$GONE/state/devices.json"
+if run_installer --sudo-user testuser "$GONE" --contextual-pam >"$GONE/notyet.log" 2>&1; then
+  fail "a configured lane with no module reported success on the not-yet path"
+fi
+grep -Fq 'run --disable-contextual-pam' "$GONE/notyet.log" ||
+  fail "the missing-module refusal does not name the way out"
+
+# A package upgrade ships a new module. It is staged beside the live one,
+# proven to load, and only then renamed into place; the PAM block never
+# moves, and a self-test failure leaves the old module running.
+REFRESH="$TEST_ROOT/pam-module-refresh"
+setup_legacy_host "$REFRESH" ubuntu-24.04
+run_installer --sudo-user testuser "$REFRESH" --contextual-pam >"$REFRESH/install.log" 2>&1 ||
+  { sed -n '1,40p' "$REFRESH/install.log" >&2; fail "could not migrate the refresh host"; }
+mkdir -p "$REFRESH/migrated" "$REFRESH/v2" "$REFRESH/v3"
+cp "$REFRESH/pam.d/"* "$REFRESH/migrated/"
+printf 'fake pam module v2\n' > "$REFRESH/v2/$PAM_MODULE_ARTIFACT"
+printf '%s  %s\n' "$(sha256_file "$REFRESH/v2/$PAM_MODULE_ARTIFACT")" "$PAM_MODULE_ARTIFACT" > "$REFRESH/v2/SHA256SUMS"
+printf 'fake pam module v3\n' > "$REFRESH/v3/$PAM_MODULE_ARTIFACT"
+printf '%s  %s\n' "$(sha256_file "$REFRESH/v3/$PAM_MODULE_ARTIFACT")" "$PAM_MODULE_ARTIFACT" > "$REFRESH/v3/SHA256SUMS"
+refresh_module="$REFRESH/security/$PAM_MODULE_ARTIFACT"
+
+OSHIOKI_CHECKSUMS="$REFRESH/v2/SHA256SUMS" PAM_MODULE_BIN="$REFRESH/v2/$PAM_MODULE_ARTIFACT" \
+  run_installer --sudo-user testuser "$REFRESH" --contextual-pam >"$REFRESH/refresh.log" 2>&1 ||
+  { sed -n '1,40p' "$REFRESH/refresh.log" >&2; fail "the module refresh failed"; }
+grep -Fq 'contextual PAM module refreshed' "$REFRESH/refresh.log" || fail "the refresh did not report itself"
+cmp -s "$REFRESH/v2/$PAM_MODULE_ARTIFACT" "$refresh_module" || fail "the refresh did not replace the module"
+for service in sudo sudo-i; do
+  cmp -s "$REFRESH/migrated/$service" "$REFRESH/pam.d/$service" || fail "the refresh changed $service"
+done
+[ ! -e "$refresh_module.oshioki-new" ] || fail "the refresh left its staged module behind"
+[ ! -e "$refresh_module.oshioki-previous" ] || fail "the refresh left its backup behind"
+
+# Re-running with the same module is a no-op that still exits 0.
+OSHIOKI_CHECKSUMS="$REFRESH/v2/SHA256SUMS" PAM_MODULE_BIN="$REFRESH/v2/$PAM_MODULE_ARTIFACT" \
+  run_installer --sudo-user testuser "$REFRESH" --contextual-pam >"$REFRESH/again.log" 2>&1 ||
+  fail "a second refresh with an unchanged module failed"
+grep -Fq 'already current' "$REFRESH/again.log" || fail "an unchanged module was not reported as current"
+
+# A staged module that does not load never reaches the live path.
+if OSHIOKI_CHECKSUMS="$REFRESH/v3/SHA256SUMS" PAM_MODULE_BIN="$REFRESH/v3/$PAM_MODULE_ARTIFACT" \
+   FAIL_PAM_SELFTEST=1 \
+   run_installer --sudo-user testuser "$REFRESH" --contextual-pam >"$REFRESH/selftest.log" 2>&1; then
+  fail "a refresh whose self-test failed reported success"
+fi
+grep -Fq 'is unchanged' "$REFRESH/selftest.log" || fail "the failed refresh did not say the module is unchanged"
+cmp -s "$REFRESH/v2/$PAM_MODULE_ARTIFACT" "$refresh_module" || fail "the failed refresh replaced the module"
+[ ! -e "$refresh_module.oshioki-new" ] || fail "the failed refresh left its staged module behind"
+for service in sudo sudo-i; do
+  cmp -s "$REFRESH/migrated/$service" "$REFRESH/pam.d/$service" || fail "the failed refresh changed $service"
+done
+
+# Disable sweeps the refresh staging names too: nothing ever references
+# them, and one left by an interrupted refresh is a stray copy of the module.
+printf 'stray\n' > "$refresh_module.oshioki-new"
+printf 'stray\n' > "$refresh_module.oshioki-previous"
+run_installer "$REFRESH" --disable-contextual-pam >"$REFRESH/disable.log" 2>&1 ||
+  { sed -n '1,40p' "$REFRESH/disable.log" >&2; fail "disable failed on the refresh host"; }
+[ ! -e "$refresh_module" ] || fail "disable left the module"
+[ ! -e "$refresh_module.oshioki-new" ] || fail "disable left a staged module"
+[ ! -e "$refresh_module.oshioki-previous" ] || fail "disable left a module backup"
+
+# Two modes at once is still rejected.
+if run_installer "$TEST_ROOT/pam-two-modes" --contextual-pam --prelaunch >"$TEST_ROOT/pam-two-modes.log" 2>&1; then
+  fail "accepted two modes"
+fi
+
+
+
+# An indented @include common-auth is the same directive to PAM, so the
+# insertion anchor has to find it.
+INDENTED="$TEST_ROOT/pam-indented-include"
+setup_legacy_host "$INDENTED" indented-include
+run_installer --sudo-user testuser "$INDENTED" --contextual-pam >"$INDENTED/log" 2>&1 ||
+  { sed -n '1,40p' "$INDENTED/log" >&2; fail "an indented @include common-auth was refused"; }
+grep -Fxq "$PAM_AUTH_LINE" "$INDENTED/pam.d/sudo" || fail "indented include: no exact auth line"
+[ "$(grep -A1 '^# END oshioki pam$' "$INDENTED/pam.d/sudo" | tail -1)" = '  @include common-auth' ] ||
+  fail "indented include: the block is not immediately above the include"
+sed '/^# BEGIN oshioki pam$/,/^# END oshioki pam$/d' "$INDENTED/pam.d/sudo" > "$INDENTED/stripped"
+cmp -s "$INDENTED/stripped" "$INDENTED/pristine/sudo" || fail "indented include: changed something else"
+
+# A file with no trailing newline must round-trip byte-identically; awk's
+# print would otherwise add one silently.
+NOEOL="$TEST_ROOT/pam-no-trailing-newline"
+setup_legacy_host "$NOEOL" no-trailing-newline
+[ "$(tail -c 1 "$NOEOL/pristine/sudo" | od -An -t x1 | tr -d '[:space:]')" != 0a ] ||
+  fail "the no-trailing-newline fixture ends with a newline"
+run_installer --sudo-user testuser "$NOEOL" --contextual-pam >"$NOEOL/log" 2>&1 ||
+  { sed -n '1,40p' "$NOEOL/log" >&2; fail "a file without a trailing newline was refused"; }
+[ "$(tail -c 1 "$NOEOL/pam.d/sudo" | od -An -t x1 | tr -d '[:space:]')" != 0a ] ||
+  fail "the install added a trailing newline"
+run_installer "$NOEOL" --disable-contextual-pam >"$NOEOL/disable.log" 2>&1 ||
+  fail "disable failed on a file without a trailing newline"
+cmp -s "$NOEOL/pristine/sudo" "$NOEOL/pam.d/sudo" || fail "the install/uninstall round trip was not byte-identical"
+
+# A host with no sudo-i service: skipped with a note, not refused.
+NOSUDOI="$TEST_ROOT/pam-no-sudo-i"
+setup_legacy_host "$NOSUDOI" no-sudo-i
+run_installer --sudo-user testuser "$NOSUDOI" --contextual-pam >"$NOSUDOI/log" 2>&1 ||
+  { sed -n '1,40p' "$NOSUDOI/log" >&2; fail "a host without sudo-i was refused"; }
+grep -Fq 'does not exist on this host and was skipped' "$NOSUDOI/log" ||
+  fail "an absent service file was not reported as skipped"
+grep -Fxq "$PAM_AUTH_LINE" "$NOSUDOI/pam.d/sudo" || fail "no sudo-i: sudo was not edited"
+[ ! -e "$NOSUDOI/pam.d/sudo-i" ] || fail "no sudo-i: a sudo-i file was created"
+run_installer --sudo-user testuser "$NOSUDOI" --contextual-pam-status >"$NOSUDOI/status.log" 2>&1 ||
+  { sed -n '1,20p' "$NOSUDOI/status.log" >&2; fail "status failed on a host without sudo-i"; }
+grep -q 'sudo-i=no-such-service' "$NOSUDOI/status.log" || fail "status did not distinguish an absent service"
+
+# An implausible PAM_SECURITY_DIR override is refused before anything runs.
+BADDIR="$TEST_ROOT/pam-bad-security-dir"
+setup_legacy_host "$BADDIR" ubuntu-24.04
+mkdir -p "$BADDIR/not-a-pam-dir"
+: > "$BADDIR/not-a-pam-dir/pam_unix.so"
+if PAM_SECURITY_DIR="$BADDIR/not-a-pam-dir" \
+   run_installer --sudo-user testuser "$BADDIR" --contextual-pam >"$BADDIR/log" 2>&1; then
+  fail "accepted an implausible PAM_SECURITY_DIR"
+fi
+grep -Fq 'implausible PAM security directory' "$BADDIR/log" || fail "missing security dir refusal"
+pam_unchanged "$BADDIR" || fail "the security dir refusal modified a PAM file"
+
+# A security directory anybody can write to is a standing offer to replace
+# the code libpam loads into every privileged sudo.
+LOOSEDIR="$TEST_ROOT/pam-loose-security-dir"
+setup_legacy_host "$LOOSEDIR" ubuntu-24.04
+mkdir -p "$LOOSEDIR/loose/security"
+: > "$LOOSEDIR/loose/security/pam_unix.so"
+if PAM_SECURITY_DIR="$LOOSEDIR/loose/security" \
+   run_installer --sudo-user testuser "$LOOSEDIR" --contextual-pam >"$LOOSEDIR/log" 2>&1; then
+  fail "accepted a world-writable PAM security directory"
+fi
+grep -Fq 'not root-owned and not writable by others' "$LOOSEDIR/log" ||
+  fail "the world-writable security directory refusal was not explained"
+pam_unchanged "$LOOSEDIR" || fail "the world-writable refusal modified a PAM file"
+[ ! -e "$LOOSEDIR/loose/security/liboshioki_pam.so" ] ||
+  fail "the world-writable refusal installed the module anyway"
+# The same check must not reject the ordinary case.
+[ -f "$LOOSEDIR/security/pam_unix.so" ] || fail "loose-dir fixture lost its pam_unix.so"
+run_installer --sudo-user testuser "$LOOSEDIR" --contextual-pam >"$LOOSEDIR/ok.log" 2>&1 ||
+  { sed -n '1,20p' "$LOOSEDIR/ok.log" >&2; fail "the ownership check rejected a normal security directory"; }
+
+# Status must not pass a module it never verified.
+NOMANIFEST="$TEST_ROOT/pam-no-manifest"
+setup_legacy_host "$NOMANIFEST" ubuntu-24.04
+run_installer --sudo-user testuser "$NOMANIFEST" --contextual-pam >"$NOMANIFEST/install.log" 2>&1 ||
+  fail "no-manifest status setup could not install"
+run_installer --sudo-user testuser "$NOMANIFEST" --contextual-pam-status >"$NOMANIFEST/with.log" 2>&1 ||
+  fail "status failed with a manifest present"
+grep -q '^OK    module: .*sha256 matches' "$NOMANIFEST/with.log" || fail "status did not verify against the manifest"
+if OSHIOKI_CHECKSUMS="$NOMANIFEST/absent-manifest" \
+   run_installer --sudo-user testuser "$NOMANIFEST" --contextual-pam-status >"$NOMANIFEST/without.log" 2>&1; then
+  fail "status exited 0 without verifying the module"
+fi
+grep -q '^FAIL  module: .*no SHA256SUMS manifest was found' "$NOMANIFEST/without.log" ||
+  fail "status did not report the missing manifest as a failure"
+
+# Disable refuses to strand a module another service still references.
+DISABLE_REF="$TEST_ROOT/pam-disable-referrer"
+setup_legacy_host "$DISABLE_REF" ubuntu-24.04
+run_installer --sudo-user testuser "$DISABLE_REF" --contextual-pam >"$DISABLE_REF/install.log" 2>&1 ||
+  fail "referrer setup could not install"
+printf 'auth sufficient liboshioki_pam.so\n' > "$DISABLE_REF/pam.d/other-service"
+if run_installer "$DISABLE_REF" --disable-contextual-pam >"$DISABLE_REF/log" 2>&1; then
+  fail "disable unlinked a module another service still references"
+fi
+grep -Fq 'still references the module' "$DISABLE_REF/log" || fail "the stranded-reference refusal was not explained"
+grep -Fq 'other-service' "$DISABLE_REF/log" || fail "the refusal did not name the referring file"
+[ -f "$DISABLE_REF/security/liboshioki_pam.so" ] || fail "disable removed a still-referenced module"
+
+# ... but our own leftovers are not referrers. A crashed earlier run can
+# leave a snapshot or a stage file next to the service it was editing, and
+# every one of them contains the auth line.
+DISABLE_LITTER="$TEST_ROOT/pam-disable-litter"
+setup_legacy_host "$DISABLE_LITTER" ubuntu-24.04
+run_installer --sudo-user testuser "$DISABLE_LITTER" --contextual-pam >"$DISABLE_LITTER/install.log" 2>&1 ||
+  fail "litter setup could not install"
+cp "$DISABLE_LITTER/pam.d/sudo" "$DISABLE_LITTER/pam.d/sudo.oshioki-backup.AbCdEf"
+cp "$DISABLE_LITTER/pam.d/sudo" "$DISABLE_LITTER/pam.d/sudo.QwErTy"
+cp "$DISABLE_LITTER/pam.d/sudo" "$DISABLE_LITTER/pam.d/sudo.QwErTy.notrail"
+run_installer "$DISABLE_LITTER" --disable-contextual-pam >"$DISABLE_LITTER/log" 2>&1 ||
+  { sed -n '1,20p' "$DISABLE_LITTER/log" >&2; fail "our own leftovers blocked the module removal"; }
+[ ! -e "$DISABLE_LITTER/security/liboshioki_pam.so" ] || fail "disable left the module because of its own litter"
+
+# --- macOS (faked uname -s) ----------------------------------------------
+# OpenPAM has no bracket controls, so the macOS lane is a `sufficient` line
+# in /etc/pam.d/sudo_local and the stock /etc/pam.d/sudo is only
+# fingerprinted, never edited. The base macOS pair is verified against a live
+# 15.7.5 host; the missing-file and pam_tid variants remain synthetic (see
+# tests/pam-layouts/README.md).
+MAC_PLUGIN_DEST_NAME=oshioki.dylib
+setup_darwin_host() {
+  local root="$1" layout="$2"
+  mkdir -p "$root/state" "$root/pam.d" "$root/security" "$root/sbin" "$root/sudoers.d" "$root/pristine"
+  printf '{"version":1,"devices":[{"version":1,"kind":"secure-enclave","fingerprint":"x","active":true}]}\n' \
+    > "$root/state/devices.json"
+  printf '#includedir %s\n' "$root/sudoers.d" > "$root/sudoers"
+  cp /usr/bin/true "$root/sbin/oshioki"
+  # The legacy lane, written directly: --prelaunch on this host would build a
+  # Linux one, and what matters here is only that both artifacts exist for
+  # the migration to retire.
+  printf '%s\n' '# BEGIN oshioki' \
+    "Plugin approval_exec $root/plugin/$MAC_PLUGIN_DEST_NAME" '# END oshioki' > "$root/sudo.conf"
+  printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$root/sudoers.d/oshioki"
+  chmod 0440 "$root/sudoers.d/oshioki"
+  cp "$PAM_LAYOUTS/$layout/pam.d/"* "$root/pam.d/"
+  cp "$root/pam.d/"* "$root/pristine/"
+}
+run_darwin_installer() {
+  FAKE_UNAME_S=Darwin PAM_MODULE_BIN="$TEST_ROOT/service/target/release/liboshioki_pam.dylib" \
+    run_installer "$@"
+}
+MAC_AUTH_LINE_FOR() { printf 'auth       sufficient     %s/liboshioki_pam.dylib\n' "$1"; }
+
+# A stock macOS machine may not have the private module directory yet. A dry
+# run reports that planned directory creation without creating it; the real
+# migration creates only the missing leaf after checking its parent path.
+MAC_FIRST="$TEST_ROOT/pam-macos-first-install"
+setup_darwin_host "$MAC_FIRST" macos-14
+MAC_FIRST_SECURITY="$MAC_FIRST/new-parent/security"
+mkdir -p "$MAC_FIRST/new-parent"
+PAM_SECURITY_DIR="$MAC_FIRST_SECURITY" run_darwin_installer --sudo-user testuser "$MAC_FIRST" \
+  --contextual-pam --dry-run >"$MAC_FIRST/dry.log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_FIRST/dry.log" >&2; fail "macOS: missing security dir dry-run failed"; }
+grep -Fq "DRY: create $MAC_FIRST_SECURITY" "$MAC_FIRST/dry.log" ||
+  fail "macOS: missing security dir dry-run did not plan creation"
+[ ! -e "$MAC_FIRST_SECURITY" ] || fail "macOS: dry-run created the security directory"
+PAM_SECURITY_DIR="$MAC_FIRST_SECURITY" run_darwin_installer --sudo-user testuser "$MAC_FIRST" \
+  --contextual-pam >"$MAC_FIRST/install.log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_FIRST/install.log" >&2; fail "macOS: missing security dir install failed"; }
+[ -d "$MAC_FIRST_SECURITY" ] || fail "macOS: first install did not create the security directory"
+[ -f "$MAC_FIRST_SECURITY/liboshioki_pam.dylib" ] || fail "macOS: first install did not place the PAM module"
+grep -Fxq "$(MAC_AUTH_LINE_FOR "$MAC_FIRST_SECURITY")" "$MAC_FIRST/pam.d/sudo_local" ||
+  fail "macOS: first install wrote no auth line for the created directory"
+PAM_SECURITY_DIR="$MAC_FIRST_SECURITY" run_darwin_installer --sudo-user testuser "$MAC_FIRST" \
+  --contextual-pam >"$MAC_FIRST/rerun.log" 2>&1 ||
+  fail "macOS: first-install rerun failed"
+grep -Fq 'already current' "$MAC_FIRST/rerun.log" || fail "macOS: rerun did not converge on the existing module"
+[ "$(grep -c '^# BEGIN oshioki pam$' "$MAC_FIRST/pam.d/sudo_local")" -eq 1 ] ||
+  fail "macOS: first-install rerun duplicated the PAM block"
+
+# If the first install creates the directory but its module self-test fails,
+# rollback removes the empty directory as well as restoring the old lane.
+MAC_FIRST_ROLLBACK="$TEST_ROOT/pam-macos-first-rollback"
+setup_darwin_host "$MAC_FIRST_ROLLBACK" macos-14
+MAC_FIRST_ROLLBACK_SECURITY="$MAC_FIRST_ROLLBACK/new-parent/security"
+mkdir -p "$MAC_FIRST_ROLLBACK/new-parent"
+if PAM_SECURITY_DIR="$MAC_FIRST_ROLLBACK_SECURITY" FAIL_PAM_MODULE_INSTALL=1 \
+   run_darwin_installer --sudo-user testuser "$MAC_FIRST_ROLLBACK" --contextual-pam >"$MAC_FIRST_ROLLBACK/log" 2>&1; then
+  fail "macOS: failed first-install module copy reported success"
+fi
+[ ! -e "$MAC_FIRST_ROLLBACK_SECURITY" ] ||
+  fail "macOS: failed first install left the newly-created security directory"
+pam_unchanged "$MAC_FIRST_ROLLBACK" || fail "macOS: first-install rollback changed a PAM file"
+grep -Fq '# BEGIN oshioki' "$MAC_FIRST_ROLLBACK/sudo.conf" ||
+  fail "macOS: first-install rollback did not restore the legacy plugin"
+[ -e "$MAC_FIRST_ROLLBACK/sudoers.d/oshioki" ] ||
+  fail "macOS: first-install rollback did not restore the legacy rule"
+
+# Self-test failure happens after the module has landed, so rollback must
+# remove the module before removing the newly-created directory leaf.
+MAC_FIRST_SELFTEST="$TEST_ROOT/pam-macos-first-selftest-rollback"
+setup_darwin_host "$MAC_FIRST_SELFTEST" macos-14
+MAC_FIRST_SELFTEST_SECURITY="$MAC_FIRST_SELFTEST/new-parent/security"
+mkdir -p "$MAC_FIRST_SELFTEST/new-parent"
+if PAM_SECURITY_DIR="$MAC_FIRST_SELFTEST_SECURITY" FAIL_PAM_SELFTEST=1 \
+   run_darwin_installer --sudo-user testuser "$MAC_FIRST_SELFTEST" --contextual-pam >"$MAC_FIRST_SELFTEST/log" 2>&1; then
+  fail "macOS: failed first-install self-test reported success"
+fi
+[ ! -e "$MAC_FIRST_SELFTEST_SECURITY" ] ||
+  fail "macOS: self-test rollback left the newly-created security directory"
+pam_unchanged "$MAC_FIRST_SELFTEST" || fail "macOS: self-test rollback changed a PAM file"
+grep -Fq '# BEGIN oshioki' "$MAC_FIRST_SELFTEST/sudo.conf" ||
+  fail "macOS: self-test rollback did not restore the legacy plugin"
+[ -e "$MAC_FIRST_SELFTEST/sudoers.d/oshioki" ] ||
+  fail "macOS: self-test rollback did not restore the legacy rule"
+
+# A target symlink, non-root leaf, or writable ancestor is never accepted,
+# including when the target is absent and would otherwise be created.
+MAC_SYMLINK="$TEST_ROOT/pam-macos-symlink-target"
+setup_darwin_host "$MAC_SYMLINK" macos-14
+mkdir -p "$MAC_SYMLINK/real-security" "$MAC_SYMLINK/link-parent"
+ln -s "$MAC_SYMLINK/real-security" "$MAC_SYMLINK/link-parent/security"
+if PAM_SECURITY_DIR="$MAC_SYMLINK/link-parent/security" \
+   run_darwin_installer --sudo-user testuser "$MAC_SYMLINK" --contextual-pam >"$MAC_SYMLINK/log" 2>&1; then
+  fail "macOS: accepted a PAM security directory symlink"
+fi
+grep -Fq 'symlink' "$MAC_SYMLINK/log" || fail "macOS: symlink refusal was not explained"
+pam_unchanged "$MAC_SYMLINK" || fail "macOS: symlink refusal changed a PAM file"
+
+# An ancestor symlink is resolved before the strict ownership walk, preserving
+# merged-/usr-style paths such as /lib/security while still rejecting a
+# symlink at the security-directory leaf itself.
+MAC_SYMLINK_ANCESTOR="$TEST_ROOT/pam-macos-symlink-ancestor"
+setup_darwin_host "$MAC_SYMLINK_ANCESTOR" macos-14
+mkdir -p "$MAC_SYMLINK_ANCESTOR/real-parent/nested"
+ln -s "$MAC_SYMLINK_ANCESTOR/real-parent" "$MAC_SYMLINK_ANCESTOR/link-parent"
+MAC_SYMLINK_ANCESTOR_SECURITY="$MAC_SYMLINK_ANCESTOR/link-parent/nested/security"
+PAM_SECURITY_DIR="$MAC_SYMLINK_ANCESTOR_SECURITY" \
+  run_darwin_installer --sudo-user testuser "$MAC_SYMLINK_ANCESTOR" --contextual-pam >"$MAC_SYMLINK_ANCESTOR/log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_SYMLINK_ANCESTOR/log" >&2; fail "macOS: safe ancestor symlink was refused"; }
+MAC_SYMLINK_ANCESTOR_REAL="$MAC_SYMLINK_ANCESTOR/real-parent/nested/security"
+[ -f "$MAC_SYMLINK_ANCESTOR_REAL/liboshioki_pam.dylib" ] ||
+  fail "macOS: safe ancestor symlink did not create the canonical target"
+grep -Fxq "$(MAC_AUTH_LINE_FOR "$MAC_SYMLINK_ANCESTOR_REAL")" "$MAC_SYMLINK_ANCESTOR/pam.d/sudo_local" ||
+  fail "macOS: safe ancestor symlink wrote the wrong auth path"
+
+# An immediate parent symlink needs the same physical resolution; retaining
+# its final component would leave the leaf under the symlink and fail the
+# ancestor walk before the directory can be created.
+MAC_SYMLINK_PARENT="$TEST_ROOT/pam-macos-symlink-parent"
+setup_darwin_host "$MAC_SYMLINK_PARENT" macos-14
+mkdir -p "$MAC_SYMLINK_PARENT/real-parent"
+ln -s "$MAC_SYMLINK_PARENT/real-parent" "$MAC_SYMLINK_PARENT/link-parent"
+MAC_SYMLINK_PARENT_SECURITY="$MAC_SYMLINK_PARENT/link-parent/security"
+PAM_SECURITY_DIR="$MAC_SYMLINK_PARENT_SECURITY" \
+  run_darwin_installer --sudo-user testuser "$MAC_SYMLINK_PARENT" --contextual-pam >"$MAC_SYMLINK_PARENT/log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_SYMLINK_PARENT/log" >&2; fail "macOS: immediate parent symlink was refused"; }
+MAC_SYMLINK_PARENT_REAL="$MAC_SYMLINK_PARENT/real-parent/security"
+[ -f "$MAC_SYMLINK_PARENT_REAL/liboshioki_pam.dylib" ] ||
+  fail "macOS: immediate parent symlink did not create the canonical target"
+grep -Fxq "$(MAC_AUTH_LINE_FOR "$MAC_SYMLINK_PARENT_REAL")" "$MAC_SYMLINK_PARENT/pam.d/sudo_local" ||
+  fail "macOS: immediate parent symlink wrote the wrong auth path"
+
+MAC_NONROOT="$TEST_ROOT/pam-macos-nonroot-target"
+setup_darwin_host "$MAC_NONROOT" macos-14
+MAC_NONROOT_SECURITY="$MAC_NONROOT/nonroot/security"
+mkdir -p "$MAC_NONROOT_SECURITY"
+if PAM_SECURITY_DIR="$MAC_NONROOT_SECURITY" \
+   FAKE_STAT_SPECIAL_PATH="$MAC_NONROOT_SECURITY" FAKE_STAT_SPECIAL_OWNER=1000 \
+   run_darwin_installer --sudo-user testuser "$MAC_NONROOT" --contextual-pam >"$MAC_NONROOT/log" 2>&1; then
+  fail "macOS: accepted a non-root PAM security directory"
+fi
+grep -Fq 'not root-owned and not writable by others' "$MAC_NONROOT/log" ||
+  fail "macOS: non-root PAM directory refusal was not explained"
+pam_unchanged "$MAC_NONROOT" || fail "macOS: non-root refusal changed a PAM file"
+
+MAC_UNSAFE_ANCESTOR="$TEST_ROOT/pam-macos-unsafe-ancestor"
+setup_darwin_host "$MAC_UNSAFE_ANCESTOR" macos-14
+MAC_UNSAFE_ANCESTOR_SECURITY="$MAC_UNSAFE_ANCESTOR/loose/security"
+mkdir -p "$MAC_UNSAFE_ANCESTOR/loose"
+if PAM_SECURITY_DIR="$MAC_UNSAFE_ANCESTOR_SECURITY" \
+   FAKE_STAT_SPECIAL_PATH="$MAC_UNSAFE_ANCESTOR/loose" FAKE_STAT_SPECIAL_MODE=777 \
+   run_darwin_installer --sudo-user testuser "$MAC_UNSAFE_ANCESTOR" --contextual-pam >"$MAC_UNSAFE_ANCESTOR/log" 2>&1; then
+  fail "macOS: accepted an unsafe PAM ancestor"
+fi
+grep -Fq 'not root-owned and not writable by others' "$MAC_UNSAFE_ANCESTOR/log" ||
+  fail "macOS: unsafe PAM ancestor refusal was not explained"
+[ ! -e "$MAC_UNSAFE_ANCESTOR_SECURITY" ] || fail "macOS: unsafe ancestor path created a target"
+pam_unchanged "$MAC_UNSAFE_ANCESTOR" || fail "macOS: unsafe ancestor refusal changed a PAM file"
+
+# The ancestor walk also protects an already-existing target: only checking
+# the immediate parent would miss this unsafe component two levels above it.
+MAC_UNSAFE_EXISTING="$TEST_ROOT/pam-macos-unsafe-existing"
+setup_darwin_host "$MAC_UNSAFE_EXISTING" macos-14
+MAC_UNSAFE_EXISTING_PARENT="$MAC_UNSAFE_EXISTING/unsafe/nested"
+MAC_UNSAFE_EXISTING_SECURITY="$MAC_UNSAFE_EXISTING_PARENT/security"
+mkdir -p "$MAC_UNSAFE_EXISTING_SECURITY"
+if PAM_SECURITY_DIR="$MAC_UNSAFE_EXISTING_SECURITY" \
+   FAKE_STAT_SPECIAL_PATH="$MAC_UNSAFE_EXISTING/unsafe" FAKE_STAT_SPECIAL_MODE=777 \
+   run_darwin_installer --sudo-user testuser "$MAC_UNSAFE_EXISTING" --contextual-pam >"$MAC_UNSAFE_EXISTING/log" 2>&1; then
+  fail "macOS: accepted an unsafe ancestor above an existing PAM directory"
+fi
+grep -Fq 'not root-owned and not writable by others' "$MAC_UNSAFE_EXISTING/log" ||
+  fail "macOS: existing-target unsafe ancestor refusal was not explained"
+[ ! -e "$MAC_UNSAFE_EXISTING_SECURITY/liboshioki_pam.dylib" ] ||
+  fail "macOS: existing-target unsafe ancestor left a module behind"
+pam_unchanged "$MAC_UNSAFE_EXISTING" ||
+  fail "macOS: existing-target unsafe ancestor refusal changed a PAM file"
+
+# Stock sudo_local (comments only): the block is appended and /etc/pam.d/sudo
+# is never touched.
+MAC="$TEST_ROOT/pam-macos-14"
+setup_darwin_host "$MAC" macos-14
+run_darwin_installer --sudo-user testuser "$MAC" --contextual-pam >"$MAC/log" 2>&1 ||
+  { sed -n '1,40p' "$MAC/log" >&2; fail "macOS 14 stock layout was refused"; }
+mac_line="$(MAC_AUTH_LINE_FOR "$MAC/security")"
+grep -Fxq "$mac_line" "$MAC/pam.d/sudo_local" || fail "macOS: sudo_local has no exact auth line"
+cmp -s "$MAC/pristine/sudo" "$MAC/pam.d/sudo" || fail "macOS: /etc/pam.d/sudo was edited"
+sed '/^# BEGIN oshioki pam$/,/^# END oshioki pam$/d' "$MAC/pam.d/sudo_local" > "$MAC/stripped"
+cmp -s "$MAC/stripped" "$MAC/pristine/sudo_local" || fail "macOS: sudo_local changed outside the owned block"
+[ -f "$MAC/security/liboshioki_pam.dylib" ] || fail "macOS: no module installed"
+run_darwin_installer --sudo-user testuser "$MAC" --contextual-pam >"$MAC/second.log" 2>&1 ||
+  fail "macOS: a re-run failed"
+[ "$(grep -c '^# BEGIN oshioki pam$' "$MAC/pam.d/sudo_local")" -eq 1 ] || fail "macOS: a re-run duplicated the block"
+
+# No sudo_local at all: the installer creates it.
+MAC_NEW="$TEST_ROOT/pam-macos-new"
+setup_darwin_host "$MAC_NEW" macos-15-no-sudo-local
+run_darwin_installer --sudo-user testuser "$MAC_NEW" --contextual-pam >"$MAC_NEW/log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_NEW/log" >&2; fail "macOS: a missing sudo_local was refused"; }
+[ -f "$MAC_NEW/pam.d/sudo_local" ] || fail "macOS: sudo_local was not created"
+grep -Fxq "$(MAC_AUTH_LINE_FOR "$MAC_NEW/security")" "$MAC_NEW/pam.d/sudo_local" ||
+  fail "macOS: the created sudo_local has no exact auth line"
+cmp -s "$MAC_NEW/pristine/sudo" "$MAC_NEW/pam.d/sudo" || fail "macOS: /etc/pam.d/sudo was edited"
+
+# An enabled pam_tid line: Touch ID keeps its place and stays first.
+MAC_TID="$TEST_ROOT/pam-macos-tid"
+setup_darwin_host "$MAC_TID" macos-15-pam-tid
+run_darwin_installer --sudo-user testuser "$MAC_TID" --contextual-pam >"$MAC_TID/log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_TID/log" >&2; fail "macOS: a pam_tid layout was refused"; }
+grep -Fxq 'auth       sufficient     pam_tid.so' "$MAC_TID/pam.d/sudo_local" ||
+  fail "macOS: the administrator pam_tid line was rewritten"
+tid_line="$(grep -n 'pam_tid.so' "$MAC_TID/pam.d/sudo_local" | head -1 | cut -d: -f1)"
+begin_line="$(grep -n '^# BEGIN oshioki pam$' "$MAC_TID/pam.d/sudo_local" | head -1 | cut -d: -f1)"
+[ "$tid_line" -lt "$begin_line" ] || fail "macOS: the owned block was placed before pam_tid"
+[ "$begin_line" -eq $((tid_line + 1)) ] || fail "macOS: the owned block does not immediately follow pam_tid"
+
+# A customised /etc/pam.d/sudo refuses, and nothing is written.
+MAC_REFUSE="$TEST_ROOT/pam-macos-refuse"
+setup_darwin_host "$MAC_REFUSE" refuse-macos-custom-sudo
+if run_darwin_installer --sudo-user testuser "$MAC_REFUSE" --contextual-pam >"$MAC_REFUSE/log" 2>&1; then
+  fail "macOS: a customised sudo stack was accepted"
+fi
+grep -Fq 'refusing a customised PAM stack' "$MAC_REFUSE/log" || fail "macOS: the refusal was not explained"
+pam_unchanged "$MAC_REFUSE" || fail "macOS: the refusal modified a PAM file"
+[ ! -e "$MAC_REFUSE/security/liboshioki_pam.dylib" ] || fail "macOS: the refusal installed the module"
+
+# Disable removes the block from sudo_local, leaving the administrator's
+# pam_tid line and every comment intact, and only then the module.
+MAC_DISABLE="$TEST_ROOT/pam-macos-disable"
+setup_darwin_host "$MAC_DISABLE" macos-15-pam-tid
+run_darwin_installer --sudo-user testuser "$MAC_DISABLE" --contextual-pam >"$MAC_DISABLE/install.log" 2>&1 ||
+  fail "macOS: disable setup could not install"
+INSTALL_TRACE="$MAC_DISABLE/trace" run_darwin_installer "$MAC_DISABLE" --disable-contextual-pam \
+  >"$MAC_DISABLE/log" 2>&1 || fail "macOS: --disable-contextual-pam failed"
+cmp -s "$MAC_DISABLE/pristine/sudo_local" "$MAC_DISABLE/pam.d/sudo_local" ||
+  fail "macOS: disable did not restore sudo_local byte for byte"
+[ ! -e "$MAC_DISABLE/security/liboshioki_pam.dylib" ] || fail "macOS: disable left the module"
+mac_edit="$(grep -n '^pam:disable:edit:sudo_local$' "$MAC_DISABLE/trace" | head -1 | cut -d: -f1)"
+mac_unlink="$(grep -n '^pam:disable:module-removed:' "$MAC_DISABLE/trace" | head -1 | cut -d: -f1)"
+[ -n "$mac_edit" ] || fail "macOS: the disable trace records no PAM edit"
+[ -n "$mac_unlink" ] || fail "macOS: the disable trace records no module removal"
+[ "$mac_edit" -lt "$mac_unlink" ] || fail "macOS: the module was unlinked before the PAM entry was removed"
+
+# The macOS auth line embeds an absolute path, so a disable that runs after
+# someone removed /usr/local/lib/pam must still find and remove the real
+# line rather than a line built from an empty directory.
+MAC_GONE="$TEST_ROOT/pam-macos-dir-gone"
+setup_darwin_host "$MAC_GONE" macos-15-pam-tid
+run_darwin_installer --sudo-user testuser "$MAC_GONE" --contextual-pam >"$MAC_GONE/install.log" 2>&1 ||
+  fail "macOS: dir-gone setup could not install"
+grep -Fxq "$(MAC_AUTH_LINE_FOR "$MAC_GONE/security")" "$MAC_GONE/pam.d/sudo_local" ||
+  fail "macOS: dir-gone setup wrote no auth line"
+rm -rf "$MAC_GONE/security"
+PAM_SECURITY_DIR='' run_darwin_installer "$MAC_GONE" --disable-contextual-pam >"$MAC_GONE/log" 2>&1 ||
+  { sed -n '1,20p' "$MAC_GONE/log" >&2; fail "macOS: disable failed with the security directory gone"; }
+if grep -Fq liboshioki_pam "$MAC_GONE/pam.d/sudo_local"; then
+  fail "macOS: disable left sudo_local pointing at a deleted dylib"
+fi
+cmp -s "$MAC_GONE/pristine/sudo_local" "$MAC_GONE/pam.d/sudo_local" ||
+  fail "macOS: disable did not restore sudo_local byte for byte"
+
+# A sudo_local the installer created itself holds nothing but our header once
+# the block is stripped, so disable removes the file rather than leaving an
+# empty one behind.
+MAC_CREATED_DISABLE="$TEST_ROOT/pam-macos-created-disable"
+setup_darwin_host "$MAC_CREATED_DISABLE" macos-15-no-sudo-local
+run_darwin_installer --sudo-user testuser "$MAC_CREATED_DISABLE" --contextual-pam \
+  >"$MAC_CREATED_DISABLE/install.log" 2>&1 ||
+  fail "macOS: created-sudo_local disable setup could not install"
+[ -f "$MAC_CREATED_DISABLE/pam.d/sudo_local" ] ||
+  fail "macOS: created-sudo_local setup wrote no sudo_local"
+INSTALL_TRACE="$MAC_CREATED_DISABLE/trace" \
+  run_darwin_installer "$MAC_CREATED_DISABLE" --disable-contextual-pam \
+  >"$MAC_CREATED_DISABLE/log" 2>&1 ||
+  { sed -n '1,20p' "$MAC_CREATED_DISABLE/log" >&2; fail "macOS: created-sudo_local disable failed"; }
+[ ! -e "$MAC_CREATED_DISABLE/pam.d/sudo_local" ] ||
+  fail "macOS: disable left behind the comment-only sudo_local the installer created"
+grep -q '^pam:disable:file-removed:sudo_local$' "$MAC_CREATED_DISABLE/trace" ||
+  fail "macOS: the disable trace records no sudo_local removal"
+cmp -s "$MAC_CREATED_DISABLE/pristine/sudo" "$MAC_CREATED_DISABLE/pam.d/sudo" ||
+  fail "macOS: created-sudo_local disable edited /etc/pam.d/sudo"
+
+# One administrator line in the same created file makes it theirs: disable
+# strips only our own block and the file stays.
+MAC_ADOPTED="$TEST_ROOT/pam-macos-adopted-sudo-local"
+setup_darwin_host "$MAC_ADOPTED" macos-15-no-sudo-local
+run_darwin_installer --sudo-user testuser "$MAC_ADOPTED" --contextual-pam \
+  >"$MAC_ADOPTED/install.log" 2>&1 ||
+  fail "macOS: adopted-sudo_local setup could not install"
+printf 'auth       sufficient     pam_tid.so\n' >> "$MAC_ADOPTED/pam.d/sudo_local"
+run_darwin_installer "$MAC_ADOPTED" --disable-contextual-pam >"$MAC_ADOPTED/log" 2>&1 ||
+  { sed -n '1,20p' "$MAC_ADOPTED/log" >&2; fail "macOS: adopted-sudo_local disable failed"; }
+[ -f "$MAC_ADOPTED/pam.d/sudo_local" ] ||
+  fail "macOS: disable removed a sudo_local carrying administrator content"
+grep -Fxq 'auth       sufficient     pam_tid.so' "$MAC_ADOPTED/pam.d/sudo_local" ||
+  fail "macOS: disable did not preserve the administrator pam_tid line"
+if grep -Fq liboshioki_pam "$MAC_ADOPTED/pam.d/sudo_local"; then
+  fail "macOS: disable left our module referenced in an adopted sudo_local"
+fi
+
 echo "test-install-oshioki-hook: PASS"

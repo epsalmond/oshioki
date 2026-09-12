@@ -52,21 +52,32 @@ RECONFIGURE=0
 LOCAL=0
 PRIVILEGED=0
 VALUES_FILE=""
+# Opt-in, never the default: the contextual PAM lane replaces the approval
+# plugin and the blanket NOPASSWD rule with a PAM auth entry, and a laptop
+# that gets it by surprise is a laptop whose sudo changed shape without its
+# owner asking. Same spelling as the .deb's /etc/oshioki/install.env key so
+# one name covers both lanes.
+CONTEXTUAL_PAM="${OSHIOKI_CONTEXTUAL_PAM:-0}"
+[ "$CONTEXTUAL_PAM" = 1 ] || CONTEXTUAL_PAM=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --yes) YES=1 ;;
     --reconfigure) RECONFIGURE=1 ;;
     --local) LOCAL=1 ;;
     --privileged-phase) PRIVILEGED=1 ;;
+    --contextual-pam) CONTEXTUAL_PAM=1 ;;
     --values-file)
       [ "$#" -ge 2 ] || die "--values-file requires a path"
       VALUES_FILE="$2"; shift
       ;;
     -h|--help)
-      echo "usage: oshioki-laptop-setup [--yes] [--reconfigure] [--local]" >&2
+      echo "usage: oshioki-laptop-setup [--yes] [--reconfigure] [--local] [--contextual-pam]" >&2
       echo "  --yes          accept defaults and prompts without asking" >&2
       echo "  --reconfigure  re-enter /etc/oshioki/install.env from scratch" >&2
       echo "  --local        pair this machine with itself; no server needed" >&2
+      echo "  --contextual-pam  after the install, migrate sudo to the PAM lane" >&2
+      echo "                    (same as OSHIOKI_CONTEXTUAL_PAM=1); keep a second" >&2
+      echo "                    root shell open while it runs" >&2
       exit 0
       ;;
     *) echo "oshioki-laptop-setup: unknown argument: $1" >&2; exit 2 ;;
@@ -107,6 +118,23 @@ fi
 HOOK_BIN="${HOOK_BIN:-}"
 PLUGIN_BIN="${PLUGIN_BIN:-}"
 OSHIOKI_CHECKSUMS="${OSHIOKI_CHECKSUMS:-}"
+# The PAM module, wherever this layout put it. Left empty when it is absent:
+# only --contextual-pam needs it, and the installer's own error is clearer
+# than one invented here. The release artifact and the brew libexec keep the
+# module under its exact SHA256SUMS name, so the name never varies.
+pam_module_name=liboshioki_pam.so
+[ "$(uname -s)" != Darwin ] || pam_module_name=liboshioki_pam.dylib
+PAM_MODULE_BIN="${PAM_MODULE_BIN:-}"
+if [ -z "$PAM_MODULE_BIN" ]; then
+  for candidate in \
+    "$SCRIPT_DIR/../libexec/$pam_module_name" \
+    "$SCRIPT_DIR/$pam_module_name" \
+    "$SCRIPT_DIR/../target/release/$pam_module_name"; do
+    [ -f "$candidate" ] || continue
+    PAM_MODULE_BIN="$candidate"
+    break
+  done
+fi
 INSTALLED_HOOK="${INSTALLED_HOOK:-/usr/local/sbin/oshioki}"
 SUDO="${SUDO:-sudo}"
 LAUNCHCTL="${LAUNCHCTL:-launchctl}"
@@ -251,10 +279,12 @@ run_installer() {
   # call spells its environment out instead of prefixing nothing.
   if [ -n "${SUDO:-}" ]; then
     $SUDO HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
+      PAM_MODULE_BIN="$PAM_MODULE_BIN" \
       OSHIOKI_SUDO_USER="${OSHIOKI_SUDO_USER:-$LAPTOP_USER}" \
       "$INSTALLER" "$@" --config-file "$INSTALL_ENV"
   else
     HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
+      PAM_MODULE_BIN="$PAM_MODULE_BIN" \
       OSHIOKI_SUDO_USER="${OSHIOKI_SUDO_USER:-$LAPTOP_USER}" \
       "$INSTALLER" "$@" --config-file "$INSTALL_ENV"
   fi
@@ -749,6 +779,34 @@ info "step $VERIFY_STEP/$TOTAL_STEPS: verify"
 # server mode checks it here, after pairing.
 if [ "$LOCAL" -eq 0 ]; then
 run_installer --prelaunch-status
+fi
+
+# The opt-in migration, last: it only makes sense once the plugin lane is
+# installed, a device is paired, and the hook has been proven, which is
+# exactly the state reached above. It is not part of the default flow --
+# everything before this point leaves sudo on the plugin lane.
+if [ "$CONTEXTUAL_PAM" -eq 1 ]; then
+  [ -n "$PAM_MODULE_BIN" ] ||
+    die "no $pam_module_name found next to this script (set PAM_MODULE_BIN)"
+  info "contextual PAM migration requested (--contextual-pam):"
+  info "  - installs $PAM_MODULE_BIN into this host's PAM security directory"
+  info "  - adds one oshioki auth entry to the sudo PAM stack"
+  info "  - removes the approval plugin block and the NOPASSWD sudoers rule"
+  info "  - roll back with: $INSTALLER --disable-contextual-pam"
+  info "  - inspect with:   $INSTALLER --contextual-pam-status"
+  info "Keep a second root shell open until the status above reads all OK."
+  run_installer --contextual-pam --dry-run
+  if [ "$YES" -eq 0 ]; then
+    printf 'Apply the PAM migration above? [y/N]: ' >&2
+    IFS= read -r answer || true
+    [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "aborted; sudo is unchanged on the plugin lane"
+  fi
+  run_installer --contextual-pam
+  # Status is the verdict, not a formality: it exits non-zero unless all
+  # eight lines read OK, and this is the last moment the second root shell
+  # is still open.
+  run_installer --contextual-pam-status ||
+    info "status reported a problem above; roll back with: $INSTALLER --disable-contextual-pam"
 fi
 # Linux has no autostart, so a live socket only happens when the agent is
 # already running on a terminal. That is the finished state, not a

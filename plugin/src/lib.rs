@@ -642,9 +642,60 @@ impl Drop for InterruptGuard {
     }
 }
 
+/// The PAM service files that decide whether the contextual PAM module is
+/// live for sudo. `/etc/pam.d/sudo_local` is the macOS drop-in the installer
+/// edits there; on Linux it simply does not exist and is skipped.
+#[cfg(target_os = "linux")]
+const SUDO_PAM_SERVICE_FILES: [&str; 2] = ["/etc/pam.d/sudo", "/etc/pam.d/sudo_local"];
+
+/// True when any of `paths` has an uncommented `auth` line naming
+/// `liboshioki_pam`, i.e. the contextual PAM lane is live for sudo.
+///
+/// This plugin's password lane calls `pam_start("sudo", ...)`. If the
+/// contextual module were live at the same time, that call would recurse into
+/// `liboshioki_pam` and a device approval could satisfy the password branch.
+/// The installer's ordering makes the two mutually exclusive, but nothing in
+/// the binaries enforced it; this is the binary-side check.
+///
+/// Plain reads only, no exec, and a read error is treated as "not present":
+/// failing open keeps a host whose /etc/pam.d is unreadable on the password
+/// lane it already had, and such a host cannot have a live module anyway --
+/// the installer would not have been able to write one.
+#[cfg(target_os = "linux")]
+fn contextual_pam_lane_live(paths: &[&str]) -> bool {
+    paths.iter().any(|path| {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        contents.lines().any(|line| {
+            let line = line.trim_start();
+            if line.starts_with('#') {
+                return false;
+            }
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("auth"))
+                && fields.any(|field| field.contains("liboshioki_pam"))
+        })
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn run_hook_with_password(ctx: &SudoContext, hook: &mut HookChild) -> c_int {
-    let mut password = if ctx.noninteractive {
+    // Never run both authentication lanes on one host. The device lane below
+    // still runs; only the password lane is refused, and loudly.
+    let contextual_pam_live = contextual_pam_lane_live(&SUDO_PAM_SERVICE_FILES);
+    if contextual_pam_live {
+        write_fd(
+            libc::STDERR_FILENO,
+            b"[sudo/oshioki] the contextual PAM module is live in the sudo PAM service; \
+refusing the approval plugin's password lane (it would recurse into liboshioki_pam). \
+Run `install-oshioki-hook --contextual-pam-status` and remove one of the two lanes.\n",
+        );
+        audit_pam_lane_conflict();
+    }
+    let mut password = if ctx.noninteractive || contextual_pam_live {
         None
     } else {
         spawn_password_process(&ctx.username)
@@ -741,6 +792,21 @@ fn run_hook_without_password(hook: &mut HookChild) -> c_int {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Record the refusal above. An operator who sees sudo stop offering a
+/// password needs the reason in the authentication log, not only on a tty
+/// that may have scrolled.
+#[cfg(target_os = "linux")]
+fn audit_pam_lane_conflict() {
+    let Ok(message) = CString::new(
+        "[oshioki] approval plugin password lane refused: liboshioki_pam is live in the sudo PAM service",
+    ) else {
+        return;
+    };
+    // SAFETY: message is NUL-terminated and is used as the format string
+    // itself; it contains no format directives and no variable input.
+    unsafe { libc::syslog(libc::LOG_AUTHPRIV | libc::LOG_WARNING, message.as_ptr()) };
 }
 
 #[cfg(target_os = "linux")]
@@ -1852,6 +1918,64 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         guard
+    }
+
+    /// A unique path under the system temp directory. The detection function
+    /// takes its paths as an argument precisely so the test never has to
+    /// touch /etc/pam.d.
+    fn temp_pam_file(tag: &str, contents: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "oshioki-plugin-pam-{tag}-{}-{serial}",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write the fixture PAM service file");
+        path
+    }
+
+    #[test]
+    fn contextual_pam_lane_detected_only_on_a_live_auth_line() {
+        let live = temp_pam_file(
+            "live",
+            "#%PAM-1.0\n# BEGIN oshioki pam\nauth       sufficient     /lib/security/liboshioki_pam.so\n# END oshioki pam\n@include common-auth\n",
+        );
+        let indented = temp_pam_file(
+            "indented",
+            "\tauth sufficient /usr/local/lib/pam/liboshioki_pam.dylib\n",
+        );
+        let commented = temp_pam_file(
+            "commented",
+            "#%PAM-1.0\n#auth      sufficient     liboshioki_pam.so\n  # auth sufficient liboshioki_pam.so\n@include common-auth\n",
+        );
+        let other_type = temp_pam_file("session", "session    optional       liboshioki_pam.so\n");
+        let stock = temp_pam_file(
+            "stock",
+            "#%PAM-1.0\n@include common-auth\n@include common-account\n",
+        );
+        let absent =
+            std::env::temp_dir().join(format!("oshioki-plugin-pam-absent-{}", std::process::id()));
+
+        let as_str = |path: &std::path::Path| path.to_str().unwrap().to_owned();
+        assert!(contextual_pam_lane_live(&[&as_str(&live)]));
+        assert!(contextual_pam_lane_live(&[&as_str(&indented)]));
+        assert!(!contextual_pam_lane_live(&[&as_str(&commented)]));
+        assert!(!contextual_pam_lane_live(&[&as_str(&other_type)]));
+        assert!(!contextual_pam_lane_live(&[&as_str(&stock)]));
+        // A missing or unreadable file fails open to "not present".
+        assert!(!contextual_pam_lane_live(&[&as_str(&absent)]));
+        assert!(!contextual_pam_lane_live(&[]));
+        // Any one live file in the set is enough: this is the macOS shape,
+        // where /etc/pam.d/sudo is stock and sudo_local carries the block.
+        assert!(contextual_pam_lane_live(&[
+            &as_str(&stock),
+            &as_str(&absent),
+            &as_str(&live),
+        ]));
+
+        for path in [live, indented, commented, other_type, stock] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     fn c_array(values: &[&[u8]]) -> (Vec<CString>, Vec<*const c_char>) {

@@ -15,8 +15,10 @@ use async_nats::jetstream::{
 use futures::StreamExt as _;
 use oshioki_protocol::{
     ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, AliveV1, DecisionV1, DeliveryV1, EnrollmentIntentV1,
-    EnrollmentSubmissionV1, allow_plaintext_nats, check_nats_url, nats_url_is_tls,
+    EnrollmentSubmissionV1, allow_plaintext_nats, auth_v1::AuthDecisionV1, check_nats_url,
+    nats_url_is_tls,
 };
+use tracing::warn;
 
 use crate::{
     Ack, AckFuture, BoxFuture, HookProgress, HookTransport, HookTransportFailure, InboundMessage,
@@ -49,6 +51,14 @@ enum InitialReceipt {
 
 pub const REQUEST_STREAM: &str = "OSHIOKI";
 pub const REQUEST_CONSUMER: &str = "oshioki-server-v1";
+/// The durable consumer's subject filters. Command approval keeps its own
+/// filter unchanged; contextual sudo authentication rides a separate subject
+/// tree so the two lanes stay distinguishable on the wire.
+///
+/// Multiple filters need NATS 2.10 or newer, and the stream itself must carry
+/// both subject trees. `RUNBOOK.md` owns the upgrade step for a deployment
+/// that predates this.
+pub const REQUEST_CONSUMER_FILTERS: [&str; 2] = ["oshioki.request.>", "oshioki.auth.>"];
 pub struct NatsTransport {
     client: async_nats::Client,
 }
@@ -151,18 +161,21 @@ fn required_env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} not set"))
 }
 
-impl HookTransport for NatsTransport {
+impl NatsTransport {
+    /// The shared request/verdict round trip both hook lanes use. The caller
+    /// picks the request subject and decodes the verdict payload; every
+    /// subscription, receipt, and deadline rule below is identical for
+    /// command approval and contextual authentication.
     #[allow(clippy::too_many_lines)]
-    fn request_decision(
+    fn request_verdict_bytes(
         &self,
-        host: &str,
+        request_subject: String,
         request_id: &str,
         payload: Vec<u8>,
         timeout: Duration,
         has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-    ) -> BoxFuture<'_, DecisionV1> {
-        let request_subject = format!("oshioki.request.{host}");
+    ) -> BoxFuture<'_, Vec<u8>> {
         let request_id = request_id.to_owned();
         let ack_subject = format!("oshioki.ack.{request_id}");
         let decision_subject = format!("oshioki.verdict.{request_id}");
@@ -409,11 +422,11 @@ impl HookTransport for NatsTransport {
                     let error = anyhow::anyhow!("decision stream closed");
                     failure(FailureKind::Daemon, &error)
                 })?;
-                serde_json::from_slice(&message.payload).context("decode decision")
+                Ok::<_, anyhow::Error>(message.payload.to_vec())
             })
             .await;
             match result {
-                Ok(Ok(decision)) => Ok(decision),
+                Ok(Ok(verdict)) => Ok(verdict),
                 Ok(Err(error)) => Err(error),
                 Err(_) => {
                     let detail = anyhow::anyhow!(
@@ -424,6 +437,50 @@ impl HookTransport for NatsTransport {
                     Err(error)
                 }
             }
+        })
+    }
+}
+
+impl HookTransport for NatsTransport {
+    fn request_decision(
+        &self,
+        host: &str,
+        request_id: &str,
+        payload: Vec<u8>,
+        timeout: Duration,
+        has_browser_recipient: bool,
+        progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
+    ) -> BoxFuture<'_, DecisionV1> {
+        let verdict = self.request_verdict_bytes(
+            format!("oshioki.request.{host}"),
+            request_id,
+            payload,
+            timeout,
+            has_browser_recipient,
+            progress,
+        );
+        Box::pin(async move { serde_json::from_slice(&verdict.await?).context("decode decision") })
+    }
+
+    fn request_authentication(
+        &self,
+        host: &str,
+        request_id: &str,
+        payload: Vec<u8>,
+        timeout: Duration,
+        has_browser_recipient: bool,
+        progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
+    ) -> BoxFuture<'_, AuthDecisionV1> {
+        let verdict = self.request_verdict_bytes(
+            format!("oshioki.auth.{host}"),
+            request_id,
+            payload,
+            timeout,
+            has_browser_recipient,
+            progress,
+        );
+        Box::pin(async move {
+            serde_json::from_slice(&verdict.await?).context("decode authentication decision")
         })
     }
 
@@ -537,13 +594,40 @@ impl ServerTransport for NatsTransport {
                     REQUEST_CONSUMER,
                     pull::Config {
                         durable_name: Some(REQUEST_CONSUMER.into()),
-                        filter_subject: "oshioki.request.>".into(),
+                        filter_subjects: REQUEST_CONSUMER_FILTERS
+                            .iter()
+                            .map(|subject| (*subject).to_owned())
+                            .collect(),
                         ack_policy: AckPolicy::Explicit,
                         ..Default::default()
                     },
                 )
                 .await
                 .context("open durable request consumer")?;
+            // `get_or_create_consumer` returns an existing durable as it is
+            // and never rewrites its configuration, so a consumer created
+            // before the authentication lane existed keeps filtering only
+            // `oshioki.request.>`. Everything on `oshioki.auth.>` would then
+            // be dropped silently, and a sudo would simply hang until it fell
+            // back to a password. Say so loudly instead.
+            let configured = &consumer.cached_info().config;
+            if configured.filter_subjects != REQUEST_CONSUMER_FILTERS {
+                let active = if configured.filter_subjects.is_empty() {
+                    configured.filter_subject.clone()
+                } else {
+                    configured.filter_subjects.join(",")
+                };
+                warn!(
+                    consumer = REQUEST_CONSUMER,
+                    stream = REQUEST_STREAM,
+                    active_filters = %active,
+                    expected_filters = %REQUEST_CONSUMER_FILTERS.join(","),
+                    "durable consumer filters do not match this build; contextual sudo \
+                     authentication will not be delivered. See the \"Authentication lane \
+                     upgrade\" step in RUNBOOK.md to update the stream subjects and recreate \
+                     the consumer."
+                );
+            }
             let messages = consumer.messages().await?;
             Ok(Box::pin(messages.map(|result| {
                 result
