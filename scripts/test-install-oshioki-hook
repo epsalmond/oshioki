@@ -1151,6 +1151,28 @@ run_installer --sudo-user testuser "$STATUS_INHERIT" --contextual-pam-status >"$
   { sed -n '1,20p' "$STATUS_INHERIT/log" >&2; fail "status failed on an inheriting layout"; }
 grep -q 'sudo-i=inherited-via-include' "$STATUS_INHERIT/log" || fail "status did not report inheritance"
 
+# A helper with no execute bit is refused by both lanes. The module's own
+# path check rejects `mode & 0o111 == 0`, and under `default=die` that
+# refusal fails every sudo before a password prompt is drawn -- so the
+# migration must never start and status must say the helper is bad.
+NOEXEC_HELPER="$TEST_ROOT/pam-helper-noexec"
+setup_legacy_host "$NOEXEC_HELPER" ubuntu-24.04
+if FAKE_STAT_SPECIAL_PATH="$NOEXEC_HELPER/sbin/oshioki" FAKE_STAT_SPECIAL_MODE=644 \
+   run_installer --sudo-user testuser "$NOEXEC_HELPER" --contextual-pam >"$NOEXEC_HELPER/log" 2>&1; then
+  fail "accepted a non-executable helper"
+fi
+grep -Fq 'is missing, not executable, or on an unsafe path' "$NOEXEC_HELPER/log" ||
+  fail "non-executable helper refusal was not explained"
+[ ! -e "$NOEXEC_HELPER/security/liboshioki_pam.so" ] ||
+  fail "non-executable helper refusal installed a module"
+pam_unchanged "$NOEXEC_HELPER" || fail "non-executable helper refusal changed a PAM file"
+if FAKE_STAT_SPECIAL_PATH="$NOEXEC_HELPER/sbin/oshioki" FAKE_STAT_SPECIAL_MODE=644 \
+   run_installer --sudo-user testuser "$NOEXEC_HELPER" --contextual-pam-status >"$NOEXEC_HELPER/status.log" 2>&1; then
+  fail "status reported OK with a non-executable helper"
+fi
+grep -q '^FAIL  helper: ' "$NOEXEC_HELPER/status.log" ||
+  fail "status did not flag the non-executable helper"
+
 # --- dry-run mirrors ------------------------------------------------------
 DRY="$TEST_ROOT/pam-dry"
 setup_legacy_host "$DRY" ubuntu-24.04
