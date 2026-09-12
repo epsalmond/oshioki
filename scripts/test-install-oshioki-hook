@@ -1513,6 +1513,89 @@ fi
 grep -Fq 'cannot resolve symlink' "$KEG_HOST/readlink.log" ||
   fail "a failing readlink was not reported: $(head -1 "$KEG_HOST/readlink.log")"
 
+# The brew user's bare lane: a keg laid out exactly as the formula lays it
+# out -- hook and scripts in bin, plugin under its installed name and the
+# module and SHA256SUMS in libexec -- driven through a /opt/homebrew/bin
+# style symlink with no HOOK_BIN, PLUGIN_BIN, PAM_MODULE_BIN or
+# OSHIOKI_CHECKSUMS in the environment at all. Before the artifact lanes,
+# --contextual-pam died with "PAM_MODULE_BIN is required" and --prelaunch
+# with "missing or unsafe build artifact: <keg>/target/release/oshioki".
+BARE_HOST="$TEST_ROOT/pam-bare-keg"
+BARE_KEG="$TEST_ROOT/bare-keg/Cellar/oshioki/0.1.9"
+mkdir -p "$BARE_KEG/bin" "$BARE_KEG/libexec" "$TEST_ROOT/bare-keg/bin"
+cp "$TEST_ROOT/service/scripts/install-oshioki-hook" "$BARE_KEG/bin/"
+chmod 0755 "$BARE_KEG/bin/install-oshioki-hook"
+cp "$TEST_ROOT/service/target/release/oshioki" "$BARE_KEG/bin/oshioki"
+cp "$TEST_ROOT/service/target/release/$BUILD_PLUGIN" "$BARE_KEG/libexec/$PLUGIN_NAME"
+cp "$TEST_ROOT/service/target/release/$PAM_MODULE_ARTIFACT" "$BARE_KEG/libexec/"
+(
+  cd "$BARE_KEG/libexec"
+  printf '%s  oshioki\n' "$(sha256_file "$BARE_KEG/bin/oshioki")" > SHA256SUMS
+  printf '%s  %s\n' "$(sha256_file "$PLUGIN_NAME")" "$PLUGIN_NAME" >> SHA256SUMS
+  printf '%s  %s\n' "$(sha256_file "$PAM_MODULE_ARTIFACT")" "$PAM_MODULE_ARTIFACT" >> SHA256SUMS
+)
+ln -s "../Cellar/oshioki/0.1.9/bin/install-oshioki-hook" \
+  "$TEST_ROOT/bare-keg/bin/install-oshioki-hook"
+BARE_INSTALLER="$TEST_ROOT/bare-keg/bin/install-oshioki-hook"
+setup_legacy_host "$BARE_HOST" ubuntu-24.04
+INSTALLER_CMD="$BARE_INSTALLER" HOOK_BIN= PLUGIN_BIN= PAM_MODULE_BIN= \
+  run_installer --sudo-user testuser "$BARE_HOST" --prelaunch >"$BARE_HOST/prelaunch.log" 2>&1 ||
+  { sed -n '1,20p' "$BARE_HOST/prelaunch.log" >&2; fail "bare prelaunch from a keg could not find its own artifacts"; }
+[ "$(sha256_file "$BARE_HOST/sbin/oshioki")" = "$(sha256_file "$BARE_KEG/bin/oshioki")" ] ||
+  fail "bare prelaunch installed a hook that is not the keg's"
+[ "$(sha256_file "$BARE_HOST/plugin/$PLUGIN_NAME")" = "$(sha256_file "$BARE_KEG/libexec/$PLUGIN_NAME")" ] ||
+  fail "bare prelaunch installed a plugin that is not the keg's"
+INSTALLER_CMD="$BARE_INSTALLER" HOOK_BIN= PLUGIN_BIN= PAM_MODULE_BIN= \
+  run_installer --sudo-user testuser "$BARE_HOST" --contextual-pam >"$BARE_HOST/install.log" 2>&1 ||
+  { sed -n '1,20p' "$BARE_HOST/install.log" >&2; fail "bare --contextual-pam from a keg could not find its own module"; }
+[ "$(sha256_file "$BARE_HOST/security/$PAM_MODULE_ARTIFACT")" = \
+  "$(sha256_file "$BARE_KEG/libexec/$PAM_MODULE_ARTIFACT")" ] ||
+  fail "bare --contextual-pam installed a module that is not the keg's"
+INSTALLER_CMD="$BARE_INSTALLER" HOOK_BIN= PLUGIN_BIN= PAM_MODULE_BIN= \
+  run_installer --sudo-user testuser "$BARE_HOST" --contextual-pam-status >"$BARE_HOST/status.log" 2>&1 ||
+  { sed -n '1,20p' "$BARE_HOST/status.log" >&2; fail "bare --contextual-pam-status from a keg failed"; }
+grep -q "^OK    module: .*(sha256 matches $BARE_KEG/libexec/SHA256SUMS)\$" "$BARE_HOST/status.log" ||
+  fail "bare status did not verify the module against the keg manifest"
+# An explicit override still wins over every lane.
+INSTALLER_CMD="$BARE_INSTALLER" HOOK_BIN="$TEST_ROOT/service/target/release/oshioki" \
+  PLUGIN_BIN="$TEST_ROOT/service/target/release/$BUILD_PLUGIN" PAM_MODULE_BIN= \
+  OSHIOKI_CHECKSUMS="$TEST_ROOT/service/target/release/SHA256SUMS" \
+  run_installer --sudo-user testuser "$BARE_HOST" --prelaunch >"$BARE_HOST/override.log" 2>&1 ||
+  { sed -n '1,20p' "$BARE_HOST/override.log" >&2; fail "an explicit HOOK_BIN did not override the keg lane"; }
+
+# The .deb lane: installer and every artifact together in /usr/share/oshioki,
+# which is SCRIPT_DIR, with SERVICE_DIR the shared /usr/share that owns no
+# libexec of its own.
+DEB_HOST="$TEST_ROOT/pam-bare-deb"
+DEB_SHARE="$TEST_ROOT/bare-deb/usr/share/oshioki"
+mkdir -p "$DEB_SHARE"
+cp "$TEST_ROOT/service/scripts/install-oshioki-hook" "$DEB_SHARE/"
+chmod 0755 "$DEB_SHARE/install-oshioki-hook"
+cp "$TEST_ROOT/service/target/release/oshioki" \
+   "$TEST_ROOT/service/target/release/$BUILD_PLUGIN" \
+   "$TEST_ROOT/service/target/release/$PAM_MODULE_ARTIFACT" "$DEB_SHARE/"
+cp "$TEST_ROOT/service/target/release/SHA256SUMS" "$DEB_SHARE/"
+setup_legacy_host "$DEB_HOST" ubuntu-24.04
+INSTALLER_CMD="$DEB_SHARE/install-oshioki-hook" HOOK_BIN= PLUGIN_BIN= PAM_MODULE_BIN= \
+  run_installer --sudo-user testuser "$DEB_HOST" --contextual-pam >"$DEB_HOST/install.log" 2>&1 ||
+  { sed -n '1,20p' "$DEB_HOST/install.log" >&2; fail "bare --contextual-pam from a .deb layout could not find its own artifacts"; }
+[ "$(sha256_file "$DEB_HOST/security/$PAM_MODULE_ARTIFACT")" = \
+  "$(sha256_file "$DEB_SHARE/$PAM_MODULE_ARTIFACT")" ] ||
+  fail "the .deb layout installed a module from outside /usr/share/oshioki"
+
+# A source checkout that was never built still names target/release, so the
+# lanes did not trade a clear error for a confusing one.
+UNBUILT="$TEST_ROOT/unbuilt/scripts"
+mkdir -p "$UNBUILT"
+cp "$TEST_ROOT/service/scripts/install-oshioki-hook" "$UNBUILT/"
+chmod 0755 "$UNBUILT/install-oshioki-hook"
+if INSTALLER_CMD="$UNBUILT/install-oshioki-hook" HOOK_BIN= PLUGIN_BIN= PAM_MODULE_BIN= \
+   run_installer --sudo-user testuser "$TEST_ROOT/unbuilt-host" --prelaunch >"$TEST_ROOT/unbuilt.log" 2>&1; then
+  fail "an unbuilt checkout installed something"
+fi
+grep -Fq "missing or unsafe build artifact: $TEST_ROOT/unbuilt/target/release/oshioki" "$TEST_ROOT/unbuilt.log" ||
+  fail "an unbuilt checkout no longer names target/release: $(head -1 "$TEST_ROOT/unbuilt.log")"
+
 # Disable refuses to strand a module another service still references.
 DISABLE_REF="$TEST_ROOT/pam-disable-referrer"
 setup_legacy_host "$DISABLE_REF" ubuntu-24.04
