@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-12
+
 ### Added
 
 - Contextual sudo authentication through PAM, as an opt-in alternative to the
@@ -30,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The real sudo check now prints the browser approval URL on stderr, where the
   approval plugin forwards hook diagnostics, while keeping the command's
-  stdout reserved for the approved command's output.
+  stdout reserved for the approved command's output (#81).
 - `scripts/oshioki-phone-setup` generates NATS permission lists that now
   include `oshioki.ack.*` and `oshioki.delivery.*` for both the hook and
   server users. PR #57 (0.1.4) added the `oshioki.delivery.<request_id>`
@@ -40,7 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `Permissions Violation for Publish to "oshioki.delivery.<id>"` on the
   server and a daemon delivery-receipt timeout on the hook.
   `docs/requirements.md`'s hand-written permission checklist is updated to
-  match.
+  match (#80).
+- Release packaging ships the PAM module: the `.deb` and the macOS tarball now
+  carry `liboshioki_pam.so` / `liboshioki_pam.dylib` and list it in their
+  `SHA256SUMS`, so `--contextual-pam` has a module to install from a released
+  artifact.
+- Review fixes from the contextual-PAM work: the installer refuses a
+  non-executable helper rather than wiring PAM to something it cannot run;
+  `purge` keeps the helper while any PAM stack still references the module,
+  so a purge cannot leave sudo pointing at a module whose helper is gone; the
+  legacy approval plugin skips its own password lane when the contextual
+  module is live, so a password is prompted for once and by one owner; and
+  fault injection is off unless explicitly opted into, so a production host
+  cannot be made to fail approvals by environment alone.
 
 ## [0.1.6] - 2026-09-10
 
