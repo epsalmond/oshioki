@@ -107,6 +107,9 @@ case "${1:-} ${2:-}" in
     case "${3:-}" in
       */sudoers.d/oshioki) echo 440 ;;
       */loose/security) echo 777 ;;
+      # The helper the PAM module execs must carry an execute bit, or
+      # helper_path_secure refuses it; a real install leaves it 0755.
+      */sbin/oshioki) echo 755 ;;
       *) echo "${FAKE_STAT_MODE:-600}" ;;
     esac ;;
   *) exec /usr/bin/stat "$@" ;;
