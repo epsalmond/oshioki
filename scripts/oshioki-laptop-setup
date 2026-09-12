@@ -228,6 +228,20 @@ env_key() {
   $SUDO cat "$INSTALL_ENV" 2>/dev/null | awk -F= -v key="$1" '$1 == key { print substr($0, length($1) + 2); exit }'
 }
 
+# Does install.env exist? Ask the same way env_key() reads it. /etc/oshioki is
+# root-owned 0700 and install.env inside it 0600, so a bare `[ -f ]` run as
+# the laptop user answers "missing" for a file that is there (issue #88): the
+# run then takes the write branch and overwrites a good config, or dies
+# prompting for values it already has. Root and an empty $SUDO test directly;
+# there is no privilege to borrow then.
+install_env_exists() {
+  if [ "$(id -u)" -eq 0 ] || [ -z "${SUDO:-}" ]; then
+    [ -f "$INSTALL_ENV" ]
+  else
+    $SUDO test -f "$INSTALL_ENV"
+  fi
+}
+
 # Parse the privileged phase's value block into the config globals.
 read_markers() {
   local block line key value
@@ -574,7 +588,7 @@ fi
 if [ "$LOCAL" -eq 0 ]; then
 info "step 1/$TOTAL_STEPS: installer configuration in $INSTALL_ENV"
 $SUDO mkdir -p "$(dirname "$INSTALL_ENV")"
-if [ ! -f "$INSTALL_ENV" ] || [ "$RECONFIGURE" -eq 1 ]; then
+if ! install_env_exists || [ "$RECONFIGURE" -eq 1 ]; then
   prompt "WebAuthn origin" "${OSHIOKI_ORIGIN:-}" ORIGIN 0
   prompt "WebAuthn RP ID" "${OSHIOKI_RP_ID:-}" RP_ID 0
   prompt "NATS URL" "${NATS_URL:-nats://127.0.0.1:4222}" NATS_URL_V 0
