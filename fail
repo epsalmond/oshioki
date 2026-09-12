@@ -1,8 +1,0 @@
-OK    module: /tmp/oshioki-hook-install-test.sLDrc8/pam-brew-keg/security/liboshioki_pam.so (sha256 matches /tmp/oshioki-hook-install-test.sLDrc8/brew-keg/Cellar/oshioki/0.1.8/libexec/SHA256SUMS)
-OK    pam entries: sudo=present sudo-i=present
-OK    stock fingerprint: sudo=stock sudo-i=stock
-OK    common-auth: clean (no liboshioki_pam reference)
-OK    helper: /tmp/oshioki-hook-install-test.sLDrc8/pam-brew-keg/sbin/oshioki root-owned, executable, not writable by others, not setuid
-OK    devices: an active hardware-backed device is enrolled
-OK    legacy artifacts: none (no blanket sudoers rule, no approval plugin)
-OK    sudo -V: exits 0
