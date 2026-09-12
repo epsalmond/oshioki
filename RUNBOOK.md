@@ -123,6 +123,13 @@ and `oshioki.dylib`, `liboshioki_pam.dylib` and `SHA256SUMS` one level up in
 `libexec` — and passes all four to the installer. Run it as yourself; it
 elevates once by itself.
 
+Both `oshioki-laptop-setup` and `install-oshioki-hook` walk their own
+`$0` through every symlink before taking its dirname, so running either from
+`/opt/homebrew/bin` (a symlink into the Cellar) finds the same keg as running
+it by its `$(brew --prefix oshioki)/bin` path. Resolving the containing
+directory alone is not enough: `/opt/homebrew/bin` is a real directory, and
+before issue #91 that is where the keg probe looked.
+
 Both dylibs are linked with the keg's own `opt` path as their install name
 (`/opt/homebrew/opt/oshioki/libexec/<name>`, `plugin/build.rs` and
 `pam/build.rs`, overridable with `OSHIOKI_PLUGIN_INSTALL_NAME` /
@@ -151,7 +158,21 @@ sudo /usr/share/oshioki/install-oshioki-hook --contextual-pam-status
 sudo /usr/share/oshioki/install-oshioki-hook --disable-contextual-pam
 ```
 
+On a Homebrew install the same two commands are on `PATH`, and need no
+environment at all:
+
+```bash
+sudo install-oshioki-hook --contextual-pam-status
+sudo install-oshioki-hook --disable-contextual-pam
+```
+
 `--contextual-pam-status` exits non-zero unless every line reads `OK`.
+It finds the manifest to verify the installed module against the same way
+the install does: `target/release/SHA256SUMS` in a repo checkout, the keg's
+`libexec/SHA256SUMS` beside `bin` under Homebrew, and `SHA256SUMS` next to
+the installer for the `.deb` (`/usr/share/oshioki`) and an unpacked release
+tarball. `OSHIOKI_CHECKSUMS` still overrides that. A manifest that cannot be
+found is a `FAIL`, never a skipped check.
 `--disable-contextual-pam` removes the PAM entries, re-proves `sudo -V`, and
 only then unlinks the module; it refuses to unlink a module any file under
 `/etc/pam.d` still names. `prerm` runs the same command during package
@@ -194,14 +215,15 @@ Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 
 Outside a repo checkout the installer needs its inputs pointed at the
 installed files: set `HOOK_BIN` and `PLUGIN_BIN` to the installed hook and
-plugin and `OSHIOKI_CHECKSUMS` to the shipped `SHA256SUMS`, whose entries
-are keyed by file name. For a Homebrew install at `$(brew --prefix oshioki)`:
+plugin. `OSHIOKI_CHECKSUMS` no longer has to be set for a packaged layout —
+the installer finds the `SHA256SUMS` shipped in its own keg or package, whose
+entries are keyed by file name — but it still overrides the default when it
+is. For a Homebrew install at `$(brew --prefix oshioki)`:
 
 ```bash
 sudo HOOK_BIN="$(brew --prefix oshioki)/bin/oshioki" \
   PLUGIN_BIN="$(brew --prefix oshioki)/libexec/oshioki.dylib" \
-  OSHIOKI_CHECKSUMS="$(brew --prefix oshioki)/libexec/SHA256SUMS" \
-  "$(brew --prefix oshioki)/bin/install-oshioki-hook" --prelaunch \
+  install-oshioki-hook --prelaunch \
   --config-file /etc/oshioki/install.env
 ```
 

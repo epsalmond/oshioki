@@ -274,7 +274,7 @@ run_installer() {
     FAIL_SUDO_ON_CALL="${FAIL_SUDO_ON_CALL:-}" \
     SUDO_CALL_COUNTER="$root/sudo.calls" \
     FAKE_UNAME_S="${FAKE_UNAME_S:-}" \
-    "$TEST_ROOT/service/scripts/install-oshioki-hook" "$@"
+    "${INSTALLER_CMD:-$TEST_ROOT/service/scripts/install-oshioki-hook}" "$@"
 }
 
 if run_installer "$TEST_ROOT/no-mode" >"$TEST_ROOT/no-mode.log" 2>&1; then fail "accepted omitted mode"; fi
@@ -1445,6 +1445,56 @@ if OSHIOKI_CHECKSUMS="$NOMANIFEST/absent-manifest" \
 fi
 grep -q '^FAIL  module: .*no SHA256SUMS manifest was found' "$NOMANIFEST/without.log" ||
   fail "status did not report the missing manifest as a failure"
+
+# A Homebrew keg reached through its PATH symlink. `pwd -P` on the dirname
+# resolves symlinked directories only, so before the fix SCRIPT_DIR became
+# the fake /opt/homebrew/bin and neither the install nor the status lane
+# could find the keg's libexec/SHA256SUMS without an OSHIOKI_CHECKSUMS
+# override (issue #91).
+KEG_HOST="$TEST_ROOT/pam-brew-keg"
+KEG="$TEST_ROOT/brew-keg/Cellar/oshioki/0.1.8"
+mkdir -p "$KEG/bin" "$KEG/libexec" "$TEST_ROOT/brew-keg/bin"
+cp "$TEST_ROOT/service/scripts/install-oshioki-hook" "$KEG/bin/"
+chmod 0755 "$KEG/bin/install-oshioki-hook"
+cp "$TEST_ROOT/service/target/release/oshioki" \
+   "$TEST_ROOT/service/target/release/$BUILD_PLUGIN" \
+   "$TEST_ROOT/service/target/release/$PAM_MODULE_ARTIFACT" "$KEG/libexec/"
+(
+  cd "$KEG/libexec"
+  printf '%s  oshioki\n' "$(sha256_file oshioki)" > SHA256SUMS
+  printf '%s  %s\n' "$(sha256_file "$BUILD_PLUGIN")" "$BUILD_PLUGIN" >> SHA256SUMS
+  printf '%s  %s\n' "$(sha256_file "$PAM_MODULE_ARTIFACT")" "$PAM_MODULE_ARTIFACT" >> SHA256SUMS
+)
+# Relative, like Homebrew's own bin links, so the walk has to join it to the
+# link's own directory instead of treating it as absolute.
+ln -s "../Cellar/oshioki/0.1.8/bin/install-oshioki-hook" \
+  "$TEST_ROOT/brew-keg/bin/install-oshioki-hook"
+KEG_INSTALLER="$TEST_ROOT/brew-keg/bin/install-oshioki-hook"
+# The legacy fixture is built by the repo-layout installer; only the three
+# calls below go through the symlink, each with no OSHIOKI_CHECKSUMS set.
+setup_legacy_host "$KEG_HOST" ubuntu-24.04
+# Prelaunch verifies the hook and plugin against the same default manifest.
+INSTALLER_CMD="$KEG_INSTALLER" HOOK_BIN="$KEG/libexec/oshioki" \
+  PLUGIN_BIN="$KEG/libexec/$BUILD_PLUGIN" \
+  run_installer --sudo-user testuser "$KEG_HOST" --prelaunch >"$KEG_HOST/prelaunch.log" 2>&1 ||
+  { sed -n '1,20p' "$KEG_HOST/prelaunch.log" >&2; fail "prelaunch through a keg bin symlink could not find the keg manifest"; }
+INSTALLER_CMD="$KEG_INSTALLER" PAM_MODULE_BIN="$KEG/libexec/$PAM_MODULE_ARTIFACT" \
+  run_installer --sudo-user testuser "$KEG_HOST" --contextual-pam >"$KEG_HOST/install.log" 2>&1 ||
+  { sed -n '1,20p' "$KEG_HOST/install.log" >&2; fail "contextual-pam install through a keg bin symlink could not find the keg manifest"; }
+INSTALLER_CMD="$KEG_INSTALLER" PAM_MODULE_BIN="$KEG/libexec/$PAM_MODULE_ARTIFACT" \
+  run_installer --sudo-user testuser "$KEG_HOST" --contextual-pam-status >"$KEG_HOST/status.log" 2>&1 ||
+  { sed -n '1,20p' "$KEG_HOST/status.log" >&2; fail "status through a keg bin symlink failed without OSHIOKI_CHECKSUMS"; }
+grep -q "^OK    module: .*(sha256 matches $KEG/libexec/SHA256SUMS)\$" "$KEG_HOST/status.log" ||
+  fail "status did not verify against the keg's sibling manifest"
+# The override still wins, and a manifest that is not there is still a FAIL
+# rather than a waiver.
+if INSTALLER_CMD="$KEG_INSTALLER" PAM_MODULE_BIN="$KEG/libexec/$PAM_MODULE_ARTIFACT" \
+   OSHIOKI_CHECKSUMS="$KEG_HOST/absent-manifest" \
+   run_installer --sudo-user testuser "$KEG_HOST" --contextual-pam-status >"$KEG_HOST/override.log" 2>&1; then
+  fail "an explicit OSHIOKI_CHECKSUMS did not override the keg default"
+fi
+grep -q '^FAIL  module: .*no SHA256SUMS manifest was found' "$KEG_HOST/override.log" ||
+  fail "the override did not report the missing manifest as a failure"
 
 # Disable refuses to strand a module another service still references.
 DISABLE_REF="$TEST_ROOT/pam-disable-referrer"
