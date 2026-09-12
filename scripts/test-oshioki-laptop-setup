@@ -62,6 +62,7 @@ SH
 cat > "$TEST_ROOT/fake-bin/install-oshioki-hook" <<'SH'
 #!/usr/bin/env bash
 [ -n "${SEEN_SUDO_USER:-}" ] && printf '%s' "${OSHIOKI_SUDO_USER:-}" > "$SEEN_SUDO_USER"
+[ -n "${SEEN_CHECKSUMS:-}" ] && printf '%s' "${OSHIOKI_CHECKSUMS:-}" > "$SEEN_CHECKSUMS"
 mode="$1"
 config=""
 dry=0
@@ -252,7 +253,8 @@ run_setup() {
     OSHIOKI_ORIGIN="${OSHIOKI_ORIGIN-https://laptop.test}" OSHIOKI_RP_ID="laptop.test" \
     NATS_URL="$SETUP_NATS_URL" NATS_USER="oshioki" NATS_PASS="${NATS_PASS:-test-secret}" \
     DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
-    "$TEST_ROOT/stage/oshioki-laptop-setup" "$@" </dev/null
+    SEEN_CHECKSUMS="${SEEN_CHECKSUMS:-}" \
+    "${SETUP_CMD:-$TEST_ROOT/stage/oshioki-laptop-setup}" "$@" </dev/null
 }
 
 # Like run_setup but stages no NATS values at all: the socket-only install
@@ -341,6 +343,48 @@ if [ "$(uname -s)" = Darwin ]; then
   grep -Fq 'bootout' "$CALL_LOG" || fail "re-run never cycled the agent"
   grep -Fq 'bootstrap' "$CALL_LOG" || fail "re-run never restarted the agent"
 fi
+
+# Scenario B2: reached through a PATH symlink into a Homebrew-style keg, the
+# script must still resolve its own keg rather than the directory the
+# symlink sits in. `pwd -P` on the dirname resolves symlinked directories
+# only, so before the fix SCRIPT_DIR became the fake /opt/homebrew/bin, the
+# keg probe missed ../libexec/SHA256SUMS, and HOOK_BIN/OSHIOKI_CHECKSUMS
+# reached the installer empty (issue #91).
+KEG="$TEST_ROOT/keg/0.1.8"
+mkdir -p "$KEG/bin" "$KEG/libexec" "$TEST_ROOT/keg/brew-bin"
+cp "$SCRIPT_DIR/oshioki-laptop-setup" "$KEG/bin/"
+cp "$TEST_ROOT/fake-bin/oshioki" "$KEG/bin/oshioki"
+chmod 0755 "$KEG/bin/oshioki-laptop-setup" "$KEG/bin/oshioki"
+: > "$KEG/libexec/SHA256SUMS"
+: > "$KEG/libexec/oshioki.dylib"
+# Relative, like Homebrew's own bin links, so the walk has to join it to the
+# link's own directory instead of treating it as absolute.
+ln -s "../0.1.8/bin/oshioki-laptop-setup" "$TEST_ROOT/keg/brew-bin/oshioki-laptop-setup"
+: > "$CALL_LOG"
+SETUP_CMD="$TEST_ROOT/keg/brew-bin/oshioki-laptop-setup" \
+  SEEN_CHECKSUMS="$TEST_ROOT/seen-checksums" \
+  run_setup --yes >"$TEST_ROOT/keg.log" 2>&1 || { cat "$TEST_ROOT/keg.log" >&2; fail "keg symlink run failed"; }
+grep -Fq "installed $KEG/bin/oshioki" "$TEST_ROOT/keg.log" ||
+  fail "keg symlink run did not point HOOK_BIN at the keg"
+[ "$(cat "$TEST_ROOT/seen-checksums")" = "$KEG/libexec/SHA256SUMS" ] ||
+  fail "keg symlink run did not pass the keg manifest: $(cat "$TEST_ROOT/seen-checksums")"
+
+# ... and a readlink that cannot answer is a hard stop, not a silent
+# fallback to the link's own directory: that would put the script back on
+# the #91 path with nothing said about it.
+mkdir -p "$TEST_ROOT/keg/broken-readlink"
+cat > "$TEST_ROOT/keg/broken-readlink/readlink" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod 0755 "$TEST_ROOT/keg/broken-readlink/readlink"
+readlink_rc=0
+SETUP_CMD="$TEST_ROOT/keg/brew-bin/oshioki-laptop-setup" \
+  SETUP_PATH="$TEST_ROOT/keg/broken-readlink:/usr/bin:/bin" \
+  run_setup --yes >"$TEST_ROOT/broken-readlink.log" 2>&1 || readlink_rc=$?
+[ "$readlink_rc" -ne 0 ] || fail "a failing readlink did not stop the run"
+grep -Fq 'cannot resolve symlink' "$TEST_ROOT/broken-readlink.log" ||
+  fail "a failing readlink was not reported: $(head -1 "$TEST_ROOT/broken-readlink.log")"
 
 # Scenario C: --reconfigure rewrites install.env from current values.
 OSHIOKI_ORIGIN="https://reconfigured.test" run_setup --yes --reconfigure >"$TEST_ROOT/reconf.log" 2>&1 || fail "reconfigure failed"

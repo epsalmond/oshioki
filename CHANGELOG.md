@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `oshioki-laptop-setup` and `install-oshioki-hook` now resolve their own
+  path through symlinks before deriving anything from it. Homebrew puts both
+  on `PATH` as `/opt/homebrew/bin/<name>`, a symlink into the Cellar; `pwd -P`
+  on the dirname resolves symlinked *directories* only, so the scripts took
+  `/opt/homebrew/bin` for their install directory, missed
+  `../libexec/SHA256SUMS`, and the documented
+  `brew install ... && oshioki-laptop-setup --contextual-pam` died on
+  `missing or unsafe build artifact: /opt/homebrew/target/release/oshioki`.
+  Running the same command by its keg path worked, which is what made this
+  look like a Homebrew problem. The walk is a plain `readlink` loop, since
+  macOS ships no `readlink -f`. (#91)
+- `install-oshioki-hook --contextual-pam-status` finds the `SHA256SUMS`
+  shipped in its own keg or package instead of reporting
+  `no SHA256SUMS manifest was found to verify it against` until
+  `OSHIOKI_CHECKSUMS` was passed by hand. Install and status now share one
+  resolver: `target/release/SHA256SUMS` in a repo checkout, `libexec` beside
+  `bin` in a Homebrew keg, and the file next to the installer for the `.deb`
+  and an unpacked release tarball. An explicit `OSHIOKI_CHECKSUMS` still
+  wins, and a manifest that cannot be found is still a `FAIL`, not a skipped
+  check. (#91)
+
 ## [0.1.8] - 2026-09-12
 
 ### Fixed

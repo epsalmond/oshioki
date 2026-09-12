@@ -92,17 +92,47 @@ if [ "$PRIVILEGED" -eq 0 ] && [ "$(id -u)" -eq 0 ]; then
   die "run as yourself, not under sudo: the script elevates once by itself"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-# Absolute path to this script: the privileged phase re-invokes it under
-# sudo, and a bare name would not resolve there.
-SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+# Absolute path to this script, with every symlink in the chain walked out.
+# `pwd -P` alone resolves symlinked *directories* but not a symlinked
+# *file*, and Homebrew puts this script on PATH as
+# /opt/homebrew/bin/oshioki-laptop-setup -> ../Cellar/oshioki/<version>/bin/
+# oshioki-laptop-setup. Without this the keg probe below would look for
+# /opt/homebrew/libexec/SHA256SUMS, miss it, and leave the installer to fall
+# back on a repo-relative build path that does not exist (issue #91). It is
+# also the path the privileged phase re-invokes under sudo, where a bare
+# name would not resolve. macOS ships no `readlink -f`, hence the loop.
+resolve_script_path() {
+  local path="$1" target dir hops=0
+  while [ -L "$path" ]; do
+    hops=$((hops + 1))
+    [ "$hops" -le 40 ] || die "symlink loop resolving $1"
+    # Fail closed. A readlink that is missing or errors would otherwise leave
+    # target empty, path would become "<dir>/", the loop would end, and the
+    # function would hand back the link's own directory -- exactly the #91
+    # behaviour this walk exists to prevent, with nothing said about it.
+    target="$(readlink "$path")" && [ -n "$target" ] ||
+      die "cannot resolve symlink: $path"
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="$(dirname "$path")/$target" ;;
+    esac
+  done
+  dir="$(cd "$(dirname "$path")" && pwd -P)" ||
+    die "cannot reach the directory of $path"
+  printf '%s/%s\n' "$dir" "$(basename "$path")"
+}
+SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")" || exit 1
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+# The keg (or repo) root one level up, normalised here so every path derived
+# from it is printable and comparable rather than carrying a literal "/..".
+PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 AGENT_BIN_EXPLICIT="${AGENT_BIN:-}"
 LAPTOP_USER="${SUDO_USER:-$(id -un)}"
 INSTALLER="${INSTALLER:-$SCRIPT_DIR/install-oshioki-hook}"
 AGENT_BIN="${AGENT_BIN:-$SCRIPT_DIR/oshioki-agent}"
 # Repo checkout layout keeps the built agent next to the source tree.
-if [ ! -x "$AGENT_BIN" ] && [ -x "$SCRIPT_DIR/../target/release/oshioki-agent" ]; then
-  AGENT_BIN="$SCRIPT_DIR/../target/release/oshioki-agent"
+if [ ! -x "$AGENT_BIN" ] && [ -x "$PARENT_DIR/target/release/oshioki-agent" ]; then
+  AGENT_BIN="$PARENT_DIR/target/release/oshioki-agent"
 fi
 # Brew layout keeps binaries next to this script and data one level up in
 # libexec. HOOK_BIN and friends stay empty outside that layout so the
@@ -110,10 +140,10 @@ fi
 HOOK_BIN=""
 PLUGIN_BIN=""
 OSHIOKI_CHECKSUMS=""
-if [ -x "$SCRIPT_DIR/oshioki" ] && [ -f "$SCRIPT_DIR/../libexec/SHA256SUMS" ]; then
+if [ -x "$SCRIPT_DIR/oshioki" ] && [ -f "$PARENT_DIR/libexec/SHA256SUMS" ]; then
   HOOK_BIN="${HOOK_BIN:-$SCRIPT_DIR/oshioki}"
-  PLUGIN_BIN="${PLUGIN_BIN:-$SCRIPT_DIR/../libexec/oshioki.dylib}"
-  OSHIOKI_CHECKSUMS="${OSHIOKI_CHECKSUMS:-$SCRIPT_DIR/../libexec/SHA256SUMS}"
+  PLUGIN_BIN="${PLUGIN_BIN:-$PARENT_DIR/libexec/oshioki.dylib}"
+  OSHIOKI_CHECKSUMS="${OSHIOKI_CHECKSUMS:-$PARENT_DIR/libexec/SHA256SUMS}"
 fi
 HOOK_BIN="${HOOK_BIN:-}"
 PLUGIN_BIN="${PLUGIN_BIN:-}"
@@ -127,9 +157,9 @@ pam_module_name=liboshioki_pam.so
 PAM_MODULE_BIN="${PAM_MODULE_BIN:-}"
 if [ -z "$PAM_MODULE_BIN" ]; then
   for candidate in \
-    "$SCRIPT_DIR/../libexec/$pam_module_name" \
+    "$PARENT_DIR/libexec/$pam_module_name" \
     "$SCRIPT_DIR/$pam_module_name" \
-    "$SCRIPT_DIR/../target/release/$pam_module_name"; do
+    "$PARENT_DIR/target/release/$pam_module_name"; do
     [ -f "$candidate" ] || continue
     PAM_MODULE_BIN="$candidate"
     break
@@ -157,7 +187,7 @@ if [ "$LOCAL" -eq 1 ]; then TOTAL_STEPS=4; fi
 # write the checksum manifest the installer verifies, same as the release
 # lane. Brew layouts already ship all three, so this is a no-op there.
 if [ "$LOCAL" -eq 1 ]; then
-  repo_root="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+  repo_root="$PARENT_DIR"
   if [ -f "$repo_root/Cargo.toml" ]; then
     release="$repo_root/target/release"
     if [ ! -x "$release/oshioki" ] || [ ! -x "$release/oshioki-agent" ]; then

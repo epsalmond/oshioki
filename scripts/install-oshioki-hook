@@ -28,7 +28,34 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$MODE" ] || { echo "install-oshioki-hook: choose exactly one mode" >&2; exit 2; }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Where this script really lives. `pwd -P` alone resolves symlinked
+# *directories* but not a symlinked *file*, and Homebrew puts this script on
+# PATH as /opt/homebrew/bin/<name> -> ../Cellar/oshioki/<version>/bin/<name>.
+# Taking the dirname of the link would point every keg-relative lookup at
+# /opt/homebrew instead of the Cellar (issue #91), so walk the link chain
+# first. macOS ships no `readlink -f`, hence the loop.
+resolve_script_path() {
+  local path="$1" target dir hops=0
+  while [ -L "$path" ]; do
+    hops=$((hops + 1))
+    [ "$hops" -le 40 ] || { echo "install-oshioki-hook: symlink loop resolving $1" >&2; return 1; }
+    # Fail closed. A readlink that is missing or errors would otherwise leave
+    # target empty, path would become "<dir>/", the loop would end, and the
+    # function would hand back the link's own directory -- exactly the #91
+    # behaviour this walk exists to prevent, with nothing said about it.
+    target="$(readlink "$path")" && [ -n "$target" ] ||
+      { echo "install-oshioki-hook: cannot resolve symlink: $path" >&2; return 1; }
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="$(dirname "$path")/$target" ;;
+    esac
+  done
+  dir="$(cd "$(dirname "$path")" && pwd -P)" ||
+    { echo "install-oshioki-hook: cannot reach the directory of $path" >&2; return 1; }
+  printf '%s/%s\n' "$dir" "$(basename "$path")"
+}
+SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")" || exit 1
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 SERVICE_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 SUDO_CONF="${SUDO_CONF:-/etc/sudo.conf}"
 SBIN_DIR="${SBIN_DIR:-/usr/local/sbin}"
@@ -1133,12 +1160,21 @@ classify_pam_services() {
 }
 
 # The checksum manifest, wherever this installation flow put it. A git
-# checkout builds it into target/release; a package ships it next to the
-# installer. Status must not pass a module it never verified, so callers
-# treat "not found" as a failure rather than a waiver.
+# checkout builds it into target/release; the .deb and an unpacked release
+# tarball ship it next to the installer; a Homebrew keg puts it in the
+# libexec beside this script's bin. Next-to-the-installer is probed before
+# the libexec so the .deb, whose SERVICE_DIR is the shared /usr/share, finds
+# its own /usr/share/oshioki/SHA256SUMS rather than reaching first for a
+# /usr/share/libexec that belongs to nobody. Install and status share this
+# list, so a packaged install needs no OSHIOKI_CHECKSUMS override either
+# way. Status must not pass a module it never verified, so callers treat
+# "not found" as a failure rather than a waiver.
 default_checksums() {
   local candidate
-  for candidate in "$SERVICE_DIR/target/release/SHA256SUMS" "$SCRIPT_DIR/SHA256SUMS"; do
+  for candidate in \
+    "$SERVICE_DIR/target/release/SHA256SUMS" \
+    "$SCRIPT_DIR/SHA256SUMS" \
+    "$SERVICE_DIR/libexec/SHA256SUMS"; do
     [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
     printf '%s\n' "$candidate"
     return 0
@@ -1887,7 +1923,8 @@ case "$architecture" in
   *) die "unsupported architecture: $architecture" ;;
 esac
 
-CHECKSUMS="${OSHIOKI_CHECKSUMS:-$SERVICE_DIR/target/release/SHA256SUMS}"
+CHECKSUMS="${OSHIOKI_CHECKSUMS:-$(default_checksums || true)}"
+[ -n "$CHECKSUMS" ] || die "no artifact checksum manifest found"
 CHECKSUMS="$(canonicalize "$CHECKSUMS")"
 if [ ! -f "$CHECKSUMS" ] || [ -L "$CHECKSUMS" ]; then
   die "missing artifact checksum manifest: $CHECKSUMS"
