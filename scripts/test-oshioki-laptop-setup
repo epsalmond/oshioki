@@ -369,6 +369,23 @@ grep -Fq "installed $KEG/bin/oshioki" "$TEST_ROOT/keg.log" ||
 [ "$(cat "$TEST_ROOT/seen-checksums")" = "$KEG/libexec/SHA256SUMS" ] ||
   fail "keg symlink run did not pass the keg manifest: $(cat "$TEST_ROOT/seen-checksums")"
 
+# ... and a readlink that cannot answer is a hard stop, not a silent
+# fallback to the link's own directory: that would put the script back on
+# the #91 path with nothing said about it.
+mkdir -p "$TEST_ROOT/keg/broken-readlink"
+cat > "$TEST_ROOT/keg/broken-readlink/readlink" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod 0755 "$TEST_ROOT/keg/broken-readlink/readlink"
+readlink_rc=0
+SETUP_CMD="$TEST_ROOT/keg/brew-bin/oshioki-laptop-setup" \
+  SETUP_PATH="$TEST_ROOT/keg/broken-readlink:/usr/bin:/bin" \
+  run_setup --yes >"$TEST_ROOT/broken-readlink.log" 2>&1 || readlink_rc=$?
+[ "$readlink_rc" -ne 0 ] || fail "a failing readlink did not stop the run"
+grep -Fq 'cannot resolve symlink' "$TEST_ROOT/broken-readlink.log" ||
+  fail "a failing readlink was not reported: $(head -1 "$TEST_ROOT/broken-readlink.log")"
+
 # Scenario C: --reconfigure rewrites install.env from current values.
 OSHIOKI_ORIGIN="https://reconfigured.test" run_setup --yes --reconfigure >"$TEST_ROOT/reconf.log" 2>&1 || fail "reconfigure failed"
 grep -Fq 'OSHIOKI_ORIGIN=https://reconfigured.test' "$TEST_ROOT/etc/install.env" || fail "reconfigure kept stale origin"

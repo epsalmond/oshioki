@@ -231,7 +231,7 @@ run_installer() {
   fi
   root="$1"; shift
   mkdir -p "$root"
-  PATH="$TEST_PATH" SUDO_CONF="$root/sudo.conf" SUDO_PLUGIN_DIR="$root/plugin" SBIN_DIR="$root/sbin" \
+  PATH="${EXTRA_PATH:+$EXTRA_PATH:}$TEST_PATH" SUDO_CONF="$root/sudo.conf" SUDO_PLUGIN_DIR="$root/plugin" SBIN_DIR="$root/sbin" \
     SUDOERS_D="$root/sudoers.d" MAIN_SUDOERS="$root/sudoers" OSHIOKI_STATE_DIR="$root/state" \
     SUDO_USER="" VISUDO_CALLS="$root/visudo.calls" \
     OSHIOKI_SUDO_USER="$sudo_user" \
@@ -1495,6 +1495,23 @@ if INSTALLER_CMD="$KEG_INSTALLER" PAM_MODULE_BIN="$KEG/libexec/$PAM_MODULE_ARTIF
 fi
 grep -q '^FAIL  module: .*no SHA256SUMS manifest was found' "$KEG_HOST/override.log" ||
   fail "the override did not report the missing manifest as a failure"
+
+# A readlink that cannot answer is a hard stop, not a silent fallback to the
+# link's own directory: that would put the installer back on the #91 path
+# with nothing said about it.
+mkdir -p "$TEST_ROOT/brew-keg/broken-readlink"
+cat > "$TEST_ROOT/brew-keg/broken-readlink/readlink" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod 0755 "$TEST_ROOT/brew-keg/broken-readlink/readlink"
+if INSTALLER_CMD="$KEG_INSTALLER" EXTRA_PATH="$TEST_ROOT/brew-keg/broken-readlink" \
+   PAM_MODULE_BIN="$KEG/libexec/$PAM_MODULE_ARTIFACT" \
+   run_installer --sudo-user testuser "$KEG_HOST" --contextual-pam-status >"$KEG_HOST/readlink.log" 2>&1; then
+  fail "a failing readlink did not stop the installer"
+fi
+grep -Fq 'cannot resolve symlink' "$KEG_HOST/readlink.log" ||
+  fail "a failing readlink was not reported: $(head -1 "$KEG_HOST/readlink.log")"
 
 # Disable refuses to strand a module another service still references.
 DISABLE_REF="$TEST_ROOT/pam-disable-referrer"

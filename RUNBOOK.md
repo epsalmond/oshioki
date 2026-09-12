@@ -124,9 +124,9 @@ and `oshioki.dylib`, `liboshioki_pam.dylib` and `SHA256SUMS` one level up in
 elevates once by itself.
 
 Both `oshioki-laptop-setup` and `install-oshioki-hook` walk their own
-`$0` through every symlink before taking its dirname, so running either from
-`/opt/homebrew/bin` (a symlink into the Cellar) finds the same keg as running
-it by its `$(brew --prefix oshioki)/bin` path. Resolving the containing
+`${BASH_SOURCE[0]}` through every symlink before taking its dirname, so
+running either from `/opt/homebrew/bin` (a symlink into the Cellar) finds the
+same keg as running it by its `$(brew --prefix oshioki)/bin` path. Resolving the containing
 directory alone is not enough: `/opt/homebrew/bin` is a real directory, and
 before issue #91 that is where the keg probe looked.
 
