@@ -89,12 +89,6 @@ const PAM_AUTHINFO_UNAVAIL: c_int = 12;
 #[cfg(target_os = "macos")]
 const PAM_NO_MODULE_DATA: c_int = 24;
 
-/// Linux-PAM and `OpenPAM` both assign 26 to `PAM_ABORT`.  Verified against
-/// `security/_pam_types.h` on Linux-PAM; the macOS value is taken from
-/// `OpenPAM`'s `security/pam_constants.h` and is **not** validated on hardware
-/// (see `pam/README.md`).
-const PAM_ABORT: c_int = 26;
-
 const PAM_SERVICE: c_int = 1;
 const PAM_USER: c_int = 2;
 const PAM_TTY: c_int = 3;
@@ -267,21 +261,15 @@ enum HelperPathStatus {
 ///
 /// Linux stacks spell fail-closed with a bracket control: the installer
 /// writes `auth [... default=die] liboshioki_pam.so`, so `PAM_AUTH_ERR` ends
-/// the chain with a denial.  `OpenPAM` has no bracket controls, so the macOS
-/// entry is `auth sufficient /usr/local/lib/pam/liboshioki_pam.dylib`, and
-/// under `sufficient` a `PAM_AUTH_ERR` is merely recorded and ignored —
-/// evaluation continues into `pam_opendirectory` and a password authorises
-/// the command anyway.  `PAM_ABORT` is the one status `OpenPAM` honours as
-/// "abort the whole chain now", so macOS returns it to reach the same
-/// fail-closed outcome Linux gets from `default=die`.
-///
-/// This is unvalidated on Mac hardware; see `pam/README.md`.
+/// the chain with a denial. `OpenPAM` has no bracket controls, so the macOS
+/// entry is `auth sufficient /usr/local/lib/pam/liboshioki_pam.dylib`. Live
+/// macOS validation showed that `PAM_ABORT` under `sufficient` is also
+/// recorded and ignored; use plain `PAM_AUTH_ERR` so the stock password
+/// provider remains available. A hard helper fault is still a failed device
+/// result and never a device-authentication success: only the surrounding
+/// password conversation may authorise the command.
 const fn hard_failure_status() -> c_int {
-    if cfg!(target_os = "macos") {
-        PAM_ABORT
-    } else {
-        PAM_AUTH_ERR
-    }
+    PAM_AUTH_ERR
 }
 
 // ---------------------------------------------------------------------------
@@ -3080,19 +3068,15 @@ mod tests {
     }
 
     /// Linux keeps the hard fault as `PAM_AUTH_ERR`, which the installer's
-    /// `default=die` control turns into a denial.  macOS has no bracket
-    /// controls, so the same fault must be `PAM_ABORT` for `OpenPAM` to abort
-    /// the chain under `auth sufficient`.  Unvalidated on hardware.
+    /// `default=die` control turns into a denial. macOS has no bracket
+    /// controls, and live sudo validation showed that `PAM_ABORT` under
+    /// `auth sufficient` does not abort the chain. Both platforms therefore
+    /// return their ordinary `PAM_AUTH_ERR`; on macOS that preserves the
+    /// stock password fallback. A hard fault remains distinct from success
+    /// and unavailable, so the module itself never authenticates it.
     #[test]
-    fn a_hard_fault_maps_to_the_platform_fail_closed_status() {
-        #[cfg(target_os = "macos")]
-        assert_eq!(hard_failure_status(), PAM_ABORT);
-        #[cfg(not(target_os = "macos"))]
+    fn a_hard_fault_maps_to_ordinary_auth_error() {
         assert_eq!(hard_failure_status(), PAM_AUTH_ERR);
-        // Both PAM implementations number PAM_ABORT 26, and neither numbers
-        // it the same as its own PAM_AUTHINFO_UNAVAIL: a hard fault can never
-        // be mistaken for the fall-through-to-password status.
-        assert_eq!(PAM_ABORT, 26);
         assert_ne!(hard_failure_status(), PAM_AUTHINFO_UNAVAIL);
         assert_ne!(hard_failure_status(), PAM_SUCCESS);
     }

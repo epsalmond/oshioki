@@ -18,7 +18,8 @@ against the layouts real hosts actually ship.
 | `debian-12/` | `docker run --rm debian:12` + `apt-get install -y sudo`, 2026-09-11, captured verbatim |
 | `debian-13/` | `docker run --rm debian:13` + `apt-get install -y sudo`, 2026-09-11, captured verbatim |
 | `debian-13-sudo-i-include/` | `debian-13/` with a **synthetic** `sudo-i` that is `@include sudo` |
-| `macos-14/`, `macos-15-no-sudo-local/`, `macos-15-pam-tid/` | **Not captured from a Mac.** Written from knowledge of the stock Apple files; see the warning below |
+| `macos-14/` | `/etc/pam.d/sudo` and `sudo_local` checked byte-for-byte against macOS 15.7.5 (build 24G624) on 2026-09-12 UTC; fixture name retained for its macOS 14-era layout |
+| `macos-15-no-sudo-local/`, `macos-15-pam-tid/` | **Synthetic**, based on the verified `macos-14/` pair; the missing-file and enabled-`pam_tid` variants were not captured from a Mac |
 | `indented-include/`, `no-trailing-newline/`, `no-sudo-i/`, `refuse-indented-auth-*/`, `refuse-uppercase-auth/`, `refuse-continuation/` | **Synthetic**, derived from `ubuntu-24.04/` |
 | `refuse-*/` | Derived from the stock fixture named in each section below |
 
@@ -26,12 +27,13 @@ Debian 12 and Debian 13 ship byte-identical `sudo` and `sudo-i`. Ubuntu 24.04
 differs only by two `pam_env.so` session lines. On all three, `sudo-i` includes
 `common-auth` directly rather than including `sudo`.
 
-> **The macOS fixtures are unverified.** No Mac was available in this pass.
-> `sudo`, `sudo_local` and the commented `pam_tid.so` line are reproduced from
-> knowledge of macOS 14/15, not read off a running system. Treat every macOS
-> assertion built on them as provisional until supervised Mac validation
-> confirms the real bytes; if they differ, the fixtures are wrong, not the
-> installer's fingerprint.
+> **The base macOS pair is verified.** `macos-14/pam.d/sudo` and
+> `macos-14/pam.d/sudo_local` are byte-identical to macOS 15.7.5 (build 24G624),
+> checked on 2026-09-12 UTC (SHA-256
+> `b1912a1ed6a83fb30136ac2a3c2ad856b597f079de591cf3d2a7dc0969cae86a` and
+> `e6ed65e7629ca1d25eb1f5c2ddafe95dcb3fb100f901e8e5eba9a1555945534d`). The
+> `macos-15-no-sudo-local` and `macos-15-pam-tid` variants remain synthetic;
+> only their base layout is confirmed by that observation.
 
 ## Accept fixtures
 

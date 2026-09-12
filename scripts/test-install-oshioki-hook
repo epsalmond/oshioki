@@ -90,6 +90,12 @@ exec /usr/bin/file "$@"
 SH
 cat > "$TEST_ROOT/fake-bin/stat" <<'SH'
 #!/usr/bin/env bash
+if [ -n "${FAKE_STAT_SPECIAL_PATH:-}" ] && [ "${3:-}" = "$FAKE_STAT_SPECIAL_PATH" ]; then
+  case "${1:-} ${2:-}" in
+    '-c %u'|'-f %u') echo "${FAKE_STAT_SPECIAL_OWNER:-0}"; exit 0 ;;
+    '-c %a'|'-f %Lp') echo "${FAKE_STAT_SPECIAL_MODE:-600}"; exit 0 ;;
+  esac
+fi
 case "${1:-} ${2:-}" in
   '-c %u'|'-f %u') echo "${FAKE_STAT_OWNER:-0}" ;;
   '-c %a'|'-f %Lp')
@@ -153,6 +159,14 @@ if [ -n "${INSTALL_TRACE:-}" ]; then
   done
 fi
 for arg in "$@"; do
+  if [ "${SIGNAL_DURING_PAM_COMMIT:-0}" = 1 ] &&
+     [[ "$arg" == *.oshioki-backup.* ]] &&
+     [ ! -e "${SIGNAL_DURING_PAM_COMMIT_MARKER:-}" ]; then
+    /bin/rm "$@" || exit 1
+    : > "$SIGNAL_DURING_PAM_COMMIT_MARKER"
+    kill -TERM "$PPID"
+    exit 0
+  fi
   case "$arg" in
     */sudoers.d/oshioki)
       if [ "${FAIL_REMOVE_SUDOERS_ONCE:-0}" = 1 ] &&
@@ -223,6 +237,9 @@ run_installer() {
     NATS_URL="${INSTALL_NATS_URL-nats://nats.test:4222}" \
     NATS_PASS="${INSTALL_NATS_PASS-${NATS_PASS:-test-only}}" \
     FAKE_STAT_OWNER="${FAKE_STAT_OWNER:-0}" FAKE_STAT_MODE="${FAKE_STAT_MODE:-600}" \
+    FAKE_STAT_SPECIAL_PATH="${FAKE_STAT_SPECIAL_PATH:-}" \
+    FAKE_STAT_SPECIAL_OWNER="${FAKE_STAT_SPECIAL_OWNER:-0}" \
+    FAKE_STAT_SPECIAL_MODE="${FAKE_STAT_SPECIAL_MODE:-600}" \
     FAIL_INSTALL_TARGET="${FAIL_INSTALL_TARGET:-}" \
     FAIL_REMOVE_SUDOERS_ONCE="${FAIL_REMOVE_SUDOERS_ONCE:-0}" \
     FAIL_REMOVE_SUDOERS_MARKER="$root/remove-sudoers.marker" \
@@ -240,6 +257,8 @@ run_installer() {
     SIGNAL_AFTER_REMOVE_MARKER="$root/signal-after-remove.marker" \
     SIGNAL_DURING_BACKUP_CLEANUP="${SIGNAL_DURING_BACKUP_CLEANUP:-0}" \
     SIGNAL_DURING_BACKUP_CLEANUP_MARKER="$root/signal-during-backup-cleanup.marker" \
+    SIGNAL_DURING_PAM_COMMIT="${SIGNAL_DURING_PAM_COMMIT:-0}" \
+    SIGNAL_DURING_PAM_COMMIT_MARKER="$root/signal-during-pam-commit.marker" \
     INSTALL_TRACE="${INSTALL_TRACE:-}" \
     PAM_D="$root/pam.d" PAM_SECURITY_DIR="${PAM_SECURITY_DIR-$root/security}" \
     PAM_MODULE_BIN="${PAM_MODULE_BIN-$TEST_ROOT/service/target/release/$PAM_MODULE_ARTIFACT}" \
@@ -933,6 +952,27 @@ assert_legacy_restored() {
     fail "$label: the blanket rule was not restored"
 }
 
+# A signal while committed rollback snapshots are being deleted must not run
+# the old cleanup trap halfway through the transition. The contextual PAM
+# lane must remain live, with neither legacy privilege artifact restored.
+COMMIT_INTERRUPT="$TEST_ROOT/pam-commit-window-interrupt"
+setup_legacy_host "$COMMIT_INTERRUPT" ubuntu-24.04
+if SIGNAL_DURING_PAM_COMMIT=1 run_installer --sudo-user testuser "$COMMIT_INTERRUPT" \
+   --contextual-pam >"$COMMIT_INTERRUPT/log" 2>&1; then
+  fail "a signal during the contextual commit window reported success"
+fi
+for service in sudo sudo-i; do
+  grep -Fxq "$PAM_AUTH_LINE" "$COMMIT_INTERRUPT/pam.d/$service" ||
+    fail "commit-window signal removed the contextual PAM block from $service"
+done
+[ -f "$COMMIT_INTERRUPT/security/liboshioki_pam.so" ] ||
+  fail "commit-window signal removed the contextual PAM module"
+if grep -Fq '# BEGIN oshioki' "$COMMIT_INTERRUPT/sudo.conf"; then
+  fail "commit-window signal restored the legacy approval plugin"
+fi
+[ ! -e "$COMMIT_INTERRUPT/sudoers.d/oshioki" ] ||
+  fail "commit-window signal restored the legacy blanket rule"
+
 # Step 4: the module copy fails. Nothing referenced it, so only the two
 # legacy artifacts need to come back -- but they must come back in order.
 FAULT_MODULE="$TEST_ROOT/pam-fault-module"
@@ -1198,8 +1238,9 @@ grep -Fq 'is not a device registry' "$NOTYET/corrupt.log" || fail "missing corru
 pam_unchanged "$NOTYET" || fail "a registry-state case modified a PAM file"
 
 # A configured lane whose module has gone missing is loud, and with no
-# device to prove a replacement it is a refusal, not a quiet skip: on macOS
-# that state makes every sudo answer PAM_ABORT.
+# device to prove a replacement it is a refusal, not a quiet skip. On macOS,
+# a missing module under the sufficient entry continues to the stock password
+# provider rather than aborting the chain; it never authenticates by device.
 GONE="$TEST_ROOT/pam-module-missing"
 setup_legacy_host "$GONE" ubuntu-24.04
 run_installer --sudo-user testuser "$GONE" --contextual-pam >"$GONE/install.log" 2>&1 ||
@@ -1396,9 +1437,9 @@ run_installer "$DISABLE_LITTER" --disable-contextual-pam >"$DISABLE_LITTER/log" 
 # --- macOS (faked uname -s) ----------------------------------------------
 # OpenPAM has no bracket controls, so the macOS lane is a `sufficient` line
 # in /etc/pam.d/sudo_local and the stock /etc/pam.d/sudo is only
-# fingerprinted, never edited. These cases are the only coverage that path
-# has; no Mac was available, and tests/pam-layouts/README.md records that the
-# macOS fixtures themselves are written from knowledge rather than captured.
+# fingerprinted, never edited. The base macOS pair is verified against a live
+# 15.7.5 host; the missing-file and pam_tid variants remain synthetic (see
+# tests/pam-layouts/README.md).
 MAC_PLUGIN_DEST_NAME=oshioki.dylib
 setup_darwin_host() {
   local root="$1" layout="$2"
@@ -1422,6 +1463,162 @@ run_darwin_installer() {
     run_installer "$@"
 }
 MAC_AUTH_LINE_FOR() { printf 'auth       sufficient     %s/liboshioki_pam.dylib\n' "$1"; }
+
+# A stock macOS machine may not have the private module directory yet. A dry
+# run reports that planned directory creation without creating it; the real
+# migration creates only the missing leaf after checking its parent path.
+MAC_FIRST="$TEST_ROOT/pam-macos-first-install"
+setup_darwin_host "$MAC_FIRST" macos-14
+MAC_FIRST_SECURITY="$MAC_FIRST/new-parent/security"
+mkdir -p "$MAC_FIRST/new-parent"
+PAM_SECURITY_DIR="$MAC_FIRST_SECURITY" run_darwin_installer --sudo-user testuser "$MAC_FIRST" \
+  --contextual-pam --dry-run >"$MAC_FIRST/dry.log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_FIRST/dry.log" >&2; fail "macOS: missing security dir dry-run failed"; }
+grep -Fq "DRY: create $MAC_FIRST_SECURITY" "$MAC_FIRST/dry.log" ||
+  fail "macOS: missing security dir dry-run did not plan creation"
+[ ! -e "$MAC_FIRST_SECURITY" ] || fail "macOS: dry-run created the security directory"
+PAM_SECURITY_DIR="$MAC_FIRST_SECURITY" run_darwin_installer --sudo-user testuser "$MAC_FIRST" \
+  --contextual-pam >"$MAC_FIRST/install.log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_FIRST/install.log" >&2; fail "macOS: missing security dir install failed"; }
+[ -d "$MAC_FIRST_SECURITY" ] || fail "macOS: first install did not create the security directory"
+[ -f "$MAC_FIRST_SECURITY/liboshioki_pam.dylib" ] || fail "macOS: first install did not place the PAM module"
+grep -Fxq "$(MAC_AUTH_LINE_FOR "$MAC_FIRST_SECURITY")" "$MAC_FIRST/pam.d/sudo_local" ||
+  fail "macOS: first install wrote no auth line for the created directory"
+PAM_SECURITY_DIR="$MAC_FIRST_SECURITY" run_darwin_installer --sudo-user testuser "$MAC_FIRST" \
+  --contextual-pam >"$MAC_FIRST/rerun.log" 2>&1 ||
+  fail "macOS: first-install rerun failed"
+grep -Fq 'already current' "$MAC_FIRST/rerun.log" || fail "macOS: rerun did not converge on the existing module"
+[ "$(grep -c '^# BEGIN oshioki pam$' "$MAC_FIRST/pam.d/sudo_local")" -eq 1 ] ||
+  fail "macOS: first-install rerun duplicated the PAM block"
+
+# If the first install creates the directory but its module self-test fails,
+# rollback removes the empty directory as well as restoring the old lane.
+MAC_FIRST_ROLLBACK="$TEST_ROOT/pam-macos-first-rollback"
+setup_darwin_host "$MAC_FIRST_ROLLBACK" macos-14
+MAC_FIRST_ROLLBACK_SECURITY="$MAC_FIRST_ROLLBACK/new-parent/security"
+mkdir -p "$MAC_FIRST_ROLLBACK/new-parent"
+if PAM_SECURITY_DIR="$MAC_FIRST_ROLLBACK_SECURITY" FAIL_PAM_MODULE_INSTALL=1 \
+   run_darwin_installer --sudo-user testuser "$MAC_FIRST_ROLLBACK" --contextual-pam >"$MAC_FIRST_ROLLBACK/log" 2>&1; then
+  fail "macOS: failed first-install module copy reported success"
+fi
+[ ! -e "$MAC_FIRST_ROLLBACK_SECURITY" ] ||
+  fail "macOS: failed first install left the newly-created security directory"
+pam_unchanged "$MAC_FIRST_ROLLBACK" || fail "macOS: first-install rollback changed a PAM file"
+grep -Fq '# BEGIN oshioki' "$MAC_FIRST_ROLLBACK/sudo.conf" ||
+  fail "macOS: first-install rollback did not restore the legacy plugin"
+[ -e "$MAC_FIRST_ROLLBACK/sudoers.d/oshioki" ] ||
+  fail "macOS: first-install rollback did not restore the legacy rule"
+
+# Self-test failure happens after the module has landed, so rollback must
+# remove the module before removing the newly-created directory leaf.
+MAC_FIRST_SELFTEST="$TEST_ROOT/pam-macos-first-selftest-rollback"
+setup_darwin_host "$MAC_FIRST_SELFTEST" macos-14
+MAC_FIRST_SELFTEST_SECURITY="$MAC_FIRST_SELFTEST/new-parent/security"
+mkdir -p "$MAC_FIRST_SELFTEST/new-parent"
+if PAM_SECURITY_DIR="$MAC_FIRST_SELFTEST_SECURITY" FAIL_PAM_SELFTEST=1 \
+   run_darwin_installer --sudo-user testuser "$MAC_FIRST_SELFTEST" --contextual-pam >"$MAC_FIRST_SELFTEST/log" 2>&1; then
+  fail "macOS: failed first-install self-test reported success"
+fi
+[ ! -e "$MAC_FIRST_SELFTEST_SECURITY" ] ||
+  fail "macOS: self-test rollback left the newly-created security directory"
+pam_unchanged "$MAC_FIRST_SELFTEST" || fail "macOS: self-test rollback changed a PAM file"
+grep -Fq '# BEGIN oshioki' "$MAC_FIRST_SELFTEST/sudo.conf" ||
+  fail "macOS: self-test rollback did not restore the legacy plugin"
+[ -e "$MAC_FIRST_SELFTEST/sudoers.d/oshioki" ] ||
+  fail "macOS: self-test rollback did not restore the legacy rule"
+
+# A target symlink, non-root leaf, or writable ancestor is never accepted,
+# including when the target is absent and would otherwise be created.
+MAC_SYMLINK="$TEST_ROOT/pam-macos-symlink-target"
+setup_darwin_host "$MAC_SYMLINK" macos-14
+mkdir -p "$MAC_SYMLINK/real-security" "$MAC_SYMLINK/link-parent"
+ln -s "$MAC_SYMLINK/real-security" "$MAC_SYMLINK/link-parent/security"
+if PAM_SECURITY_DIR="$MAC_SYMLINK/link-parent/security" \
+   run_darwin_installer --sudo-user testuser "$MAC_SYMLINK" --contextual-pam >"$MAC_SYMLINK/log" 2>&1; then
+  fail "macOS: accepted a PAM security directory symlink"
+fi
+grep -Fq 'symlink' "$MAC_SYMLINK/log" || fail "macOS: symlink refusal was not explained"
+pam_unchanged "$MAC_SYMLINK" || fail "macOS: symlink refusal changed a PAM file"
+
+# An ancestor symlink is resolved before the strict ownership walk, preserving
+# merged-/usr-style paths such as /lib/security while still rejecting a
+# symlink at the security-directory leaf itself.
+MAC_SYMLINK_ANCESTOR="$TEST_ROOT/pam-macos-symlink-ancestor"
+setup_darwin_host "$MAC_SYMLINK_ANCESTOR" macos-14
+mkdir -p "$MAC_SYMLINK_ANCESTOR/real-parent/nested"
+ln -s "$MAC_SYMLINK_ANCESTOR/real-parent" "$MAC_SYMLINK_ANCESTOR/link-parent"
+MAC_SYMLINK_ANCESTOR_SECURITY="$MAC_SYMLINK_ANCESTOR/link-parent/nested/security"
+PAM_SECURITY_DIR="$MAC_SYMLINK_ANCESTOR_SECURITY" \
+  run_darwin_installer --sudo-user testuser "$MAC_SYMLINK_ANCESTOR" --contextual-pam >"$MAC_SYMLINK_ANCESTOR/log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_SYMLINK_ANCESTOR/log" >&2; fail "macOS: safe ancestor symlink was refused"; }
+MAC_SYMLINK_ANCESTOR_REAL="$MAC_SYMLINK_ANCESTOR/real-parent/nested/security"
+[ -f "$MAC_SYMLINK_ANCESTOR_REAL/liboshioki_pam.dylib" ] ||
+  fail "macOS: safe ancestor symlink did not create the canonical target"
+grep -Fxq "$(MAC_AUTH_LINE_FOR "$MAC_SYMLINK_ANCESTOR_REAL")" "$MAC_SYMLINK_ANCESTOR/pam.d/sudo_local" ||
+  fail "macOS: safe ancestor symlink wrote the wrong auth path"
+
+# An immediate parent symlink needs the same physical resolution; retaining
+# its final component would leave the leaf under the symlink and fail the
+# ancestor walk before the directory can be created.
+MAC_SYMLINK_PARENT="$TEST_ROOT/pam-macos-symlink-parent"
+setup_darwin_host "$MAC_SYMLINK_PARENT" macos-14
+mkdir -p "$MAC_SYMLINK_PARENT/real-parent"
+ln -s "$MAC_SYMLINK_PARENT/real-parent" "$MAC_SYMLINK_PARENT/link-parent"
+MAC_SYMLINK_PARENT_SECURITY="$MAC_SYMLINK_PARENT/link-parent/security"
+PAM_SECURITY_DIR="$MAC_SYMLINK_PARENT_SECURITY" \
+  run_darwin_installer --sudo-user testuser "$MAC_SYMLINK_PARENT" --contextual-pam >"$MAC_SYMLINK_PARENT/log" 2>&1 ||
+  { sed -n '1,40p' "$MAC_SYMLINK_PARENT/log" >&2; fail "macOS: immediate parent symlink was refused"; }
+MAC_SYMLINK_PARENT_REAL="$MAC_SYMLINK_PARENT/real-parent/security"
+[ -f "$MAC_SYMLINK_PARENT_REAL/liboshioki_pam.dylib" ] ||
+  fail "macOS: immediate parent symlink did not create the canonical target"
+grep -Fxq "$(MAC_AUTH_LINE_FOR "$MAC_SYMLINK_PARENT_REAL")" "$MAC_SYMLINK_PARENT/pam.d/sudo_local" ||
+  fail "macOS: immediate parent symlink wrote the wrong auth path"
+
+MAC_NONROOT="$TEST_ROOT/pam-macos-nonroot-target"
+setup_darwin_host "$MAC_NONROOT" macos-14
+MAC_NONROOT_SECURITY="$MAC_NONROOT/nonroot/security"
+mkdir -p "$MAC_NONROOT_SECURITY"
+if PAM_SECURITY_DIR="$MAC_NONROOT_SECURITY" \
+   FAKE_STAT_SPECIAL_PATH="$MAC_NONROOT_SECURITY" FAKE_STAT_SPECIAL_OWNER=1000 \
+   run_darwin_installer --sudo-user testuser "$MAC_NONROOT" --contextual-pam >"$MAC_NONROOT/log" 2>&1; then
+  fail "macOS: accepted a non-root PAM security directory"
+fi
+grep -Fq 'not root-owned and not writable by others' "$MAC_NONROOT/log" ||
+  fail "macOS: non-root PAM directory refusal was not explained"
+pam_unchanged "$MAC_NONROOT" || fail "macOS: non-root refusal changed a PAM file"
+
+MAC_UNSAFE_ANCESTOR="$TEST_ROOT/pam-macos-unsafe-ancestor"
+setup_darwin_host "$MAC_UNSAFE_ANCESTOR" macos-14
+MAC_UNSAFE_ANCESTOR_SECURITY="$MAC_UNSAFE_ANCESTOR/loose/security"
+mkdir -p "$MAC_UNSAFE_ANCESTOR/loose"
+if PAM_SECURITY_DIR="$MAC_UNSAFE_ANCESTOR_SECURITY" \
+   FAKE_STAT_SPECIAL_PATH="$MAC_UNSAFE_ANCESTOR/loose" FAKE_STAT_SPECIAL_MODE=777 \
+   run_darwin_installer --sudo-user testuser "$MAC_UNSAFE_ANCESTOR" --contextual-pam >"$MAC_UNSAFE_ANCESTOR/log" 2>&1; then
+  fail "macOS: accepted an unsafe PAM ancestor"
+fi
+grep -Fq 'not root-owned and not writable by others' "$MAC_UNSAFE_ANCESTOR/log" ||
+  fail "macOS: unsafe PAM ancestor refusal was not explained"
+[ ! -e "$MAC_UNSAFE_ANCESTOR_SECURITY" ] || fail "macOS: unsafe ancestor path created a target"
+pam_unchanged "$MAC_UNSAFE_ANCESTOR" || fail "macOS: unsafe ancestor refusal changed a PAM file"
+
+# The ancestor walk also protects an already-existing target: only checking
+# the immediate parent would miss this unsafe component two levels above it.
+MAC_UNSAFE_EXISTING="$TEST_ROOT/pam-macos-unsafe-existing"
+setup_darwin_host "$MAC_UNSAFE_EXISTING" macos-14
+MAC_UNSAFE_EXISTING_PARENT="$MAC_UNSAFE_EXISTING/unsafe/nested"
+MAC_UNSAFE_EXISTING_SECURITY="$MAC_UNSAFE_EXISTING_PARENT/security"
+mkdir -p "$MAC_UNSAFE_EXISTING_SECURITY"
+if PAM_SECURITY_DIR="$MAC_UNSAFE_EXISTING_SECURITY" \
+   FAKE_STAT_SPECIAL_PATH="$MAC_UNSAFE_EXISTING/unsafe" FAKE_STAT_SPECIAL_MODE=777 \
+   run_darwin_installer --sudo-user testuser "$MAC_UNSAFE_EXISTING" --contextual-pam >"$MAC_UNSAFE_EXISTING/log" 2>&1; then
+  fail "macOS: accepted an unsafe ancestor above an existing PAM directory"
+fi
+grep -Fq 'not root-owned and not writable by others' "$MAC_UNSAFE_EXISTING/log" ||
+  fail "macOS: existing-target unsafe ancestor refusal was not explained"
+[ ! -e "$MAC_UNSAFE_EXISTING_SECURITY/liboshioki_pam.dylib" ] ||
+  fail "macOS: existing-target unsafe ancestor left a module behind"
+pam_unchanged "$MAC_UNSAFE_EXISTING" ||
+  fail "macOS: existing-target unsafe ancestor refusal changed a PAM file"
 
 # Stock sudo_local (comments only): the block is appended and /etc/pam.d/sudo
 # is never touched.

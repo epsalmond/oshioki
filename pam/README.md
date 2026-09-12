@@ -1,16 +1,15 @@
 # Oshioki PAM foundation
 
-This crate is the first PAM-to-helper boundary for contextual sudo
-authentication. It is foundation work, not a completed PAM migration and not
-an installable release. The helper verb used by this module is not implemented
-in the current `/usr/local/sbin/oshioki` binary, so enabling this module on a
-host would not provide authentication.
+This crate is the PAM-to-helper boundary for the opt-in contextual sudo
+authentication lane. `scripts/install-oshioki-hook --contextual-pam` provides
+the staged installation, stock-stack fingerprinting, upgrade, rollback, and
+status workflow. It edits only the service-specific sudo PAM files; it does
+not modify `common-auth` or invoke `pam-auth-update`.
 
-There is currently no PAM installer, package integration, or `/etc/pam.d`
-recipe. In particular, this crate does not modify `common-auth`, invoke
-`pam-auth-update`, or claim a supported automatic change to a sudo PAM stack.
-The platform layouts, staged installation, upgrade, rollback, and recovery
-workflow remain deferred until the helper and stack contract are complete.
+The migration remains deliberately narrow: the installer refuses customised
+layouts and requires a verified hardware-backed device before it replaces the
+legacy approval lane. The helper verb and module contract described below are
+the ones shipped by the matching release artifacts.
 
 ## PAM boundary
 
@@ -144,30 +143,31 @@ The helper exit status is the decision channel:
 | --- | --- | --- |
 | exit `0` | `PAM_SUCCESS` | Device authentication accepted. |
 | exit `2` | `PAM_AUTHINFO_UNAVAIL` | Device authentication is unavailable; the surrounding PAM stack may continue its normal password path. |
-| any other exit, signal, malformed output, or security failure | `PAM_AUTH_ERR` (Linux) / `PAM_ABORT` (macOS) | Authentication did not succeed. |
+| any other exit, signal, malformed output, or security failure | `PAM_AUTH_ERR` (Linux and macOS) | Device authentication did not succeed. On macOS, the surrounding stock password provider remains available. |
 
-The hard-failure status is platform-dependent because the two PAM
-implementations express "stop here, fail closed" differently. On Linux the
-installer writes a bracket control
+The hard-failure control is platform-dependent because the two PAM
+implementations express the result differently. On Linux the installer writes a bracket control
 (`auth [success=done authinfo_unavail=ignore module_unknown=ignore ignore=ignore default=die]`),
 so `PAM_AUTH_ERR` falls under `default=die` and denies the command. OpenPAM
 has no bracket controls: the macOS entry is
 `auth sufficient /usr/local/lib/pam/liboshioki_pam.dylib` in
-`/etc/pam.d/sudo_local`, and under `sufficient` a `PAM_AUTH_ERR` is merely
-recorded and ignored — evaluation would continue into `pam_opendirectory` and
-a typed password would authorise the command, silently erasing the refusal.
-`PAM_ABORT` (26 in both implementations) is the one status OpenPAM honours as
-an immediate abort of the whole chain, so macOS returns it for exactly the
-cases Linux dies on: a refused helper path, malformed helper output, and a
-repeat call on a handle that already has a result. The unavailable path is
-unchanged on both platforms.
+`/etc/pam.d/sudo_local`. Under `sufficient`, `PAM_AUTH_ERR` is recorded and
+the stack continues into `pam_opendirectory`, so a correct typed password can
+authorise the command. This is the intended macOS fallback: the module's hard
+fault is never `PAM_SUCCESS`, and only the ordinary password conversation may
+complete authentication. The unavailable path is unchanged on both platforms.
 
-**This macOS mapping is unvalidated on hardware.** It is covered only by
-`a_hard_fault_maps_to_the_platform_fail_closed_status` in `pam/src/lib.rs`,
-which asserts the constant, not OpenPAM's reaction to it. If supervised Mac
-validation shows that `PAM_ABORT` under `sufficient` does not abort the
-chain, the fallback is to keep plain `PAM_AUTH_ERR` and document the
-asymmetry rather than to change the control word.
+Supervised validation on macOS 15.7.5 showed that returning `PAM_ABORT` (26)
+also continued through the `sufficient` entry instead of aborting the chain.
+The test temporarily removed every executable bit from the fixed helper
+(mode `0644`), observed the stock `PAM_PASSWORD_FALLBACK` prompt, and
+supplied no password; sudo exited non-zero. The helper mode was restored to
+`0755` immediately. The module therefore maps hard faults to plain
+`PAM_AUTH_ERR` on macOS, preserving the documented password fallback and
+making the OpenPAM asymmetry explicit. The unit test
+`a_hard_fault_maps_to_ordinary_auth_error` verifies that hard faults remain
+distinct from both `PAM_SUCCESS` and `PAM_AUTHINFO_UNAVAIL`; it cannot replace
+the live OpenPAM observation.
 
 Any failure to start the helper, and the bounded 90-second helper deadline,
 are classified as unavailable, never as a hard authentication failure. That
@@ -435,7 +435,7 @@ On Linux with `libpam0g-dev` installed, the focused module checks pass with
 the toolchain selected by this repository's `rust-toolchain.toml`:
 
 ```sh
-cargo test -p oshioki-pam              # 27 tests
+cargo test -p oshioki-pam              # 31 tests
 cargo clippy -p oshioki-pam --all-targets -- -D warnings
 cargo fmt -p oshioki-pam -- --check
 cargo build -p oshioki-pam             # exports pam_sm_authenticate, pam_sm_setcred
@@ -444,9 +444,11 @@ cargo build -p oshioki-pam             # exports pam_sm_authenticate, pam_sm_set
 The macOS-only paths (the `pam.2` link name, `proc_pidinfo` descriptor
 listing, and the pipe-only parent-death channel) are type-checked with
 `cargo check -p oshioki-pam --target aarch64-apple-darwin` and clippy for the
-same target, but they have not been executed on macOS in this pass. This is
-build, test and ABI evidence only; real PAM stack behavior on either operating
-system has not been validated.
+same target. Supervised validation on macOS 15.7.5 (build 24G624) also loaded
+the module through stock `sudo_local`, accepted a Secure Enclave approval, and
+confirmed ordinary password fallback after the device lane was unavailable.
+This live observation complements the unit and ABI evidence; it does not
+replace it for future macOS versions.
 
 The `authenticate` helper verb exists in the hook: it reads this schema,
 seals a request to the enrolled hardware devices, and verifies the returned
@@ -456,27 +458,39 @@ assertion. It now has consumers. The helper publishes on
 server's durable handler stores an authentication envelope in its own lane
 and serves it at `/a/<id>` for a `WebAuthn` browser. Neither lane has a
 refusal: cancelling sends nothing, and sudo falls back to a password at the
-helper's deadline. **None of this has been exercised against a real PAM
-stack**, so the module still must not be enabled in a PAM configuration.
+helper's deadline. Supervised NAS/Linux and Mac runs exercised the native
+Secure Enclave lane, status checks, rollback, and ordinary password recovery
+against real sudo/PAM stacks. On both real hosts, terminal Ctrl-C during the
+device wait exposed the stock password prompt; the second interrupt exited
+without running the command. Helper-tree cleanup is covered by the module and
+container acceptance tests; the browser lane remains a separate acceptance
+path.
 
 The following acceptance work remains open:
 
-- an accepted hardware-backed device flow end to end against real hardware;
-- real stock sudo/PAM stacks on Linux and macOS, including required account,
-  session, MFA, lockout, `pam_tid`, smart-card, and password fallback behavior;
-- native sudo timestamps, `sudo -k`/`-K`, `sudo -v`, `sudo -n`, alternate
-  principals, and administrator-selected `noninteractive_auth`;
-- known stock sudo-only service layouts, refusal of customized layouts,
-  staged module/config installation, upgrade, uninstall, and rollback. The
-  Linux half of this is now driven by `scripts/install-oshioki-hook
-  --contextual-pam` and covered by `scripts/test-install-oshioki-hook` and
-  `scripts/test-pam-acceptance`; the macOS half (`sudo_local`, `pam_tid`
-  coexistence, `PAM_ABORT`, code signing) is not;
+- the browser-mediated WebAuthn authentication flow end to end against a real
+  browser; native Secure Enclave approval was exercised on the NAS and Mac
+  hosts in this pass;
+- broader stock sudo/PAM coverage on Linux and macOS, including account,
+  session, MFA, lockout, smart-card, and alternate password-stack variants;
+  this pass covered the Mac `sudo_local`/`pam_tid` coexistence and ordinary
+  password fallback on both real hosts;
+- advanced/custom timestamp variants, `sudo -K`, `sudo -v`, alternate
+  principals, and administrator-selected `noninteractive_auth`; baseline
+  same-TTY timestamp reuse and `sudo -k`/`sudo -n` invalidation were verified
+  on both real hosts;
+- additional stock service layouts, refusal of customised layouts, staged
+  module/config installation, upgrade, uninstall, and rollback. The Linux
+  half is driven by `scripts/install-oshioki-hook --contextual-pam` and
+  covered by `scripts/test-install-oshioki-hook` and
+  `scripts/test-pam-acceptance`; supervised Mac coverage now includes
+  `sudo_local`, `pam_tid` coexistence, code signing, and the measured
+  `PAM_ABORT` asymmetry;
 - diagnostic and progress forwarding. The current helper stderr channel is
   bounded and discarded, so no approval link or progress display should be
   inferred from this crate;
-- supervised Linux, Mac, and NAS validation with a retained recovery path.
+- repeat supervised Linux, Mac, and NAS validation after future artifact
+  changes, with the retained recovery path used in this pass.
 
-Until those items are complete, this module must not be enabled in a PAM
-configuration or presented as a complete contextual sudo authentication
-feature.
+Until those remaining items are complete, keep the migration opt-in and do not
+present this foundation as universal support for every host PAM layout.

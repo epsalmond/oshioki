@@ -532,7 +532,7 @@ pam_module_dest() { printf '%s/%s\n' "$1" "$PAM_MODULE_NAME"; }
 # Linux-PAM has one; see pam/README.md for why each token is there, and in
 # particular why `module_unknown=ignore` is the difference between a degraded
 # install and a host where no sudo can ever succeed. macOS has no bracket
-# controls, so the module returns PAM_ABORT for the cases Linux dies on.
+# controls, so its ordinary auth error remains available for password fallback.
 pam_auth_line() {
   if [ "$(uname -s)" = Darwin ]; then
     printf 'auth       sufficient     %s\n' "$(pam_module_dest "$1")"
@@ -608,13 +608,55 @@ helper_path_secure() {
   return 0
 }
 
+# A Darwin PAM directory may be absent on a fresh host. It is safe to create
+# only the final leaf when every existing component is a root-owned directory
+# with no group/other write bit. Discovery rejects a symlink at the leaf and
+# resolves trusted ancestor symlinks before this canonical-path walk: this
+# directory is where sudo loads root-context code.
+pam_security_path_secure() {
+  local path="$1" parent
+  while :; do
+    [ ! -L "$path" ] || return 1
+    if [ -e "$path" ]; then
+      [ -d "$path" ] || return 1
+      path_is_root_owned_and_tight "$path" || return 1
+    fi
+    [ "$path" = / ] && break
+    parent="$(dirname "$path")"
+    [ "$parent" != "$path" ] || break
+    path="$parent"
+  done
+  return 0
+}
+
+pam_security_dir_secure() {
+  local dir="$1"
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+  pam_security_path_secure "$dir"
+}
+
+# Resolve every existing ancestor while retaining the final component. The
+# generic canonicalize helper follows only a symlink that names the complete
+# path; it would miss merged-/usr paths such as /lib/security where /lib is
+# the symlink. The leaf is checked separately before this helper is called.
+physical_directory_path() {
+  local path="$1" parent
+  path="${path%/}"
+  [ -n "$path" ] || path=/
+  [ "$path" = / ] && { printf '/\n'; return 0; }
+  parent="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$parent" "$(basename "$path")"
+}
+
+pam_security_dir_created=0
+
 # Where this platform keeps PAM modules. Discovered from the packaging
 # database first, because a hard-coded multiarch triplet is wrong on every
 # architecture but one, and a module written to the wrong directory is a
 # module PAM cannot find -- which `module_unknown=ignore` turns into a silent
 # password-only host rather than a visible error.
 discover_security_dir() {
-  local dir="" candidate listed triplet
+  local dir="" candidate listed triplet parent
   if [ -n "$PAM_SECURITY_DIR" ]; then
     dir="$PAM_SECURITY_DIR"
     # An explicit override is still checked, just against a weaker shape than
@@ -647,16 +689,37 @@ discover_security_dir() {
     printf '%s\n' "$dir" | grep -Eq '^((/usr)?/lib/[a-z0-9_]+-linux-[a-z]+/security|/(usr/)?lib/security)$' ||
       die "refusing an unexpected PAM security directory: $dir"
   fi
-  safe_directory "$dir"
-  [ -d "$dir" ] || die "PAM security directory does not exist: $dir"
   # This directory holds code libpam loads into every privileged sudo. On
   # macOS its absolute path is written into sudo_local, so a directory
   # anybody can write to is a standing offer to replace root-loaded code.
-  # Same predicate as the helper path, and applied to an explicit
-  # PAM_SECURITY_DIR override too -- which on Darwin has no pam_unix.so or
-  # multiarch cross-check behind it and would otherwise be unchecked.
-  path_is_root_owned_and_tight "$dir" ||
-    die "refusing a PAM security directory that is not root-owned and not writable by others: $dir"
+  # A fresh Darwin host may lack only the final leaf; dry-run reports the same
+  # create step while the real migration creates it after the rollback inputs
+  # are armed. The parent must already exist so we never recursively create an
+  # unsafe path. Resolve trusted ancestor symlinks before checking their
+  # ownership: merged-/usr Linux hosts commonly expose /lib this way. The
+  # final leaf itself is never accepted as a symlink.
+  if [ -L "$dir" ]; then
+    die "refusing symlink PAM security directory: $dir"
+  elif [ ! -e "$dir" ]; then
+    [ "$MODE" = contextual-pam ] || die "PAM security directory does not exist: $dir"
+    parent="$(dirname "$dir")"
+    [ -d "$parent" ] || die "PAM security directory parent does not exist: $parent"
+    # The parent itself may be a symlink (for example /lib on a merged-/usr
+    # host), so resolve the complete existing directory rather than retaining
+    # its final component as physical_directory_path intentionally does.
+    parent="$(cd "$parent" 2>/dev/null && pwd -P)" ||
+      die "could not resolve PAM security directory parent: $parent"
+    pam_security_path_secure "$parent" ||
+      die "refusing a PAM security directory that is not root-owned and not writable by others: $dir"
+    dir="$parent/$(basename "$dir")"
+  elif [ ! -d "$dir" ]; then
+    die "refusing non-directory PAM security path: $dir"
+  else
+    dir="$(physical_directory_path "$dir")" ||
+      die "could not resolve PAM security directory: $dir"
+    pam_security_dir_secure "$dir" ||
+      die "refusing a PAM security directory that is not root-owned and not writable by others: $dir"
+  fi
   if [ "$(uname -s)" != Darwin ]; then
     # If pam_unix.so is not here, this is not the directory PAM loads from,
     # whatever the path looks like.
@@ -675,6 +738,30 @@ discover_security_dir() {
     fi
   fi
   printf '%s\n' "$dir"
+}
+
+# Create the missing Darwin leaf after all rollback inputs have been captured.
+# Existing directories are rechecked here to close the preflight-to-write
+# window; a directory made by this invocation is removed by cleanup_install if
+# any later migration step fails, but only while it remains empty.
+ensure_pam_security_dir() {
+  local dir="$1" parent
+  if [ -e "$dir" ] || [ -L "$dir" ]; then
+    [ ! -L "$dir" ] || die "refusing symlink PAM security directory: $dir; restored the prior configuration"
+    pam_security_dir_secure "$dir" ||
+      die "refusing a PAM security directory that is not root-owned and not writable by others: $dir; restored the prior configuration"
+    return 0
+  fi
+  parent="$(dirname "$dir")"
+  [ -d "$parent" ] || die "PAM security directory parent does not exist: $parent; restored the prior configuration"
+  pam_security_path_secure "$parent" ||
+    die "refusing a PAM security directory that is not root-owned and not writable by others: $dir; restored the prior configuration"
+  [ "$DRY_RUN" -eq 0 ] || return 0
+  install -d -m 0755 -o root -g "$ROOT_GROUP" "$dir" ||
+    die "could not create PAM security directory: $dir; restored the prior configuration"
+  pam_security_dir_created=1
+  pam_security_dir_secure "$dir" ||
+    die "created PAM security directory is not root-owned and not writable by others: $dir; restored the prior configuration"
 }
 
 # The file as an administrator's stock content: our owned block removed, then
@@ -967,6 +1054,34 @@ EOF
   return "$status"
 }
 
+# Commit the contextual migration as one rollback state transition. Every
+# rollback arm and the newly-created-directory flag are cleared before any
+# snapshot is deleted: a signal in the cleanup window must not restore sudo's
+# legacy artifacts while leaving the PAM lane live (or vice versa).
+commit_pam_migration() {
+  local pam_entries="$pam_backups" old_backup="$backup" old_dropin_backup="$dropin_backup" status=0
+  # Keep these clears in one assignment-only simple command. Bash cannot run
+  # a pending EXIT/TERM trap between the individual state transitions.
+  pam_backups="" pam_rollback_armed=0 backup="" dropin_backup="" dropin_original_present=0 rollback_armed=0 pam_security_dir_created=0
+
+  while IFS='|' read -r file tmp; do
+    [ -n "$tmp" ] || continue
+    [ "$tmp" = "-" ] && continue
+    rm -f "$tmp" || status=1
+  done <<EOF
+$pam_entries
+EOF
+  if [ -n "$old_backup" ] && ! rm -f "$old_backup"; then
+    echo "install-oshioki-hook: could not remove its sudo.conf rollback backup" >&2
+    status=1
+  fi
+  if [ -n "$old_dropin_backup" ] && ! rm -f "$old_dropin_backup"; then
+    echo "install-oshioki-hook: could not remove its sudoers rollback backup" >&2
+    status=1
+  fi
+  return "$status"
+}
+
 # The named services that this host will actually get a block in, with the
 # ones that inherit it recorded separately for status to report.
 pam_services_to_edit=""
@@ -1096,6 +1211,12 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$MODE" != contextual-pam-status ]; then
     # copy of the module beside the live one.
     [ -z "${pam_staged:-}" ] || rm -f "$pam_staged"
     [ -z "${pam_previous:-}" ] || rm -f "$pam_previous"
+    if [ "${pam_security_dir_created:-0}" -eq 1 ] &&
+       [ -n "${security_dir:-}" ] && [ -d "$security_dir" ] && [ ! -L "$security_dir" ]; then
+      # The directory is ours only when this run created it. `rmdir` removes
+      # it only if no unrelated file appeared beneath it during the window.
+      rmdir "$security_dir" 2>/dev/null || true
+    fi
     rmdir "$LOCK_DIR" 2>/dev/null || true
   }
   handle_signal() {
@@ -1410,7 +1531,8 @@ if [ "$MODE" = contextual-pam ]; then
     *)
       # A host whose PAM stack already names a module that is not there is
       # the one case this may not shrug off: leaving it as it is means macOS
-      # sudo is answering PAM_ABORT on every request.
+      # sudo is reaching a missing module through its sufficient entry on every
+      # request.
       [ "$pam_lane_missing_module" -eq 0 ] ||
         die "the contextual PAM lane is configured but $module_dest is missing, and no hardware-backed device can prove a replacement; pin a device and re-run, or run --disable-contextual-pam"
       pam_trace "pam:not-yet"
@@ -1432,6 +1554,9 @@ if [ "$MODE" = contextual-pam ]; then
       echo "DRY: remove the managed Oshioki plugin block from $SUDO_CONF"
     fi
     validate_sudo
+    if [ ! -e "$security_dir" ]; then
+      printf 'DRY: create %s (root:%s mode 0755)\n' "$security_dir" "$ROOT_GROUP"
+    fi
     printf 'DRY: install %s to %s\n' "$PAM_MODULE_BIN" "$module_dest"
     printf 'DRY: %s pam-selftest --module %s\n' "$SBIN_DIR/oshioki" "$module_dest"
     for service in $pam_services_to_edit; do
@@ -1479,7 +1604,10 @@ if [ "$MODE" = contextual-pam ]; then
   fi
   pam_trace "pam:plugin-removed"
 
-  # --- Step 4: the module lands but nothing references it yet: inert.
+  # --- Step 4: the module lands but nothing references it yet: inert. On a
+  # fresh Darwin host this also creates the private security-directory leaf;
+  # it is still covered by the rollback armed above.
+  ensure_pam_security_dir "$security_dir"
   if [ "$FAIL_PAM_MODULE_INSTALL" = 1 ] ||
      ! install -m 0644 -o root -g "$ROOT_GROUP" "$PAM_MODULE_BIN" "$module_dest"; then
     pam_rollback_all
@@ -1549,11 +1677,10 @@ if [ "$MODE" = contextual-pam ]; then
     fi
   fi
 
-  # --- Step 8: commit. Both disarms come before the deletions, so a signal
-  # in this window cannot restore half a migration.
-  drop_pam_backups ||
-    echo "install-oshioki-hook: could not remove its PAM rollback backups" >&2
-  drop_sudo_backups
+  # --- Step 8: commit. All rollback state disarms come before any snapshot
+  # deletion, so a signal in this window cannot restore half a migration.
+  commit_pam_migration ||
+    echo "install-oshioki-hook: could not remove all migration rollback backups" >&2
   pam_trace "pam:committed"
   echo "install-oshioki-hook: contextual PAM installed ($module_dest; services ${pam_services_to_edit% })"
   [ -z "$pam_services_inherited" ] ||
