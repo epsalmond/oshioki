@@ -15,30 +15,25 @@ cargo build --locked --release --target "$TARGET" -p oshioki-hook -p oshioki-plu
 mkdir -p "$OUTPUT"
 install -m 0755 "target/$TARGET/release/oshioki" "$OUTPUT/oshioki"
 install -m 0755 "target/$TARGET/release/liboshioki_plugin.dylib" "$OUTPUT/oshioki.dylib"
-# Homebrew relocates the Cellar path and re-signs the dylib when it pours a
-# bottle, which rewrites the absolute CI build path baked into LC_ID_DYLIB and
-# invalidates any checksum taken before that happens. Strip that path out now
-# by giving the dylib a path-free install name and an ad hoc signature, before
-# it gets hashed into SHA256SUMS/manifest.json. sudo dlopens this plugin by
-# absolute path, so the install name itself is never used at load time.
-install_name_tool -id oshioki.dylib "$OUTPUT/oshioki.dylib"
+# Homebrew rewrites LC_ID_DYLIB and re-signs any dylib in a keg whose id is
+# not already the keg's opt path, which invalidates the checksum taken here
+# (issue #87). Both dylibs are linked with that exact id by plugin/build.rs
+# and pam/build.rs, so the fixup finds nothing to change and the bytes hashed
+# below survive a bottle intact. Override OSHIOKI_PLUGIN_INSTALL_NAME /
+# OSHIOKI_PAM_INSTALL_NAME to build for a non-default Homebrew prefix.
+# Neither id is used at load time: sudo dlopens the plugin by the absolute
+# path in sudo.conf and OpenPAM dlopens the module by the path in the auth
+# line. The ad hoc signature is what the rest of the lane expects; a release
+# lane signing with a Developer ID substitutes the identity here and adds
+# --options runtime --timestamp, exactly as scripts/mac/bundle-agent does for
+# the agent binary and its bundle, followed by `codesign --verify --strict`.
+PLUGIN_INSTALL_NAME="${OSHIOKI_PLUGIN_INSTALL_NAME:-/opt/homebrew/opt/oshioki/libexec/oshioki.dylib}"
+PAM_INSTALL_NAME="${OSHIOKI_PAM_INSTALL_NAME:-/opt/homebrew/opt/oshioki/libexec/liboshioki_pam.dylib}"
 codesign --force --sign - "$OUTPUT/oshioki.dylib"
 # The PAM module keeps its own name here: install-oshioki-hook looks the
 # artifact up in SHA256SUMS under exactly liboshioki_pam.dylib before it will
 # install it, and the macOS auth line names the same file.
 install -m 0644 "target/$TARGET/release/liboshioki_pam.dylib" "$OUTPUT/liboshioki_pam.dylib"
-# Unlike the plugin, this one gets its final absolute install name: sudo
-# dlopens the plugin by path, but OpenPAM resolves a module through the
-# dyld cache first, and a stale CI build path there is the difference between
-# loading our module and loading nothing. The installer places the file at
-# exactly this path.
-install_name_tool -id /usr/local/lib/pam/liboshioki_pam.dylib "$OUTPUT/liboshioki_pam.dylib"
-# Ad hoc for now, same as the plugin above, and for the same reason: nothing
-# in the current lane verifies a team signature. A release lane that signs
-# with a Developer ID substitutes the identity here and adds --options
-# runtime --timestamp, exactly as scripts/mac/bundle-agent does for the agent
-# binary and its bundle (see its signing block), followed by
-# `codesign --verify --strict`.
 codesign --force --sign - "$OUTPUT/liboshioki_pam.dylib"
 install -m 0755 "target/$TARGET/release/oshioki-agent" "$OUTPUT/oshioki-agent"
 install -m 0755 "target/$TARGET/release/oshioki-server" "$OUTPUT/oshioki-server"
@@ -71,6 +66,11 @@ nm -gU "$OUTPUT/oshioki.dylib" | grep -Eq '(_)?approval_exec$'
 # A PAM module with no pam_sm_authenticate is a module OpenPAM will load and
 # then ignore.
 nm -gU "$OUTPUT/liboshioki_pam.dylib" | grep -Eq '(_)?pam_sm_authenticate$'
+# The install names above are the whole of the fix for issue #87: if a build
+# ever loses them, the next bottle silently goes back to failing checksum
+# verification on the Mac, so assert them here rather than at install time.
+[ "$(otool -D "$OUTPUT/oshioki.dylib" | tail -1)" = "$PLUGIN_INSTALL_NAME" ]
+[ "$(otool -D "$OUTPUT/liboshioki_pam.dylib" | tail -1)" = "$PAM_INSTALL_NAME" ]
 # The agent is useless without the enclave; a build that dropped the framework
 # would still run and only fail at the first signature.
 otool -L "$OUTPUT/oshioki-agent" | grep -q 'LocalAuthentication'

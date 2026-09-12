@@ -392,6 +392,30 @@ later calls on the same handle and context; success and failure both answer
 Oshioki authentication cache: a previous device success is not reused as a
 later PAM success, and state is released when PAM cleans up the handle.
 
+## macOS install name
+
+The module is linked with `LC_ID_DYLIB` set to
+`/opt/homebrew/opt/oshioki/libexec/liboshioki_pam.dylib` (`pam/build.rs`;
+`OSHIOKI_PAM_INSTALL_NAME` overrides it for an Intel or otherwise
+non-default Homebrew prefix). Non-macOS targets get no link argument at all.
+
+The id is inert at load time. OpenPAM's `openpam_dynamic` `dlopen`s a module
+by the absolute path in the auth line and dyld resolves that path from the
+filesystem; `LC_ID_DYLIB` only names the library for things that link
+against it, and nothing links against a PAM module. A module installed at
+`/usr/local/lib/pam/liboshioki_pam.dylib` from the release tarball therefore
+loads exactly the same as it did when the id spelled that path.
+
+It is set for Homebrew's benefit. `Keg#fix_dynamic_linkage` rewrites every
+dylib in a keg so its id is `<opt_record>/<path relative to the keg>/<old
+basename>` and ad hoc re-signs each file it touched. That happens after the
+release artifact was hashed, so a bottled module no longer matched the
+`SHA256SUMS` shipped beside it and `install-oshioki-hook --contextual-pam`
+refused to install it (issue #87). `change_dylib_id` early-returns when the
+file already carries that id (`Library/Homebrew/extend/os/mac/keg.rb`:
+`return false if file.dylib_id == id`), so linking with it up front makes
+the whole fixup a no-op.
+
 ## Validation status
 
 The current foundation has direct tests for the private JSON shape and bounds,

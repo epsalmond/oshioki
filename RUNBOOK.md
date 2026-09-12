@@ -110,7 +110,36 @@ leaving the PAM entries untouched.
 
 On macOS the same opt-in is `oshioki-laptop-setup --contextual-pam` (or
 `OSHIOKI_CONTEXTUAL_PAM=1` in its environment), which runs the migration
-after the normal install and pairing.
+after the normal install and pairing. A Homebrew install needs no environment
+at all: the whole macOS flow is
+
+```bash
+brew install epsalmond/oshioki/oshioki
+oshioki-laptop-setup --contextual-pam
+```
+
+`oshioki-laptop-setup` resolves its own keg — the hook beside it in `bin`,
+and `oshioki.dylib`, `liboshioki_pam.dylib` and `SHA256SUMS` one level up in
+`libexec` — and passes all four to the installer. Run it as yourself; it
+elevates once by itself.
+
+Both dylibs are linked with the keg's own `opt` path as their install name
+(`/opt/homebrew/opt/oshioki/libexec/<name>`, `plugin/build.rs` and
+`pam/build.rs`, overridable with `OSHIOKI_PLUGIN_INSTALL_NAME` /
+`OSHIOKI_PAM_INSTALL_NAME`). That is load-bearing for checksum verification,
+not cosmetic: Homebrew's `Keg#fix_dynamic_linkage` rewrites `LC_ID_DYLIB` to
+exactly that path and ad hoc re-signs every file it modified, which used to
+leave the bottled copies failing the `SHA256SUMS` the release recorded
+(issue #87). Presetting the id makes `change_dylib_id` return early and the
+shipped bytes survive. `otool -D` on either file must print its own
+`libexec` path; if it prints anything else the next bottle will fail
+verification again.
+
+That id travels with the release tarball, so a module installed from it at
+`/usr/local/lib/pam/liboshioki_pam.dylib` also reports the Homebrew `opt`
+path under `otool -D`. Expected, and inert: sudo and OpenPAM both `dlopen`
+by the absolute path they were given, and `LC_ID_DYLIB` only names a library
+for things that link against it. Nothing links against a PAM module.
 
 Never run the migration without a recovery path already open: a second root
 shell (`sudo -i`) held for the whole run, and a verified console or `pkexec`

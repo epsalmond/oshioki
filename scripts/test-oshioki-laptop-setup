@@ -35,6 +35,10 @@ chmod 0755 "$TEST_ROOT/stage/oshioki-laptop-setup" "$TEST_ROOT/fake-bin"/* 2>/de
 
 # Fake privilege boundary: leading VAR= assignments become environment, -v/-V
 # succeed, everything else executes for real (mkdir, tee, cat, chmod).
+# OPAQUE_DIR models the one thing a same-uid shim cannot: root's ability to
+# enter a directory whose mode forbids its owner. A scenario leaves the
+# directory at 0000, so the unprivileged script gets EACCES on every path
+# under it and only commands routed through this shim can read it.
 cat > "$TEST_ROOT/fake-bin/sudo" <<'SH'
 #!/usr/bin/env bash
 while [ "$#" -gt 0 ]; do
@@ -44,6 +48,13 @@ while [ "$#" -gt 0 ]; do
     *) break ;;
   esac
 done
+if [ -n "${OPAQUE_DIR:-}" ] && [ -d "$OPAQUE_DIR" ]; then
+  chmod 0700 "$OPAQUE_DIR"
+  rc=0
+  "$@" || rc=$?
+  chmod 0000 "$OPAQUE_DIR"
+  exit "$rc"
+fi
 exec "$@"
 SH
 # Fake installer: dry-run prints a plan, install records the config it saw,
@@ -237,7 +248,8 @@ run_setup() {
     AGENT_BIN="$TEST_ROOT/fake-bin/oshioki-agent" \
     INSTALLED_HOOK="$TEST_ROOT/fake-bin/oshioki" \
     OSHIOKI_INSTALL_ENV="$TEST_ROOT/etc/install.env" \
-    OSHIOKI_ORIGIN="${OSHIOKI_ORIGIN:-https://laptop.test}" OSHIOKI_RP_ID="laptop.test" \
+    OPAQUE_DIR="${OPAQUE_DIR:-}" \
+    OSHIOKI_ORIGIN="${OSHIOKI_ORIGIN-https://laptop.test}" OSHIOKI_RP_ID="laptop.test" \
     NATS_URL="$SETUP_NATS_URL" NATS_USER="oshioki" NATS_PASS="${NATS_PASS:-test-secret}" \
     DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
     "$TEST_ROOT/stage/oshioki-laptop-setup" "$@" </dev/null
@@ -556,6 +568,40 @@ cp "$TEST_ROOT/etc/install.env" "$TEST_ROOT/install.env.before"
 if DEVICES_ACTIVE=0 run_setup_local --local --yes >"$TEST_ROOT/stale-reuse.log" 2>&1; then fail "reinstalled stale placeholders"; fi
 grep -Fq -- '--reconfigure' "$TEST_ROOT/stale-reuse.log" || fail "stale refusal never advised --reconfigure"
 cmp -s "$TEST_ROOT/etc/install.env" "$TEST_ROOT/install.env.before" || fail "refusal rewrote install.env"
+
+# Scenario J (issue #88): /etc/oshioki is root-owned 0700 on a real laptop, so
+# the unprivileged `[ -f ]` that used to guard step 1 answered "missing" for
+# an install.env that was there. The run then took the write branch: with an
+# origin staged it silently overwrote a good config, and with none it died
+# "WebAuthn origin has no default". Both are wrong answers to a question the
+# script can put through sudo, which is how it reads the same file everywhere
+# else.
+: > "$CALL_LOG"
+printf '%s\n' \
+  'OSHIOKI_ORIGIN=https://preserved.test' \
+  'OSHIOKI_RP_ID=preserved.test' \
+  "NATS_URL=$SETUP_NATS_URL" \
+  'NATS_USER=oshioki' \
+  'NATS_PASS=test-secret' \
+  "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" > "$TEST_ROOT/etc/install.env"
+chmod 0600 "$TEST_ROOT/etc/install.env"
+chmod 0000 "$TEST_ROOT/etc"
+# No origin staged at all: a run that takes the write branch cannot invent one
+# under --yes, so the bug shows as a hard failure instead of a subtly
+# rewritten file. The reuse assertions still catch a silent overwrite if some
+# default ever appears.
+opaque_rc=0
+OPAQUE_DIR="$TEST_ROOT/etc" OSHIOKI_ORIGIN="" DEVICES_ACTIVE=1 \
+  run_setup --yes >"$TEST_ROOT/opaque.log" 2>&1 || opaque_rc=$?
+chmod 0700 "$TEST_ROOT/etc"
+if [ "$opaque_rc" -ne 0 ]; then
+  cat "$TEST_ROOT/opaque.log" >&2
+  fail "setup failed with an unreadable install.env directory"
+fi
+grep -Fq 'reusing existing' "$TEST_ROOT/opaque.log" \
+  || fail "setup did not reuse the install.env it could not stat"
+grep -Fq 'OSHIOKI_ORIGIN=https://preserved.test' "$TEST_ROOT/etc/install.env" \
+  || fail "setup overwrote an install.env it could not stat"
 
 # Self-policing teardown: the EXIT trap removes the tree, but rm succeeds
 # even with live holders (open files unlink), so leaked processes would go

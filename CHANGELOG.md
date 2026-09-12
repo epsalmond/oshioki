@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Homebrew no longer rewrites the macOS dylibs out of agreement with the
+  `SHA256SUMS` shipped beside them. `Keg#fix_dynamic_linkage` sets every
+  dylib's `LC_ID_DYLIB` to the keg's `opt` path and ad hoc re-signs each file
+  it modified, so a bottled `liboshioki_pam.dylib` and `oshioki.dylib` failed
+  the checksum the release recorded and `install-oshioki-hook` refused to
+  install them. Both are now linked with that exact install name up front
+  (`pam/build.rs`, `plugin/build.rs`, overridable with
+  `OSHIOKI_PAM_INSTALL_NAME` / `OSHIOKI_PLUGIN_INSTALL_NAME` for a non-default
+  Homebrew prefix), which makes the fixup a no-op and leaves the shipped bytes
+  intact. Neither id is used at load time: sudo and OpenPAM both `dlopen` by
+  absolute path. `scripts/build-darwin-artifact` asserts both ids with
+  `otool -D`, so a build that loses them fails instead of shipping a bottle
+  that cannot verify. (#87)
+- `oshioki-laptop-setup` no longer mistakes an existing
+  `/etc/oshioki/install.env` for a missing one. The directory is root-owned
+  0700, so the unprivileged `[ -f ]` that guarded step 1 returned false for a
+  file that was there; the run then prompted for values it already had and
+  overwrote a good config, or died with "WebAuthn origin has no default" under
+  `--yes`. The probe now goes through `sudo`, the same way the script already
+  reads the file. (#88)
+
 ## [0.1.7] - 2026-09-12
 
 ### Added
