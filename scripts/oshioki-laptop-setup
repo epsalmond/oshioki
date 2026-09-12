@@ -166,6 +166,10 @@ if [ -z "$PAM_MODULE_BIN" ]; then
   done
 fi
 INSTALLED_HOOK="${INSTALLED_HOOK:-/usr/local/sbin/oshioki}"
+# Seconds to wait for `oshioki enroll` to print its URL. Deliberately longer
+# than the hook's own transport timeouts so a reachability problem is
+# reported by the hook, in its own words, rather than by this poll.
+ENROLL_URL_TIMEOUT="${OSHIOKI_ENROLL_URL_TIMEOUT:-60}"
 SUDO="${SUDO:-sudo}"
 LAUNCHCTL="${LAUNCHCTL:-launchctl}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
@@ -698,16 +702,29 @@ if ! "$AGENT_BIN" show >/dev/null 2>&1; then
   $SUDO "$INSTALLED_HOOK" enroll >"$enroll_log" 2>&1 &
   enroll_pid=$!
   url=""
-  for _ in $(seq 1 60); do
+  enroll_live=1
+  for _ in $(seq 1 "$ENROLL_URL_TIMEOUT"); do
     url="$(grep -oE 'https?://[^[:space:]'\'']+' "$enroll_log" 2>/dev/null | head -1 || true)"
     [ -n "$url" ] && break
-    kill -0 "$enroll_pid" 2>/dev/null || break
+    kill -0 "$enroll_pid" 2>/dev/null || { enroll_live=0; break; }
     sleep 1
   done
   # The process can exit between the grep and the liveness check with the
   # URL already written: read the log once more before giving up.
   [ -n "$url" ] || url="$(grep -oE 'https?://[^[:space:]'\'']+' "$enroll_log" 2>/dev/null | head -1 || true)"
-  if [ -z "$url" ]; then cat "$enroll_log" >&2; rm -f "$enroll_log"; die "enrollment produced no URL"; fi
+  if [ -z "$url" ]; then
+    cat "$enroll_log" >&2
+    rm -f "$enroll_log"
+    # Which of the two failures this was decides what the operator does
+    # next, so say it. A hook that exited printed its own reason above; a
+    # hook still running after the poll window is stuck on something that
+    # never answered, and the hook's own transport timeouts are shorter than
+    # this window precisely so the first case is the usual one.
+    if [ "$enroll_live" -eq 1 ]; then
+      die "enrollment produced no URL: $INSTALLED_HOOK enroll was still running after ${ENROLL_URL_TIMEOUT}s with nothing to show; check that the enrollment server and NATS are running and reachable from this host"
+    fi
+    die "enrollment produced no URL: $INSTALLED_HOOK enroll exited without printing one (its output is above)"
+  fi
   NATS_URL="$NATS_URL_V" NATS_USER="$NATS_USER_V" NATS_PASS="$NATS_PASS_V" \
     "$AGENT_BIN" pair "$url" --label "$(hostname -s 2>/dev/null || hostname)"
   wait "$enroll_pid" || { cat "$enroll_log" >&2; rm -f "$enroll_log"; die "enrollment failed"; }

@@ -213,12 +213,23 @@ device approval only and never opens this password branch.
 Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 `oshioki.dylib` in the same directory.
 
-Outside a repo checkout the installer needs its inputs pointed at the
-installed files: set `HOOK_BIN` and `PLUGIN_BIN` to the installed hook and
-plugin. `OSHIOKI_CHECKSUMS` no longer has to be set for a packaged layout —
-the installer finds the `SHA256SUMS` shipped in its own keg or package, whose
-entries are keyed by file name — but it still overrides the default when it
-is. For a Homebrew install at `$(brew --prefix oshioki)`:
+Outside a repo checkout the installer needs no environment either.
+`HOOK_BIN`, `PLUGIN_BIN` and `PAM_MODULE_BIN` are found the same way
+`OSHIOKI_CHECKSUMS` is, in the same order: `target/release` in a repo
+checkout, next to the installer for the `.deb` (`/usr/share/oshioki`) and an
+unpacked release tarball, and the keg's `libexec` beside `bin` under
+Homebrew. The plugin is looked up under both its build name
+(`liboshioki_plugin.dylib`) and its installed name (`oshioki.dylib`), because
+the release tarball renames it and the manifest is keyed by file name. Each
+variable still overrides its default when it is set, which is what the `.deb`
+postinst and `oshioki-laptop-setup` do. So on a Homebrew install:
+
+```bash
+sudo install-oshioki-hook --prelaunch --config-file /etc/oshioki/install.env
+sudo install-oshioki-hook --contextual-pam
+```
+
+An explicit form still works and still wins:
 
 ```bash
 sudo HOOK_BIN="$(brew --prefix oshioki)/bin/oshioki" \
