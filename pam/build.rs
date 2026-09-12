@@ -13,7 +13,7 @@
 //! the keg's opt path up front therefore makes the whole fixup a no-op and
 //! leaves the shipped bytes -- and their checksum -- intact.
 //!
-//! The id is inert at load time either way: OpenPAM's `openpam_dynamic`
+//! The id is inert at load time either way: `OpenPAM`'s `openpam_dynamic`
 //! `dlopen`s a module by the absolute path in the auth line, and dyld
 //! resolves that path from the filesystem. `LC_ID_DYLIB` only names the
 //! library for things that link against it, and nothing links against a PAM
