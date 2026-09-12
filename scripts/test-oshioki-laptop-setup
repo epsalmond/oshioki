@@ -134,6 +134,18 @@ SH
 # exports a fixed record for pin-record to consume.
 cat > "$TEST_ROOT/fake-bin/oshioki-agent" <<'SH'
 #!/usr/bin/env bash
+# AGENT_KEYCHAIN_LOCKED reproduces what every verb does in a session with no
+# unlocked login keychain: the Security framework's own wording, on stderr.
+if [ -n "${AGENT_KEYCHAIN_LOCKED:-}" ]; then
+  cat >&2 <<'ERR'
+Error: read the box secret for /home/test/.config/oshioki/agent.json
+
+Caused by:
+    0: read secret AAAA from the login keychain
+    1: User interaction is not allowed.
+ERR
+  exit 1
+fi
 case "${1:-}" in
   show) [ -f "$AGENT_STATE/agent.json" ] ;;
   pair)
@@ -270,6 +282,7 @@ run_setup() {
     SEEN_CHECKSUMS="${SEEN_CHECKSUMS:-}" \
     ENROLL_MODE="${ENROLL_MODE:-url}" \
     OSHIOKI_ENROLL_URL_TIMEOUT="${OSHIOKI_ENROLL_URL_TIMEOUT:-60}" \
+    AGENT_KEYCHAIN_LOCKED="${AGENT_KEYCHAIN_LOCKED:-}" \
     "${SETUP_CMD:-$TEST_ROOT/stage/oshioki-laptop-setup}" "$@" </dev/null
 }
 
@@ -345,6 +358,21 @@ fi
 if [ "$(uname -s)" = Darwin ]; then
   grep -Fq 'agent socket is live' "$TEST_ROOT/fresh.log" || fail "verify never completed"
 fi
+
+# A session with no unlocked login keychain is named as such, before the
+# setup mistakes it for a missing identity and enrols a second device.
+rm -f "$AGENT_STATE/agent.json" "$AGENT_STATE/paired-url"
+if AGENT_KEYCHAIN_LOCKED=1 DEVICES_ACTIVE=0 run_setup --yes >"$TEST_ROOT/keychain.log" 2>&1; then
+  fail "setup continued with a locked login keychain"
+fi
+grep -Fq 'login keychain is not available in this session' "$TEST_ROOT/keychain.log" ||
+  fail "a locked login keychain was not named: $(tail -1 "$TEST_ROOT/keychain.log")"
+grep -Fq 'security unlock-keychain' "$TEST_ROOT/keychain.log" ||
+  fail "the locked-keychain error says nothing about what to do"
+if grep -Fq 'enrolling a new device' "$TEST_ROOT/keychain.log"; then
+  fail "a locked login keychain still enrolled a device"
+fi
+[ ! -e "$AGENT_STATE/paired-url" ] || fail "a locked login keychain still paired"
 
 # An enrollment that produces no URL says which of the two failures it was,
 # so the operator knows whether to read the hook's reason or go looking for

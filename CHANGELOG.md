@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `oshioki-laptop-setup` could only report as `enrollment produced no URL`.
   The connect and the publish now time out after 20s and name the server and
   the file to fix.
+- `oshioki-laptop-setup` on macOS stops with a named cause when the login
+  keychain is not available to the session, instead of reading that as "no
+  agent identity", enrolling a device nobody asked for, and then dying on a
+  Security framework string. The agent keeps its box secret in the login
+  keychain, which only a graphical login session has unlocked, so running the
+  setup over ssh or from a job with no session cannot read or create an
+  identity. The error says to run it from a Terminal window on that Mac, or
+  to unlock the keychain first.
 - `oshioki-laptop-setup` says which of the two enrollment failures it hit:
   `oshioki enroll` exited without printing a URL (its own explanation is
   above), or it was still running when the poll window closed. The window is

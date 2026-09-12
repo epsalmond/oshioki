@@ -118,6 +118,16 @@ brew install epsalmond/oshioki/oshioki
 oshioki-laptop-setup --contextual-pam
 ```
 
+Run it from a Terminal window while logged in to that Mac. The agent keeps
+its box secret in the login keychain, which only a graphical login session
+has unlocked; over ssh, or from a job with no session, the Security framework
+answers `User interaction is not allowed` and no identity can be read or
+created. The setup names that case and stops rather than enrolling a second
+device. To drive it from a remote shell anyway, unlock the keychain first
+(`security unlock-keychain ~/Library/Keychains/login.keychain-db`) or run it
+inside the logged-in user's session
+(`sudo launchctl asuser "$(id -u eric)" sudo -u eric ...`).
+
 `oshioki-laptop-setup` resolves its own keg — the hook beside it in `bin`,
 and `oshioki.dylib`, `liboshioki_pam.dylib` and `SHA256SUMS` one level up in
 `libexec` — and passes all four to the installer. Run it as yourself; it
