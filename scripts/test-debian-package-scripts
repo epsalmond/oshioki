@@ -345,5 +345,9 @@ run_postrm_purge 2>"$CASE_ROOT/log"
 [ -e "$CASE_ROOT/security/liboshioki_pam.so" ] || fail "postrm purge removed a module PAM still references"
 grep -Fq "leaving $CASE_ROOT/security/liboshioki_pam.so in place" "$CASE_ROOT/log" ||
   fail "postrm purge did not name the module it left behind"
+# A module that stays must keep the helper it execs and the config it reads,
+# or /etc/pam.d names a module with nothing to run.
+grep -Fq "leaving /usr/local/sbin/oshioki and /etc/oshioki in place" "$CASE_ROOT/log" ||
+  fail "postrm purge did not keep the helper a referenced module still execs"
 
 echo "test-debian-package-scripts: PASS"

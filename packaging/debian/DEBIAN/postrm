@@ -65,6 +65,11 @@ owned_sudoers_dropin_user() {
 # discovery run could equally have chosen, and the .oshioki-new /
 # .oshioki-previous names cover a refresh that was interrupted between
 # staging and the rename.
+# Returns non-zero when a module was found but deliberately kept, because
+# /etc/pam.d still names it. The caller must then keep the helper the module
+# execs and the config it reads too: a referenced module whose helper or
+# credentials are gone is exactly the broken-auth state this ordering rule
+# exists to avoid.
 sweep_pam_module() {
   found=0
   for module in $PAM_MODULE_GLOBS; do
@@ -78,12 +83,13 @@ sweep_pam_module() {
       [ -f "$module" ] || continue
       echo "oshioki: warning: $PAM_D still references liboshioki_pam; leaving $module in place" >&2
     done
-    return 0
+    return 1
   fi
   for module in $PAM_MODULE_GLOBS; do
     [ -f "$module" ] || continue
     rm -f "$module"
   done
+  return 0
 }
 
 remove_verified_sudoers_dropin() {
@@ -107,9 +113,18 @@ case "$1" in
     # because the packaged installer may already have been deleted.
     remove_verified_sudoers_dropin ||
       echo "oshioki: warning: could not remove an unverified sudoers drop-in; leaving it in place" >&2
-    sweep_pam_module
-    rm -rf /etc/oshioki /var/lib/oshioki
-    rm -f /usr/local/sbin/oshioki /usr/local/libexec/sudo/oshioki.so
+    # Server state is never load-bearing for authentication, so it always
+    # goes. The helper and its config only go when the module went with them:
+    # if sweep_pam_module kept the module, /etc/pam.d still execs that helper
+    # on every sudo, and removing it here would leave a referenced module
+    # with nothing to run.
+    if sweep_pam_module; then
+      rm -rf /etc/oshioki
+      rm -f /usr/local/sbin/oshioki /usr/local/libexec/sudo/oshioki.so
+    else
+      echo "oshioki: warning: $PAM_D still references liboshioki_pam; leaving /usr/local/sbin/oshioki and /etc/oshioki in place" >&2
+    fi
+    rm -rf /var/lib/oshioki
     ;;
 esac
 
