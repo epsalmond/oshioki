@@ -1302,7 +1302,9 @@ pam_module_removal_targets() {
   for suffix in "" .oshioki-new .oshioki-previous; do
     [ -z "$dir" ] || printf '%s%s\n' "$(pam_module_dest "$dir")" "$suffix"
   done
-  if [ "$(uname -s)" != Darwin ]; then
+  # An explicit PAM_SECURITY_DIR is a staging root or a test fixture; stray
+  # copies in the real system directories are not this invocation's to sweep.
+  if [ "$(uname -s)" != Darwin ] && [ -z "$PAM_SECURITY_DIR" ]; then
     for candidate in "/usr/lib/$(uname -m)-linux-gnu/security" /lib/security /usr/lib/security; do
       [ "$candidate" != "$dir" ] || continue
       for suffix in "" .oshioki-new .oshioki-previous; do
