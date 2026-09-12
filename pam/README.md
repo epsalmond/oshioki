@@ -193,8 +193,9 @@ helper tree does not outlive the call. The group is always signalled while the
 leader is still an unreaped zombie, because a reaped leader's process-group ID
 can be recycled and the signal could then reach an unrelated group;
 final stack fallback behavior still depends on the administrator's sudo PAM
-controls. The helper verb is not yet present in the shipping hook, so this
-table is a private foundation contract rather than an enabled product flow.
+controls. The `authenticate` helper verb ships in the hook and has consumers
+(see the schema section below), so these mappings describe an enabled product
+flow, not a private foundation contract.
 
 ## Cancellation
 

@@ -412,9 +412,14 @@ systemctl restart oshioki-server
 Verify with `nats consumer info OSHIOKI oshioki-server-v1`: the filter list
 must show both `oshioki.request.>` and `oshioki.auth.>`.
 
-Nothing consumes `oshioki.auth.>` yet — the server's JetStream handler still
-rejects any envelope that is not a command request — so this step prepares the
-transport ahead of that work rather than enabling authentication on its own.
+This widening is required, not preparatory: the server already consumes
+`oshioki.auth.>`. Its JetStream handler routes on the envelope's own `type`
+tag (`server/src/main.rs`, the `envelope_type` match), hands an
+`AUTH_ENVELOPE_TYPE` envelope to `ingest_auth_envelope`, and serves the
+stored request to a `WebAuthn` browser at the `/a/:id` route
+(`authentication_page`). A consumer whose filters still list only
+`oshioki.request.>` therefore never delivers an authentication request, and
+every contextual sudo falls back to a password.
 
 ## Logs
 
