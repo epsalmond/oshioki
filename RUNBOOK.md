@@ -176,6 +176,22 @@ same keg as running it by its `$(brew --prefix oshioki)/bin` path. Resolving the
 directory alone is not enough: `/opt/homebrew/bin` is a real directory, and
 before issue #91 that is where the keg probe looked.
 
+From 0.1.12 the keg also carries `Oshioki.app` in its root. Setup prefers
+`<keg>/Oshioki.app/Contents/MacOS/oshioki-agent` over the flat
+`bin/oshioki-agent` whenever it is there and matches its
+`libexec/SHA256SUMS` entry (name
+`Oshioki.app/Contents/MacOS/oshioki-agent`); a mismatch is reported and the
+flat binary is used. The flat binary is then verified against its own
+`oshioki-agent` entry, and a mismatch there stops the run outright: there is
+nothing safe left to fall back to. A manifest that names neither, which is
+every release before 0.1.12, cannot answer and is not treated as a failure. The bundle is what makes the Touch ID sheet say Oshioki
+with the logo instead of a file name and a generic badge. The LaunchAgent
+plist always names the stable `opt` spelling of whichever binary was chosen
+— `/opt/homebrew/opt/oshioki/...`, not `/opt/homebrew/Cellar/oshioki/<version>/...`
+— including when an existing plist's credentials are being preserved, because
+`brew cleanup` deletes the versioned directory after an upgrade and a plist
+naming it stops spawning the agent at the next login.
+
 Both dylibs are linked with the keg's own `opt` path as their install name
 (`/opt/homebrew/opt/oshioki/libexec/<name>`, `plugin/build.rs` and
 `pam/build.rs`, overridable with `OSHIOKI_PLUGIN_INSTALL_NAME` /

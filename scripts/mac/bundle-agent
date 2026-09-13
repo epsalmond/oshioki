@@ -13,6 +13,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 usage: scripts/mac/bundle-agent [--binary PATH] [--output DIR] [--sign IDENTITY]
+                               [--version VERSION]
 
   --binary PATH   agent binary to wrap (default: target/release/oshioki-agent,
                   built with `cargo build --release -p oshioki-agent` if absent)
@@ -20,6 +21,8 @@ usage: scripts/mac/bundle-agent [--binary PATH] [--output DIR] [--sign IDENTITY]
   --sign IDENTITY codesign identity, e.g. "Developer ID Application: ...".
                   Signs the bundle with the hardened runtime and the keychain
                   entitlement. Absent, the bundle stays unsigned.
+  --version VER   version for CFBundleShortVersionString/CFBundleVersion
+                  (default: the workspace version in the root Cargo.toml)
 
 Prints the path of the binary inside the bundle, which is what the LaunchAgent
 should run.
@@ -30,18 +33,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 BINARY=""
 OUTPUT="$ROOT/target/mac"
 SIGN=""
+VERSION=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
     --output) OUTPUT="${2:?--output needs a path}"; shift 2 ;;
     --sign) SIGN="${2:?--sign needs an identity}"; shift 2 ;;
+    --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 [ "$(uname -s)" = "Darwin" ] || { echo "bundle-agent only runs on macOS" >&2; exit 1; }
+
+# A bundle whose version never moves is a bundle Launch Services and every
+# crash report describe as 0.1.0 forever. The workspace version is the one
+# the binary inside already reports, so read it from there by default rather
+# than keeping a second number in sync by hand.
+if [ -z "$VERSION" ]; then
+  VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' \
+    "$ROOT/Cargo.toml" | head -1)"
+fi
+[ -n "$VERSION" ] || { echo "cannot read the workspace version from $ROOT/Cargo.toml" >&2; exit 1; }
 
 if [ -z "$BINARY" ]; then
   BINARY="$ROOT/target/release/oshioki-agent"
@@ -56,7 +71,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 0755 "$BINARY" "$APP/Contents/MacOS/oshioki-agent"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# Unquoted delimiter on purpose: $VERSION below is the only expansion wanted
+# and the rest of the document carries no $ or backtick of its own.
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -68,15 +85,18 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key><string>Oshioki</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSUIElement</key><true/>
 </dict>
 </plist>
 PLIST
 
-# The icon is what the sheet shows next to the name. Losing it costs the logo
-# and nothing else, so a machine with no renderer still gets a working bundle.
+# The icon is what the sheet shows next to the name. A renderer is preferred
+# so the icns always tracks the SVG, but assets/Oshioki.icns is checked in as
+# the last resort: a builder with no renderer (a CI image where qlmanage
+# cannot reach a window server, say) would otherwise ship a logo-less bundle.
 icon_source="$ROOT/assets/oshioki.svg"
 png="$(mktemp -d)/oshioki.png"
 rendered=false
@@ -91,6 +111,7 @@ elif command -v qlmanage >/dev/null 2>&1; then
   fi
 fi
 
+icns="$APP/Contents/Resources/Oshioki.icns"
 if [ "$rendered" = true ]; then
   iconset="$(dirname "$png")/Oshioki.iconset"
   mkdir -p "$iconset"
@@ -99,9 +120,13 @@ if [ "$rendered" = true ]; then
     sips -z $((size * 2)) $((size * 2)) "$png" \
       --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
   done
-  iconutil -c icns "$iconset" -o "$APP/Contents/Resources/Oshioki.icns"
+  iconutil -c icns "$iconset" -o "$icns"
+  echo "icon: rendered from $icon_source" >&2
+elif [ -f "$ROOT/assets/Oshioki.icns" ]; then
+  install -m 0644 "$ROOT/assets/Oshioki.icns" "$icns"
+  echo "icon: no SVG renderer here, using the checked-in assets/Oshioki.icns" >&2
 else
-  echo "note: no SVG renderer found, so the sheet shows the name without the logo" >&2
+  echo "note: no SVG renderer and no assets/Oshioki.icns, so the sheet shows the name without the logo" >&2
 fi
 rm -rf "$(dirname "$png")"
 

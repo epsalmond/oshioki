@@ -37,6 +37,41 @@ install -m 0644 "target/$TARGET/release/liboshioki_pam.dylib" "$OUTPUT/liboshiok
 codesign --force --sign - "$OUTPUT/liboshioki_pam.dylib"
 install -m 0755 "target/$TARGET/release/oshioki-agent" "$OUTPUT/oshioki-agent"
 install -m 0755 "target/$TARGET/release/oshioki-server" "$OUTPUT/oshioki-server"
+# The Touch ID sheet takes its name and icon from the calling process's app
+# bundle, so the agent a brew install runs has to live inside Oshioki.app.
+# The bundle is staged here, next to the flat binary, and both ship: a keg
+# from an older release has no bundle and oshioki-laptop-setup falls back to
+# the flat one. bundle-agent copies the binary that was just built rather
+# than building its own, so the two are the same build; the cmp below is the
+# guard that keeps it that way.
+CARGO_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+[ -n "$CARGO_VERSION" ] || { echo "cannot read the workspace version from $ROOT/Cargo.toml" >&2; exit 1; }
+"$ROOT/scripts/mac/bundle-agent" --binary "$OUTPUT/oshioki-agent" --output "$OUTPUT" \
+  --version "$CARGO_VERSION" >/dev/null
+APP_BIN="$OUTPUT/Oshioki.app/Contents/MacOS/oshioki-agent"
+cmp -s "$OUTPUT/oshioki-agent" "$APP_BIN" ||
+  { echo "the bundled agent is not a copy of $OUTPUT/oshioki-agent" >&2; exit 1; }
+# An unsigned bundle fails `codesign --verify` outright ("code has no
+# resources but signature indicates they must be present"), so the ad hoc
+# signature is what makes the poured bundle verifiable. It seals
+# Contents/_CodeSignature over the Info.plist and the icns and rewrites the
+# main executable's own signature -- which is why the bundle copy no longer
+# matches the flat binary byte for byte after this point and gets its own
+# SHA256SUMS entry below rather than sharing the flat one.
+codesign --force --sign - "$OUTPUT/Oshioki.app"
+codesign --verify --deep --strict "$OUTPUT/Oshioki.app"
+# Losing the icon is silent in bundle-agent (a machine with no renderer still
+# gets a working bundle), but a release without it is the whole point missed.
+[ -f "$OUTPUT/Oshioki.app/Contents/Resources/Oshioki.icns" ] ||
+  { echo "Oshioki.app has no icon: no SVG renderer on this builder" >&2; exit 1; }
+# The bundle version is what Launch Services and crash reports show. It was a
+# hardcoded 0.1.0 until 0.1.12; assert it tracks the release rather than
+# trusting that it still does.
+for key in CFBundleShortVersionString CFBundleVersion; do
+  got="$(/usr/bin/plutil -extract "$key" raw -o - "$OUTPUT/Oshioki.app/Contents/Info.plist")"
+  [ "$got" = "$CARGO_VERSION" ] ||
+    { echo "Oshioki.app $key is $got, not the Cargo version $CARGO_VERSION" >&2; exit 1; }
+done
 install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$OUTPUT/install-oshioki-hook"
 install -m 0755 "$ROOT/scripts/oshioki-laptop-setup" "$OUTPUT/oshioki-laptop-setup"
 install -m 0755 "$ROOT/scripts/oshioki-phone-setup" "$OUTPUT/oshioki-phone-setup"
@@ -55,11 +90,17 @@ toolchain="$(rustc --version --verbose | tr '\n' ';')"
 cat > "$OUTPUT/manifest.json" <<EOF
 {"schema_version":1,"target":"$TARGET","revision":"$REVISION","toolchain":"$toolchain","files":[{"name":"oshioki","mode":"$(mode_of "$OUTPUT/oshioki")","sha256":"$hook_hash","media_type":"application/vnd.oshioki.hook.v1"},{"name":"oshioki.dylib","mode":"$(mode_of "$OUTPUT/oshioki.dylib")","sha256":"$plugin_hash","media_type":"application/vnd.oshioki.plugin.v1"},{"name":"liboshioki_pam.dylib","mode":"$(mode_of "$OUTPUT/liboshioki_pam.dylib")","sha256":"$pam_hash","media_type":"application/vnd.oshioki.pam.v1"},{"name":"oshioki-agent","mode":"$(mode_of "$OUTPUT/oshioki-agent")","sha256":"$agent_hash","media_type":"application/vnd.oshioki.agent.v1"},{"name":"install-oshioki-hook","mode":"$(mode_of "$OUTPUT/install-oshioki-hook")","sha256":"$installer_hash","media_type":"application/vnd.oshioki.installer.v1"},{"name":"oshioki-laptop-setup","mode":"$(mode_of "$OUTPUT/oshioki-laptop-setup")","sha256":"$setup_hash","media_type":"application/vnd.oshioki.setup.v1"},{"name":"oshioki-server","mode":"$(mode_of "$OUTPUT/oshioki-server")","sha256":"$server_hash","media_type":"application/vnd.oshioki.server.v1"},{"name":"oshioki-phone-setup","mode":"$(mode_of "$OUTPUT/oshioki-phone-setup")","sha256":"$phone_setup_hash","media_type":"application/vnd.oshioki.phone-setup.v1"}]}
 EOF
+# manifest.json stays a flat-file manifest: it is hashed into SHA256SUMS
+# itself and the installer reads it by name, so the bundle entry goes only
+# into SHA256SUMS, which is what oshioki-laptop-setup verifies the bundle
+# against before it will run it.
+app_bin_rel="Oshioki.app/Contents/MacOS/oshioki-agent"
 (
   cd "$OUTPUT"
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json > SHA256SUMS; fi
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json "$app_bin_rel" > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json "$app_bin_rel" > SHA256SUMS; fi
 )
-for artifact in oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server; do
+for artifact in oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server \
+  "Oshioki.app/Contents/MacOS/oshioki-agent"; do
   file "$OUTPUT/$artifact" | grep -q 'arm64'
 done
 nm -gU "$OUTPUT/oshioki.dylib" | grep -Eq '(_)?approval_exec$'

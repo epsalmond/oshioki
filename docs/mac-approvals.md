@@ -29,7 +29,22 @@ scripts/mac/install-agent
 `bundle-agent` wraps the binary in an `Oshioki.app`, unsigned unless
 `--sign` names a codesigning identity. The sheet takes
 its title and icon from the calling process's bundle, so without it the sheet
-shows the binary's file name and a generic badge. `install-agent` writes
+shows the binary's file name and a generic badge.
+
+A Homebrew install gets the same bundle without building anything: from
+0.1.12 `scripts/build-darwin-artifact` stages `Oshioki.app` into the release
+tarball beside the flat `oshioki-agent` (the same build, copied, then ad hoc
+signed so `codesign --verify --deep --strict` passes on the poured bundle),
+the formula installs it in the keg root, and its inner binary is hashed in
+`libexec/SHA256SUMS` under `Oshioki.app/Contents/MacOS/oshioki-agent`.
+`oshioki-laptop-setup` prefers that binary when it is present and matches
+that hash, and falls back to the flat one for kegs from older releases —
+after verifying that flat binary against its own `oshioki-agent` entry, and
+refusing to install an agent that fails it. The
+LaunchAgent it writes names the `opt` path
+(`/opt/homebrew/opt/oshioki/Oshioki.app/Contents/MacOS/oshioki-agent`), never
+the versioned `Cellar` path, so `brew upgrade` followed by `brew cleanup`
+does not leave it pointing at a deleted directory. `install-agent` writes
 `~/Library/LaunchAgents/com.oshioki.agent.plist` and loads it. It runs as the
 user, needs no sudo, and logs to `~/Library/Logs/oshioki-agent.log`.
 

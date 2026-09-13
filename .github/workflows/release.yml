@@ -67,9 +67,27 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
       - run: scripts/build-darwin-artifact dist
+      # COPYFILE_DISABLE keeps bsdtar from writing ._ AppleDouble members for
+      # extended attributes. Inside Oshioki.app those would be unsealed
+      # contents and `codesign --verify` on the poured bundle would fail.
       - run: |
-          tar -czf "oshioki-macos-arm64-${{ needs.gate.outputs.version }}.tar.gz" -C dist \
-            oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json SHA256SUMS
+          COPYFILE_DISABLE=1 tar -czf "oshioki-macos-arm64-${{ needs.gate.outputs.version }}.tar.gz" -C dist \
+            oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json SHA256SUMS Oshioki.app
+          tar -tzf "oshioki-macos-arm64-${{ needs.gate.outputs.version }}.tar.gz" | sort
+      # What the tar step produced is what a brew user actually pours, so the
+      # bundle is checked after the round trip rather than only in the
+      # staging directory: a tar that dropped the _CodeSignature seal or an
+      # AppleDouble member that unsealed it would otherwise ship.
+      - run: |
+          verify="$(mktemp -d)"
+          tar -xzf "oshioki-macos-arm64-${{ needs.gate.outputs.version }}.tar.gz" -C "$verify"
+          cd "$verify"
+          codesign --verify --deep --strict --verbose=1 Oshioki.app
+          grep -E '  (oshioki-agent|Oshioki\.app/Contents/MacOS/oshioki-agent)$' SHA256SUMS \
+            > agent-sums
+          test "$(wc -l < agent-sums)" -eq 2
+          shasum -a 256 -c agent-sums
+          file Oshioki.app/Contents/MacOS/oshioki-agent | grep -q 'arm64'
       - uses: actions/upload-artifact@v4
         with:
           name: mac
