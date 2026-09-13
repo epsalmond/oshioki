@@ -380,10 +380,50 @@ prompt() {
   printf -v "$var" '%s' "$value"
 }
 
-# Read one key out of install.env without sourcing it.
-env_key() {
-  $SUDO cat "$INSTALL_ENV" 2>/dev/null | awk -F= -v key="$1" '$1 == key { print substr($0, length($1) + 2); exit }'
+# install.env is root-owned 0600, so reading it needs privilege -- but it must
+# cost exactly one elevation, not one per key. Without a tty (ssh, `launchctl
+# asuser`, any job with no controlling terminal) sudo cannot key its timestamp
+# by tty and keys it by the parent pid instead, so a sudo run inside `$(... |
+# ...)` has a freshly forked subshell as its parent, misses the ticket, and
+# authenticates again: on the contextual PAM lane that is one more Touch ID
+# sheet each time. Eight env_key calls used to mean eight sheets. So the file
+# is copied once, through a single top-level sudo whose parent is this script's
+# own shell, into a private 0600 temp file, and every key is read from there
+# with no privilege at all.
+INSTALL_ENV_SNAPSHOT=""
+snapshot_install_env() {
+  [ -z "$INSTALL_ENV_SNAPSHOT" ] || return 0
+  # mktemp creates the file 0600, which matters: it holds the NATS password.
+  INSTALL_ENV_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/oshioki-env.XXXXXX")"
+  if [ "$(id -u)" -eq 0 ] || [ -z "${SUDO:-}" ]; then
+    cat "$INSTALL_ENV" > "$INSTALL_ENV_SNAPSHOT" 2>/dev/null || true
+  else
+    # The redirection is performed by this shell, as the invoking user, so the
+    # copy stays user-owned however sudo is configured. A missing or
+    # unreadable install.env leaves an empty snapshot, which env_key answers
+    # exactly as the old pipeline did: with empty values.
+    $SUDO cat "$INSTALL_ENV" > "$INSTALL_ENV_SNAPSHOT" 2>/dev/null || true
+  fi
 }
+
+# Read one key out of the snapshot without sourcing it. Callers use it inside
+# `$(...)`, so it must never take the snapshot itself: the assignment would
+# happen in the substitution's subshell and be lost, and the next key would
+# elevate all over again. snapshot_install_env() is called from the main shell
+# before the first key is read.
+env_key() {
+  [ -n "$INSTALL_ENV_SNAPSHOT" ] || die "install.env was not snapshotted before env_key"
+  awk -F= -v key="$1" '$1 == key { print substr($0, length($1) + 2); exit }' \
+    "$INSTALL_ENV_SNAPSHOT" 2>/dev/null || true
+}
+
+# One EXIT trap for the whole run: the snapshot carries a credential and the
+# enrollment child outlives a failed run otherwise.
+cleanup_run() {
+  [ -z "$INSTALL_ENV_SNAPSHOT" ] || rm -f "$INSTALL_ENV_SNAPSHOT"
+  if [ -n "${enroll_pid:-}" ]; then kill "$enroll_pid" 2>/dev/null || true; fi
+}
+trap cleanup_run EXIT
 
 # Does install.env exist? Ask the same way env_key() reads it. /etc/oshioki is
 # root-owned 0700 and install.env inside it 0600, so a bare `[ -f ]` run as
@@ -815,6 +855,7 @@ if ! install_env_exists || [ "$RECONFIGURE" -eq 1 ]; then
     AGENT_NATS_URL_V=""
     AGENT_NATS_USER_V=""
   fi
+  env_tmp="$(mktemp "${TMPDIR:-/tmp}/oshioki-install-env.XXXXXX")"
   {
     printf 'OSHIOKI_ORIGIN=%s\n' "$ORIGIN"
     printf 'OSHIOKI_RP_ID=%s\n' "$RP_ID"
@@ -825,13 +866,21 @@ if ! install_env_exists || [ "$RECONFIGURE" -eq 1 ]; then
     printf 'OSHIOKI_AGENT_NATS_URL=%s\n' "$AGENT_NATS_URL_V"
     printf 'OSHIOKI_AGENT_NATS_USER=%s\n' "$AGENT_NATS_USER_V"
     printf 'OSHIOKI_AGENT_NATS_PASS=%s\n' "$AGENT_NATS_PASS_V"
-  } | $SUDO tee "$INSTALL_ENV" >/dev/null
+  } > "$env_tmp"
+  # Staged through a 0600 temp file rather than piped into `$SUDO tee`: sudo
+  # on the far side of a pipeline is forked from this shell like any other
+  # pipeline element, and keeping every sudo a plain top-level command is what
+  # keeps the whole run on one timestamp ticket (see snapshot_install_env).
+  $SUDO cp "$env_tmp" "$INSTALL_ENV"
+  rm -f "$env_tmp"
   $SUDO chmod 0600 "$INSTALL_ENV"
 else
   info "reusing existing $INSTALL_ENV (pass --reconfigure to redo it)"
 fi
 fi
 if [ "$LOCAL" -eq 0 ]; then
+# One elevation for the whole file, from this shell, before any key is read.
+snapshot_install_env
 ORIGIN="$(env_key OSHIOKI_ORIGIN)"
 NATS_URL_V="$(env_key NATS_URL)"
 NATS_USER_V="$(env_key NATS_USER)"
@@ -869,14 +918,21 @@ if [ "$LOCAL" -eq 1 ]; then
   phase_flags=""
   if [ "$YES" -eq 1 ]; then phase_flags="--yes"; fi
   if [ "$RECONFIGURE" -eq 1 ]; then phase_flags="$phase_flags --reconfigure"; fi
+  # The phase's value block comes back through a file, not a command
+  # substitution: `$(...)` runs its body in a forked subshell, and a sudo
+  # whose parent is that subshell cannot reuse a timestamp ticket keyed by
+  # parent pid (which is how sudo keys it with no tty). Redirecting instead
+  # keeps this sudo a plain top-level command of the main shell.
+  phase_file="$(mktemp "${TMPDIR:-/tmp}/oshioki-phase.XXXXXX")"
   # phase_flags intentionally splits on word boundaries.
   # shellcheck disable=SC2086
-  phase_out="$($SUDO HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
+  $SUDO HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
     OSHIOKI_SUDO_USER="$LAPTOP_USER" OSHIOKI_INSTALL_ENV="$INSTALL_ENV" \
     INSTALLER="$INSTALLER" INSTALLED_HOOK="$INSTALLED_HOOK" OSHIOKI_RECORD="$record" \
     OSHIOKI_FINGERPRINT="$fingerprint" \
-    "$SCRIPT_PATH" --privileged-phase --local --values-file "$values" $phase_flags)"
-  rm -f "$values" "$record"
+    "$SCRIPT_PATH" --privileged-phase --local --values-file "$values" $phase_flags > "$phase_file"
+  phase_out="$(cat "$phase_file")"
+  rm -f "$values" "$record" "$phase_file"
   read_markers "$phase_out"
   check_config
 else
@@ -894,16 +950,18 @@ if [ "$LOCAL" -eq 0 ]; then
 info "step 3/$TOTAL_STEPS: agent identity"
 [ -x "$INSTALLED_HOOK" ] || die "installed hook not found: $INSTALLED_HOOK (set INSTALLED_HOOK)"
 mkdir -p "$AGENT_STATE"
-cleanup_enroll() {
-  if [ -n "${enroll_pid:-}" ]; then kill "$enroll_pid" 2>/dev/null || true; fi
-}
-trap cleanup_enroll EXIT
 agent_show_out="$("$AGENT_BIN" show 2>&1)" && agent_show_ok=1 || agent_show_ok=0
 if [ "$agent_show_ok" -eq 0 ] && agent_keychain_blocked "$agent_show_out"; then
   die_keychain_locked
 fi
 if [ "$agent_show_ok" -eq 0 ]; then
   info "no agent identity; enrolling a new device (needs the server reachable)"
+  # Takes the timestamp ticket in the foreground, with this script's own shell
+  # as sudo's parent. The backgrounded enroll below is a simple command, so
+  # bash forks once and execs sudo directly in that child -- its parent is
+  # still this shell, so it reuses the ticket just taken rather than asking
+  # for a second approval. Anything more complex behind `&` (a pipeline, a
+  # brace group, a subshell) would not, and must not be introduced here.
   $SUDO -v
   enroll_log="$(mktemp -t oshioki-enroll.XXXXXX)"
   $SUDO "$INSTALLED_HOOK" enroll >"$enroll_log" 2>&1 &
@@ -947,11 +1005,17 @@ if [ "$agent_show_ok" -eq 0 ]; then
 else
   info "agent identity present"
 fi
-if $SUDO "$INSTALLED_HOOK" status 2>/dev/null | grep -q 'active=true'; then
+# Not `$SUDO ... | grep`: every sudo in this script is a plain top-level
+# command so the whole run rides one timestamp ticket (see
+# snapshot_install_env).
+status_out="$(mktemp "${TMPDIR:-/tmp}/oshioki-status.XXXXXX")"
+$SUDO "$INSTALLED_HOOK" status > "$status_out" 2>/dev/null || true
+if grep -q 'active=true' "$status_out"; then
   info "host has active devices"
 else
   info "host has no active devices yet; pair a device to approve requests"
 fi
+rm -f "$status_out"
 fi
 # Server mode pairs after installing, so enabling may still be pending; the
 # privileged phase already did this strictly for local mode. This is a
@@ -1248,9 +1312,24 @@ else
   [ -S "$AGENT_SOCKET_V" ] || die "agent socket never appeared at $AGENT_SOCKET_V; see $AGENT_STATE/agent.log"
 fi
 if [ -t 0 ]; then
-  info "final proof: one real sudo (a Touch ID prompt is coming)"
-  $SUDO true || die "sudo true was denied; see $AGENT_STATE/agent.log"
-  info "ready: sudo approved through the agent socket."
+  # Only promise a prompt when this sudo will really be a fresh
+  # authentication. The install above already elevated, and sudo's timestamp
+  # ticket from that elevation is still valid here, so the usual case is no
+  # prompt at all -- saying one is coming teaches the operator to distrust the
+  # message. `-n` never prompts: it succeeds on a live ticket and fails
+  # quietly without one, which is exactly the question being asked.
+  if [ -n "${SUDO:-}" ] && $SUDO -n true 2>/dev/null; then
+    info "final proof: one real sudo (it rides the approval already given; no new prompt)"
+    info "ready: sudo approved through the agent socket."
+  else
+    info "final proof: one real sudo (a Touch ID prompt is coming)"
+    $SUDO true || die "sudo true was denied; see $AGENT_STATE/agent.log"
+    info "ready: sudo approved through the agent socket."
+  fi
 else
+  # No controlling terminal: sudo keys its timestamp by parent pid here, not
+  # by tty, so the ticket this run took belongs to this shell and dies with
+  # it. A `sudo true` typed afterwards in a terminal is a fresh
+  # authentication and will raise its own prompt.
   info "ready: the agent socket is live and sudo validates. Run 'sudo true'."
 fi

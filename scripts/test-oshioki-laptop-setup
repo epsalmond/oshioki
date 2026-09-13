@@ -40,15 +40,69 @@ chmod 0755 "$TEST_ROOT/stage/oshioki-laptop-setup" "$TEST_ROOT/fake-bin"/* 2>/de
 # enter a directory whose mode forbids its owner. A scenario leaves the
 # directory at 0000, so the unprivileged script gets EACCES on every path
 # under it and only commands routed through this shim can read it.
+#
+# It also models real sudo's timestamp ticket, because on the contextual PAM
+# lane one authentication is one Touch ID sheet and the whole point of a run
+# is that there be exactly one. Real sudo keys the ticket by controlling tty
+# when it has one, and by the PARENT PID when it does not (ssh, `launchctl
+# asuser`, cron). FAKE_TTY selects the first shape, its absence the second.
+# Each authentication appends a line to SUDO_AUTH_LOG; every invocation,
+# authenticating or not, appends its argv and its parent pid to SUDO_CALL_LOG.
 cat > "$TEST_ROOT/fake-bin/sudo" <<'SH'
 #!/usr/bin/env bash
+sudo_ppid="$PPID"
+[ -z "${SUDO_CALL_LOG:-}" ] || printf 'ppid=%s argv=%s\n' "$sudo_ppid" "$*" >> "$SUDO_CALL_LOG"
+mode=run
+noninteractive=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     *=*) export "$1"; shift ;;
-    -v|-V) exit 0 ;;
+    -k|-K) mode=kill; shift ;;
+    -n) noninteractive=1; shift ;;
+    -V) mode=version; shift ;;
+    -v) mode=validate; shift ;;
     *) break ;;
   esac
 done
+ticket_file() {
+  [ -n "${SUDO_TICKET_DIR:-}" ] || return 1
+  mkdir -p "$SUDO_TICKET_DIR"
+  if [ -n "${FAKE_TTY:-}" ]; then
+    printf '%s/tty-%s\n' "$SUDO_TICKET_DIR" "$FAKE_TTY"
+  else
+    printf '%s/ppid-%s\n' "$SUDO_TICKET_DIR" "$sudo_ppid"
+  fi
+}
+# 0 when a live ticket already covers this caller, 1 when an authentication
+# would be needed.
+ticket_valid() {
+  local f now ts
+  f="$(ticket_file)" || return 0
+  [ -f "$f" ] || return 1
+  now="$(date +%s)"; ts="$(cat "$f" 2>/dev/null || echo 0)"
+  [ "$((now - ts))" -le "${SUDO_TICKET_TIMEOUT:-300}" ] || return 1
+  printf '%s' "$now" > "$f"
+  return 0
+}
+authenticate() {
+  local f
+  f="$(ticket_file)" || return 0
+  if ticket_valid; then return 0; fi
+  if [ "$noninteractive" -eq 1 ]; then
+    echo "sudo: a password is required" >&2
+    exit 1
+  fi
+  [ -z "${SUDO_AUTH_LOG:-}" ] || printf '%s ppid=%s\n' "${f##*/}" "$sudo_ppid" >> "$SUDO_AUTH_LOG"
+  date +%s > "$f"
+}
+case "$mode" in
+  # -V is sudo's version mode: it never reaches the policy plugin or PAM, so
+  # it never authenticates. The installer's validate_sudo relies on that.
+  version) exit 0 ;;
+  kill) f="$(ticket_file)" && rm -f "$f"; exit 0 ;;
+  validate) authenticate; exit 0 ;;
+esac
+authenticate
 if [ -n "${OPAQUE_DIR:-}" ] && [ -d "$OPAQUE_DIR" ]; then
   chmod 0700 "$OPAQUE_DIR"
   rc=0
@@ -362,8 +416,20 @@ run_setup() {
   # `uname -s` calls see; every other fake in that directory is already
   # wired in by explicit path variables (SUDO=, LAUNCHCTL=, ...), so nothing
   # else changes by being on PATH too.
+  # SETUP_PTY runs the script with a controlling terminal, so its own
+  # `[ -t 0 ]` and the fake sudo's tty-keyed ticket both see one. Without it
+  # the run has no tty at all, which is the ssh / `launchctl asuser` shape.
+  local -a pty_wrap=()
+  if [ -n "${SETUP_PTY:-}" ]; then
+    pty_wrap=(python3 -c 'import os,pty,sys; raise SystemExit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))')
+  fi
+  ${pty_wrap[@]+"${pty_wrap[@]}"} \
   env -i PATH="$TEST_ROOT/fake-bin:${SETUP_PATH:-/usr/bin:/bin}" HOME="$TEST_ROOT/home" \
     FAKE_UNAME="${FAKE_UNAME:-$(uname -s)}" \
+    SUDO_TICKET_DIR="${SUDO_TICKET_DIR:-$TEST_ROOT/sudo-tickets}" \
+    SUDO_AUTH_LOG="${SUDO_AUTH_LOG:-$TEST_ROOT/sudo-auth.log}" \
+    SUDO_CALL_LOG="${SUDO_CALL_LOG:-$TEST_ROOT/sudo-calls.log}" \
+    FAKE_TTY="${SETUP_PTY:+harness-tty}" \
     AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
     APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
@@ -404,6 +470,9 @@ run_setup() {
 # into NATS mode, so none are passed.
 run_setup_local() {
   env -i PATH="/usr/bin:/bin" HOME="$TEST_ROOT/home" \
+    SUDO_TICKET_DIR="${SUDO_TICKET_DIR:-$TEST_ROOT/sudo-tickets}" \
+    SUDO_AUTH_LOG="${SUDO_AUTH_LOG:-$TEST_ROOT/sudo-auth.log}" \
+    SUDO_CALL_LOG="${SUDO_CALL_LOG:-$TEST_ROOT/sudo-calls.log}" \
     AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
     APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
@@ -495,7 +564,90 @@ grep -Fq 'contextual PAM migration requested' "$TEST_ROOT/ctxpam.log" ||
   fail "--contextual-pam never reached the migration"
 grep -Fq 'OK    pam entries' "$TEST_ROOT/ctxpam.log" ||
   fail "--contextual-pam never ran its own status"
+
+# One elevation per run. On the contextual PAM lane every sudo authentication
+# is one Touch ID sheet, so a full `--yes --contextual-pam` run must
+# authenticate exactly once whether or not it has a controlling terminal.
+# Real sudo keys its timestamp ticket by tty when there is one and by PARENT
+# PID when there is not, so a run over ssh or under `launchctl asuser` only
+# stays on one ticket if every sudo is a plain top-level command of the
+# script's own shell. Before this fix the no-tty run authenticated 11 times on
+# a live Mac (11 `socket authentication answered` lines in the agent log) and
+# 9 times against this harness, because env_key ran `$SUDO cat | awk` inside
+# `$(...)`: eight forked subshells, eight fresh parents, eight extra sheets.
+sudo_auth_count() { wc -l < "$TEST_ROOT/sudo-auth.log" | tr -d '[:space:]'; }
+reset_sudo_ticket() {
+  rm -rf "$TEST_ROOT/sudo-tickets"
+  : > "$TEST_ROOT/sudo-auth.log"
+  : > "$TEST_ROOT/sudo-calls.log"
+}
+# Every sudo must be a direct child of the script's main shell: a single
+# distinct parent pid across the whole run. This is what rules out sudo behind
+# `$(... | ...)`, inside a subshell, or spawned from a background job -- each
+# of which hands sudo a fresh parent and so a fresh authentication.
+assert_one_sudo_parent() {
+  local parents
+  parents="$(sed -n 's/^ppid=\([0-9][0-9]*\).*/\1/p' "$TEST_ROOT/sudo-calls.log" | sort -u | wc -l | tr -d '[:space:]')"
+  [ "$parents" = 1 ] ||
+    { sort -u "$TEST_ROOT/sudo-calls.log" >&2; fail "$1: sudo ran under $parents different parents, want 1"; }
+}
+# -k/-K throw the ticket away, which would force the very re-authentication
+# this whole property is about. The run must never reach for them.
+assert_no_ticket_reset() {
+  if grep -qE 'argv=(.* )?-[kK]( |$)' "$TEST_ROOT/sudo-calls.log"; then
+    fail "$1: the run invalidated the sudo timestamp with -k/-K"
+  fi
+}
+
+: > "$TEST_ROOT/pam-lane"
+: > "$AGENT_STATE/agent.json"
+: > "$TEST_ROOT/stage/liboshioki_pam.so"
+rm -f "${LAUNCHAGENTS_DIR:-$TEST_ROOT/home/Library/LaunchAgents}/com.oshioki.agent.plist"
+
+# No tty: the ssh / `launchctl asuser` shape, where sudo keys by parent pid.
+reset_sudo_ticket
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 run_setup --yes --contextual-pam \
+  >"$TEST_ROOT/one-elevation-notty.log" 2>&1 ||
+  { sed -n '1,40p' "$TEST_ROOT/one-elevation-notty.log" >&2; fail "no-tty --contextual-pam run did not finish"; }
+notty_auths="$(sudo_auth_count)"
+[ "$notty_auths" = 1 ] ||
+  { cat "$TEST_ROOT/sudo-auth.log" >&2; sort -u "$TEST_ROOT/sudo-calls.log" >&2; fail "no-tty run authenticated $notty_auths times, want exactly 1"; }
+assert_one_sudo_parent "no-tty"
+assert_no_ticket_reset "no-tty"
+# With no terminal there is no final `sudo true`, and the closing line must
+# not promise the operator a prompt that this run never raises.
+grep -Fq 'agent socket is live and sudo validates' "$TEST_ROOT/one-elevation-notty.log" ||
+  fail "no-tty run did not close with the no-terminal message"
+if grep -Fq 'Touch ID prompt is coming' "$TEST_ROOT/one-elevation-notty.log"; then
+  fail "no-tty run promised a Touch ID prompt it never raises"
+fi
+
+# With a tty: the Terminal shape, where sudo keys by controlling terminal.
+# The final proof then runs, and because the install already took the ticket
+# it must say so rather than announce another prompt.
+reset_sudo_ticket
+rm -f "${LAUNCHAGENTS_DIR:-$TEST_ROOT/home/Library/LaunchAgents}/com.oshioki.agent.plist"
+: > "$TEST_ROOT/pam-lane"
+SETUP_PTY=1 FAKE_UNAME=Darwin DEVICES_ACTIVE=1 run_setup --yes --contextual-pam \
+  >"$TEST_ROOT/one-elevation-tty.log" 2>&1 ||
+  { sed -n '1,40p' "$TEST_ROOT/one-elevation-tty.log" >&2; fail "tty --contextual-pam run did not finish"; }
+tty_auths="$(sudo_auth_count)"
+[ "$tty_auths" = 1 ] ||
+  { cat "$TEST_ROOT/sudo-auth.log" >&2; fail "tty run authenticated $tty_auths times, want exactly 1"; }
+assert_one_sudo_parent "tty"
+assert_no_ticket_reset "tty"
+grep -Fq 'rides the approval already given' "$TEST_ROOT/one-elevation-tty.log" ||
+  fail "the tty run did not say the final proof reuses the approval already given"
+if grep -Fq 'Touch ID prompt is coming' "$TEST_ROOT/one-elevation-tty.log"; then
+  fail "the tty run promised a second Touch ID prompt on a live ticket"
+fi
+# A run that starts with no ticket at all still says a prompt is coming.
+reset_sudo_ticket
+grep -Fq 'final proof' "$TEST_ROOT/one-elevation-tty.log" ||
+  fail "the tty run never reached the final proof"
+
 rm -f "$TEST_ROOT/pam-lane" "$TEST_ROOT/stage/liboshioki_pam.so"
+rm -f "${LAUNCHAGENTS_DIR:-$TEST_ROOT/home/Library/LaunchAgents}/com.oshioki.agent.plist"
 : > "$TEST_ROOT/plugin-enabled"
 
 # A session with no unlocked login keychain is named as such, before the

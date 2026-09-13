@@ -1418,6 +1418,13 @@ has_our_plugin() {
   [ -f "$SUDO_CONF" ] && grep -Fxq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF" 2>/dev/null
 }
 
+# Loads sudo.conf and every plugin it names, and fails if any of that is
+# broken -- which is the whole point of calling it after each rewrite below.
+# It costs no approval: `-V` is sudo's version mode, which prints and exits
+# without ever reaching the policy plugin or PAM, and this installer only ever
+# runs as root, where sudo does not authenticate the invoking user at all.
+# Both reasons hold independently, so on the contextual PAM lane this raises
+# no Touch ID sheet however often it is called.
 validate_sudo() {
   if [ "${SKIP_NODEVER:-0}" = 1 ]; then return 0; fi
   if [ "$DRY_RUN" -eq 1 ]; then printf 'DRY: sudo -V  # validate %s\n' "$SUDO_CONF"; return 0; fi
