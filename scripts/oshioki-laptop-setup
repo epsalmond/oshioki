@@ -870,7 +870,17 @@ info "step $VERIFY_STEP/$TOTAL_STEPS: verify"
 # Local mode verified the plugin strictly inside the privileged phase;
 # server mode checks it here, after pairing.
 if [ "$LOCAL" -eq 0 ]; then
-run_installer --prelaunch-status
+  # With --contextual-pam this is not the last word: a lane host whose module
+  # has gone missing fails this check, and the migration below is exactly the
+  # repair for it. Report and carry on; --contextual-pam-status at the end is
+  # the verdict. Without --contextual-pam the plugin lane is the whole
+  # install, so a bad status is still fatal.
+  if [ "$CONTEXTUAL_PAM" -eq 1 ]; then
+    run_installer --prelaunch-status ||
+      info "the contextual PAM migration below is what repairs this"
+  else
+    run_installer --prelaunch-status
+  fi
 fi
 
 # The opt-in migration, last: it only makes sense once the plugin lane is

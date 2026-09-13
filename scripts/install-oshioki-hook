@@ -1263,13 +1263,42 @@ if [ "$MODE" = prelaunch-status ]; then
   # `oshioki-laptop-setup --contextual-pam` fail its own final verify before
   # it ever reached the migration. Name the lane and point at the status
   # command that applies to it.
+  # A half-written managed block is a broken edit of /etc/sudo.conf whichever
+  # lane sudo is on, so it is named before the lane is considered rather than
+  # skipped by the early return below.
+  if [ -f "$SUDO_CONF" ]; then
+    validate_block "$SUDO_CONF"
+    begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"
+    if [ "$begins" -gt 0 ] && ! grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then
+      die "malformed managed block in $SUDO_CONF"
+    fi
+  else
+    begins=0
+  fi
   if pam_lane_active; then
+    # The PAM entry alone is not the lane. An entry naming a module that is
+    # not there is a host whose sudo authenticates by whatever the rest of
+    # the stack says, which on macOS is a password prompt and on Linux is
+    # `module_unknown=ignore` -- a degraded host that this mode used to call
+    # active and exit 0 on. Only existence and ownership are asserted here;
+    # the checksum against SHA256SUMS belongs to --contextual-pam-status,
+    # which is the mode that resolves a manifest.
+    lane_dir="$(discover_security_dir 2>/dev/null)" || lane_dir=""
+    lane_module=""
+    [ -z "$lane_dir" ] || lane_module="$(pam_module_dest "$lane_dir")"
+    if [ -z "$lane_module" ] || [ ! -f "$lane_module" ] || [ -L "$lane_module" ] ||
+       [ ! -r "$lane_module" ]; then
+      echo "FAIL  contextual PAM lane: entry present but module missing at ${lane_module:-$PAM_MODULE_NAME}; run install-oshioki-hook --contextual-pam or --disable-contextual-pam"
+      exit 1
+    fi
+    if [ "$(stat_owner "$lane_module" 2>/dev/null || true)" != 0 ]; then
+      echo "FAIL  contextual PAM lane: entry present but module at $lane_module is not root-owned; run install-oshioki-hook --contextual-pam or --disable-contextual-pam"
+      exit 1
+    fi
     echo "contextual PAM lane active; the approval plugin is intentionally not enabled (see --contextual-pam-status)"
     exit 0
   fi
   [ -f "$SUDO_CONF" ] || { echo "disabled"; exit 1; }
-  validate_block "$SUDO_CONF"
-  begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"
   if [ "$begins" -gt 0 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then
     # With no named user there is no drop-in to verify, so the plugin block
     # alone reports enabled; laptop-setup always names one, keeping the
@@ -1287,8 +1316,9 @@ if [ "$MODE" = prelaunch-status ]; then
     echo "enabled without passwordless sudo"
     exit 1
   fi
-  if [ "$begins" -eq 0 ]; then echo "disabled"; exit 1; fi
-  die "malformed managed block in $SUDO_CONF"
+  # Malformed blocks already died above; anything left here has no block.
+  echo "disabled"
+  exit 1
 fi
 
 # Package removal uses this mode after dpkg has already lost the rest of the

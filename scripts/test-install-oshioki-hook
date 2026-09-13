@@ -1526,6 +1526,42 @@ run_installer --sudo-user testuser "$LANE_STATUS" --prelaunch-status >"$LANE_STA
   { sed -n '1,5p' "$LANE_STATUS/status.log" >&2; fail "prelaunch-status called a contextual PAM host disabled"; }
 grep -Fq 'contextual PAM lane active' "$LANE_STATUS/status.log" ||
   fail "prelaunch-status did not name the contextual PAM lane: $(head -1 "$LANE_STATUS/status.log")"
+# The entry alone is not the lane: a module that is not there is a host whose
+# sudo silently falls through to whatever the rest of the stack says.
+LANE_MODULE="$LANE_STATUS/security/$PAM_MODULE_ARTIFACT"
+mv "$LANE_MODULE" "$LANE_MODULE.away"
+if run_installer --sudo-user testuser "$LANE_STATUS" --prelaunch-status >"$LANE_STATUS/nomodule.log" 2>&1; then
+  fail "prelaunch-status called a lane host with no module active"
+fi
+grep -Fq "FAIL  contextual PAM lane: entry present but module missing at $LANE_MODULE" "$LANE_STATUS/nomodule.log" ||
+  fail "prelaunch-status did not name the missing module: $(head -1 "$LANE_STATUS/nomodule.log")"
+grep -Fq 'install-oshioki-hook --contextual-pam or --disable-contextual-pam' "$LANE_STATUS/nomodule.log" ||
+  fail "the missing-module error says nothing about what to do"
+mv "$LANE_MODULE.away" "$LANE_MODULE"
+run_installer --sudo-user testuser "$LANE_STATUS" --prelaunch-status >/dev/null 2>&1 ||
+  fail "prelaunch-status stopped reporting the lane once the module was back"
+
+# A half-written managed block in sudo.conf is named on a lane host too: the
+# lane early-return used to skip that check entirely.
+if [ -f "$LANE_STATUS/sudo.conf" ]; then
+  cp "$LANE_STATUS/sudo.conf" "$LANE_STATUS/sudo.conf.before-halfblock"
+else
+  : > "$LANE_STATUS/sudo.conf.before-halfblock"
+  LANE_SUDO_CONF_WAS_ABSENT=1
+fi
+printf '# BEGIN oshioki\n' >> "$LANE_STATUS/sudo.conf"
+if run_installer --sudo-user testuser "$LANE_STATUS" --prelaunch-status >"$LANE_STATUS/halfblock.log" 2>&1; then
+  fail "prelaunch-status accepted a half-written block on a lane host"
+fi
+grep -Fq "malformed managed block in $LANE_STATUS/sudo.conf" "$LANE_STATUS/halfblock.log" ||
+  fail "a half-written block on a lane host was not named: $(head -1 "$LANE_STATUS/halfblock.log")"
+if [ "${LANE_SUDO_CONF_WAS_ABSENT:-0}" = 1 ]; then
+  rm -f "$LANE_STATUS/sudo.conf"
+else
+  cp "$LANE_STATUS/sudo.conf.before-halfblock" "$LANE_STATUS/sudo.conf"
+fi
+rm -f "$LANE_STATUS/sudo.conf.before-halfblock"
+
 # Disabling the lane puts the ordinary answer back.
 run_installer --sudo-user testuser "$LANE_STATUS" --disable-contextual-pam >"$LANE_STATUS/disable.log" 2>&1 ||
   { sed -n '1,5p' "$LANE_STATUS/disable.log" >&2; fail "lane fixture could not be disabled"; }
