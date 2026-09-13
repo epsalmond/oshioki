@@ -1272,6 +1272,7 @@ version = "0.1.13"
 dependencies = [
  "anyhow",
  "async-nats",
+ "base64",
  "clap",
  "futures",
  "oshioki-enclave",

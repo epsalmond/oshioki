@@ -37,7 +37,20 @@ silently accepting the partial environment emitted by an older plugin. This
 does not change the v1 JSON schema: `RequestV1.env` already defaults to empty
 and is omitted when empty, so old requests and signatures remain readable.
 
-The hook and the server route through `oshioki-transport`. The hook holds a `HookTransport`; the server holds a `ServerTransport`. `OSHIOKI_TRANSPORT=nats` is the default and the only transport this issue lands. The wire format (SMTP-style subjects and v1 JSON payloads) is identical to what shipped before the seam. The agent keeps talking to NATS directly until a device-side transport ships (#6/#7).
+The hook and the server route through `oshioki-transport`. The hook holds a
+`HookTransport`; the server holds a `ServerTransport`. `OSHIOKI_TRANSPORT=nats`
+is the default and the only configured transport backend. Native agents also
+serve local hook requests over a Unix socket beside this transport seam.
+
+When `OSHIOKI_AGENT_SOCKET` is configured, the hook tries that socket before
+NATS. If it is unavailable, or closes or stays silent before its `AliveV1`
+acknowledgement, the hook can fall back to NATS when `NATS_URL` is set. A
+malformed protocol reply, a socket decision, or any failure after a valid
+acknowledgement is final and never falls back. Without `NATS_URL` in the hook
+configuration, that hook uses the socket only. An agent with no `NATS_URL` in
+its own runtime environment answers socket requests only. Browser approval
+uses the server and NATS path. The wire format uses the existing NATS subjects
+and v1 JSON payloads.
 
 ## Device kinds
 
