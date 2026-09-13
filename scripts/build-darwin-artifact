@@ -99,7 +99,8 @@ app_bin_rel="Oshioki.app/Contents/MacOS/oshioki-agent"
   cd "$OUTPUT"
   if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json "$app_bin_rel" > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json "$app_bin_rel" > SHA256SUMS; fi
 )
-for artifact in oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server; do
+for artifact in oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server \
+  "Oshioki.app/Contents/MacOS/oshioki-agent"; do
   file "$OUTPUT/$artifact" | grep -q 'arm64'
 done
 nm -gU "$OUTPUT/oshioki.dylib" | grep -Eq '(_)?approval_exec$'

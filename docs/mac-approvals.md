@@ -38,7 +38,9 @@ signed so `codesign --verify --deep --strict` passes on the poured bundle),
 the formula installs it in the keg root, and its inner binary is hashed in
 `libexec/SHA256SUMS` under `Oshioki.app/Contents/MacOS/oshioki-agent`.
 `oshioki-laptop-setup` prefers that binary when it is present and matches
-that hash, and falls back to the flat one for kegs from older releases. The
+that hash, and falls back to the flat one for kegs from older releases —
+after verifying that flat binary against its own `oshioki-agent` entry, and
+refusing to install an agent that fails it. The
 LaunchAgent it writes names the `opt` path
 (`/opt/homebrew/opt/oshioki/Oshioki.app/Contents/MacOS/oshioki-agent`), never
 the versioned `Cellar` path, so `brew upgrade` followed by `brew cleanup`

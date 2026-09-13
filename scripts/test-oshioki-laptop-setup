@@ -1223,7 +1223,10 @@ cp "$CELLAR_KEG/bin/oshioki-agent" "$CELLAR_KEG/$BUNDLE_REL"
 chmod 0755 "$CELLAR_KEG/bin/oshioki-laptop-setup" "$CELLAR_KEG/bin/oshioki" \
   "$CELLAR_KEG/bin/oshioki-agent" "$CELLAR_KEG/$BUNDLE_REL"
 : > "$CELLAR_KEG/libexec/oshioki.dylib"
-( cd "$CELLAR_KEG" && sha256_line "$BUNDLE_REL" bin/oshioki-agent > libexec/SHA256SUMS )
+# SHA256SUMS is the release manifest, so the flat binary is listed under the
+# staging-root name the artifact gives it, not under bin/.
+( cd "$CELLAR_KEG" && sha256_line "$BUNDLE_REL" > libexec/SHA256SUMS )
+( cd "$CELLAR_KEG/bin" && sha256_line oshioki-agent >> ../libexec/SHA256SUMS )
 ln -sfn "../Cellar/oshioki/0.1.12" "$BREW/opt/oshioki"
 # Homebrew's own bin link, relative and through opt.
 ln -sfn "../opt/oshioki/bin/oshioki-laptop-setup" "$BREW/bin/oshioki-laptop-setup"
@@ -1243,7 +1246,7 @@ plist_program() {
 # present and matches the manifest. Without this the Touch ID sheet shows a
 # bare file name and the generic executable badge.
 keg_reset
-FAKE_UNAME=Darwin DEVICES_ACTIVE=1 SETUP_AGENT_BIN= \
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 SETUP_AGENT_BIN='' \
   SETUP_CMD="$BREW/bin/oshioki-laptop-setup" \
   run_setup --yes >"$TEST_ROOT/keg-bundle.log" 2>&1 ||
   { tail -5 "$TEST_ROOT/keg-bundle.log" >&2; fail "keg bundle setup failed"; }
@@ -1267,7 +1270,7 @@ fi
 # stays in use -- still at the stable opt path.
 keg_reset
 mv "$CELLAR_KEG/Oshioki.app" "$TEST_ROOT/Oshioki.app.stash"
-FAKE_UNAME=Darwin DEVICES_ACTIVE=1 SETUP_AGENT_BIN= \
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 SETUP_AGENT_BIN='' \
   SETUP_CMD="$BREW/bin/oshioki-laptop-setup" \
   run_setup --yes >"$TEST_ROOT/keg-flat.log" 2>&1 ||
   { tail -5 "$TEST_ROOT/keg-flat.log" >&2; fail "keg flat-fallback setup failed"; }
@@ -1301,7 +1304,7 @@ cat > "$plist_t" <<PLIST
 </dict></plist>
 PLIST
 chmod 0600 "$plist_t"
-FAKE_UNAME=Darwin DEVICES_ACTIVE=1 SETUP_AGENT_BIN= \
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 SETUP_AGENT_BIN='' \
   SETUP_CMD="$BREW/bin/oshioki-laptop-setup" \
   run_setup --yes >"$TEST_ROOT/keg-preserve.log" 2>&1 ||
   { tail -5 "$TEST_ROOT/keg-preserve.log" >&2; fail "keg preserve setup failed"; }
@@ -1312,6 +1315,45 @@ grep -Fq '<string>real-secret-W</string>' "$plist_t" ||
 prog_w="$(plist_program "$plist_t")"
 [ "$prog_w" = "$BREW/opt/oshioki/$BUNDLE_REL" ] ||
   fail "keg-preserve: ProgramArguments was not moved to the stable bundle path: $prog_w"
+
+# Scenario X: the keg's flat agent not matching its own SHA256SUMS entry is a
+# hard stop. The agent is what answers every sudo on the machine, so there is
+# nothing safe to fall back to; before this check an unverified binary was
+# installed into the LaunchAgent without a word.
+keg_reset
+mv "$CELLAR_KEG/Oshioki.app" "$TEST_ROOT/Oshioki.app.stash"
+cp "$CELLAR_KEG/bin/oshioki-agent" "$TEST_ROOT/agent-pristine"
+# A comment: the file still runs, so what stops the run is the checksum and
+# nothing else.
+printf '# tampered\n' >> "$CELLAR_KEG/bin/oshioki-agent"
+flat_rc=0
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 SETUP_AGENT_BIN='' \
+  SETUP_CMD="$BREW/bin/oshioki-laptop-setup" \
+  run_setup --yes >"$TEST_ROOT/keg-tampered.log" 2>&1 || flat_rc=$?
+[ "$flat_rc" -ne 0 ] || fail "keg-tampered: an unverified flat agent did not stop the run"
+grep -Fq 'does not match' "$TEST_ROOT/keg-tampered.log" ||
+  fail "keg-tampered: the mismatch was not reported: $(tail -2 "$TEST_ROOT/keg-tampered.log")"
+if [ -f "$plist_t" ]; then fail "keg-tampered: a LaunchAgent was written for an unverified agent"; fi
+
+cp "$TEST_ROOT/agent-pristine" "$CELLAR_KEG/bin/oshioki-agent"
+chmod 0755 "$CELLAR_KEG/bin/oshioki-agent"
+
+# Scenario Y: a manifest from an older release that lists neither name is not
+# a failure -- it simply cannot answer -- so the run proceeds on the flat
+# binary rather than refusing to install at all.
+keg_reset
+# Neither oshioki-agent nor the bundle is named here, which is what a
+# manifest from before either entry existed looks like.
+printf '%s  oshioki\n' "0000000000000000000000000000000000000000000000000000000000000000" \
+  > "$CELLAR_KEG/libexec/SHA256SUMS"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 SETUP_AGENT_BIN='' \
+  SETUP_CMD="$BREW/bin/oshioki-laptop-setup" \
+  run_setup --yes >"$TEST_ROOT/keg-nomanifest.log" 2>&1 ||
+  { tail -5 "$TEST_ROOT/keg-nomanifest.log" >&2; fail "keg-nomanifest: an older manifest stopped the run"; }
+prog_y="$(plist_program "$plist_t")"
+[ "$prog_y" = "$BREW/opt/oshioki/bin/oshioki-agent" ] ||
+  fail "keg-nomanifest: expected the flat binary at the opt path, got: $prog_y"
+mv "$TEST_ROOT/Oshioki.app.stash" "$CELLAR_KEG/Oshioki.app"
 
 # Self-policing teardown: the EXIT trap removes the tree, but rm succeeds
 # even with live holders (open files unlink), so leaked processes would go

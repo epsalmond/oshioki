@@ -162,29 +162,49 @@ OSHIOKI_CHECKSUMS="${OSHIOKI_CHECKSUMS:-}"
 # A bare binary makes the Touch ID sheet show a file name and the generic
 # executable badge; the same bytes inside Oshioki.app make it show the Oshioki
 # name and logo. Releases from 0.1.12 ship the bundle in the keg root beside
-# bin/, with its inner binary -- byte-identical to the flat one -- hashed in
-# the same SHA256SUMS under its bundle-relative name. Prefer it when it is
-# there and verifies; older kegs have no bundle and keep the flat binary.
+# bin/, hashed in the same SHA256SUMS under its bundle-relative name. Prefer
+# it when it is there and verifies; older kegs have no bundle and keep the
+# flat binary, which is verified against its own entry rather than trusted:
+# this agent is what answers every sudo on this machine.
 # An explicitly chosen AGENT_BIN is always left alone.
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
+# $1 name as SHA256SUMS spells it, $2 file. 0 matches, 1 differs, 2 no entry
+# (an older manifest, which is not a failure -- it simply cannot answer).
+checksum_status() {
+  local want have
+  want="$(awk -v n="$1" '$2 == n || $2 == "*" n {print $1; exit}' "$OSHIOKI_CHECKSUMS")"
+  [ -n "$want" ] || return 2
+  have="$(sha256_of "$2")"
+  [ "$want" = "$have" ]
+}
 AGENT_BUNDLE_REL="Oshioki.app/Contents/MacOS/oshioki-agent"
 if [ -z "$AGENT_BIN_EXPLICIT" ] && [ "$(uname -s)" = Darwin ] \
-  && [ -x "$PARENT_DIR/$AGENT_BUNDLE_REL" ] \
   && [ -n "$OSHIOKI_CHECKSUMS" ] && [ -f "$OSHIOKI_CHECKSUMS" ]; then
-  bundle_want="$(awk -v n="$AGENT_BUNDLE_REL" '$2 == n || $2 == "*" n {print $1; exit}' \
-    "$OSHIOKI_CHECKSUMS")"
-  bundle_have="$(sha256_of "$PARENT_DIR/$AGENT_BUNDLE_REL")"
-  if [ -z "$bundle_want" ]; then
-    : # No entry: an older manifest. Stay on the flat binary silently.
-  elif [ "$bundle_want" = "$bundle_have" ]; then
-    AGENT_BIN="$PARENT_DIR/$AGENT_BUNDLE_REL"
-  else
-    # A bundle that does not match its manifest is a tampered or half-poured
-    # keg, not something to run: say so and stay on the verified flat binary.
-    echo "oshioki-laptop-setup: $AGENT_BUNDLE_REL does not match SHA256SUMS; using the flat agent binary" >&2
+  bundle_bin="$PARENT_DIR/$AGENT_BUNDLE_REL"
+  if [ -x "$bundle_bin" ]; then
+    bundle_rc=0
+    checksum_status "$AGENT_BUNDLE_REL" "$bundle_bin" || bundle_rc=$?
+    case "$bundle_rc" in
+      0) AGENT_BIN="$bundle_bin" ;;
+      2) : ;; # No entry: an older manifest. Stay on the flat binary.
+      # A bundle that does not match its manifest is a tampered or
+      # half-poured keg, not something to run: say so and fall back to the
+      # flat binary, which the check below verifies in turn.
+      *) info "$AGENT_BUNDLE_REL does not match SHA256SUMS; using the flat agent binary" ;;
+    esac
+  fi
+  if [ "$AGENT_BIN" != "$bundle_bin" ] && [ -x "$AGENT_BIN" ]; then
+    flat_rc=0
+    checksum_status "oshioki-agent" "$AGENT_BIN" || flat_rc=$?
+    # A keg whose flat agent does not match its own manifest has been
+    # tampered with or half-written. There is nothing safe left to fall back
+    # to, so stop rather than install an unverified agent as the thing that
+    # answers every sudo on this machine.
+    [ "$flat_rc" -ne 1 ] ||
+      die "$AGENT_BIN does not match $OSHIOKI_CHECKSUMS; reinstall the package before re-running"
   fi
 fi
 # <prefix>/Cellar/<formula>/<version>/... is the path `brew upgrade` plus
@@ -195,6 +215,10 @@ fi
 stable_keg_path() {
   local path="$1" prefix rest formula version opt
   case "$path" in */Cellar/*) ;; *) printf '%s\n' "$path"; return 0 ;; esac
+  # %% (longest match) cuts at the FIRST /Cellar/, which is the Homebrew
+  # prefix; % would cut at the last and mis-read a keg that happens to
+  # contain a directory called Cellar. The -ef check below is what makes a
+  # wrong guess harmless either way.
   prefix="${path%%/Cellar/*}"
   rest="${path#"$prefix"/Cellar/}"
   formula="${rest%%/*}"

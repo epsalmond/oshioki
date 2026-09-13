@@ -181,7 +181,10 @@ From 0.1.12 the keg also carries `Oshioki.app` in its root. Setup prefers
 `bin/oshioki-agent` whenever it is there and matches its
 `libexec/SHA256SUMS` entry (name
 `Oshioki.app/Contents/MacOS/oshioki-agent`); a mismatch is reported and the
-flat binary is used. The bundle is what makes the Touch ID sheet say Oshioki
+flat binary is used. The flat binary is then verified against its own
+`oshioki-agent` entry, and a mismatch there stops the run outright: there is
+nothing safe left to fall back to. A manifest that names neither, which is
+every release before 0.1.12, cannot answer and is not treated as a failure. The bundle is what makes the Touch ID sheet say Oshioki
 with the logo instead of a file name and a generic badge. The LaunchAgent
 plist always names the stable `opt` spelling of whichever binary was chosen
 — `/opt/homebrew/opt/oshioki/...`, not `/opt/homebrew/Cellar/oshioki/<version>/...`

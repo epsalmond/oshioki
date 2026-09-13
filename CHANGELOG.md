@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `oshioki-laptop-setup` prefers the keg's bundled agent when it is present
   and verifies against `SHA256SUMS`, falling back to the flat binary for
-  kegs from older releases.
+  kegs from older releases. The flat binary is verified against its own
+  manifest entry too, and a mismatch now stops the run instead of installing
+  an unverified agent.
 
 ### Fixed
 

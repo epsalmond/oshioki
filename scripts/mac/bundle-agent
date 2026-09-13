@@ -71,6 +71,8 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 0755 "$BINARY" "$APP/Contents/MacOS/oshioki-agent"
 
+# Unquoted delimiter on purpose: $VERSION below is the only expansion wanted
+# and the rest of the document carries no $ or backtick of its own.
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -91,8 +93,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# The icon is what the sheet shows next to the name. Losing it costs the logo
-# and nothing else, so a machine with no renderer still gets a working bundle.
+# The icon is what the sheet shows next to the name. A renderer is preferred
+# so the icns always tracks the SVG, but assets/Oshioki.icns is checked in as
+# the last resort: a builder with no renderer (a CI image where qlmanage
+# cannot reach a window server, say) would otherwise ship a logo-less bundle.
 icon_source="$ROOT/assets/oshioki.svg"
 png="$(mktemp -d)/oshioki.png"
 rendered=false
@@ -107,6 +111,7 @@ elif command -v qlmanage >/dev/null 2>&1; then
   fi
 fi
 
+icns="$APP/Contents/Resources/Oshioki.icns"
 if [ "$rendered" = true ]; then
   iconset="$(dirname "$png")/Oshioki.iconset"
   mkdir -p "$iconset"
@@ -115,9 +120,13 @@ if [ "$rendered" = true ]; then
     sips -z $((size * 2)) $((size * 2)) "$png" \
       --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
   done
-  iconutil -c icns "$iconset" -o "$APP/Contents/Resources/Oshioki.icns"
+  iconutil -c icns "$iconset" -o "$icns"
+  echo "icon: rendered from $icon_source" >&2
+elif [ -f "$ROOT/assets/Oshioki.icns" ]; then
+  install -m 0644 "$ROOT/assets/Oshioki.icns" "$icns"
+  echo "icon: no SVG renderer here, using the checked-in assets/Oshioki.icns" >&2
 else
-  echo "note: no SVG renderer found, so the sheet shows the name without the logo" >&2
+  echo "note: no SVG renderer and no assets/Oshioki.icns, so the sheet shows the name without the logo" >&2
 fi
 rm -rf "$(dirname "$png")"
 
