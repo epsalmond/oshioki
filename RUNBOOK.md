@@ -35,12 +35,14 @@ approves through a terminal prompt there, so setup writes
 a terminal you keep open. It finishes without the proof, and sudo works from
 the moment the agent is running. Run it as yourself, never under sudo. A root run poisons user-owned files (the app
 bundle loses its readable icon that way). Non-interactive with `--yes`
-plus values in the environment. Setup costs two Touch ID approvals, the
-elevation and the proof (plus the sudo password on a machine that has never
-run setup). Day-to-day sudo with a hardware-backed device costs one device
-approval: the installer couples a `sudoers.d` NOPASSWD drop-in to the plugin
-block. A software native device keeps normal sudo password authentication
-because its signing key is readable by the enrolled account. On Linux, an
+plus values in the environment. Setup costs one Touch ID approval: every
+privileged step rides a single sudo timestamp ticket, and the closing proof
+reuses it rather than asking again (plus the sudo password on a machine
+that has never run setup). Day-to-day sudo with a hardware-backed device
+costs one device approval: the installer couples a `sudoers.d` NOPASSWD
+drop-in to the plugin block. A software native device keeps normal sudo
+password authentication because its signing key is readable by the enrolled
+account. On Linux, an
 interactive request also races the invoking account password through the
 host's `sudo` PAM service. Press Enter to skip that fallback and wait for
 device approval. The manual steps below remain for non-brew layouts.
@@ -163,6 +165,28 @@ device. To drive it from a remote shell anyway, unlock the keychain first
 (`security unlock-keychain ~/Library/Keychains/login.keychain-db`) or run it
 inside the logged-in user's session
 (`sudo launchctl asuser "$(id -u eric)" sudo -u eric ...`).
+
+A run with no controlling terminal — ssh, `launchctl asuser`, any job with no
+tty — still costs exactly one authentication, the same as a Terminal run.
+`sudo` keys its timestamp ticket by controlling tty when it has one and by
+**parent pid** when it does not, so every `sudo` in `oshioki-laptop-setup` is
+a plain top-level command of the script's own shell: no `$( ... | ... )`
+around one, no pipeline with `sudo` on either side, and nothing behind `&`
+more complex than a simple command. On the contextual PAM lane one
+authentication is one Touch ID sheet, so breaking that rule is directly
+visible as extra sheets (and as extra `socket authentication answered` lines
+in `~/.config/oshioki/agent.log`). `scripts/test-oshioki-laptop-setup` models
+both keying shapes and asserts one authentication per run for each.
+
+The ticket a no-tty run takes belongs to that run's shell and dies with it, so
+the setup does not claim a Touch ID prompt is coming when it closes; a `sudo
+true` typed afterwards in a terminal is a fresh authentication with its own
+sheet. In a Terminal the closing proof rides the ticket the install already
+took, and the setup says so instead of announcing a second prompt. Read that
+closing line for what it claims: on a warm ticket the final `sudo` never
+reaches PAM, so it proves only that sudoers parses, the ticket is live and
+the agent socket answered the liveness wait — it does not prove an approval
+round trip. Only a cold `sudo` says "approved through the agent socket".
 
 `oshioki-laptop-setup` resolves its own keg — the hook beside it in `bin`,
 and `oshioki.dylib`, `liboshioki_pam.dylib` and `SHA256SUMS` one level up in

@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `oshioki-laptop-setup` now raises exactly one Touch ID sheet per run on the
+  contextual PAM lane, with or without a controlling terminal. `sudo` keys its
+  timestamp ticket by tty when it has one and by parent pid when it does not,
+  so a run over ssh or under `launchctl asuser` used to authenticate once per
+  forked parent: reading eight keys out of `/etc/oshioki/install.env` through
+  `$($SUDO cat ... | awk ...)` alone cost eight extra sheets (eleven
+  authentications in all on a live Mac). `install.env` is now copied once,
+  through a single top-level `sudo`, into a private 0600 temp file that every
+  key is read from unprivileged, and the remaining privileged calls — the
+  `--privileged-phase` re-invocation, the `install.env` write, the hook
+  `status` probe — no longer sit inside a command substitution or a pipeline.
+
+### Security
+
+- `oshioki-laptop-setup` keeps every temp file it writes -- the `install.env`
+  snapshot, the staged `install.env`, the values block, the privileged phase's
+  report -- in one 0700 run-private directory removed by an EXIT trap, so a
+  denied or cancelled sudo, or a Ctrl-C at the Touch ID sheet, can no longer
+  orphan a world-readable-directory file holding `NATS_PASS`. `install.env`
+  itself is now written through a root-owned `install -m 0600` sibling and an
+  atomic `mv` rather than a `cp` that truncates the live file first.
+
+### Changed
+
+- The closing proof in `oshioki-laptop-setup` only announces a Touch ID prompt
+  when the `sudo` it is about to run really will be a fresh authentication.
+  With the install's ticket still live it says the proof rides the approval
+  already given, and a run with no terminal says the ticket dies with the run.
+  On that warm-ticket path the sudo never reaches PAM, so the closing line now
+  claims only what it proved -- sudo works and the agent socket is live -- and
+  reserves "approved through the agent socket" for a sudo that really
+  authenticated.
+
 ## [0.1.12] - 2026-09-13
 
 ### Added
