@@ -103,8 +103,10 @@ that in production.
 apart from the hook's `NATS_URL`/`NATS_USER`/`NATS_PASS` above:
 `oshioki-laptop-setup` prompts for them separately (see above) and never
 falls back to the hook's credential when writing the agent's LaunchAgent.
-Omitting all three leaves the agent socket-only, same as omitting the
-hook's.
+They are optional: omitting all three, or answering the password prompt
+blank (including under `--yes`), leaves the agent socket-only, same as
+omitting the hook's -- the setup warns loudly when it does this, since
+approvals from other hosts then cannot reach this Mac.
 
 For socket mode (below), also add:
 

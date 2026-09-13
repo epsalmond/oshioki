@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `oshioki-laptop-setup`'s Mac agent NATS verification could declare success
+  even when the agent was authenticating with the wrong role's credentials:
+  the agent logs `NATS connected` before it subscribes, and a `Permissions
+  Violation` server error for that subscription can arrive one poll later.
+  The verify step now keeps polling for the rest of its timeout budget after
+  seeing `NATS connected`, so a violation that lands right after is still
+  caught. A non-numeric `OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT` now falls back
+  to the default instead of aborting the step.
+- An `install.env` written by 0.1.10 or earlier, with no agent NATS keys and
+  no existing LaunchAgent plist, used to leave the Mac agent socket-only
+  with no warning at all: the install looked complete, but approvals from
+  other hosts could never arrive. `oshioki-laptop-setup` now warns loudly
+  when this happens and names the fix.
+- A LaunchAgent plist mistakenly carrying the hook's own `NATS_USER` (the
+  0.1.10 bug) was treated as a real, working device configuration to
+  preserve, so the run only failed later at the NATS violation check --
+  after the hook was already installed -- with a message that named neither
+  `--reconfigure` nor the `OSHIOKI_AGENT_NATS_*` variables. Such a plist is
+  now detected as broken and rewritten with the agent's own role, and the
+  violation failure now names both.
+- The Mac agent's own NATS credentials are no longer hard-required:
+  `--yes` with none staged, and the interactive prompt answered blank, both
+  now leave the agent socket-only (with the warning above) instead of
+  aborting the whole setup.
+
+### Added
+
+- `OSHIOKI_AGENT_NATS_URL`, `OSHIOKI_AGENT_NATS_USER`, and
+  `OSHIOKI_AGENT_NATS_PASS` env vars for staging the Mac agent's own NATS
+  role non-interactively (see `RUNBOOK.md`).
+
 ## [0.1.10] - 2026-09-12
 
 ### Fixed

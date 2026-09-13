@@ -82,7 +82,9 @@ while [ "$#" -gt 0 ]; do
     -h|--help)
       echo "usage: oshioki-laptop-setup [--yes] [--reconfigure] [--local] [--contextual-pam]" >&2
       echo "  --yes          accept defaults and prompts without asking" >&2
-      echo "  --reconfigure  re-enter /etc/oshioki/install.env from scratch" >&2
+      echo "  --reconfigure  re-enter /etc/oshioki/install.env from scratch;" >&2
+      echo "                 also rewrites the agent autostart (LaunchAgent" >&2
+      echo "                 plist / agent.env)" >&2
       echo "  --local        pair this machine with itself; no server needed" >&2
       echo "  --contextual-pam  after the install, migrate sudo to the PAM lane" >&2
       echo "                    (same as OSHIOKI_CONTEXTUAL_PAM=1); keep a second" >&2
@@ -264,15 +266,23 @@ if [ "$LOCAL" -eq 1 ]; then
   fi
 fi
 
+# $5 (optional flag, default 0): when 1, an empty answer is accepted as a
+# deliberate "none" rather than treated as missing -- used for the one
+# prompt (the agent's own NATS password) that can legitimately be declined
+# to leave the agent socket-only. Every other prompt keeps requiring a value.
 prompt() {
-  local label="$1" def="$2" var="$3" secret="$4" value
+  local label="$1" def="$2" var="$3" secret="$4" optional="${5:-0}" value
   if [ "$YES" -eq 1 ]; then
-    [ -n "$def" ] || die "$label has no default; set it in the environment or re-run without --yes"
+    if [ -z "$def" ] && [ "$optional" -ne 1 ]; then
+      die "$label has no default; set it in the environment or re-run without --yes"
+    fi
     printf -v "$var" '%s' "$def"
     return 0
   fi
   if [ ! -t 0 ]; then
-    [ -n "$def" ] || die "$label has no default and stdin is not a terminal"
+    if [ -z "$def" ] && [ "$optional" -ne 1 ]; then
+      die "$label has no default and stdin is not a terminal"
+    fi
     printf -v "$var" '%s' "$def"
     return 0
   fi
@@ -289,7 +299,9 @@ prompt() {
     printf '%s: ' "$label" >&2
     IFS= read -r value || true
   fi
-  [ -n "$value" ] || die "$label is required"
+  if [ -z "$value" ] && [ "$optional" -ne 1 ]; then
+    die "$label is required"
+  fi
   printf -v "$var" '%s' "$value"
 }
 
@@ -347,6 +359,14 @@ check_config() {
   if [ -z "$AGENT_NATS_URL_V" ]; then
     if [ -n "$AGENT_NATS_USER_V" ] || [ -n "$AGENT_NATS_PASS_V" ]; then
       die "$INSTALL_ENV has agent NATS credentials without OSHIOKI_AGENT_NATS_URL; remove them or set a URL"
+    fi
+    # A hook that talks to a real NATS but an agent with no credentials at
+    # all (an install.env written by 0.1.10 or earlier, or an operator who
+    # declined the agent prompt) looks fully configured -- the plist/agent.env
+    # still gets written, just socket-only -- but approvals from other hosts
+    # can never reach this Mac. Say so loudly instead of leaving that silent.
+    if [ -n "$NATS_URL_V" ]; then
+      info "warning: agent will be socket-only; approvals from other hosts will not reach this Mac; set OSHIOKI_AGENT_NATS_URL/USER/PASS and re-run with --reconfigure"
     fi
   else
     case "$AGENT_NATS_URL_V" in
@@ -701,13 +721,25 @@ if ! install_env_exists || [ "$RECONFIGURE" -eq 1 ]; then
   # hook's above. Reusing the hook's NATS_USER/NATS_PASS here is the bug
   # this guards against: the agent then authenticates as the hook's role,
   # which the server answers with a permissions violation on every
-  # subscribe instead of ever delivering an approval. Defaults to the same
-  # bus as the hook (the common case) but every field is independently
-  # overridable, since a laptop can run a local hook-side NATS (e.g. a
-  # phone-bridge broker) while the agent talks to a different, real bus.
-  prompt "Agent NATS URL" "${OSHIOKI_AGENT_NATS_URL:-$NATS_URL_V}" AGENT_NATS_URL_V 0
-  prompt "Agent NATS user" "${OSHIOKI_AGENT_NATS_USER:-oshioki-agent}" AGENT_NATS_USER_V 0
-  prompt "Agent NATS password" "${OSHIOKI_AGENT_NATS_PASS:-}" AGENT_NATS_PASS_V 1
+  # subscribe instead of ever delivering an approval.
+  #
+  # Optional: the password is asked FIRST, with an empty answer accepted
+  # (the only prompt in this whole block that can be declined) meaning
+  # socket-only -- the agent then gets no NATS keys at all, and
+  # check_config's own warning covers telling the operator what that costs.
+  # Only when a password IS given are the URL and user asked, defaulting to
+  # the same bus as the hook (the common case) and "oshioki-agent"; every
+  # field stays independently overridable, since a laptop can run a local
+  # hook-side NATS (e.g. a phone-bridge broker) while the agent talks to a
+  # different, real bus.
+  prompt "Agent NATS password (blank leaves the agent socket-only)" "${OSHIOKI_AGENT_NATS_PASS:-}" AGENT_NATS_PASS_V 1 1
+  if [ -n "$AGENT_NATS_PASS_V" ]; then
+    prompt "Agent NATS URL" "${OSHIOKI_AGENT_NATS_URL:-$NATS_URL_V}" AGENT_NATS_URL_V 0
+    prompt "Agent NATS user" "${OSHIOKI_AGENT_NATS_USER:-oshioki-agent}" AGENT_NATS_USER_V 0
+  else
+    AGENT_NATS_URL_V=""
+    AGENT_NATS_USER_V=""
+  fi
   {
     printf 'OSHIOKI_ORIGIN=%s\n' "$ORIGIN"
     printf 'OSHIOKI_RP_ID=%s\n' "$RP_ID"
@@ -866,6 +898,14 @@ case "$(uname -s)" in
     plist="$plist_dir/$LABEL.plist"
     xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
     json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+    # Extracts the <string> value that immediately follows <key>$2</key> in
+    # plist $1, regardless of whether the file is single-line (this script's
+    # own output) or normally formatted with each key on its own line
+    # (plutil/PlistBuddy, or hand-edited) -- `tr -d '\n'` folds both shapes to
+    # one line before the same sed pattern matches either.
+    plist_key_value() {
+      tr -d '\n' < "$1" | sed -n "s/.*<key>$2<\/key>[[:space:]]*<string>\\([^<]*\\)<\/string>.*/\\1/p"
+    }
     # An existing plist that already names a NATS_URL or NATS_USER is either
     # a prior correct run of this same script or a hand-maintained one; both
     # are the operator's real, working configuration for this device's own
@@ -878,8 +918,21 @@ case "$(uname -s)" in
     # be the hook's own role. Only --reconfigure is allowed to replace it.
     preserving=0
     if [ -f "$plist" ] && [ "$RECONFIGURE" -eq 0 ] && grep -Eq '<key>NATS_(URL|USER)</key>' "$plist"; then
-      preserving=1
-      info "preserving existing NATS/agent environment in $plist (pass --reconfigure to replace it)"
+      # A plist whose NATS_USER equals the HOOK's own NATS_USER is not a
+      # real device configuration to protect -- it is the bug buggy 0.1.10
+      # wrote: the agent authenticating as the hook's role, which the server
+      # answers with a permissions violation on every subscribe. Detection
+      # must call this broken and rewrite it, not preserve it: preserving it
+      # only postpones the failure to the violation check below, by which
+      # point the hook has already been installed, and (before this fix) the
+      # die there named neither --reconfigure nor the variables to fix.
+      existing_nats_user="$(plist_key_value "$plist" NATS_USER)"
+      if [ -n "$NATS_USER_V" ] && [ -n "$existing_nats_user" ] && [ "$existing_nats_user" = "$NATS_USER_V" ]; then
+        info "existing agent autostart uses the hook credentials (written by 0.1.10); rewriting"
+      else
+        preserving=1
+        info "preserving existing NATS/agent environment in $plist (pass --reconfigure to replace it)"
+      fi
     fi
     if [ "$preserving" -eq 1 ]; then
       # plutil -replace edits the file's own existing structure in place, so
@@ -894,7 +947,8 @@ case "$(uname -s)" in
       # extraction came back empty, so the file written carried an EMPTY
       # EnvironmentVariables dict -- silently dropping the agent's real NATS
       # credentials to socket-only.
-      "$PLUTIL" -replace ProgramArguments -json "[\"$(json_escape "$AGENT_BIN")\",\"run\"]" "$plist"
+      "$PLUTIL" -replace ProgramArguments -json "[\"$(json_escape "$AGENT_BIN")\",\"run\"]" "$plist" ||
+        die "could not update $plist (plutil failed above); re-run with --reconfigure to replace it outright"
     else
       {
         printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
@@ -942,21 +996,40 @@ case "$(uname -s)" in
     # all; a socket-only agent never touches NATS and there is nothing here
     # to wait for.
     if [ "$preserving" -eq 1 ] || [ -n "$AGENT_NATS_URL_V" ]; then
+      # A non-numeric (or empty) override must fall back to the default
+      # rather than reach `seq`, which aborts the whole step on bad input.
+      verify_timeout="${OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT:-5}"
+      case "$verify_timeout" in
+        ''|*[!0-9]*)
+          info "OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT is not a positive number; using the default (5)"
+          verify_timeout=5
+          ;;
+      esac
       violation=0
       connected=0
-      for _ in $(seq 1 "${OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT:-5}"); do
+      # The agent logs "NATS connected" on Connected, BEFORE it subscribes;
+      # a "Permissions Violation" server error for the subscription arrives
+      # one RTT later. Returning success on the first sample that sees
+      # "connected" can therefore miss a violation that lands on the very
+      # next sample -- exactly the failure this whole block exists to catch.
+      # So once "connected" is seen this keeps polling for the rest of the
+      # timeout budget, watching for a violation, and only declares success
+      # once that window passes clean. A violation seen at any point still
+      # fails the step immediately.
+      elapsed=0
+      while [ "$elapsed" -lt "$verify_timeout" ]; do
         if [ -f "$agent_log" ] && tail -n "+$((log_start + 1))" "$agent_log" | grep -q 'Permissions Violation'; then
           violation=1
           break
         fi
         if [ -f "$agent_log" ] && tail -n "+$((log_start + 1))" "$agent_log" | grep -q 'NATS connected'; then
           connected=1
-          break
         fi
         sleep 1
+        elapsed=$((elapsed + 1))
       done
       if [ "$violation" -eq 1 ]; then
-        die "agent logged a NATS permissions violation right after (re)starting -- it is very likely running with the wrong role's credentials; see $agent_log"
+        die "agent logged a NATS permissions violation right after (re)starting -- it is very likely running with the wrong role's credentials; run this again with --reconfigure and correct OSHIOKI_AGENT_NATS_URL/USER/PASS, or see $agent_log"
       elif [ "$connected" -eq 1 ]; then
         info "agent connected to its NATS bus"
       else
