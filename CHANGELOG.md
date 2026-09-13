@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The macOS release tarball now ships `Oshioki.app` beside the flat binaries,
+  and the Homebrew formula installs it in the keg root, so a `brew` install
+  gets the native approver with its icon without building anything. The
+  bundle's inner binary is a copy of the flat `oshioki-agent` from the same
+  build, ad hoc signed so `codesign --verify --deep --strict` passes after a
+  bottle pour, and hashed in `SHA256SUMS` under
+  `Oshioki.app/Contents/MacOS/oshioki-agent`.
+
+### Changed
+
+- `oshioki-laptop-setup` prefers the keg's bundled agent when it is present
+  and verifies against `SHA256SUMS`, falling back to the flat binary for
+  kegs from older releases.
+
+### Fixed
+
+- The LaunchAgent plist now names the upgrade-stable `opt` path rather than
+  the versioned `Cellar` path, including when an existing plist's
+  credentials are preserved. `brew upgrade` followed by `brew cleanup`
+  deletes the versioned directory, which left the agent unable to spawn at
+  the next login.
+
 ## [0.1.11] - 2026-09-13
 
 ### Fixed

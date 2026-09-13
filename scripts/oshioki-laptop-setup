@@ -159,6 +159,57 @@ fi
 HOOK_BIN="${HOOK_BIN:-}"
 PLUGIN_BIN="${PLUGIN_BIN:-}"
 OSHIOKI_CHECKSUMS="${OSHIOKI_CHECKSUMS:-}"
+# A bare binary makes the Touch ID sheet show a file name and the generic
+# executable badge; the same bytes inside Oshioki.app make it show the Oshioki
+# name and logo. Releases from 0.1.12 ship the bundle in the keg root beside
+# bin/, with its inner binary -- byte-identical to the flat one -- hashed in
+# the same SHA256SUMS under its bundle-relative name. Prefer it when it is
+# there and verifies; older kegs have no bundle and keep the flat binary.
+# An explicitly chosen AGENT_BIN is always left alone.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+AGENT_BUNDLE_REL="Oshioki.app/Contents/MacOS/oshioki-agent"
+if [ -z "$AGENT_BIN_EXPLICIT" ] && [ "$(uname -s)" = Darwin ] \
+  && [ -x "$PARENT_DIR/$AGENT_BUNDLE_REL" ] \
+  && [ -n "$OSHIOKI_CHECKSUMS" ] && [ -f "$OSHIOKI_CHECKSUMS" ]; then
+  bundle_want="$(awk -v n="$AGENT_BUNDLE_REL" '$2 == n || $2 == "*" n {print $1; exit}' \
+    "$OSHIOKI_CHECKSUMS")"
+  bundle_have="$(sha256_of "$PARENT_DIR/$AGENT_BUNDLE_REL")"
+  if [ -z "$bundle_want" ]; then
+    : # No entry: an older manifest. Stay on the flat binary silently.
+  elif [ "$bundle_want" = "$bundle_have" ]; then
+    AGENT_BIN="$PARENT_DIR/$AGENT_BUNDLE_REL"
+  else
+    # A bundle that does not match its manifest is a tampered or half-poured
+    # keg, not something to run: say so and stay on the verified flat binary.
+    echo "oshioki-laptop-setup: $AGENT_BUNDLE_REL does not match SHA256SUMS; using the flat agent binary" >&2
+  fi
+fi
+# <prefix>/Cellar/<formula>/<version>/... is the path `brew upgrade` plus
+# `brew cleanup` deletes outright; <prefix>/opt/<formula>/... is the stable
+# spelling of the same file. A LaunchAgent must name the second or it breaks
+# on the next upgrade. Anything that is not a Cellar path, or whose opt link
+# does not resolve to the very same file, is handed back unchanged.
+stable_keg_path() {
+  local path="$1" prefix rest formula version opt
+  case "$path" in */Cellar/*) ;; *) printf '%s\n' "$path"; return 0 ;; esac
+  prefix="${path%%/Cellar/*}"
+  rest="${path#"$prefix"/Cellar/}"
+  formula="${rest%%/*}"
+  rest="${rest#"$formula"/}"
+  version="${rest%%/*}"
+  rest="${rest#"$version"/}"
+  if [ -z "$formula" ] || [ -z "$version" ] || [ -z "$rest" ] \
+    || [ "$rest" = "$version" ]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  opt="$prefix/opt/$formula/$rest"
+  if [ -e "$opt" ] && [ "$opt" -ef "$path" ]; then printf '%s\n' "$opt"
+  else printf '%s\n' "$path"; fi
+}
 # The PAM module, wherever this layout put it. Left empty when it is absent:
 # only --contextual-pam needs it, and the installer's own error is clearer
 # than one invented here. The release artifact and the brew libexec keep the
@@ -896,6 +947,13 @@ case "$(uname -s)" in
     plist_dir="${LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"
     mkdir -p "$plist_dir"
     plist="$plist_dir/$LABEL.plist"
+    # Never write the versioned Cellar path into the plist: `brew upgrade`
+    # followed by `brew cleanup` removes that directory and the LaunchAgent
+    # then fails to spawn on every login until setup is re-run. The opt
+    # symlink points at whatever version is current.
+    AGENT_BIN_PLIST="$(stable_keg_path "$AGENT_BIN")"
+    [ "$AGENT_BIN_PLIST" = "$AGENT_BIN" ] ||
+      info "using the upgrade-stable path $AGENT_BIN_PLIST for the LaunchAgent"
     xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
     json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
     # Extracts the <string> value that immediately follows <key>$2</key> in
@@ -947,7 +1005,7 @@ case "$(uname -s)" in
       # extraction came back empty, so the file written carried an EMPTY
       # EnvironmentVariables dict -- silently dropping the agent's real NATS
       # credentials to socket-only.
-      "$PLUTIL" -replace ProgramArguments -json "[\"$(json_escape "$AGENT_BIN")\",\"run\"]" "$plist" ||
+      "$PLUTIL" -replace ProgramArguments -json "[\"$(json_escape "$AGENT_BIN_PLIST")\",\"run\"]" "$plist" ||
         die "could not update $plist (plutil failed above); re-run with --reconfigure to replace it outright"
     else
       {
@@ -955,7 +1013,7 @@ case "$(uname -s)" in
         printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
         printf '%s\n' '<plist version="1.0"><dict>'
         printf '  <key>Label</key><string>%s</string>\n' "$LABEL"
-        printf '  <key>ProgramArguments</key><array><string>%s</string><string>run</string></array>\n' "$(xml_escape "$AGENT_BIN")"
+        printf '  <key>ProgramArguments</key><array><string>%s</string><string>run</string></array>\n' "$(xml_escape "$AGENT_BIN_PLIST")"
         printf '%s\n' '  <key>EnvironmentVariables</key><dict>'
         # Socket-only writes no NATS keys at all: the agent would otherwise
         # log an authorization failure on every start against a server that
