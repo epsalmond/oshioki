@@ -28,7 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installs; answering `disabled` was a true statement about the plugin and a
   false one about the install. It made `oshioki-laptop-setup
   --contextual-pam` fail its own final verify and exit before it ever reached
-  the migration it was asked for. Off the lane the answer is unchanged.
+  the migration it was asked for. The lane is only reported when the module
+  the PAM entry references is actually there as a root-owned regular file: an
+  entry naming a module that is missing is a degraded host, and it now reports
+  `FAIL contextual PAM lane: entry present but module missing at <path>` and
+  exits non-zero. A half-written managed block in `sudo.conf` is still named
+  on a lane host, since that check now runs before the lane is considered.
+  Off the lane the answer is unchanged, and `oshioki-laptop-setup
+  --contextual-pam` treats a failing verify as something the migration below
+  repairs rather than a reason to stop.
 - `oshioki enroll` bounds its wait on the approval transport, the way `check`
   and `authenticate` already did. It prints nothing until the enrollment
   intent has been published, so a NATS host that blackholes rather than
