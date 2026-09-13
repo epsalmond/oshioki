@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-09-13
+
 ### Fixed
 
 - `oshioki-laptop-setup`'s Mac agent NATS verification could declare success
