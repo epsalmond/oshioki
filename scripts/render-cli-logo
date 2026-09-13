@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+SVG="$ROOT/assets/oshioki.svg"
+OUTPUT="$ROOT/assets/oshioki-cli.png"
+SIZE="${1:-256}"
+
+usage() {
+  echo "usage: scripts/render-cli-logo [SIZE]" >&2
+  exit 2
+}
+
+[[ "$SIZE" =~ ^[1-9][0-9]*$ ]] || usage
+[ -f "$SVG" ] || {
+  echo "canonical logo is missing: $SVG" >&2
+  exit 1
+}
+
+find_browser() {
+  if [ -n "${CHROME_BIN:-}" ]; then
+    [ -x "$CHROME_BIN" ] || {
+      echo "CHROME_BIN is not executable: $CHROME_BIN" >&2
+      exit 1
+    }
+    printf '%s\n' "$CHROME_BIN"
+    return
+  fi
+
+  local candidate
+  for candidate in chromium chromium-browser google-chrome google-chrome-stable; do
+    if candidate="$(command -v "$candidate" 2>/dev/null)"; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+
+  for candidate in \
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' \
+    '/Applications/Chromium.app/Contents/MacOS/Chromium'; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+
+  local cache_root="${PLAYWRIGHT_BROWSERS_PATH:-${XDG_CACHE_HOME:-$HOME/.cache}/ms-playwright}"
+  if [ -d "$cache_root" ]; then
+    local browser_name
+    # Playwright's headless shell exits cleanly with an isolated profile;
+    # prefer it over the full browser when both are cached.
+    for browser_name in headless_shell chrome; do
+      while IFS= read -r candidate; do
+        [ -x "$candidate" ] || continue
+        printf '%s\n' "$candidate"
+        return
+      done < <(
+        find "$cache_root" -type f -path "*/chrome-linux*/$browser_name" \
+          -perm -u+x -print 2>/dev/null | sort -r
+      )
+    done
+  fi
+
+  echo "Chromium is required; set CHROME_BIN to its executable path" >&2
+  exit 1
+}
+
+BROWSER="$(find_browser)"
+TEMP_DIR="$(mktemp -d "$ROOT/assets/.oshioki-cli.XXXXXX")"
+trap 'rm -rf -- "$TEMP_DIR"' EXIT
+ulimit -c 0
+
+CHROME_ARGS=(
+  --headless=new
+  --disable-gpu
+  --disable-dev-shm-usage
+  --hide-scrollbars
+  --no-first-run
+  --no-default-browser-check
+  --disable-background-networking
+  --disable-breakpad
+  --disable-crashpad
+  --force-device-scale-factor=1
+  --default-background-color=00000000
+  --window-size="${SIZE},${SIZE}"
+  --screenshot="$TEMP_DIR/oshioki-cli.png"
+  --user-data-dir="$TEMP_DIR/profile"
+  "file://$SVG"
+)
+
+# Ubuntu/AppArmor can disable the user-namespace sandbox. Probe that host
+# capability before starting Chromium so a failed sandbox does not leave a
+# crash diagnostic in the worktree.
+SANDBOX_ARGS=()
+if [ "$(uname -s)" = Linux ] && {
+  ! command -v unshare >/dev/null 2>&1 || ! unshare -Ur true >/dev/null 2>&1
+}; then
+  SANDBOX_ARGS=(--no-sandbox)
+fi
+
+if ! "$BROWSER" "${SANDBOX_ARGS[@]}" "${CHROME_ARGS[@]}" >/dev/null 2>"$TEMP_DIR/chrome.log"; then
+  # Retry with the sandbox disabled for other hosts whose Chromium policy
+  # rejects the first invocation.
+  [ "${#SANDBOX_ARGS[@]}" -eq 0 ] || {
+    echo "Chromium failed:" >&2
+    sed -n '1,80p' "$TEMP_DIR/chrome.log" >&2
+    exit 1
+  }
+  rm -rf -- "$TEMP_DIR/profile"
+  if ! "$BROWSER" --no-sandbox "${CHROME_ARGS[@]}" >/dev/null 2>"$TEMP_DIR/chrome.log"; then
+    echo "Chromium failed:" >&2
+    sed -n '1,80p' "$TEMP_DIR/chrome.log" >&2
+    exit 1
+  fi
+fi
+
+[ -s "$TEMP_DIR/oshioki-cli.png" ] || {
+  echo "Chromium did not produce a PNG:" >&2
+  sed -n '1,80p' "$TEMP_DIR/chrome.log" >&2
+  exit 1
+}
+
+mv -- "$TEMP_DIR/oshioki-cli.png" "$OUTPUT"
+echo "rendered $OUTPUT (${SIZE}x${SIZE}) from $SVG"

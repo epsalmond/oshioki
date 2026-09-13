@@ -24,6 +24,9 @@ use tracing::{debug, info, warn};
 use url::{Host, Url};
 use uuid::Uuid;
 
+#[path = "../../cli/terminal_logo.rs"]
+mod terminal_logo;
+
 use oshioki_protocol::auth_v1::{
     AUTH_ENVELOPE_TYPE, AUTH_REQUEST_TYPE, AUTH_WIRE_VERSION, AuthDecisionV1, AuthEnvelopeV1,
     AuthInvocationV1, AuthRequestV1, SubmittedAuthContextV1, TrustedAuthContextV1,
@@ -73,7 +76,12 @@ fn approval_unavailable(detail: impl Into<String>) -> anyhow::Error {
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Parser)]
-#[command(name = "oshioki", about = "sudo approval hook", version)]
+#[command(
+    name = "oshioki",
+    about = "Manage Oshioki sudo approvals",
+    version,
+    after_help = "Examples:\n  sudo oshioki enroll\n  sudo oshioki status\n  sudo oshioki revoke <fingerprint>"
+)]
 struct Cli {
     #[command(subcommand)]
     verb: Verb,
@@ -81,6 +89,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Verb {
+    /// Private handshake used by the sudo plugin.
+    #[command(hide = true)]
     Check {
         /// Required private handshake from the matching root-owned plugin.
         /// Hidden from normal operator help; a missing or mismatched value
@@ -98,30 +108,38 @@ enum Verb {
         #[arg(long, hide = true)]
         pam_liveness_fd: Option<RawFd>,
     },
+    /// Create an enrollment URL and wait for a device to finish enrolling.
     Enroll {
-        #[arg(long, allow_hyphen_values = true)]
+        /// Resume an enrollment by ID.
+        #[arg(long, value_name = "ENROLLMENT_ID", allow_hyphen_values = true)]
         resume: Option<String>,
         /// Permit a loopback enrollment origin for local development only.
         #[arg(long)]
         allow_localhost: bool,
     },
-    Revoke {
-        #[arg(allow_hyphen_values = true)]
-        fingerprint: String,
-    },
+    /// Pin a device fetched from the configured server.
     Pin {
-        #[arg(allow_hyphen_values = true)]
+        /// Device fingerprint to fetch and confirm.
+        #[arg(value_name = "FINGERPRINT", allow_hyphen_values = true)]
         fingerprint: String,
     },
-    /// Pin a device record from a file, as printed by `oshioki-agent
-    /// device-record`, for hosts the server never sees. The fingerprint
-    /// confirmation is the same ceremony as `pin`; nothing is fetched.
+    /// Pin a device from a JSON record file.
     PinRecord {
-        #[arg(allow_hyphen_values = true)]
+        /// Path to a record from `oshioki-agent device-record`.
+        #[arg(value_name = "PATH", allow_hyphen_values = true)]
         path: PathBuf,
     },
+    /// Revoke an enrolled device by fingerprint.
+    Revoke {
+        /// Device fingerprint to revoke.
+        #[arg(value_name = "FINGERPRINT", allow_hyphen_values = true)]
+        fingerprint: String,
+    },
+    /// Show sudo authentication and enrolled devices.
     Status,
+    /// Open browser approval pages for incoming requests.
     Watch,
+    /// Send a synthetic request through the approval flow.
     Test,
     /// Private installer verb. `scripts/install-oshioki-hook --contextual-pam`
     /// runs it after staging the PAM module and before any /etc/pam.d file
@@ -154,6 +172,7 @@ struct ServerHealthV1 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    terminal_logo::maybe_print_for_help();
     let cli = Cli::parse();
     // Both privileged sudo verbs share the terminal/audit split and the
     // exit-status contract; only their payloads differ.
@@ -3461,6 +3480,7 @@ mod tests {
             );
         }
     }
+    use clap::CommandFactory as _;
     use p256::ecdsa::SigningKey;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[test]
@@ -3488,6 +3508,60 @@ mod tests {
                 resume: None,
             }
         ));
+    }
+
+    #[test]
+    fn private_check_remains_parseable_but_is_hidden_from_operator_help() {
+        let cli =
+            Cli::try_parse_from(["oshioki", "check", "--plugin-protocol-version", "1"]).unwrap();
+        assert!(matches!(
+            cli.verb,
+            Verb::Check {
+                plugin_protocol_version: Some(1)
+            }
+        ));
+
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("Manage Oshioki sudo approvals"), "{help}");
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with("check")),
+            "{help}"
+        );
+        assert!(!help.contains("plugin-protocol-version"), "{help}");
+    }
+
+    #[test]
+    fn public_command_help_names_arguments_and_actions() {
+        let mut command = Cli::command();
+        let expected = [
+            ("enroll", "Create an enrollment URL", "ENROLLMENT_ID"),
+            ("pin", "Pin a device fetched", "FINGERPRINT"),
+            ("pin-record", "Pin a device from", "PATH"),
+            ("revoke", "Revoke an enrolled device", "FINGERPRINT"),
+        ];
+        for (name, description, value_name) in expected {
+            let subcommand = command
+                .find_subcommand_mut(name)
+                .expect("public command should be present");
+            let help = subcommand.render_help().to_string();
+            assert!(help.contains(description), "{name}: {help}");
+            assert!(help.contains(value_name), "{name}: {help}");
+        }
+        for (name, description) in [
+            ("status", "Show sudo authentication"),
+            ("watch", "Open browser approval pages"),
+            ("test", "Send a synthetic request"),
+        ] {
+            let subcommand = command
+                .find_subcommand_mut(name)
+                .expect("public command should be present");
+            assert!(
+                subcommand.render_help().to_string().contains(description),
+                "{name}"
+            );
+        }
     }
     /// The complete effective environment reaches the signed request in its
     /// original order, including variables not in the finite display

@@ -32,6 +32,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{info, warn};
 
+#[path = "../../cli/terminal_logo.rs"]
+mod terminal_logo;
+
 const PAIR_TIMEOUT: Duration = Duration::from_secs(300);
 /// Maximum number of request handlers, across both transports, that may be
 /// waiting on a prompt or doing request work at once. Admission is
@@ -107,7 +110,11 @@ impl RequestPermit {
 }
 
 #[derive(Parser)]
-#[command(name = "oshioki-agent", version, about)]
+#[command(
+    name = "oshioki-agent",
+    version,
+    about = "Run a native Oshioki approval agent"
+)]
 struct Cli {
     /// Directory holding the agent identity (default: `$OSHIOKI_AGENT_STATE`,
     /// then ~/.config/oshioki).
@@ -121,7 +128,8 @@ struct Cli {
 enum Verb {
     /// Enroll this device with a host using the URL printed by `oshioki enroll`.
     Pair {
-        #[arg(allow_hyphen_values = true)]
+        /// Enrollment URL printed by `oshioki enroll`.
+        #[arg(value_name = "ENROLLMENT_URL", allow_hyphen_values = true)]
         enrollment_url: String,
         /// Label shown on the host's device list.
         #[arg(long)]
@@ -136,14 +144,14 @@ enum Verb {
         #[arg(long)]
         force: bool,
     },
-    /// Watch for requests and decide them.
+    /// Watch for sudo requests and ask for approval.
     Run {
         /// Decide every request without asking. For tests only.
         #[cfg(feature = "unattended")]
         #[arg(long, value_enum)]
         auto: Option<Auto>,
     },
-    /// Print this device's fingerprint.
+    /// Print this device's fingerprint and signer.
     Show,
     /// Create this device's identity without enrolling it. For offline
     /// pairing: `device-record` reads what `init` writes.
@@ -206,6 +214,7 @@ fn requested_signer_kind(flag: Option<SignerArg>) -> Option<SignerKind> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    terminal_logo::maybe_print_for_help();
     // Silent by default hid a day of "NATS unreachable" from the LaunchAgent
     // log; RUST_LOG still overrides.
     tracing_subscriber::fmt()

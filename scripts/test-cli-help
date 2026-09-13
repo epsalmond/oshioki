@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Check interactive CLI help output without contacting any Oshioki service."""
+
+from __future__ import annotations
+
+import errno
+import os
+import pty
+import selectors
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+GRAPHICS = b"\x1b_G"
+
+
+def environment(term_program: str = "kitty", term: str = "xterm-kitty") -> dict[str, str]:
+    result = dict(os.environ)
+    result["TERM_PROGRAM"] = term_program
+    result["TERM"] = term
+    result.pop("TMUX", None)
+    result.pop("STY", None)
+    return result
+
+
+def run_pty(binary: Path, arguments: list[str], env: dict[str, str]) -> tuple[bytes, int]:
+    master, slave = pty.openpty()
+    try:
+        process = subprocess.Popen(
+            [str(binary), *arguments],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=slave,
+            stderr=slave,
+        )
+    finally:
+        os.close(slave)
+
+    output = bytearray()
+    selector = selectors.DefaultSelector()
+    selector.register(master, selectors.EVENT_READ)
+    deadline = time.monotonic() + 10
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait(timeout=5)
+                raise TimeoutError(f"timed out: {binary} {' '.join(arguments)}")
+            for key, _ in selector.select(timeout=min(0.1, remaining)):
+                try:
+                    chunk = os.read(key.fd, 8192)
+                    if not chunk:
+                        selector.unregister(key.fd)
+                    else:
+                        output.extend(chunk)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    selector.unregister(key.fd)
+            if process.poll() is not None and not selector.get_map():
+                break
+        returncode = process.wait(timeout=5)
+    finally:
+        selector.close()
+        os.close(master)
+    return bytes(output), returncode
+
+
+def run_pipe(binary: Path, arguments: list[str], env: dict[str, str]) -> tuple[bytes, bytes, int]:
+    result = subprocess.run(
+        [str(binary), *arguments],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    return result.stdout, result.stderr, result.returncode
+
+
+def check_binary(binary: Path, subcommand: str) -> None:
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise SystemExit(f"missing executable: {binary}; build the workspace first")
+
+    for term_program, term in [
+        ("kitty", "xterm-kitty"),
+        ("WezTerm", "xterm-256color"),
+        ("ghostty", "xterm-ghostty"),
+    ]:
+        output, status = run_pty(binary, ["--help"], environment(term_program, term))
+        assert status == 0, (binary, term_program, status)
+        assert GRAPHICS in output, (
+            binary,
+            term_program,
+            "graphics help did not contain a Kitty sequence",
+        )
+
+    for arguments, env, expected_status in [
+        (["--help"], environment("kitty", "dumb"), 0),
+        (["--help"], {**environment(), "TMUX": "/tmp/tmux"}, 0),
+        (["--help"], {**environment(), "STY": "screen"}, 0),
+        (["--version"], environment(), 0),
+        ([subcommand, "--help"], environment(), 0),
+        (["not-a-command"], environment(), 2),
+        ([], environment(), 2),
+    ]:
+        output, status = run_pty(binary, arguments, env)
+        assert status == expected_status, (binary, arguments, status)
+        assert GRAPHICS not in output, (binary, arguments, "unexpected graphics sequence")
+
+    output, _, status = run_pipe(binary, ["--help"], environment())
+    assert status == 0, (binary, status)
+    assert GRAPHICS not in output, (binary, "piped help contained a graphics sequence")
+
+
+def main() -> None:
+    target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    binaries = [
+        (Path(os.environ.get("OSHIOKI_HOOK_BIN", target / "debug/oshioki")), "status"),
+        (
+            Path(os.environ.get("OSHIOKI_AGENT_BIN", target / "debug/oshioki-agent")),
+            "pair",
+        ),
+    ]
+    for binary, subcommand in binaries:
+        check_binary(binary, subcommand)
+    print("test-cli-help: PASS")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (AssertionError, OSError, subprocess.SubprocessError) as error:
+        print(f"test-cli-help: FAIL: {error}", file=sys.stderr)
+        raise SystemExit(1) from error

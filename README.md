@@ -2,24 +2,20 @@
 
 <p align="center"><img src="assets/oshioki.svg" alt="Oshioki logo" width="160"></p>
 
-Oshioki (お仕置き): the sound of a keypress, and a pun for "punishment."
+Oshioki (お仕置き) adds Touch ID, WebAuthn, or native device approval to
+`sudo`.
+WebAuthn runs in a phone browser. Native approvals use `oshioki-agent`.
 
-TouchID or WebAuthn approval (from your phone) for sudo requests. Works for
-agents, remote servers, VMs, containers or anywhere that has network access to
-your approval device.
-
-Requests are encrypted, and approvals are signed, so forging an approval is
-difficult. gpt-5.6-daybreak was used to look for vulnerabilities.
-
-NATS is used as the transport, because it's cool. A local socket is also
-supported (but isn't as cool.)
+Requests are encrypted and approvals are signed. A local Unix socket is
+available for native approvals. NATS with JetStream connects hosts, servers,
+and approval devices.
 
 Licensed under MIT OR Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and
 [LICENSE-APACHE](LICENSE-APACHE).
 
 ## Install
 
-Debian/Ubuntu (amd64), from the
+Debian or Ubuntu (amd64), from the
 [latest release](https://github.com/epsalmond/oshioki/releases):
 
 ```bash
@@ -32,103 +28,152 @@ macOS (Apple Silicon):
 brew install epsalmond/oshioki/oshioki
 ```
 
-From source (any platform with Rust):
+From a source checkout:
 
 ```bash
-cargo build --locked --release -p oshioki-hook -p oshioki-server
+cargo build --locked --release --workspace
 ```
 
-then wire up the hook with `scripts/install-oshioki-hook` — see the
-[runbook](RUNBOOK.md).
+Follow the [runbook](RUNBOOK.md) to install the hook from a source build.
 
-## Configure
+## Choose a setup
 
-### Phone enrollment
+### Local Mac with Touch ID
 
-On a host with the hook installed, run setup as your normal user:
+Run setup as your logged-in user:
+
+```bash
+oshioki-laptop-setup --local
+```
+
+On macOS, this creates a Secure Enclave identity, uses Touch ID for each
+approval, and starts the agent with a LaunchAgent. The local setup needs no
+server. On Linux, it creates a software native identity, writes the agent
+environment, and prints the command to run it in a terminal; normal sudo
+password authentication remains required.
+
+See [Mac approvals](docs/mac-approvals.md) and the [runbook](RUNBOOK.md) for
+manual setup and recovery.
+
+### Phone
+
+Run setup on the host as your normal user, then enroll the phone:
 
 ```bash
 oshioki-phone-setup
 sudo oshioki enroll
 ```
 
-Setup prefers Tailscale. It runs a local Oshioki server and NATS with
-JetStream, then uses Tailscale Serve for HTTPS. Open the enrollment URL in
-your phone's browser while the phone is connected to the same tailnet.
-The existing local Touch ID device and socket remain configured.
-
-Tailscale is optional. To use an existing HTTPS Oshioki server:
+The default uses a local Oshioki server, NATS with JetStream, and Tailscale
+Serve. Open the printed URL in a browser on a phone connected to the same
+tailnet. An existing HTTPS server is supported too:
 
 ```bash
-oshioki-phone-setup --server-url https://sudo.example.com --nats-config /path/to/hook-nats.env
+oshioki-phone-setup \
+  --server-url https://sudo.example.com \
+  --nats-config /path/to/hook-nats.env
 sudo oshioki enroll
 ```
 
-The configuration file supplies that server's NATS connection settings.
-Setup verifies the HTTPS endpoint before changing the hook configuration.
-See [phone setup](docs/phone-enrollment.md) for prerequisites and service
-management. A `localhost` enrollment URL only works on the host itself;
-`enroll` now explains how to configure phone access instead of printing one.
+See [phone enrollment](docs/phone-enrollment.md) for prerequisites, service
+management, and the HTTPS server option.
 
-### Transport
+### Native device
 
-You need a reachable NATS server with JetStream alongside the Oshioki server. `OSHIOKI_TRANSPORT` selects the transport; the default is `nats`. Others are planned (#6, #7).
-
-NATS connections past your own machine require TLS: use `tls://` URLs, with
-the server presenting a certificate your system trusts (hostname-verified
-against the system roots). Plaintext `nats://` works only for loopback
-hosts — anything else is refused at startup. For testing without server
-certificates (Compose, the dev scripts), set `OSHIOKI_ALLOW_PLAINTEXT_NATS=1`
-in the component's own config channel: the process environment for the
-server and the agent, `config.env` for the hook (sudo scrubs its
-environment). Never set it in production. Give each component role — hook,
-agent, server — its own NATS user, so one leaked credential does not open
-the whole control plane.
-
-Enroll a device from the host:
+Start enrollment on the host:
 
 ```bash
 sudo oshioki enroll
 ```
 
-That prints an enrollment URL. Open it in a browser to enroll WebAuthn, or run
-this from your terminal:
+On the device, run the command printed by `enroll`, then start the agent:
 
 ```bash
 oshioki-agent pair '<enrollment-url>' --label <label>
 oshioki-agent run
 ```
 
-From then on, hardware-backed approvals can replace the sudo password; a
-software native identity still requires normal sudo authentication. On Linux,
-an interactive request also races the invoking account password through the
-host's `sudo` PAM service. Press Enter to skip that fallback and wait for
-device approval. `sudo -n` never opens the plugin password prompt. The
-device-only flow requires the installer's `sudoers.d` `NOPASSWD` rule, which
-is written only for a hardware-backed device. Details in
-[docs/native-agent.md](docs/native-agent.md) and
-[docs/mac-approvals.md](docs/mac-approvals.md).
+macOS uses the Secure Enclave by default. Other platforms use a software
+key. Software native identities still require the normal sudo password.
+See [native agent](docs/native-agent.md) for identity state, offline pairing,
+and the macOS LaunchAgent.
+
+For a host that cannot reach the server, export the public device record on
+the approval device, copy it to the host, and pin it there:
 
 ```bash
-sudo oshioki status               # enrolled devices
-sudo oshioki revoke <fingerprint> # remove one
+oshioki-agent init
+oshioki-agent device-record --label <label> > /tmp/oshioki-device.json
+# Copy /tmp/oshioki-device.json to the host.
+sudo oshioki pin-record /tmp/oshioki-device.json
 ```
 
-Installing the hook and running acceptance sessions is covered in the
-[runbook](RUNBOOK.md).
+### Remote host
 
-### Server
+Install the hook on each host that needs approval. Run an Oshioki server with
+NATS and JetStream, then give the hook and each native agent separate NATS
+credentials. NATS connections outside loopback require TLS with a trusted,
+hostname-matched certificate. The plaintext opt-out is for local testing
+only.
 
-If you are running on remote servers, NATS with JetStream is needed to reach
-your laptop. See [docs/requirements.md](docs/requirements.md) and
-[docs/configuration.md](docs/configuration.md). Either install the `.deb` and
-create `/etc/oshioki/server.env`, then `systemctl enable --now oshioki-server`,
-or build from source with `cargo build --locked --release -p oshioki-server`.
+See [production requirements](docs/requirements.md),
+[configuration](docs/configuration.md), and the [runbook](RUNBOOK.md).
+
+## Command reference
+
+Run host commands as root because they read or update `/etc/oshioki`.
+
+| Command | Purpose |
+| --- | --- |
+| `sudo oshioki enroll` | Create an enrollment URL and wait for a device. |
+| `sudo oshioki enroll --resume <enrollment-id>` | Resume an enrollment. |
+| `sudo oshioki pin <fingerprint>` | Fetch and pin a device from the server. |
+| `sudo oshioki pin-record <path>` | Pin a JSON device record from a file. |
+| `sudo oshioki revoke <fingerprint>` | Revoke a device on the server and host. |
+| `sudo oshioki status` | Show sudo authentication and enrolled devices. |
+| `sudo oshioki watch` | Open browser approval pages for incoming requests. |
+| `sudo oshioki test` | Send a synthetic request through the approval flow. |
+
+Use `oshioki --help` for the public command list and
+`oshioki-agent --help` for the native agent. In Kitty-compatible terminals,
+including WezTerm and Ghostty, either top-level help command also shows the
+embedded Oshioki logo. Pipes and tmux or screen sessions stay plain text.
+
+The native agent has separate commands for pairing, running, inspecting, and
+exporting an identity:
+
+```bash
+oshioki-agent --help
+oshioki-agent pair '<enrollment-url>' --label <label>
+oshioki-agent run
+oshioki-agent show
+```
+
+## Configure
+
+The hook reads its state from `/etc/oshioki` by default. The native agent uses
+`~/.config/oshioki` unless `OSHIOKI_AGENT_STATE` or `--state` changes it.
+
+The hook can try a native agent Unix socket before falling back to NATS. A
+socket-only host omits `NATS_URL` from its hook configuration. Browser
+WebAuthn approval still needs the Oshioki server.
+
+Use `tls://` for NATS outside loopback. Set
+`OSHIOKI_ALLOW_PLAINTEXT_NATS=1` only in the component's development
+configuration. Keep hook, agent, and server credentials separate.
+
+See [configuration](docs/configuration.md) for environment variables,
+[architecture](docs/architecture.md) for the request flow, and
+[security](SECURITY.md) for reporting vulnerabilities.
 
 ## Develop it
 
-Start with [CONTRIBUTING.md](CONTRIBUTING.md). Internals live in
-[docs/architecture.md](docs/architecture.md),
-[docs/configuration.md](docs/configuration.md), and
-[docs/requirements.md](docs/requirements.md). [CHANGELOG.md](CHANGELOG.md)
-tracks the road to 1.0; report vulnerabilities per [SECURITY.md](SECURITY.md).
+Start with [CONTRIBUTING.md](CONTRIBUTING.md):
+
+```bash
+scripts/dev build
+scripts/dev test --quick
+```
+
+The [runbook](RUNBOOK.md) covers supervised acceptance sessions and host
+installation details. [CHANGELOG.md](CHANGELOG.md) records release changes.
