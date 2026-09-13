@@ -13,6 +13,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 usage: scripts/mac/bundle-agent [--binary PATH] [--output DIR] [--sign IDENTITY]
+                               [--version VERSION]
 
   --binary PATH   agent binary to wrap (default: target/release/oshioki-agent,
                   built with `cargo build --release -p oshioki-agent` if absent)
@@ -20,6 +21,8 @@ usage: scripts/mac/bundle-agent [--binary PATH] [--output DIR] [--sign IDENTITY]
   --sign IDENTITY codesign identity, e.g. "Developer ID Application: ...".
                   Signs the bundle with the hardened runtime and the keychain
                   entitlement. Absent, the bundle stays unsigned.
+  --version VER   version for CFBundleShortVersionString/CFBundleVersion
+                  (default: the workspace version in the root Cargo.toml)
 
 Prints the path of the binary inside the bundle, which is what the LaunchAgent
 should run.
@@ -30,18 +33,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 BINARY=""
 OUTPUT="$ROOT/target/mac"
 SIGN=""
+VERSION=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --binary) BINARY="${2:?--binary needs a path}"; shift 2 ;;
     --output) OUTPUT="${2:?--output needs a path}"; shift 2 ;;
     --sign) SIGN="${2:?--sign needs an identity}"; shift 2 ;;
+    --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 [ "$(uname -s)" = "Darwin" ] || { echo "bundle-agent only runs on macOS" >&2; exit 1; }
+
+# A bundle whose version never moves is a bundle Launch Services and every
+# crash report describe as 0.1.0 forever. The workspace version is the one
+# the binary inside already reports, so read it from there by default rather
+# than keeping a second number in sync by hand.
+if [ -z "$VERSION" ]; then
+  VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' \
+    "$ROOT/Cargo.toml" | head -1)"
+fi
+[ -n "$VERSION" ] || { echo "cannot read the workspace version from $ROOT/Cargo.toml" >&2; exit 1; }
 
 if [ -z "$BINARY" ]; then
   BINARY="$ROOT/target/release/oshioki-agent"
@@ -56,7 +71,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 0755 "$BINARY" "$APP/Contents/MacOS/oshioki-agent"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -68,7 +83,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key><string>Oshioki</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSUIElement</key><true/>
 </dict>

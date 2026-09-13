@@ -44,7 +44,10 @@ install -m 0755 "target/$TARGET/release/oshioki-server" "$OUTPUT/oshioki-server"
 # the flat one. bundle-agent copies the binary that was just built rather
 # than building its own, so the two are the same build; the cmp below is the
 # guard that keeps it that way.
-"$ROOT/scripts/mac/bundle-agent" --binary "$OUTPUT/oshioki-agent" --output "$OUTPUT" >/dev/null
+CARGO_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+[ -n "$CARGO_VERSION" ] || { echo "cannot read the workspace version from $ROOT/Cargo.toml" >&2; exit 1; }
+"$ROOT/scripts/mac/bundle-agent" --binary "$OUTPUT/oshioki-agent" --output "$OUTPUT" \
+  --version "$CARGO_VERSION" >/dev/null
 APP_BIN="$OUTPUT/Oshioki.app/Contents/MacOS/oshioki-agent"
 cmp -s "$OUTPUT/oshioki-agent" "$APP_BIN" ||
   { echo "the bundled agent is not a copy of $OUTPUT/oshioki-agent" >&2; exit 1; }
@@ -61,6 +64,14 @@ codesign --verify --deep --strict "$OUTPUT/Oshioki.app"
 # gets a working bundle), but a release without it is the whole point missed.
 [ -f "$OUTPUT/Oshioki.app/Contents/Resources/Oshioki.icns" ] ||
   { echo "Oshioki.app has no icon: no SVG renderer on this builder" >&2; exit 1; }
+# The bundle version is what Launch Services and crash reports show. It was a
+# hardcoded 0.1.0 until 0.1.12; assert it tracks the release rather than
+# trusting that it still does.
+for key in CFBundleShortVersionString CFBundleVersion; do
+  got="$(/usr/bin/plutil -extract "$key" raw -o - "$OUTPUT/Oshioki.app/Contents/Info.plist")"
+  [ "$got" = "$CARGO_VERSION" ] ||
+    { echo "Oshioki.app $key is $got, not the Cargo version $CARGO_VERSION" >&2; exit 1; }
+done
 install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$OUTPUT/install-oshioki-hook"
 install -m 0755 "$ROOT/scripts/oshioki-laptop-setup" "$OUTPUT/oshioki-laptop-setup"
 install -m 0755 "$ROOT/scripts/oshioki-phone-setup" "$OUTPUT/oshioki-phone-setup"
