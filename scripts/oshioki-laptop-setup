@@ -391,10 +391,42 @@ prompt() {
 # own shell, into a private 0600 temp file, and every key is read from there
 # with no privilege at all.
 INSTALL_ENV_SNAPSHOT=""
+
+# Every temp file this script makes carries a credential -- install.env's
+# NATS_PASS, the staged values block, the privileged phase's report -- and any
+# of them can be orphaned before its own `rm` runs: a denied or cancelled sudo
+# exits under `set -e`, and Ctrl-C at the Touch ID sheet never returns at all.
+# So nothing relies on reaching an inline `rm`; each file is registered here
+# the moment it exists and the EXIT trap is what guarantees it goes.
+# One run-private directory rather than a list of registered paths: every
+# temp file below is created inside a `$(...)`, so anything that worked by
+# appending to a variable would append in the substitution's subshell and be
+# lost -- the same trap that made env_key elevate eight times. A directory
+# needs no bookkeeping: whatever lands in it goes when the trap fires.
+# 0700 on the directory, 0600 on each file: both matter, because these carry
+# the NATS password.
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/oshioki-run.XXXXXX")" ||
+  die "cannot create a temp directory"
+chmod 0700 "$TMP_DIR"
+# One EXIT trap for the whole run. Nothing relies on reaching an inline `rm`:
+# a denied or cancelled sudo exits under `set -e` before one, and Ctrl-C at
+# the Touch ID sheet never returns at all.
+cleanup_run() {
+  rm -rf "$TMP_DIR"
+  if [ -n "${enroll_pid:-}" ]; then kill "$enroll_pid" 2>/dev/null || true; fi
+}
+trap cleanup_run EXIT
+
+run_tmp() {
+  local path
+  path="$(mktemp "$TMP_DIR/$1.XXXXXX")" || die "cannot create a temp file"
+  chmod 0600 "$path"
+  printf '%s' "$path"
+}
+
 snapshot_install_env() {
   [ -z "$INSTALL_ENV_SNAPSHOT" ] || return 0
-  # mktemp creates the file 0600, which matters: it holds the NATS password.
-  INSTALL_ENV_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/oshioki-env.XXXXXX")"
+  INSTALL_ENV_SNAPSHOT="$(run_tmp oshioki-env)"
   if [ "$(id -u)" -eq 0 ] || [ -z "${SUDO:-}" ]; then
     cat "$INSTALL_ENV" > "$INSTALL_ENV_SNAPSHOT" 2>/dev/null || true
   else
@@ -417,13 +449,6 @@ env_key() {
     "$INSTALL_ENV_SNAPSHOT" 2>/dev/null || true
 }
 
-# One EXIT trap for the whole run: the snapshot carries a credential and the
-# enrollment child outlives a failed run otherwise.
-cleanup_run() {
-  [ -z "$INSTALL_ENV_SNAPSHOT" ] || rm -f "$INSTALL_ENV_SNAPSHOT"
-  if [ -n "${enroll_pid:-}" ]; then kill "$enroll_pid" 2>/dev/null || true; fi
-}
-trap cleanup_run EXIT
 
 # Does install.env exist? Ask through sudo, the same way the snapshot above
 # takes it -- and as one plain top-level command, so it rides the same ticket.
@@ -773,7 +798,7 @@ if [ "$LOCAL" -eq 1 ]; then
   fi
   # Exported here, pinned by the privileged phase: the record crosses the
   # boundary as a file, never as arguments.
-  record="$(mktemp "${TMPDIR:-/tmp}/oshioki-record.XXXXXX")"
+  record="$(run_tmp oshioki-record)"
   "$AGENT_BIN" device-record --label "$(hostname -s 2>/dev/null || hostname)" > "$record"
   fingerprint="$(grep '"fingerprint":' "$record" | sed -e 's/^[^:]*:[[:space:]]*"//' -e 's/".*$//' || true)"
   [ -n "$fingerprint" ] || { rm -f "$record"; die "device record has no fingerprint"; }
@@ -811,7 +836,7 @@ if [ "$LOCAL" -eq 1 ]; then
   fi
   # Staged for the privileged phase, which writes install.env itself (or
   # reuses it) and reports the effective values back.
-  values="$(mktemp "${TMPDIR:-/tmp}/oshioki-values.XXXXXX")"
+  values="$(run_tmp oshioki-values)"
   {
     printf 'OSHIOKI_ORIGIN=%s\n' "${OSHIOKI_ORIGIN:-https://localhost}"
     printf 'OSHIOKI_RP_ID=%s\n' "${OSHIOKI_RP_ID:-localhost}"
@@ -822,7 +847,6 @@ if [ "$LOCAL" -eq 1 ]; then
     fi
     printf 'OSHIOKI_AGENT_SOCKET=%s\n' "${OSHIOKI_AGENT_SOCKET:-$DEFAULT_SOCKET}"
   } > "$values"
-  chmod 0600 "$values"
 fi
 if [ "$LOCAL" -eq 0 ]; then
 info "step 1/$TOTAL_STEPS: installer configuration in $INSTALL_ENV"
@@ -857,7 +881,7 @@ if ! install_env_exists || [ "$RECONFIGURE" -eq 1 ]; then
     AGENT_NATS_URL_V=""
     AGENT_NATS_USER_V=""
   fi
-  env_tmp="$(mktemp "${TMPDIR:-/tmp}/oshioki-install-env.XXXXXX")"
+  env_tmp="$(run_tmp oshioki-install-env)"
   {
     printf 'OSHIOKI_ORIGIN=%s\n' "$ORIGIN"
     printf 'OSHIOKI_RP_ID=%s\n' "$RP_ID"
@@ -873,9 +897,16 @@ if ! install_env_exists || [ "$RECONFIGURE" -eq 1 ]; then
   # on the far side of a pipeline is forked from this shell like any other
   # pipeline element, and keeping every sudo a plain top-level command is what
   # keeps the whole run on one timestamp ticket (see snapshot_install_env).
-  $SUDO cp "$env_tmp" "$INSTALL_ENV"
+  #
+  # Installed to a root-owned sibling and then renamed, never copied over the
+  # live file: `cp` truncates the destination first, so an interrupted copy
+  # leaves install.env half-written and world-unreadable garbage is what the
+  # next sudo reads. `mv` within the same directory is atomic, and `install`
+  # creates the sibling root-owned at 0600 in one step rather than leaving a
+  # readable window before a separate chmod.
+  $SUDO install -m 0600 "$env_tmp" "$INSTALL_ENV.new"
+  $SUDO mv -f "$INSTALL_ENV.new" "$INSTALL_ENV"
   rm -f "$env_tmp"
-  $SUDO chmod 0600 "$INSTALL_ENV"
 else
   info "reusing existing $INSTALL_ENV (pass --reconfigure to redo it)"
 fi
@@ -925,7 +956,7 @@ if [ "$LOCAL" -eq 1 ]; then
   # whose parent is that subshell cannot reuse a timestamp ticket keyed by
   # parent pid (which is how sudo keys it with no tty). Redirecting instead
   # keeps this sudo a plain top-level command of the main shell.
-  phase_file="$(mktemp "${TMPDIR:-/tmp}/oshioki-phase.XXXXXX")"
+  phase_file="$(run_tmp oshioki-phase)"
   # phase_flags intentionally splits on word boundaries.
   # shellcheck disable=SC2086
   $SUDO HOOK_BIN="$HOOK_BIN" PLUGIN_BIN="$PLUGIN_BIN" OSHIOKI_CHECKSUMS="$OSHIOKI_CHECKSUMS" \
@@ -965,7 +996,7 @@ if [ "$agent_show_ok" -eq 0 ]; then
   # for a second approval. Anything more complex behind `&` (a pipeline, a
   # brace group, a subshell) would not, and must not be introduced here.
   $SUDO -v
-  enroll_log="$(mktemp -t oshioki-enroll.XXXXXX)"
+  enroll_log="$(run_tmp oshioki-enroll)"
   $SUDO "$INSTALLED_HOOK" enroll >"$enroll_log" 2>&1 &
   enroll_pid=$!
   url=""
@@ -1010,7 +1041,7 @@ fi
 # Not `$SUDO ... | grep`: every sudo in this script is a plain top-level
 # command so the whole run rides one timestamp ticket (see
 # snapshot_install_env).
-status_out="$(mktemp "${TMPDIR:-/tmp}/oshioki-status.XXXXXX")"
+status_out="$(run_tmp oshioki-status)"
 $SUDO "$INSTALLED_HOOK" status > "$status_out" 2>/dev/null || true
 if grep -q 'active=true' "$status_out"; then
   info "host has active devices"
@@ -1320,9 +1351,17 @@ if [ -t 0 ]; then
   # prompt at all -- saying one is coming teaches the operator to distrust the
   # message. `-n` never prompts: it succeeds on a live ticket and fails
   # quietly without one, which is exactly the question being asked.
-  if [ -n "${SUDO:-}" ] && $SUDO -n true 2>/dev/null; then
+  #
+  # A warm ticket also means that sudo never reached PAM, so it proved nothing
+  # about the agent: claiming "approved through the agent socket" there would
+  # be a claim about a code path this run did not execute. Say what was
+  # actually established instead -- sudo.conf and sudoers parse, the ticket is
+  # live, and the socket answered the liveness wait just above. Forcing a cold
+  # sudo with `-k` would buy a real proof at the cost of a second Touch ID
+  # sheet on every run, which is the whole thing this flow exists to avoid.
+  if [ -n "${SUDO:-}" ] && $SUDO -n true; then
     info "final proof: one real sudo (it rides the approval already given; no new prompt)"
-    info "ready: sudo approved through the agent socket."
+    info "ready: sudo works and the agent socket is live; no approval was needed for this one, so it went unprompted."
   else
     info "final proof: one real sudo (a Touch ID prompt is coming)"
     $SUDO true || die "sudo true was denied; see $AGENT_STATE/agent.log"

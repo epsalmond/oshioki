@@ -37,11 +37,12 @@ the moment the agent is running. Run it as yourself, never under sudo. A root ru
 bundle loses its readable icon that way). Non-interactive with `--yes`
 plus values in the environment. Setup costs one Touch ID approval: every
 privileged step rides a single sudo timestamp ticket, and the closing proof
-reuses it rather than asking again (plus the sudo password on a machine that
-has never run setup). Day-to-day sudo with a hardware-backed device costs one device
-approval: the installer couples a `sudoers.d` NOPASSWD drop-in to the plugin
-block. A software native device keeps normal sudo password authentication
-because its signing key is readable by the enrolled account. On Linux, an
+reuses it rather than asking again (plus the sudo password on a machine
+that has never run setup). Day-to-day sudo with a hardware-backed device
+costs one device approval: the installer couples a `sudoers.d` NOPASSWD
+drop-in to the plugin block. A software native device keeps normal sudo
+password authentication because its signing key is readable by the enrolled
+account. On Linux, an
 interactive request also races the invoking account password through the
 host's `sudo` PAM service. Press Enter to skip that fallback and wait for
 device approval. The manual steps below remain for non-brew layouts.
@@ -181,7 +182,11 @@ The ticket a no-tty run takes belongs to that run's shell and dies with it, so
 the setup does not claim a Touch ID prompt is coming when it closes; a `sudo
 true` typed afterwards in a terminal is a fresh authentication with its own
 sheet. In a Terminal the closing proof rides the ticket the install already
-took, and the setup says so instead of announcing a second prompt.
+took, and the setup says so instead of announcing a second prompt. Read that
+closing line for what it claims: on a warm ticket the final `sudo` never
+reaches PAM, so it proves only that sudoers parses, the ticket is live and
+the agent socket answered the liveness wait — it does not prove an approval
+round trip. Only a cold `sudo` says "approved through the agent socket".
 
 `oshioki-laptop-setup` resolves its own keg — the hook beside it in `bin`,
 and `oshioki.dylib`, `liboshioki_pam.dylib` and `SHA256SUMS` one level up in

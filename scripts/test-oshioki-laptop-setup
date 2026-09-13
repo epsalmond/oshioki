@@ -30,7 +30,7 @@ verify_done() {
   fi
 }
 
-mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/stage/libexec" "$TEST_ROOT/home" "$TEST_ROOT/etc"
+mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/stage/libexec" "$TEST_ROOT/home" "$TEST_ROOT/etc" "$TEST_ROOT/tmp"
 cp "$SCRIPT_DIR/oshioki-laptop-setup" "$TEST_ROOT/stage/"
 chmod 0755 "$TEST_ROOT/stage/oshioki-laptop-setup" "$TEST_ROOT/fake-bin"/* 2>/dev/null || true
 
@@ -80,7 +80,9 @@ ticket_valid() {
   f="$(ticket_file)" || return 0
   [ -f "$f" ] || return 1
   now="$(date +%s)"; ts="$(cat "$f" 2>/dev/null || echo 0)"
-  [ "$((now - ts))" -le "${SUDO_TICKET_TIMEOUT:-300}" ] || return 1
+  # Strictly less than, like real sudo: a timeout of 0 means no ticket ever
+  # survives, which is how a scenario asks for a genuinely cold sudo.
+  [ "$((now - ts))" -lt "${SUDO_TICKET_TIMEOUT:-300}" ] || return 1
   printf '%s' "$now" > "$f"
   return 0
 }
@@ -95,6 +97,13 @@ authenticate() {
   [ -z "${SUDO_AUTH_LOG:-}" ] || printf '%s ppid=%s\n' "${f##*/}" "$sudo_ppid" >> "$SUDO_AUTH_LOG"
   date +%s > "$f"
 }
+# SUDO_DENY_MATCH stands in for a cancelled Touch ID sheet or a refused
+# approval: sudo exits non-zero having run nothing. Matched on the command sudo
+# was asked to run, so a scenario can deny one specific call.
+if [ -n "${SUDO_DENY_MATCH:-}" ] && printf '%s' "$*" | grep -Eq "$SUDO_DENY_MATCH"; then
+  echo "sudo: request denied" >&2
+  exit 1
+fi
 case "$mode" in
   # -V is sudo's version mode: it never reaches the policy plugin or PAM, so
   # it never authenticates. The installer's validate_sudo relies on that.
@@ -428,6 +437,9 @@ run_setup() {
     FAKE_UNAME="${FAKE_UNAME:-$(uname -s)}" \
     SUDO_TICKET_DIR="${SUDO_TICKET_DIR:-$TEST_ROOT/sudo-tickets}" \
     SUDO_AUTH_LOG="${SUDO_AUTH_LOG:-$TEST_ROOT/sudo-auth.log}" \
+    SUDO_TICKET_TIMEOUT="${SUDO_TICKET_TIMEOUT:-300}" \
+    SUDO_DENY_MATCH="${SUDO_DENY_MATCH:-}" \
+    TMPDIR="$TEST_ROOT/tmp" \
     SUDO_CALL_LOG="${SUDO_CALL_LOG:-$TEST_ROOT/sudo-calls.log}" \
     FAKE_TTY="${SETUP_PTY:+harness-tty}" \
     AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
@@ -472,6 +484,9 @@ run_setup_local() {
   env -i PATH="/usr/bin:/bin" HOME="$TEST_ROOT/home" \
     SUDO_TICKET_DIR="${SUDO_TICKET_DIR:-$TEST_ROOT/sudo-tickets}" \
     SUDO_AUTH_LOG="${SUDO_AUTH_LOG:-$TEST_ROOT/sudo-auth.log}" \
+    SUDO_TICKET_TIMEOUT="${SUDO_TICKET_TIMEOUT:-300}" \
+    SUDO_DENY_MATCH="${SUDO_DENY_MATCH:-}" \
+    TMPDIR="$TEST_ROOT/tmp" \
     SUDO_CALL_LOG="${SUDO_CALL_LOG:-$TEST_ROOT/sudo-calls.log}" \
     AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
@@ -636,15 +651,61 @@ tty_auths="$(sudo_auth_count)"
   { cat "$TEST_ROOT/sudo-auth.log" >&2; fail "tty run authenticated $tty_auths times, want exactly 1"; }
 assert_one_sudo_parent "tty"
 assert_no_ticket_reset "tty"
+# A warm ticket means `sudo -n true` never reaches PAM, so the close must claim
+# only what it actually proved -- sudoers parses, the ticket is live, and the
+# socket answered the liveness wait above -- and must not say the agent socket
+# approved anything, which nothing on this path asked it to do.
 grep -Fq 'rides the approval already given' "$TEST_ROOT/one-elevation-tty.log" ||
   fail "the tty run did not say the final proof reuses the approval already given"
+grep -Fq 'no approval was needed' "$TEST_ROOT/one-elevation-tty.log" ||
+  fail "the warm-ticket close did not say what it actually proved"
+if grep -Fq 'approved through the agent socket' "$TEST_ROOT/one-elevation-tty.log"; then
+  fail "the warm-ticket close claimed an agent-socket approval it never made"
+fi
 if grep -Fq 'Touch ID prompt is coming' "$TEST_ROOT/one-elevation-tty.log"; then
   fail "the tty run promised a second Touch ID prompt on a live ticket"
 fi
-# A run that starts with no ticket at all still says a prompt is coming.
+
+# Cold ticket, tty: the proof really does go through PAM, so the run says a
+# prompt is coming and then claims the agent-socket approval it just made.
+# Asserted on this run's OWN log: reading the warm run's log back would pass
+# whatever the cold path printed.
 reset_sudo_ticket
-grep -Fq 'final proof' "$TEST_ROOT/one-elevation-tty.log" ||
-  fail "the tty run never reached the final proof"
+rm -f "${LAUNCHAGENTS_DIR:-$TEST_ROOT/home/Library/LaunchAgents}/com.oshioki.agent.plist"
+: > "$TEST_ROOT/pam-lane"
+# SUDO_TICKET_TIMEOUT=0 expires the install's ticket the instant it is taken,
+# so the closing sudo is a genuinely cold one on an otherwise identical run.
+SUDO_TICKET_TIMEOUT=0 SETUP_PTY=1 FAKE_UNAME=Darwin DEVICES_ACTIVE=1 \
+  run_setup --yes --contextual-pam >"$TEST_ROOT/one-elevation-cold.log" 2>&1 ||
+  { sed -n '1,40p' "$TEST_ROOT/one-elevation-cold.log" >&2; fail "cold-ticket tty run did not finish"; }
+grep -Fq 'Touch ID prompt is coming' "$TEST_ROOT/one-elevation-cold.log" ||
+  fail "a cold ticket did not announce the Touch ID prompt"
+grep -Fq 'approved through the agent socket' "$TEST_ROOT/one-elevation-cold.log" ||
+  fail "the cold-ticket close did not claim the approval it actually made"
+if grep -Fq 'rides the approval already given' "$TEST_ROOT/one-elevation-cold.log"; then
+  fail "a cold ticket claimed it reused an approval"
+fi
+
+# 1: no secret-bearing temp file may outlive the run. A denied sudo at the
+# install.env copy exits under `set -e` before any rm, so only the EXIT trap
+# can clear it -- and install.env holds NATS_PASS.
+reset_sudo_ticket
+rm -f "$TEST_ROOT/etc/install.env"
+: > "$TEST_ROOT/plugin-enabled"
+rm -rf "$TEST_ROOT/tmp"/oshioki-*
+tmp_before="$(find "$TEST_ROOT/tmp" -name 'oshioki-*' 2>/dev/null | wc -l | tr -d '[:space:]')"
+[ "$tmp_before" = 0 ] || fail "the scenario started with oshioki-* temp files"
+if SUDO_DENY_MATCH='install -m 0600' DEVICES_ACTIVE=1 \
+  run_setup --yes --reconfigure >"$TEST_ROOT/denied-sudo.log" 2>&1; then
+  fail "a denied sudo did not fail the run"
+fi
+# Not a vacuous pass: the run must have died at the denied sudo, not earlier.
+grep -Fq 'sudo: request denied' "$TEST_ROOT/denied-sudo.log" ||
+  { tail -5 "$TEST_ROOT/denied-sudo.log" >&2; fail "the run did not fail at the denied sudo"; }
+leftover="$(find "$TEST_ROOT/tmp" -name 'oshioki-*' 2>/dev/null)"
+[ -z "$leftover" ] ||
+  fail "a denied sudo left secret-bearing temp files behind: $leftover"
+rm -f "$TEST_ROOT/etc/install.env"
 
 rm -f "$TEST_ROOT/pam-lane" "$TEST_ROOT/stage/liboshioki_pam.so"
 rm -f "${LAUNCHAGENTS_DIR:-$TEST_ROOT/home/Library/LaunchAgents}/com.oshioki.agent.plist"
@@ -872,7 +933,16 @@ fi
 # state, no NATS values staged, so the install is socket-only: no NATS keys
 # anywhere, never placeholders.
 rm -f "$TEST_ROOT/etc/install.env" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+reset_sudo_ticket
 DEVICES_ACTIVE=0 run_setup_local --local --yes >"$TEST_ROOT/local.log" 2>&1 || fail "local setup failed"
+# --local does all its privileged work inside one re-invocation of this script
+# under sudo, so it must cost one authentication too -- the outer flow has no
+# tty here, which is where a sudo behind a substitution would show up.
+local_auths="$(sudo_auth_count)"
+[ "$local_auths" = 1 ] ||
+  { cat "$TEST_ROOT/sudo-auth.log" >&2; fail "--local authenticated $local_auths times, want exactly 1"; }
+assert_one_sudo_parent "--local"
+assert_no_ticket_reset "--local"
 grep -Fq 'OSHIOKI_LOCAL=1' "$TEST_ROOT/etc/install.env" || fail "local flag missing from install.env"
 if grep -Eq '^NATS_' "$TEST_ROOT/etc/install.env"; then fail "socket-only install.env claims a NATS"; fi
 if grep -Eq '^NATS_' "$APPLIED_CONFIG"; then fail "socket-only installer input claims a NATS"; fi
