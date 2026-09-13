@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `install-oshioki-hook` finds the hook, the sudo plugin and the PAM module
+  the same way it already finds `SHA256SUMS`. From a Homebrew keg a bare
+  `sudo install-oshioki-hook --contextual-pam` died with
+  `PAM_MODULE_BIN is required` and a bare `--prelaunch` with
+  `missing or unsafe build artifact: <keg>/target/release/oshioki`, so the
+  manual flow the tap caveats describe needed environment variables the
+  caveats never mentioned. `HOOK_BIN`, `PLUGIN_BIN` and `PAM_MODULE_BIN` now
+  probe `target/release` for a checkout, the directory beside the installer
+  for the `.deb` and an unpacked release tarball, and the keg's `libexec`
+  last. The plugin is probed under both its build name and its installed
+  name, since the tarball renames it and verification is by file name. An
+  explicit variable still wins, and an unbuilt checkout still fails by naming
+  `target/release`.
+- `install-oshioki-hook --prelaunch-status` names the contextual PAM lane
+  instead of reporting `disabled` on a host that is on it. A lane host has no
+  plugin block in `sudo.conf` by design, and `--prelaunch` says so as it
+  installs; answering `disabled` was a true statement about the plugin and a
+  false one about the install. It made `oshioki-laptop-setup
+  --contextual-pam` fail its own final verify and exit before it ever reached
+  the migration it was asked for. The lane is only reported when the module
+  the PAM entry references is actually there as a root-owned regular file: an
+  entry naming a module that is missing is a degraded host, and it now reports
+  `FAIL contextual PAM lane: entry present but module missing at <path>` and
+  exits non-zero. A half-written managed block in `sudo.conf` is still named
+  on a lane host, since that check now runs before the lane is considered.
+  Off the lane the answer is unchanged, and `oshioki-laptop-setup
+  --contextual-pam` treats a failing verify as something the migration below
+  repairs rather than a reason to stop.
+- `oshioki enroll` bounds its wait on the approval transport, the way `check`
+  and `authenticate` already did. It prints nothing until the enrollment
+  intent has been published, so a NATS host that blackholes rather than
+  refusing turned a misconfiguration into a silent hang that
+  `oshioki-laptop-setup` could only report as `enrollment produced no URL`.
+  The connect and the publish now time out after 20s and name the server and
+  the file to fix.
+- `oshioki-laptop-setup` on macOS stops with a named cause when the login
+  keychain is not available to the session, instead of reading that as "no
+  agent identity", enrolling a device nobody asked for, and then dying on a
+  Security framework string. The agent keeps its box secret in the login
+  keychain, which only a graphical login session has unlocked, so running the
+  setup over ssh or from a job with no session cannot read or create an
+  identity. The error says to run it from a Terminal window on that Mac, or
+  to unlock the keychain first.
+- `oshioki-laptop-setup` says which of the two enrollment failures it hit:
+  `oshioki enroll` exited without printing a URL (its own explanation is
+  above), or it was still running when the poll window closed. The window is
+  `OSHIOKI_ENROLL_URL_TIMEOUT` seconds, 60 by default, deliberately longer
+  than the hook's own transport timeouts so the hook reports first.
+
 ## [0.1.9] - 2026-09-12
 
 ### Fixed

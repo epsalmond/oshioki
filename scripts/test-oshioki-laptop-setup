@@ -83,7 +83,26 @@ case "$mode --dry-run=$dry" in
     # marker stands in for the registry here.
     if [ -f "$AGENT_STATE/pinned" ] || [ "${DEVICES_ACTIVE:-0}" = 1 ]; then : > "$PLUGIN_ENABLED_FILE"; fi
     ;;
-  "--prelaunch-status --dry-run=0") [ -f "$PLUGIN_ENABLED_FILE" ] ;;
+  "--prelaunch-status --dry-run=0")
+    # Mirrors the real installer: a host on the contextual PAM lane has no
+    # plugin block by design and says so instead of reporting disabled.
+    if [ -n "${PAM_LANE_FILE:-}" ] && [ -f "$PAM_LANE_FILE" ]; then
+      echo "contextual PAM lane active; the approval plugin is intentionally not enabled (see --contextual-pam-status)"
+      exit 0
+    fi
+    [ -f "$PLUGIN_ENABLED_FILE" ]
+    ;;
+  "--contextual-pam --dry-run=1") echo "DRY: PAM migration plan" ;;
+  "--contextual-pam --dry-run=0")
+    [ -n "${PAM_MODULE_BIN:-}" ] || { echo "fake installer got no PAM_MODULE_BIN" >&2; exit 1; }
+    : > "$PAM_LANE_FILE"
+    rm -f "$PLUGIN_ENABLED_FILE"
+    echo "contextual PAM enabled"
+    ;;
+  "--contextual-pam-status --dry-run=0")
+    [ -f "$PAM_LANE_FILE" ] || { echo "FAIL  pam entries: absent" >&2; exit 1; }
+    echo "OK    pam entries: sudo_local=present"
+    ;;
   *) echo "fake installer saw unexpected call: $mode dry=$dry" >&2; exit 1 ;;
 esac
 SH
@@ -97,10 +116,24 @@ case "${1:-}" in
     if [ -f "$AGENT_STATE/pinned" ] || [ "${DEVICES_ACTIVE:-0}" = 1 ]; then echo "  fp  label  kind=SecureEnclave  active=true"; else echo "Enrolled devices (0):"; fi
     ;;
   enroll)
-    echo "Enrollment URL (expires in five minutes):"
-    echo "  https://enroll.test/e/id?value=secret"
-    echo "Native agent:"
-    echo "  oshioki-agent pair 'https://enroll.test/e/id?value=secret'"
+    # ENROLL_MODE stands in for the three shapes the real verb has: it
+    # prints a URL, it gives up with its own explanation, or it is stuck on
+    # something that never answers and prints nothing at all.
+    case "${ENROLL_MODE:-url}" in
+      fail)
+        echo "oshioki: enrollment could not connect to nats://nats.test within 20s: start the NATS server, or fix NATS_URL in /etc/oshioki/config.env" >&2
+        exit 1
+        ;;
+      hang)
+        sleep 60
+        ;;
+      *)
+        echo "Enrollment URL (expires in five minutes):"
+        echo "  https://enroll.test/e/id?value=secret"
+        echo "Native agent:"
+        echo "  oshioki-agent pair 'https://enroll.test/e/id?value=secret'"
+        ;;
+    esac
     ;;
   pin-record)
     [ -f "$2" ] || { echo "pin-record got no record file" >&2; exit 1; }
@@ -120,6 +153,18 @@ SH
 # exports a fixed record for pin-record to consume.
 cat > "$TEST_ROOT/fake-bin/oshioki-agent" <<'SH'
 #!/usr/bin/env bash
+# AGENT_KEYCHAIN_LOCKED reproduces what every verb does in a session with no
+# unlocked login keychain: the Security framework's own wording, on stderr.
+if [ -n "${AGENT_KEYCHAIN_LOCKED:-}" ]; then
+  cat >&2 <<'ERR'
+Error: read the box secret for /home/test/.config/oshioki/agent.json
+
+Caused by:
+    0: read secret AAAA from the login keychain
+    1: User interaction is not allowed.
+ERR
+  exit 1
+fi
 case "${1:-}" in
   show) [ -f "$AGENT_STATE/agent.json" ] ;;
   pair)
@@ -239,6 +284,8 @@ run_setup() {
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
     APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
     PLUGIN_ENABLED_FILE="$TEST_ROOT/plugin-enabled" \
+    PAM_LANE_FILE="$TEST_ROOT/pam-lane" \
+    PAM_MODULE_BIN="${PAM_MODULE_BIN:-$TEST_ROOT/stage/liboshioki_pam.so}" \
     CALL_LOG="$TEST_ROOT/calls.log" \
     HOLDER_PIDS="$TEST_ROOT/holder-pids" \
     SUDO="$TEST_ROOT/fake-bin/sudo" \
@@ -254,6 +301,9 @@ run_setup() {
     NATS_URL="$SETUP_NATS_URL" NATS_USER="oshioki" NATS_PASS="${NATS_PASS:-test-secret}" \
     DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
     SEEN_CHECKSUMS="${SEEN_CHECKSUMS:-}" \
+    ENROLL_MODE="${ENROLL_MODE:-url}" \
+    OSHIOKI_ENROLL_URL_TIMEOUT="${OSHIOKI_ENROLL_URL_TIMEOUT:-60}" \
+    AGENT_KEYCHAIN_LOCKED="${AGENT_KEYCHAIN_LOCKED:-}" \
     "${SETUP_CMD:-$TEST_ROOT/stage/oshioki-laptop-setup}" "$@" </dev/null
 }
 
@@ -329,6 +379,59 @@ fi
 if [ "$(uname -s)" = Darwin ]; then
   grep -Fq 'agent socket is live' "$TEST_ROOT/fresh.log" || fail "verify never completed"
 fi
+
+# --contextual-pam runs the migration and, on a host already on the lane,
+# still reaches it: the final verify asks --prelaunch-status, which reports
+# the lane rather than calling the install disabled. Before that, the verify
+# exited non-zero and the migration never ran.
+: > "$TEST_ROOT/pam-lane"
+: > "$AGENT_STATE/agent.json"
+: > "$TEST_ROOT/stage/liboshioki_pam.so"
+DEVICES_ACTIVE=1 run_setup --yes --contextual-pam >"$TEST_ROOT/ctxpam.log" 2>&1 ||
+  { sed -n '1,40p' "$TEST_ROOT/ctxpam.log" >&2; fail "--contextual-pam on a lane host did not finish"; }
+grep -Fq 'contextual PAM lane active' "$TEST_ROOT/ctxpam.log" ||
+  fail "the verify step did not report the lane"
+grep -Fq 'contextual PAM migration requested' "$TEST_ROOT/ctxpam.log" ||
+  fail "--contextual-pam never reached the migration"
+grep -Fq 'OK    pam entries' "$TEST_ROOT/ctxpam.log" ||
+  fail "--contextual-pam never ran its own status"
+rm -f "$TEST_ROOT/pam-lane" "$TEST_ROOT/stage/liboshioki_pam.so"
+: > "$TEST_ROOT/plugin-enabled"
+
+# A session with no unlocked login keychain is named as such, before the
+# setup mistakes it for a missing identity and enrols a second device.
+rm -f "$AGENT_STATE/agent.json" "$AGENT_STATE/paired-url"
+if AGENT_KEYCHAIN_LOCKED=1 DEVICES_ACTIVE=0 run_setup --yes >"$TEST_ROOT/keychain.log" 2>&1; then
+  fail "setup continued with a locked login keychain"
+fi
+grep -Fq 'login keychain is not available in this session' "$TEST_ROOT/keychain.log" ||
+  fail "a locked login keychain was not named: $(tail -1 "$TEST_ROOT/keychain.log")"
+grep -Fq 'security unlock-keychain' "$TEST_ROOT/keychain.log" ||
+  fail "the locked-keychain error says nothing about what to do"
+if grep -Fq 'enrolling a new device' "$TEST_ROOT/keychain.log"; then
+  fail "a locked login keychain still enrolled a device"
+fi
+[ ! -e "$AGENT_STATE/paired-url" ] || fail "a locked login keychain still paired"
+
+# An enrollment that produces no URL says which of the two failures it was,
+# so the operator knows whether to read the hook's reason or go looking for
+# an unreachable server. Both cases run against a fresh identity.
+rm -f "$AGENT_STATE/agent.json"
+if ENROLL_MODE=fail DEVICES_ACTIVE=0 run_setup --yes >"$TEST_ROOT/enroll-fail.log" 2>&1; then
+  fail "setup continued after enrollment failed"
+fi
+grep -Fq 'could not connect to nats://nats.test' "$TEST_ROOT/enroll-fail.log" ||
+  fail "the hook's own enrollment error was swallowed"
+grep -Fq 'exited without printing one' "$TEST_ROOT/enroll-fail.log" ||
+  fail "a hook that exited was not reported as having exited"
+rm -f "$AGENT_STATE/agent.json"
+if ENROLL_MODE=hang OSHIOKI_ENROLL_URL_TIMEOUT=2 DEVICES_ACTIVE=0 \
+   run_setup --yes >"$TEST_ROOT/enroll-hang.log" 2>&1; then
+  fail "setup continued after enrollment hung"
+fi
+grep -Fq 'was still running after 2s' "$TEST_ROOT/enroll-hang.log" ||
+  fail "a stuck enrollment was not reported as stuck: $(tail -1 "$TEST_ROOT/enroll-hang.log")"
+rm -f "$AGENT_STATE/agent.json"
 
 # Scenario B: re-run is idempotent. Identity exists, devices active, enroll
 # must not run again.

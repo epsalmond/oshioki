@@ -81,8 +81,45 @@ case "$(uname -s)" in
 esac
 ROOT_GROUP=root
 [ "$(uname -s)" = Darwin ] && ROOT_GROUP=wheel
-HOOK_BIN="${HOOK_BIN:-$SERVICE_DIR/target/release/oshioki}"
-PLUGIN_BIN="${PLUGIN_BIN:-$SERVICE_DIR/target/release/$BUILD_PLUGIN}"
+# The build artifacts, wherever this installation flow put them. The lanes
+# and their order mirror default_checksums, for the same reasons: a git
+# checkout builds into target/release; the .deb and an unpacked release
+# tarball put the artifacts next to this script; a Homebrew keg splits them
+# between the keg bin this script lives in and the keg libexec one level up.
+# Next-to-the-script is probed before the libexec so the .deb, whose
+# SERVICE_DIR is the shared /usr/share, does not reach first for a
+# /usr/share/libexec that belongs to nobody. An explicit environment variable
+# always wins: these are consulted only when one is unset, so the .deb
+# postinst and oshioki-laptop-setup keep pointing the installer wherever they
+# like. When no lane has the file the repo path is handed back unchanged, so
+# a source checkout that simply has not been built still fails with the
+# familiar "missing or unsafe build artifact" naming target/release.
+first_artifact() {
+  local candidate
+  for candidate in "$@"; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+HOOK_BIN="${HOOK_BIN:-$(first_artifact \
+  "$SERVICE_DIR/target/release/oshioki" \
+  "$SCRIPT_DIR/oshioki" \
+  "$SERVICE_DIR/libexec/oshioki" ||
+  printf '%s\n' "$SERVICE_DIR/target/release/oshioki")}"
+# The plugin is the one artifact whose installed name differs from its build
+# name: cargo emits liboshioki_plugin.dylib and the release tarball, and so
+# the keg libexec, rename it to oshioki.dylib. Both spellings are probed in
+# every lane because SHA256SUMS records whichever one that layout shipped and
+# verification is by basename.
+PLUGIN_BIN="${PLUGIN_BIN:-$(first_artifact \
+  "$SERVICE_DIR/target/release/$BUILD_PLUGIN" \
+  "$SCRIPT_DIR/$BUILD_PLUGIN" \
+  "$SCRIPT_DIR/$PLUGIN_NAME" \
+  "$SERVICE_DIR/libexec/$PLUGIN_NAME" \
+  "$SERVICE_DIR/libexec/$BUILD_PLUGIN" ||
+  printf '%s\n' "$SERVICE_DIR/target/release/$BUILD_PLUGIN")}"
 PLUGIN_DEST="$PLUGIN_DIR/$PLUGIN_NAME"
 
 die() { echo "install-oshioki-hook: $*" >&2; exit 1; }
@@ -548,6 +585,16 @@ case "$(uname -s)" in
     PAM_SERVICES="sudo sudo-i"
     ;;
 esac
+# Same lanes as the hook and the plugin, resolved here rather than beside
+# them only because PAM_MODULE_NAME is not known until the case above has
+# run. Left empty when no lane has the module: --contextual-pam still stops
+# with "PAM_MODULE_BIN is required", and every other mode never wanted it.
+if [ -z "$PAM_MODULE_BIN" ]; then
+  PAM_MODULE_BIN="$(first_artifact \
+    "$SERVICE_DIR/target/release/$PAM_MODULE_NAME" \
+    "$SCRIPT_DIR/$PAM_MODULE_NAME" \
+    "$SERVICE_DIR/libexec/$PAM_MODULE_NAME" || true)"
+fi
 # A packaging/test override in the same class as SUDO_PLUGIN_DIR and SBIN_DIR.
 # When it is empty the directory is discovered, never assumed.
 PAM_SECURITY_DIR="${PAM_SECURITY_DIR:-}"
@@ -1209,9 +1256,49 @@ validate_visudo() {
 }
 
 if [ "$MODE" = prelaunch-status ]; then
+  # A host on the contextual PAM lane has no plugin block in sudo.conf by
+  # design: --prelaunch installs the artifacts there and says it is leaving
+  # the lane alone. Answering "disabled" is a true statement about the
+  # plugin and a false one about the install, and it is what made
+  # `oshioki-laptop-setup --contextual-pam` fail its own final verify before
+  # it ever reached the migration. Name the lane and point at the status
+  # command that applies to it.
+  # A half-written managed block is a broken edit of /etc/sudo.conf whichever
+  # lane sudo is on, so it is named before the lane is considered rather than
+  # skipped by the early return below.
+  if [ -f "$SUDO_CONF" ]; then
+    validate_block "$SUDO_CONF"
+    begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"
+    if [ "$begins" -gt 0 ] && ! grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then
+      die "malformed managed block in $SUDO_CONF"
+    fi
+  else
+    begins=0
+  fi
+  if pam_lane_active; then
+    # The PAM entry alone is not the lane. An entry naming a module that is
+    # not there is a host whose sudo authenticates by whatever the rest of
+    # the stack says, which on macOS is a password prompt and on Linux is
+    # `module_unknown=ignore` -- a degraded host that this mode used to call
+    # active and exit 0 on. Only existence and ownership are asserted here;
+    # the checksum against SHA256SUMS belongs to --contextual-pam-status,
+    # which is the mode that resolves a manifest.
+    lane_dir="$(discover_security_dir 2>/dev/null)" || lane_dir=""
+    lane_module=""
+    [ -z "$lane_dir" ] || lane_module="$(pam_module_dest "$lane_dir")"
+    if [ -z "$lane_module" ] || [ ! -f "$lane_module" ] || [ -L "$lane_module" ] ||
+       [ ! -r "$lane_module" ]; then
+      echo "FAIL  contextual PAM lane: entry present but module missing at ${lane_module:-$PAM_MODULE_NAME}; run install-oshioki-hook --contextual-pam or --disable-contextual-pam"
+      exit 1
+    fi
+    if [ "$(stat_owner "$lane_module" 2>/dev/null || true)" != 0 ]; then
+      echo "FAIL  contextual PAM lane: entry present but module at $lane_module is not root-owned; run install-oshioki-hook --contextual-pam or --disable-contextual-pam"
+      exit 1
+    fi
+    echo "contextual PAM lane active; the approval plugin is intentionally not enabled (see --contextual-pam-status)"
+    exit 0
+  fi
   [ -f "$SUDO_CONF" ] || { echo "disabled"; exit 1; }
-  validate_block "$SUDO_CONF"
-  begins="$(grep -cF "$BEGIN_MARK" "$SUDO_CONF" || true)"
   if [ "$begins" -gt 0 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then
     # With no named user there is no drop-in to verify, so the plugin block
     # alone reports enabled; laptop-setup always names one, keeping the
@@ -1229,8 +1316,9 @@ if [ "$MODE" = prelaunch-status ]; then
     echo "enabled without passwordless sudo"
     exit 1
   fi
-  if [ "$begins" -eq 0 ]; then echo "disabled"; exit 1; fi
-  die "malformed managed block in $SUDO_CONF"
+  # Malformed blocks already died above; anything left here has no block.
+  echo "disabled"
+  exit 1
 fi
 
 # Package removal uses this mode after dpkg has already lost the rest of the

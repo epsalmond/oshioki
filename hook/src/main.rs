@@ -44,6 +44,12 @@ const DEFAULT_CONFIG_DIR: &str = "/etc/oshioki";
 /// governs the wait for a verdict.
 const AGENT_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DAEMON_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long enroll waits on the approval transport before it says so. Longer
+/// than `DAEMON_ACK_TIMEOUT` because enrollment is an interactive, one-shot
+/// operation against a server that may be waking up, and shorter than the
+/// 60s URL poll in `oshioki-laptop-setup` so the script reports the hook's
+/// own explanation rather than its own "produced no URL".
+const ENROLLMENT_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(20);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
 const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(300);
 const CHECK_RC_DENIED: i32 = 1;
@@ -2310,6 +2316,39 @@ fn validate_server_health(config: &HookConfigV1, health: &ServerHealthV1) -> Res
     }
 }
 
+/// The approval server as it is safe to print: host only, credentials gone.
+/// Falls back to a description rather than an empty string so every message
+/// built from it still reads as a sentence.
+fn enrollment_transport_display(directory: &Path) -> String {
+    transports_from(directory)
+        .ok()
+        .and_then(|transports| transports.nats_url)
+        .map_or_else(
+            || "the configured approval transport".to_owned(),
+            |url| nats_display_url(&url),
+        )
+}
+
+/// Connect the way `check` and `authenticate` do: under a timeout. Enroll was
+/// the one verb whose connect was unbounded, and because it prints nothing
+/// until after the intent is published, a NATS host that blackholes instead
+/// of refusing turned a misconfiguration into a silent hang that
+/// `oshioki-laptop-setup` could only report as "enrollment produced no URL".
+async fn enrollment_transport(
+    directory: &Path,
+    nats_display: &str,
+) -> Result<Box<dyn HookTransport>> {
+    match tokio::time::timeout(ENROLLMENT_TRANSPORT_TIMEOUT, transport_from(directory)).await {
+        Err(_) => bail!(
+            "enrollment could not connect to {} within {}s: start the NATS server, or fix NATS_URL in {}/config.env",
+            nats_display,
+            ENROLLMENT_TRANSPORT_TIMEOUT.as_secs(),
+            directory.display()
+        ),
+        Ok(result) => result,
+    }
+}
+
 async fn cmd_enroll(resume: Option<&str>, allow_localhost: bool) -> Result<()> {
     let directory = config_dir();
     require_enroll_privileges(&directory)?;
@@ -2330,7 +2369,8 @@ async fn cmd_enroll(resume: Option<&str>, allow_localhost: bool) -> Result<()> {
     let secret_bytes: [u8; 32] = oshioki_protocol::decode_base64url(&state.secret)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid enrollment secret"))?;
-    let transport = transport_from(&config_dir()).await?;
+    let nats_display = enrollment_transport_display(&directory);
+    let transport = enrollment_transport(&directory, &nats_display).await?;
     let reply_subject = format!("oshioki.enrollment.submission.{}", state.enrollment_id);
     let intent = EnrollmentIntentV1 {
         version: VERSION_V1,
@@ -2348,7 +2388,19 @@ async fn cmd_enroll(resume: Option<&str>, allow_localhost: bool) -> Result<()> {
         + Duration::from_secs(remaining.min(ENROLLMENT_TIMEOUT.as_secs()));
     // Deliver the intent first so the enrollment URL never outruns the row
     // the server builds from it: publish, confirm, then print, then wait.
-    let reply_stream = transport.publish_enrollment_intent(&intent).await?;
+    let reply_stream = match tokio::time::timeout(
+        ENROLLMENT_TRANSPORT_TIMEOUT,
+        transport.publish_enrollment_intent(&intent),
+    )
+    .await
+    {
+        Err(_) => bail!(
+            "enrollment intent was not acknowledged by {} within {}s: the enrollment server may not be subscribed",
+            nats_display,
+            ENROLLMENT_TRANSPORT_TIMEOUT.as_secs()
+        ),
+        Ok(result) => result?,
+    };
     println!(
         "Enrollment URL (expires in five minutes):\n  {enrollment_url}\nNative agent:\n  oshioki-agent pair '{enrollment_url}'"
     );

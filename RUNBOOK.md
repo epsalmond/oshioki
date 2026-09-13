@@ -118,6 +118,16 @@ brew install epsalmond/oshioki/oshioki
 oshioki-laptop-setup --contextual-pam
 ```
 
+Run it from a Terminal window while logged in to that Mac. The agent keeps
+its box secret in the login keychain, which only a graphical login session
+has unlocked; over ssh, or from a job with no session, the Security framework
+answers `User interaction is not allowed` and no identity can be read or
+created. The setup names that case and stops rather than enrolling a second
+device. To drive it from a remote shell anyway, unlock the keychain first
+(`security unlock-keychain ~/Library/Keychains/login.keychain-db`) or run it
+inside the logged-in user's session
+(`sudo launchctl asuser "$(id -u eric)" sudo -u eric ...`).
+
 `oshioki-laptop-setup` resolves its own keg — the hook beside it in `bin`,
 and `oshioki.dylib`, `liboshioki_pam.dylib` and `SHA256SUMS` one level up in
 `libexec` — and passes all four to the installer. Run it as yourself; it
@@ -166,6 +176,14 @@ sudo install-oshioki-hook --contextual-pam-status
 sudo install-oshioki-hook --disable-contextual-pam
 ```
 
+`--prelaunch-status` on a host that is on the contextual PAM lane reports the
+lane and exits 0: the approval plugin is intentionally not enabled there, and
+`--contextual-pam-status` is the check that applies. It reports the lane only
+when the module named by the PAM entry is present and root-owned; an entry
+without its module is a degraded host and exits non-zero, naming the path and
+the two commands that resolve it. The checksum against `SHA256SUMS` stays with
+`--contextual-pam-status`.
+
 `--contextual-pam-status` exits non-zero unless every line reads `OK`.
 It finds the manifest to verify the installed module against the same way
 the install does: `target/release/SHA256SUMS` in a repo checkout, the keg's
@@ -213,12 +231,23 @@ device approval only and never opens this password branch.
 Linux uses `/usr/local/libexec/sudo/oshioki.so`. Darwin uses
 `oshioki.dylib` in the same directory.
 
-Outside a repo checkout the installer needs its inputs pointed at the
-installed files: set `HOOK_BIN` and `PLUGIN_BIN` to the installed hook and
-plugin. `OSHIOKI_CHECKSUMS` no longer has to be set for a packaged layout —
-the installer finds the `SHA256SUMS` shipped in its own keg or package, whose
-entries are keyed by file name — but it still overrides the default when it
-is. For a Homebrew install at `$(brew --prefix oshioki)`:
+Outside a repo checkout the installer needs no environment either.
+`HOOK_BIN`, `PLUGIN_BIN` and `PAM_MODULE_BIN` are found the same way
+`OSHIOKI_CHECKSUMS` is, in the same order: `target/release` in a repo
+checkout, next to the installer for the `.deb` (`/usr/share/oshioki`) and an
+unpacked release tarball, and the keg's `libexec` beside `bin` under
+Homebrew. The plugin is looked up under both its build name
+(`liboshioki_plugin.dylib`) and its installed name (`oshioki.dylib`), because
+the release tarball renames it and the manifest is keyed by file name. Each
+variable still overrides its default when it is set, which is what the `.deb`
+postinst and `oshioki-laptop-setup` do. So on a Homebrew install:
+
+```bash
+sudo install-oshioki-hook --prelaunch --config-file /etc/oshioki/install.env
+sudo install-oshioki-hook --contextual-pam
+```
+
+An explicit form still works and still wins:
 
 ```bash
 sudo HOOK_BIN="$(brew --prefix oshioki)/bin/oshioki" \

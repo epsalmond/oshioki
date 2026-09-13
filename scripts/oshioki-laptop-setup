@@ -166,6 +166,27 @@ if [ -z "$PAM_MODULE_BIN" ]; then
   done
 fi
 INSTALLED_HOOK="${INSTALLED_HOOK:-/usr/local/sbin/oshioki}"
+# Seconds to wait for `oshioki enroll` to print its URL. Deliberately longer
+# than the hook's own transport timeouts so a reachability problem is
+# reported by the hook, in its own words, rather than by this poll.
+ENROLL_URL_TIMEOUT="${OSHIOKI_ENROLL_URL_TIMEOUT:-60}"
+# The agent keeps its box secret in the macOS login keychain, which only a
+# graphical login session has unlocked. Over ssh, or from a launchd job with
+# no session, the Security framework refuses with errSecInteractionNotAllowed
+# and every agent verb fails the same way: it cannot read an existing identity
+# and it cannot store a new one. Without this the setup reads that as "no
+# agent identity", enrols a second device nobody asked for, and only then dies
+# on a Security framework string. Matched on the framework's own wording,
+# which is what the agent's error chain carries up.
+agent_keychain_blocked() {
+  case "$1" in
+    *'User interaction is not allowed'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+die_keychain_locked() {
+  die "the login keychain is not available in this session: macOS answered \"User interaction is not allowed\". The agent keeps its box secret there, so no identity can be read or created over ssh, over a remote shell, or from a job with no graphical session. Run this from a Terminal window while logged in to this Mac, or unlock the keychain first with: security unlock-keychain ~/Library/Keychains/login.keychain-db"
+}
 SUDO="${SUDO:-sudo}"
 LAUNCHCTL="${LAUNCHCTL:-launchctl}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
@@ -571,7 +592,11 @@ if [ "$LOCAL" -eq 1 ]; then
   info "step 1/$TOTAL_STEPS: agent identity and configuration"
   [ -x "$AGENT_BIN" ] || die "agent not found: $AGENT_BIN (set AGENT_BIN)"
   mkdir -p "$AGENT_STATE"
-  if ! "$AGENT_BIN" show >/dev/null 2>&1; then
+  local_show_out="$("$AGENT_BIN" show 2>&1)" && local_show_ok=1 || local_show_ok=0
+  if [ "$local_show_ok" -eq 0 ] && agent_keychain_blocked "$local_show_out"; then
+    die_keychain_locked
+  fi
+  if [ "$local_show_ok" -eq 0 ]; then
     info "no agent identity; creating one (no server involved)"
     "$AGENT_BIN" init
   else
@@ -691,25 +716,48 @@ cleanup_enroll() {
   if [ -n "${enroll_pid:-}" ]; then kill "$enroll_pid" 2>/dev/null || true; fi
 }
 trap cleanup_enroll EXIT
-if ! "$AGENT_BIN" show >/dev/null 2>&1; then
+agent_show_out="$("$AGENT_BIN" show 2>&1)" && agent_show_ok=1 || agent_show_ok=0
+if [ "$agent_show_ok" -eq 0 ] && agent_keychain_blocked "$agent_show_out"; then
+  die_keychain_locked
+fi
+if [ "$agent_show_ok" -eq 0 ]; then
   info "no agent identity; enrolling a new device (needs the server reachable)"
   $SUDO -v
   enroll_log="$(mktemp -t oshioki-enroll.XXXXXX)"
   $SUDO "$INSTALLED_HOOK" enroll >"$enroll_log" 2>&1 &
   enroll_pid=$!
   url=""
-  for _ in $(seq 1 60); do
+  enroll_live=1
+  for _ in $(seq 1 "$ENROLL_URL_TIMEOUT"); do
     url="$(grep -oE 'https?://[^[:space:]'\'']+' "$enroll_log" 2>/dev/null | head -1 || true)"
     [ -n "$url" ] && break
-    kill -0 "$enroll_pid" 2>/dev/null || break
+    kill -0 "$enroll_pid" 2>/dev/null || { enroll_live=0; break; }
     sleep 1
   done
   # The process can exit between the grep and the liveness check with the
   # URL already written: read the log once more before giving up.
   [ -n "$url" ] || url="$(grep -oE 'https?://[^[:space:]'\'']+' "$enroll_log" 2>/dev/null | head -1 || true)"
-  if [ -z "$url" ]; then cat "$enroll_log" >&2; rm -f "$enroll_log"; die "enrollment produced no URL"; fi
-  NATS_URL="$NATS_URL_V" NATS_USER="$NATS_USER_V" NATS_PASS="$NATS_PASS_V" \
-    "$AGENT_BIN" pair "$url" --label "$(hostname -s 2>/dev/null || hostname)"
+  if [ -z "$url" ]; then
+    cat "$enroll_log" >&2
+    rm -f "$enroll_log"
+    # Which of the two failures this was decides what the operator does
+    # next, so say it. A hook that exited printed its own reason above; a
+    # hook still running after the poll window is stuck on something that
+    # never answered, and the hook's own transport timeouts are shorter than
+    # this window precisely so the first case is the usual one.
+    if [ "$enroll_live" -eq 1 ]; then
+      die "enrollment produced no URL: $INSTALLED_HOOK enroll was still running after ${ENROLL_URL_TIMEOUT}s with nothing to show; check that the enrollment server and NATS are running and reachable from this host"
+    fi
+    die "enrollment produced no URL: $INSTALLED_HOOK enroll exited without printing one (its output is above)"
+  fi
+  pair_out="$(NATS_URL="$NATS_URL_V" NATS_USER="$NATS_USER_V" NATS_PASS="$NATS_PASS_V" \
+    "$AGENT_BIN" pair "$url" --label "$(hostname -s 2>/dev/null || hostname)" 2>&1)" &&
+    pair_ok=1 || pair_ok=0
+  printf '%s\n' "$pair_out"
+  if [ "$pair_ok" -eq 0 ]; then
+    agent_keychain_blocked "$pair_out" && die_keychain_locked
+    die "pairing failed"
+  fi
   wait "$enroll_pid" || { cat "$enroll_log" >&2; rm -f "$enroll_log"; die "enrollment failed"; }
   rm -f "$enroll_log"
   enroll_pid=""
@@ -822,7 +870,17 @@ info "step $VERIFY_STEP/$TOTAL_STEPS: verify"
 # Local mode verified the plugin strictly inside the privileged phase;
 # server mode checks it here, after pairing.
 if [ "$LOCAL" -eq 0 ]; then
-run_installer --prelaunch-status
+  # With --contextual-pam this is not the last word: a lane host whose module
+  # has gone missing fails this check, and the migration below is exactly the
+  # repair for it. Report and carry on; --contextual-pam-status at the end is
+  # the verdict. Without --contextual-pam the plugin lane is the whole
+  # install, so a bad status is still fatal.
+  if [ "$CONTEXTUAL_PAM" -eq 1 ]; then
+    run_installer --prelaunch-status ||
+      info "the contextual PAM migration below is what repairs this"
+  else
+    run_installer --prelaunch-status
+  fi
 fi
 
 # The opt-in migration, last: it only makes sense once the plugin lane is
