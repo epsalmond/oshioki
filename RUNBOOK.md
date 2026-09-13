@@ -45,6 +45,30 @@ interactive request also races the invoking account password through the
 host's `sudo` PAM service. Press Enter to skip that fallback and wait for
 device approval. The manual steps below remain for non-brew layouts.
 
+The agent's autostart environment (the LaunchAgent plist on Darwin,
+`~/.config/oshioki/agent.env` on Linux) is never the hook's own NATS role. It
+gets a separate, independently-configured bus and credential —
+`OSHIOKI_AGENT_NATS_URL` / `OSHIOKI_AGENT_NATS_USER` / `OSHIOKI_AGENT_NATS_PASS`
+in `install.env` (server mode; see below) or the same three names staged on
+the environment for `--local` — defaulting the URL to the hook's own bus but
+independently overridable, since a laptop can run a local hook-side NATS
+(a phone-bridge broker, say) while its agent needs the real bus. Writing the
+hook's `NATS_USER`/`NATS_PASS` into the agent's environment authenticates it
+as the hook's role, which the server answers with a `Permissions Violation
+for Subscription` on every subscribe rather than ever delivering an
+approval — that outage is exactly what this separation prevents. If
+`~/Library/LaunchAgents/com.oshioki.agent.plist` already names a `NATS_URL`
+or `NATS_USER` (a prior correct run, or a hand-maintained plist), an
+ordinary re-run leaves that environment untouched and only refreshes
+`ProgramArguments` (the agent binary path); pass `--reconfigure` to replace
+it. After (re)starting the agent on Darwin, setup waits up to
+`OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT` seconds (default 5) for `NATS connected`
+in `~/.config/oshioki/agent.log` and fails loudly if it instead sees a
+`Permissions Violation` line — proof the agent reached the bus under the
+right role, not just that a plist was written and `launchctl bootstrap`
+returned 0. Override the LaunchAgent directory with `LAUNCHAGENTS_DIR` for
+testing; never point it at a real login's `~/Library/LaunchAgents`.
+
 ## Prelaunch installer
 
 Keep a second root shell open during supervised acceptance. Create a root-owned
@@ -64,6 +88,9 @@ OSHIOKI_RP_ID=sudo.example.com
 NATS_URL=tls://nats.example.com:4222
 NATS_USER=oshioki-hook
 NATS_PASS=<secret>
+OSHIOKI_AGENT_NATS_URL=tls://nats.example.com:4222
+OSHIOKI_AGENT_NATS_USER=oshioki-agent
+OSHIOKI_AGENT_NATS_PASS=<secret>
 ```
 
 The hook refuses plaintext `nats://` past loopback: the NATS server needs
@@ -71,6 +98,15 @@ TLS with a certificate chaining to the system roots (hostname-verified), and
 each role — hook, agent, server — gets its own NATS user. Testing without
 server certificates sets `OSHIOKI_ALLOW_PLAINTEXT_NATS=1` instead; never do
 that in production.
+
+`OSHIOKI_AGENT_NATS_URL`/`USER`/`PASS` are the Mac agent's own role, kept
+apart from the hook's `NATS_URL`/`NATS_USER`/`NATS_PASS` above:
+`oshioki-laptop-setup` prompts for them separately (see above) and never
+falls back to the hook's credential when writing the agent's LaunchAgent.
+They are optional: omitting all three, or answering the password prompt
+blank (including under `--yes`), leaves the agent socket-only, same as
+omitting the hook's -- the setup warns loudly when it does this, since
+approvals from other hosts then cannot reach this Mac.
 
 For socket mode (below), also add:
 

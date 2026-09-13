@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1090
 # End-to-end plumbing test for oshioki-laptop-setup with faked privilege and
 # service boundaries. The real script runs; sudo, the installer, the hook,
 # the agent, and launchctl/systemctl are fakes.
@@ -199,12 +200,82 @@ if [ "${1:-}" = bootstrap ] && [ -n "${SOCKET_TO_MAKE:-}" ]; then
     sleep 0.1
   done
 fi
+# Stands in for the real agent actually reaching (or failing to reach) its
+# NATS bus after the restart: the setup script's own verify step polls this
+# same log for these exact lines. AGENT_LOG_LINE lets a scenario simulate a
+# wrong-role rejection instead of the default success line.
+if [ "${1:-}" = bootstrap ] && [ -n "${AGENT_STATE:-}" ]; then
+  mkdir -p "$AGENT_STATE"
+  printf '%s\n' "${AGENT_LOG_LINE:-NATS connected; watching for requests}" >> "$AGENT_STATE/agent.log"
+  # Models the real timing this poll has to survive: the agent logs
+  # "NATS connected" on Connected, one RTT BEFORE any "Permissions
+  # Violation" the server sends back, never in the same instant. Appended in
+  # the background after AGENT_LOG_DELAY seconds so the setup script's own
+  # poll (which samples once a second) sees it on a later iteration than the
+  # connected line above, not the same one.
+  if [ -n "${AGENT_LOG_DELAYED_LINE:-}" ]; then
+    ( sleep "${AGENT_LOG_DELAY:-1}"; printf '%s\n' "$AGENT_LOG_DELAYED_LINE" >> "$AGENT_STATE/agent.log" ) &
+  fi
+fi
 SH
 # systemctl only ever records: Linux installs no unit, so the only calls
 # left are the ones that take a stale one away.
 cat > "$TEST_ROOT/fake-bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$CALL_LOG"
+SH
+# Lets a scenario force which branch of the real script's `case "$(uname -s)"`
+# runs, independent of the host this test suite happens to execute on: the
+# agent-credential fix below is Darwin-only code (the LaunchAgent plist), and
+# this dev sandbox is Linux. FAKE_UNAME must be set by every caller (run_setup
+# defaults it to the real host's uname), so a missing setting fails loudly
+# instead of silently taking whichever branch the real host would.
+cat > "$TEST_ROOT/fake-bin/uname" <<'SH'
+#!/usr/bin/env bash
+echo "${FAKE_UNAME:?FAKE_UNAME not set}"
+SH
+# Real macOS always has plutil; this sandbox may not be a Mac, so stand in
+# with just enough of it to exercise the one invocation the real script
+# makes: `plutil -replace KEY -json JSON FILE`. Real plutil reformats the
+# whole file into its own canonical style; this fake only replaces the
+# named key's XML in place (whatever line layout it already has, single- or
+# multi-line) and leaves every other byte untouched, which is the property
+# the preservation tests actually check.
+cat > "$TEST_ROOT/fake-bin/plutil" <<'SH'
+#!/usr/bin/env python3
+import json, re, sys
+
+def die(msg):
+    sys.stderr.write("fake plutil: %s\n" % msg)
+    sys.exit(1)
+
+argv = sys.argv[1:]
+if len(argv) != 5 or argv[0] != "-replace" or argv[2] != "-json":
+    die("unsupported invocation: %r" % (argv,))
+key, value_json, path = argv[1], argv[3], argv[4]
+try:
+    value = json.loads(value_json)
+except ValueError as exc:
+    die("invalid -json value: %s" % exc)
+if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+    die("this fake only supports a JSON array of strings")
+
+def xml_escape(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+with open(path, "r") as f:
+    content = f.read()
+
+array_xml = "<key>%s</key><array>%s</array>" % (
+    xml_escape(key), "".join("<string>%s</string>" % xml_escape(v) for v in value)
+)
+pattern = re.compile(r"<key>%s</key>\s*<array>.*?</array>" % re.escape(key), re.DOTALL)
+new_content, n = pattern.subn(array_xml, content, count=1)
+if n != 1:
+    die("key %r not found as an array in %s" % (key, path))
+
+with open(path, "w") as f:
+    f.write(new_content)
 SH
 chmod 0755 "$TEST_ROOT/fake-bin"/*
 
@@ -217,11 +288,14 @@ export SOCKET_TO_MAKE="$AGENT_STATE/agent.sock"
 : > "$CALL_LOG"
 
 # Minimal NATS server for the installer's probe: INFO with auth_required,
-# then +PONG for a CONNECT carrying the expected user and password, -ERR
-# otherwise. The expected pair lives in STUB_CREDS_FILE (two lines) and is
-# re-read per connection, so scenarios can change it without restarting the
-# stub: a running process never sees later variable assignments. One
-# connection per probe is all the installer ever makes.
+# then +PONG for a CONNECT carrying any (user, password) pair from
+# STUB_CREDS_FILE, -ERR otherwise. The file is a flat list of pairs, two
+# lines each (an ordinary hook-only scenario stages one pair; the
+# agent-role-separation scenario stages the hook's and the agent's pairs
+# together, so both probes succeed against the one stub). Re-read per
+# connection, so scenarios can change it without restarting the stub: a
+# running process never sees later variable assignments. One connection per
+# probe is all the installer ever makes.
 cat > "$TEST_ROOT/fake-bin/nats-stub" <<'SH'
 #!/usr/bin/env python3
 import json, os, socket, sys
@@ -246,10 +320,11 @@ while True:
       hello = {}
     try:
       with open(os.environ["STUB_CREDS_FILE"]) as handle:
-        want = handle.read().splitlines()
+        lines = handle.read().splitlines()
     except OSError:
-      want = []
-    if len(want) >= 2 and hello.get("user") == want[0] and hello.get("pass") == want[1]:
+      lines = []
+    pairs = [(lines[i], lines[i + 1]) for i in range(0, len(lines) - 1, 2)]
+    if (hello.get("user"), hello.get("pass")) in pairs:
       conn.sendall(b"PONG\r\n")
     else:
       conn.sendall(b"-ERR 'Authorization Violation'\r\n")
@@ -265,7 +340,11 @@ chmod 0755 "$TEST_ROOT/fake-bin/nats-stub"
 STUB_PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
 export STUB_PORT
 export STUB_CREDS_FILE="$TEST_ROOT/stub-creds"
-printf '%s\n' 'oshioki' 'test-secret' > "$STUB_CREDS_FILE"
+# Both roles accepted by default: the hook's (oshioki/test-secret) and the
+# agent's own (oshioki-agent/agent-secret), matching run_setup's defaults --
+# so an ordinary scenario probes and connects both, and the plist/agent.env
+# assertions below can tell the two apart.
+printf '%s\n' 'oshioki' 'test-secret' 'oshioki-agent' 'agent-secret' > "$STUB_CREDS_FILE"
 export SETUP_NATS_URL="nats://127.0.0.1:$STUB_PORT"
 "$TEST_ROOT/fake-bin/nats-stub" "$STUB_PORT" &
 STUB_PID="$!"
@@ -278,8 +357,13 @@ python3 -c 'import socket,os;s=socket.socket();s.settimeout(1);s.connect(("127.0
 
 run_setup() {
   # SETUP_PATH lets a scenario stage a host that lacks a tool (python3), so
-  # the script's own `command -v` probes take the fallback branch.
-  env -i PATH="${SETUP_PATH:-/usr/bin:/bin}" HOME="$TEST_ROOT/home" \
+  # the script's own `command -v` probes take the fallback branch. fake-bin
+  # goes first so the fake `uname` below is what the script's own
+  # `uname -s` calls see; every other fake in that directory is already
+  # wired in by explicit path variables (SUDO=, LAUNCHCTL=, ...), so nothing
+  # else changes by being on PATH too.
+  env -i PATH="$TEST_ROOT/fake-bin:${SETUP_PATH:-/usr/bin:/bin}" HOME="$TEST_ROOT/home" \
+    FAKE_UNAME="${FAKE_UNAME:-$(uname -s)}" \
     AGENT_STATE="$TEST_ROOT/home/.config/oshioki" \
     SOCKET_TO_MAKE="$TEST_ROOT/home/.config/oshioki/agent.sock" \
     APPLIED_CONFIG="$TEST_ROOT/applied-config.env" \
@@ -291,6 +375,11 @@ run_setup() {
     SUDO="$TEST_ROOT/fake-bin/sudo" \
     LAUNCHCTL="$TEST_ROOT/fake-bin/launchctl" \
     SYSTEMCTL="$TEST_ROOT/fake-bin/systemctl" \
+    LAUNCHAGENTS_DIR="${LAUNCHAGENTS_DIR:-$TEST_ROOT/home/Library/LaunchAgents}" \
+    AGENT_LOG_LINE="${AGENT_LOG_LINE:-}" \
+    AGENT_LOG_DELAYED_LINE="${AGENT_LOG_DELAYED_LINE:-}" \
+    AGENT_LOG_DELAY="${AGENT_LOG_DELAY:-1}" \
+    OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT="${OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT:-2}" \
     INSTALLER="$TEST_ROOT/fake-bin/install-oshioki-hook" \
     SEEN_SUDO_USER="$TEST_ROOT/seen-sudo-user" \
     AGENT_BIN="$TEST_ROOT/fake-bin/oshioki-agent" \
@@ -299,6 +388,9 @@ run_setup() {
     OPAQUE_DIR="${OPAQUE_DIR:-}" \
     OSHIOKI_ORIGIN="${OSHIOKI_ORIGIN-https://laptop.test}" OSHIOKI_RP_ID="laptop.test" \
     NATS_URL="$SETUP_NATS_URL" NATS_USER="oshioki" NATS_PASS="${NATS_PASS:-test-secret}" \
+    OSHIOKI_AGENT_NATS_URL="${OSHIOKI_AGENT_NATS_URL-$SETUP_NATS_URL}" \
+    OSHIOKI_AGENT_NATS_USER="${OSHIOKI_AGENT_NATS_USER-oshioki-agent}" \
+    OSHIOKI_AGENT_NATS_PASS="${OSHIOKI_AGENT_NATS_PASS-agent-secret}" \
     DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
     SEEN_CHECKSUMS="${SEEN_CHECKSUMS:-}" \
     ENROLL_MODE="${ENROLL_MODE:-url}" \
@@ -351,11 +443,17 @@ grep -Fq 'https://enroll.test/e/id' "$AGENT_STATE/paired-url" || fail "pair got 
 if [ "$(uname -s)" = Darwin ]; then
   plist="$TEST_ROOT/home/Library/LaunchAgents/com.oshioki.agent.plist"
   [ -f "$plist" ] || fail "LaunchAgent plist missing"
-  grep -Fq '<string>test-secret</string>' "$plist" || fail "plist missing NATS password"
+  # The agent's OWN role (agent-secret), never the hook's (test-secret): see
+  # the dedicated agent-credential-separation scenarios below for the
+  # sharper regression test, but every server-mode fresh install should
+  # already get this right.
+  grep -Fq '<string>agent-secret</string>' "$plist" || fail "plist missing agent's own NATS password"
+  if grep -Fq '<string>test-secret</string>' "$plist"; then fail "plist carries the hook's NATS password"; fi
   grep -Fq '<key>OSHIOKI_AGENT_SOCKET</key>' "$plist" || fail "plist missing agent socket"
   grep -Fq '<key>OSHIOKI_AGENT_STATE</key>' "$plist" || fail "plist missing agent state"
   [ "$(file_mode "$plist")" = 600 ] || fail "plist is not 0600"
   grep -Fq 'bootstrap' "$CALL_LOG" || fail "launchctl bootstrap never ran"
+  grep -Fq 'agent connected to its NATS bus' "$TEST_ROOT/fresh.log" || fail "verify step never confirmed the NATS connection"
 else
   # No autostart on Linux: the agent needs a terminal for its prompt, so
   # the setup writes only the environment and says how to run it.
@@ -368,8 +466,10 @@ else
   # the agent ends up with, not the bytes on disk.
   env_value() { (set -a; . "$1"; set +a; eval "printf '%s' \"\$$2\""); }
   [ "$(env_value "$agent_env" NATS_URL)" = "$SETUP_NATS_URL" ] || fail "agent.env NATS URL did not survive sourcing"
-  [ "$(env_value "$agent_env" NATS_USER)" = oshioki ] || fail "agent.env NATS user did not survive sourcing"
-  [ "$(env_value "$agent_env" NATS_PASS)" = test-secret ] || fail "agent.env NATS password did not survive sourcing"
+  # The agent's OWN role (oshioki-agent/agent-secret), never the hook's
+  # (oshioki/test-secret).
+  [ "$(env_value "$agent_env" NATS_USER)" = oshioki-agent ] || fail "agent.env NATS user did not survive sourcing"
+  [ "$(env_value "$agent_env" NATS_PASS)" = agent-secret ] || fail "agent.env NATS password did not survive sourcing"
   [ "$(env_value "$agent_env" OSHIOKI_AGENT_SOCKET)" = "$AGENT_STATE/agent.sock" ] || fail "agent.env socket did not survive sourcing"
   [ "$(env_value "$agent_env" OSHIOKI_AGENT_STATE)" = "$AGENT_STATE" ] || fail "agent.env state dir did not survive sourcing"
   [ "$(file_mode "$agent_env")" = 600 ] || fail "agent.env is not 0600"
@@ -494,12 +594,14 @@ OSHIOKI_ORIGIN="https://reconfigured.test" run_setup --yes --reconfigure >"$TEST
 grep -Fq 'OSHIOKI_ORIGIN=https://reconfigured.test' "$TEST_ROOT/etc/install.env" || fail "reconfigure kept stale origin"
 
 # Scenario D: a password with spaces and % reaches the autostart config
-# literally instead of being split or expanded.
+# literally instead of being split or expanded. Staged as the AGENT's own
+# password -- that is what actually reaches the plist/agent.env now, never
+# the hook's.
 NASTY='p% a%s s'
-printf '%s\n' 'oshioki' "$NASTY" > "$STUB_CREDS_FILE"
-NATS_PASS="$NASTY" run_setup --yes --reconfigure >"$TEST_ROOT/nasty.log" 2>&1 || fail "nasty password setup failed"
-printf '%s\n' 'oshioki' 'test-secret' > "$STUB_CREDS_FILE"
-grep -Fq "NATS verified at $SETUP_NATS_URL" "$TEST_ROOT/nasty.log" || fail "probe rejected the nasty password"
+printf '%s\n' 'oshioki' 'test-secret' 'oshioki-agent' "$NASTY" > "$STUB_CREDS_FILE"
+OSHIOKI_AGENT_NATS_PASS="$NASTY" run_setup --yes --reconfigure >"$TEST_ROOT/nasty.log" 2>&1 || fail "nasty password setup failed"
+printf '%s\n' 'oshioki' 'test-secret' 'oshioki-agent' 'agent-secret' > "$STUB_CREDS_FILE"
+grep -Fq "agent NATS verified at $SETUP_NATS_URL" "$TEST_ROOT/nasty.log" || fail "probe rejected the nasty password"
 if [ "$(uname -s)" = Darwin ]; then
   grep -Fq "<string>$NASTY</string>" "$plist" || fail "plist mangled the password"
 else
@@ -749,6 +851,354 @@ grep -Fq 'reusing existing' "$TEST_ROOT/opaque.log" \
   || fail "setup did not reuse the install.env it could not stat"
 grep -Fq 'OSHIOKI_ORIGIN=https://preserved.test' "$TEST_ROOT/etc/install.env" \
   || fail "setup overwrote an install.env it could not stat"
+
+# Scenario K (Darwin, forced): the agent's own NATS role never becomes the
+# hook's, even freshly configuring both together with every value distinct
+# from every other scenario's defaults. FAKE_UNAME forces the Darwin branch
+# regardless of the host running this suite, since the LaunchAgent plist is
+# Darwin-only code and this sandbox may not be a Mac.
+plist_k="$TEST_ROOT/home/Library/LaunchAgents/com.oshioki.agent.plist"
+rm -f "$plist_k" "$TEST_ROOT/etc/install.env" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled" "$AGENT_STATE/agent.log"
+# run_setup's hook NATS_USER is fixed at "oshioki" (only NATS_PASS and the
+# agent-role names are independently overridable), so the hook pair here
+# keeps that user with a scenario-specific password.
+printf '%s\n' 'oshioki' 'hook-secret-K' 'oshioki-agent-k' 'agent-secret-K' > "$STUB_CREDS_FILE"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=0 NATS_PASS="hook-secret-K" \
+  OSHIOKI_AGENT_NATS_USER="oshioki-agent-k" OSHIOKI_AGENT_NATS_PASS="agent-secret-K" \
+  run_setup --yes >"$TEST_ROOT/separation.log" 2>&1 || fail "agent-credential-separation setup failed"
+printf '%s\n' 'oshioki' 'test-secret' 'oshioki-agent' 'agent-secret' > "$STUB_CREDS_FILE"
+[ -f "$plist_k" ] || fail "agent-credential-separation: plist missing"
+grep -Fq '<string>oshioki-agent-k</string>' "$plist_k" || fail "agent-credential-separation: plist missing agent's own NATS user"
+grep -Fq '<string>agent-secret-K</string>' "$plist_k" || fail "agent-credential-separation: plist missing agent's own NATS password"
+if grep -Fq '<string>hook-secret-K</string>' "$plist_k"; then fail "agent-credential-separation: plist carries the hook's NATS password"; fi
+grep -Fq 'agent connected to its NATS bus' "$TEST_ROOT/separation.log" || fail "agent-credential-separation: verify never confirmed the NATS connection"
+
+# Scenario L (Darwin, forced): an existing plist that already names a real
+# NATS_URL/USER survives an ordinary re-run untouched -- only
+# ProgramArguments (the agent binary path, which moves on every brew
+# upgrade) is refreshed. This is what protects an already-correctly-
+# configured agent, paired to the real bus, from losing its credentials to
+# whatever this run staged -- including this suite's own defaults.
+plist_l="$plist_k"
+mkdir -p "$(dirname "$plist_l")"
+old_bin="$TEST_ROOT/fake-bin/oshioki-agent-old"
+cp "$TEST_ROOT/fake-bin/oshioki-agent" "$old_bin"
+chmod 0755 "$old_bin"
+cat > "$plist_l" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.oshioki.agent</string>
+  <key>ProgramArguments</key><array><string>$old_bin</string><string>run</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>NATS_URL</key><string>tls://real-bus.example:4231</string>
+    <key>NATS_USER</key><string>oshioki-agent-real</string>
+    <key>NATS_PASS</key><string>real-secret-L</string>
+    <key>OSHIOKI_AGENT_SOCKET</key><string>$AGENT_STATE/agent.sock</string>
+    <key>OSHIOKI_AGENT_STATE</key><string>$AGENT_STATE</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$AGENT_STATE/agent.log</string>
+  <key>StandardErrorPath</key><string>$AGENT_STATE/agent.log</string>
+</dict></plist>
+PLIST
+chmod 0600 "$plist_l"
+rm -f "$AGENT_STATE/agent.log"
+# Scenario K left its own hook password in install.env; drop it so this
+# scenario's ordinary re-run probes against the (reset) default creds
+# instead of a stale one from an unrelated scenario. Device identity is
+# untouched -- an already-paired agent is exactly the case under test.
+rm -f "$TEST_ROOT/etc/install.env"
+: > "$CALL_LOG"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 run_setup --yes >"$TEST_ROOT/preserve.log" 2>&1 || fail "plist-preservation setup failed"
+grep -Fq 'preserving existing NATS/agent environment' "$TEST_ROOT/preserve.log" || fail "setup never announced preserving the existing plist"
+grep -Fq "<string>$TEST_ROOT/fake-bin/oshioki-agent</string>" "$plist_l" || fail "plist-preservation: ProgramArguments was not refreshed to the current agent binary"
+if grep -Fq "<string>$old_bin</string>" "$plist_l"; then fail "plist-preservation: ProgramArguments still points at the old binary"; fi
+grep -Fq '<string>tls://real-bus.example:4231</string>' "$plist_l" || fail "plist-preservation: real NATS_URL was lost"
+grep -Fq '<string>oshioki-agent-real</string>' "$plist_l" || fail "plist-preservation: real NATS_USER was lost"
+grep -Fq '<string>real-secret-L</string>' "$plist_l" || fail "plist-preservation: real NATS_PASS was lost"
+if grep -Fq '<string>agent-secret</string>' "$plist_l"; then fail "plist-preservation: this run's staged agent creds leaked into the preserved plist"; fi
+grep -Fq 'agent connected to its NATS bus' "$TEST_ROOT/preserve.log" || fail "plist-preservation: verify never confirmed the NATS connection"
+
+# Scenario M (Darwin, forced): the agent logging a NATS permissions
+# violation right after (re)starting fails the step loudly, rather than
+# reporting success because a plist was written and launchctl returned 0.
+# This is the actual live-outage signature (wrong-role credential
+# authenticates, then every subscribe is refused) that scenarios K and L's
+# happy-path checks cannot see on their own.
+plist_m="$plist_k"
+rm -f "$plist_m" "$AGENT_STATE/agent.log"
+violation_rc=0
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 \
+  AGENT_LOG_LINE='NATS server error error="Permissions Violation for Subscription to \"oshioki.request.>\""' \
+  run_setup --yes >"$TEST_ROOT/violation.log" 2>&1 || violation_rc=$?
+[ "$violation_rc" -ne 0 ] || fail "a permissions violation did not fail the autostart step"
+grep -Fiq 'permissions violation' "$TEST_ROOT/violation.log" || fail "the violation failure did not explain itself"
+
+# Scenario N (Darwin, forced): an existing plist in NORMAL multi-line
+# format -- <key>EnvironmentVariables</key> and <dict> on separate lines,
+# one <key>/<string> pair per line -- exactly what `plutil -convert xml1`,
+# PlistBuddy, or a human editing the file by hand produces, survives an
+# ordinary re-run just like scenario L's single-line seed. This is the
+# regression check for the bug this fix addresses: a same-line sed
+# extraction only matched the script's OWN single-line output, so against
+# this format it still announced preserving, then wrote an EMPTY
+# EnvironmentVariables dict, silently dropping the real NATS credentials to
+# socket-only.
+plist_n="$plist_k"
+mkdir -p "$(dirname "$plist_n")"
+old_bin_n="$TEST_ROOT/fake-bin/oshioki-agent-old-n"
+cp "$TEST_ROOT/fake-bin/oshioki-agent" "$old_bin_n"
+chmod 0755 "$old_bin_n"
+cat > "$plist_n" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>NATS_PASS</key>
+		<string>real-secret-N</string>
+		<key>NATS_URL</key>
+		<string>tls://example.invalid:4231</string>
+		<key>NATS_USER</key>
+		<string>oshioki-agent</string>
+		<key>OSHIOKI_AGENT_SOCKET</key>
+		<string>$AGENT_STATE/agent.sock</string>
+		<key>OSHIOKI_AGENT_STATE</key>
+		<string>$AGENT_STATE</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.oshioki.agent</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$old_bin_n</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>$AGENT_STATE/agent.log</string>
+	<key>StandardOutPath</key>
+	<string>$AGENT_STATE/agent.log</string>
+</dict>
+</plist>
+PLIST
+chmod 0600 "$plist_n"
+rm -f "$AGENT_STATE/agent.log" "$TEST_ROOT/etc/install.env"
+: > "$CALL_LOG"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 run_setup --yes >"$TEST_ROOT/preserve-multiline.log" 2>&1 \
+  || fail "plist-preservation (multi-line format) setup failed"
+grep -Fq 'preserving existing NATS/agent environment' "$TEST_ROOT/preserve-multiline.log" \
+  || fail "setup never announced preserving the multi-line-format plist"
+grep -Fq "<string>$TEST_ROOT/fake-bin/oshioki-agent</string>" "$plist_n" \
+  || fail "plist-preservation (multi-line): ProgramArguments was not refreshed to the current agent binary"
+if grep -Fq "<string>$old_bin_n</string>" "$plist_n"; then
+  fail "plist-preservation (multi-line): ProgramArguments still points at the old binary"
+fi
+grep -Fq '<string>tls://example.invalid:4231</string>' "$plist_n" \
+  || fail "plist-preservation (multi-line): real NATS_URL was lost"
+grep -Fq '<string>oshioki-agent</string>' "$plist_n" \
+  || fail "plist-preservation (multi-line): real NATS_USER was lost"
+grep -Fq '<string>real-secret-N</string>' "$plist_n" \
+  || fail "plist-preservation (multi-line): real NATS_PASS was lost"
+# The actual failure mode this fix targets: EnvironmentVariables must not
+# collapse to an empty dict while the script claims it preserved it.
+python3 -c '
+import re, sys
+content = open(sys.argv[1]).read()
+m = re.search(r"<key>EnvironmentVariables</key>\s*<dict>(.*?)</dict>", content, re.S)
+sys.exit(0 if m and m.group(1).strip() else 1)
+' "$plist_n" || fail "plist-preservation (multi-line): EnvironmentVariables dict is empty despite claiming to preserve it"
+grep -Fq 'agent connected to its NATS bus' "$TEST_ROOT/preserve-multiline.log" \
+  || fail "plist-preservation (multi-line): verify never confirmed the NATS connection"
+
+# Scenario O (Darwin, forced; issue review item 1): the agent logs "NATS
+# connected" BEFORE it subscribes; a "Permissions Violation" server error
+# arrives one RTT later. A poll that returns success on the first sample
+# that sees "connected" can miss a violation that shows up on the very next
+# sample -- exactly this fixture. The fix must keep polling for the rest of
+# the timeout budget after seeing "connected" and still fail on a violation
+# that arrives after it.
+plist_o="$plist_k"
+rm -f "$plist_o" "$AGENT_STATE/agent.log"
+delayed_violation_rc=0
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT=4 \
+  AGENT_LOG_LINE='NATS connected; watching for requests' \
+  AGENT_LOG_DELAYED_LINE='NATS server error error="Permissions Violation for Subscription to \"oshioki.request.>\""' \
+  AGENT_LOG_DELAY=1 \
+  run_setup --yes >"$TEST_ROOT/delayed-violation.log" 2>&1 || delayed_violation_rc=$?
+[ "$delayed_violation_rc" -ne 0 ] ||
+  fail "a violation arriving one poll after 'connected' did not fail the autostart step"
+grep -Fiq 'permissions violation' "$TEST_ROOT/delayed-violation.log" ||
+  fail "the delayed violation was not reported: $(tail -5 "$TEST_ROOT/delayed-violation.log")"
+
+# Same fixture family: a non-numeric verify timeout must fall back to the
+# default (5) instead of reaching `seq` and aborting the whole step.
+plist_o2="$plist_k"
+rm -f "$plist_o2" "$AGENT_STATE/agent.log"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT=notanumber \
+  AGENT_LOG_LINE='NATS connected; watching for requests' \
+  run_setup --yes >"$TEST_ROOT/bad-timeout.log" 2>&1 ||
+  fail "a non-numeric verify timeout aborted the run: $(tail -5 "$TEST_ROOT/bad-timeout.log")"
+grep -Fq 'agent connected to its NATS bus' "$TEST_ROOT/bad-timeout.log" ||
+  fail "a non-numeric verify timeout did not fall back to a working default"
+
+# Scenario P (issue review item 2): install.env has the hook's NATS but no
+# agent NATS keys at all (as written by 0.1.10 or earlier) and there is no
+# existing plist to preserve. The agent must still get written -- socket-only
+# -- but the setup must say so loudly rather than leaving the Mac looking
+# fully configured while approvals from other hosts can never arrive.
+plist_p="$plist_k"
+rm -f "$plist_p" "$TEST_ROOT/etc/install.env" "$AGENT_STATE/agent.log" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+printf '%s\n' \
+  'OSHIOKI_ORIGIN=https://laptop.test' \
+  'OSHIOKI_RP_ID=laptop.test' \
+  "NATS_URL=$SETUP_NATS_URL" \
+  'NATS_USER=oshioki' \
+  'NATS_PASS=test-secret' \
+  "OSHIOKI_AGENT_SOCKET=$AGENT_STATE/agent.sock" > "$TEST_ROOT/etc/install.env"
+chmod 0600 "$TEST_ROOT/etc/install.env"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 \
+  OSHIOKI_AGENT_NATS_URL="" OSHIOKI_AGENT_NATS_USER="" OSHIOKI_AGENT_NATS_PASS="" \
+  run_setup --yes >"$TEST_ROOT/downgrade.log" 2>&1 || fail "socket-only agent downgrade should not abort under --yes"
+grep -Fq 'socket-only' "$TEST_ROOT/downgrade.log" || fail "the silent socket-only downgrade was not reported"
+grep -Fq 'approvals from other hosts will not reach this Mac' "$TEST_ROOT/downgrade.log" ||
+  fail "the socket-only warning did not explain the consequence"
+grep -Fq -- '--reconfigure' "$TEST_ROOT/downgrade.log" || fail "the socket-only warning did not name --reconfigure"
+if [ -f "$plist_p" ] && grep -Eq '<key>NATS_(URL|USER|PASS)</key>' "$plist_p"; then
+  fail "a socket-only agent plist should carry no NATS keys"
+fi
+
+# Scenario Q (issue review item 3): an existing plist written by buggy 0.1.10
+# carries the HOOK's own NATS_USER (a wrong role, not a real configuration).
+# Detection must treat this as broken and rewrite it with the agent's own
+# role, not "preserve" it as if it were a real device credential; the
+# eventual violation `die` message (scenario M) must also name the remedy.
+plist_q="$plist_k"
+rm -f "$plist_q" "$TEST_ROOT/etc/install.env" "$AGENT_STATE/agent.log" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+mkdir -p "$(dirname "$plist_q")"
+cat > "$plist_q" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.oshioki.agent</string>
+  <key>ProgramArguments</key><array><string>$TEST_ROOT/fake-bin/oshioki-agent-old-q</string><string>run</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>NATS_URL</key><string>$SETUP_NATS_URL</string>
+    <key>NATS_USER</key><string>oshioki</string>
+    <key>NATS_PASS</key><string>test-secret</string>
+    <key>OSHIOKI_AGENT_SOCKET</key><string>$AGENT_STATE/agent.sock</string>
+    <key>OSHIOKI_AGENT_STATE</key><string>$AGENT_STATE</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$AGENT_STATE/agent.log</string>
+  <key>StandardErrorPath</key><string>$AGENT_STATE/agent.log</string>
+</dict></plist>
+PLIST
+chmod 0600 "$plist_q"
+: > "$CALL_LOG"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 run_setup --yes >"$TEST_ROOT/broken-preserve.log" 2>&1 ||
+  fail "broken-plist rewrite setup failed"
+grep -Fq 'existing agent autostart uses the hook credentials' "$TEST_ROOT/broken-preserve.log" ||
+  fail "a plist carrying the hook's own NATS user was not identified as broken"
+if grep -Fq 'preserving existing NATS/agent environment' "$TEST_ROOT/broken-preserve.log"; then
+  fail "a plist carrying the hook's own NATS user was preserved instead of rewritten"
+fi
+grep -Fq '<string>agent-secret</string>' "$plist_q" ||
+  fail "the broken plist was not rewritten with the agent's own credentials"
+if grep -Fq '<string>test-secret</string>' "$plist_q"; then
+  fail "the broken plist still carries the hook's NATS password"
+fi
+
+# The violation `die` message (scenario M) has to name the remedy, not just
+# the log path, so an operator hitting it knows what to run next.
+: > "$AGENT_STATE/agent.log"
+violation2_rc=0
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 \
+  AGENT_LOG_LINE='NATS server error error="Permissions Violation for Subscription to \"oshioki.request.>\""' \
+  run_setup --yes >"$TEST_ROOT/violation2.log" 2>&1 || violation2_rc=$?
+[ "$violation2_rc" -ne 0 ] || fail "a permissions violation did not fail the autostart step (second check)"
+grep -Fq -- '--reconfigure' "$TEST_ROOT/violation2.log" ||
+  fail "the violation die message did not name --reconfigure"
+grep -Fq 'OSHIOKI_AGENT_NATS' "$TEST_ROOT/violation2.log" ||
+  fail "the violation die message did not name the OSHIOKI_AGENT_NATS_* variables"
+
+# Scenario R (issue review item 4): agent NATS credentials are optional.
+# This is the actual regression case: writing a FRESH install.env (no prior
+# file, or --reconfigure) is the only path that prompts for the agent's own
+# NATS role at all, and under --yes an empty OSHIOKI_AGENT_NATS_PASS used to
+# reach prompt()'s "$label has no default" die instead of falling back to a
+# socket-only agent -- the interactive prompt had the same problem, since it
+# could not be answered with a blank line either. This must now succeed and
+# leave the agent socket-only.
+rm -f "$TEST_ROOT/etc/install.env" "$plist_k" "$AGENT_STATE/agent.log" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 \
+  OSHIOKI_AGENT_NATS_URL="" OSHIOKI_AGENT_NATS_USER="" OSHIOKI_AGENT_NATS_PASS="" \
+  run_setup --yes >"$TEST_ROOT/optional-creds.log" 2>&1 ||
+  { tail -5 "$TEST_ROOT/optional-creds.log" >&2; fail "--yes with no agent NATS password should not abort"; }
+if grep -Eq '^OSHIOKI_AGENT_NATS_(URL|USER|PASS)=.' "$TEST_ROOT/etc/install.env"; then
+  fail "declining the agent NATS password still wrote agent NATS keys"
+fi
+grep -Fq 'socket-only' "$TEST_ROOT/optional-creds.log" || fail "declining the agent password was not reported as socket-only"
+
+# The other half of the same fix: when a password IS supplied, the URL and
+# user get sensible defaults (the hook's own NATS_URL, and "oshioki-agent")
+# without being separately supplied -- this is the --yes path through the
+# same prompt() calls the interactive terminal uses, so it exercises the
+# identical code.
+rm -f "$TEST_ROOT/etc/install.env" "$plist_k" "$AGENT_STATE/agent.log" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+printf '%s\n' 'oshioki' 'test-secret' 'oshioki-agent' 'agent-secret' > "$STUB_CREDS_FILE"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 OSHIOKI_AGENT_NATS_URL="" OSHIOKI_AGENT_NATS_USER="" \
+  OSHIOKI_AGENT_NATS_PASS="agent-secret" \
+  run_setup --yes >"$TEST_ROOT/default-url.log" 2>&1 || fail "supplying only the agent password should default URL/user"
+grep -Fq "OSHIOKI_AGENT_NATS_URL=$SETUP_NATS_URL" "$TEST_ROOT/etc/install.env" ||
+  fail "agent NATS URL did not default to the hook's NATS_URL"
+grep -Fq 'OSHIOKI_AGENT_NATS_USER=oshioki-agent' "$TEST_ROOT/etc/install.env" ||
+  fail "agent NATS user did not default to oshioki-agent"
+
+# Scenario S (issue review item 5): a plutil failure while updating a
+# preserved plist must name the plist path and --reconfigure, not surface a
+# bare plutil error. Staged by giving the fake plutil a plist with no
+# ProgramArguments array to replace, which is exactly what a plist mangled
+# by hand or by another tool would produce.
+plist_s="$plist_k"
+rm -f "$plist_s" "$TEST_ROOT/etc/install.env" "$AGENT_STATE/agent.log" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+mkdir -p "$(dirname "$plist_s")"
+cat > "$plist_s" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.oshioki.agent</string>
+  <key>ProgramArguments</key><string>not-an-array</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>NATS_URL</key><string>tls://real-bus.example:4231</string>
+    <key>NATS_USER</key><string>oshioki-agent-real</string>
+    <key>NATS_PASS</key><string>real-secret-S</string>
+    <key>OSHIOKI_AGENT_SOCKET</key><string>$AGENT_STATE/agent.sock</string>
+    <key>OSHIOKI_AGENT_STATE</key><string>$AGENT_STATE</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$AGENT_STATE/agent.log</string>
+  <key>StandardErrorPath</key><string>$AGENT_STATE/agent.log</string>
+</dict></plist>
+PLIST
+chmod 0600 "$plist_s"
+plutil_rc=0
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 run_setup --yes >"$TEST_ROOT/plutil-fail.log" 2>&1 || plutil_rc=$?
+[ "$plutil_rc" -ne 0 ] || fail "a plutil failure did not stop the run"
+# Must be one clear message naming the plist path and --reconfigure together
+# -- not the bare "fake plutil: key ... not found" error on its own, and not
+# an unrelated --reconfigure mention from an earlier, different log line.
+grep -Fq "could not update $plist_s" "$TEST_ROOT/plutil-fail.log" ||
+  fail "the plutil failure was not wrapped in a clear message naming the plist: $(tail -3 "$TEST_ROOT/plutil-fail.log")"
+grep -F "could not update $plist_s" "$TEST_ROOT/plutil-fail.log" | grep -Fq -- '--reconfigure' ||
+  fail "the plutil failure message did not suggest --reconfigure"
 
 # Self-policing teardown: the EXIT trap removes the tree, but rm succeeds
 # even with live holders (open files unlink), so leaked processes would go

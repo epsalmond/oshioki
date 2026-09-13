@@ -30,7 +30,7 @@ scripts/mac/install-agent
 `--sign` names a codesigning identity. The sheet takes
 its title and icon from the calling process's bundle, so without it the sheet
 shows the binary's file name and a generic badge. `install-agent` writes
-`~/Library/LaunchAgents/dev.oshioki.agent.plist` and loads it. It runs as the
+`~/Library/LaunchAgents/com.oshioki.agent.plist` and loads it. It runs as the
 user, needs no sudo, and logs to `~/Library/Logs/oshioki-agent.log`.
 
 Pairing signs an enrollment proof, so it shows one Touch ID sheet of its own.
