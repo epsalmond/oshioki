@@ -7,11 +7,20 @@ const IMAGE_CHUNK_SIZE: usize = 4096;
 const IMAGE_WIDTH_CELLS: usize = 8;
 const IMAGE_HEIGHT_CELLS: usize = 4;
 
-/// Prints the Oshioki logo before top-level `--help` when the terminal is a
-/// known Kitty graphics implementation. All other output paths stay plain.
-pub fn maybe_print_for_help() {
-    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if !is_top_level_help(&arguments) || !io::stdout().is_terminal() {
+/// Returns whether arguments request the top-level help page.
+pub fn is_top_level_help(arguments: &[std::ffi::OsString]) -> bool {
+    match arguments {
+        [] => true,
+        [flag] => {
+            flag == OsStr::new("help") || flag == OsStr::new("-h") || flag == OsStr::new("--help")
+        }
+        _ => false,
+    }
+}
+
+/// Prints the logo for a top-level help request when the terminal supports it.
+pub fn maybe_print_for_arguments(arguments: &[std::ffi::OsString]) {
+    if !is_top_level_help(arguments) || !io::stdout().is_terminal() {
         return;
     }
     if !supports_kitty_graphics(
@@ -23,10 +32,6 @@ pub fn maybe_print_for_help() {
         return;
     }
     let _ = write_logo(&mut io::stdout());
-}
-
-fn is_top_level_help(arguments: &[std::ffi::OsString]) -> bool {
-    matches!(arguments, [flag] if flag == OsStr::new("-h") || flag == OsStr::new("--help"))
 }
 
 fn supports_kitty_graphics(
@@ -126,10 +131,15 @@ mod tests {
     }
 
     #[test]
-    fn only_a_bare_top_level_help_request_gets_a_logo() {
+    fn recognizes_only_bare_top_level_help_requests() {
+        assert!(is_top_level_help(&[]));
+        assert!(is_top_level_help(&[OsString::from("help")]));
         assert!(is_top_level_help(&[OsString::from("--help")]));
         assert!(is_top_level_help(&[OsString::from("-h")]));
-        assert!(!is_top_level_help(&[]));
+        assert!(!is_top_level_help(&[
+            OsString::from("help"),
+            OsString::from("pair")
+        ]));
         assert!(!is_top_level_help(&[
             OsString::from("status"),
             OsString::from("--help")

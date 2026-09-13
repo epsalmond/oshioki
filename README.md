@@ -2,16 +2,16 @@
 
 <p align="center"><img src="assets/oshioki.svg" alt="Oshioki logo" width="160"></p>
 
-Oshioki (お仕置き) adds Touch ID, WebAuthn, or native device approval to
-`sudo`.
-WebAuthn runs in a phone browser. Native approvals use `oshioki-agent`.
+Oshioki (お仕置き) puts the pun in punishment.
+
+Adds Touch ID, WebAuthn, or native device approval to `sudo`.
+
+WebAuthn runs in a WebAuthn-compatible browser. Native approvals use
+`oshioki-agent`.
 
 Requests are encrypted and approvals are signed. A local Unix socket is
-available for native approvals. NATS with JetStream connects hosts, servers,
-and approval devices.
-
-Licensed under MIT OR Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and
-[LICENSE-APACHE](LICENSE-APACHE).
+available for native approvals. NATS with JetStream connects your servers, VMs,
+etc to your phone or laptop.
 
 ## Install
 
@@ -38,7 +38,7 @@ Follow the [runbook](RUNBOOK.md) to install the hook from a source build.
 
 ## Choose a setup
 
-### Local Mac with Touch ID
+### Local device
 
 Run setup as your logged-in user:
 
@@ -93,13 +93,13 @@ oshioki-agent pair '<enrollment-url>' --label <label>
 oshioki-agent run
 ```
 
-macOS uses the Secure Enclave by default. Other platforms use a software
-key. Software native identities still require the normal sudo password.
-See [native agent](docs/native-agent.md) for identity state, offline pairing,
-and the macOS LaunchAgent.
+macOS uses the Secure Enclave by default. Other platforms use a software key.
+Software native identities still require the normal sudo password. See
+[native agent](docs/native-agent.md) for identity state, offline pairing, and
+the macOS LaunchAgent.
 
-For a host that cannot reach the server, export the public device record on
-the approval device, copy it to the host, and pin it there:
+For a host that cannot reach the server, export the public device record on the
+approval device, copy it to the host, and pin it there:
 
 ```bash
 oshioki-agent init
@@ -113,8 +113,7 @@ sudo oshioki pin-record /tmp/oshioki-device.json
 Install the hook on each host that needs approval. Run an Oshioki server with
 NATS and JetStream, then give the hook and each native agent separate NATS
 credentials. NATS connections outside loopback require TLS with a trusted,
-hostname-matched certificate. The plaintext opt-out is for local testing
-only.
+hostname-matched certificate. The plaintext opt-out is for local testing only.
 
 See [production requirements](docs/requirements.md),
 [configuration](docs/configuration.md), and the [runbook](RUNBOOK.md).
@@ -123,21 +122,21 @@ See [production requirements](docs/requirements.md),
 
 Run host commands as root because they read or update `/etc/oshioki`.
 
-| Command | Purpose |
-| --- | --- |
-| `sudo oshioki enroll` | Create an enrollment URL and wait for a device. |
-| `sudo oshioki enroll --resume <enrollment-id>` | Resume an enrollment. |
-| `sudo oshioki pin <fingerprint>` | Fetch and pin a device from the server. |
-| `sudo oshioki pin-record <path>` | Pin a JSON device record from a file. |
-| `sudo oshioki revoke <fingerprint>` | Revoke a device on the server and host. |
-| `sudo oshioki status` | Show sudo authentication and enrolled devices. |
-| `sudo oshioki watch` | Open browser approval pages for incoming requests. |
-| `sudo oshioki test` | Send a synthetic request through the approval flow. |
+| Command                                        | Purpose                                             |
+| ---------------------------------------------- | --------------------------------------------------- |
+| `sudo oshioki enroll`                          | Create an enrollment URL and wait for a device.     |
+| `sudo oshioki enroll --resume <enrollment-id>` | Resume an enrollment.                               |
+| `sudo oshioki pin <fingerprint>`               | Fetch and pin a device from the server.             |
+| `sudo oshioki pin-record <path>`               | Pin a JSON device record from a file.               |
+| `sudo oshioki revoke <fingerprint>`            | Revoke a device on the server and host.             |
+| `sudo oshioki status`                          | Show sudo authentication and enrolled devices.      |
+| `sudo oshioki watch`                           | Open browser approval pages for incoming requests.  |
+| `sudo oshioki test`                            | Send a synthetic request through the approval flow. |
 
-Use `oshioki --help` for the public command list and
-`oshioki-agent --help` for the native agent. In Kitty-compatible terminals,
-including WezTerm and Ghostty, either top-level help command also shows the
-embedded Oshioki logo. Pipes and tmux or screen sessions stay plain text.
+Running either CLI without arguments or with exactly `help`, `-h`, or `--help`
+prints the same top-level help. In Kitty-compatible terminals, including WezTerm
+and Ghostty, these forms also show the embedded Oshioki logo. Pipes and tmux or
+screen sessions stay plain text.
 
 The native agent has separate commands for pairing, running, inspecting, and
 exporting an identity:
@@ -155,12 +154,12 @@ The hook reads its state from `/etc/oshioki` by default. The native agent uses
 `~/.config/oshioki` unless `OSHIOKI_AGENT_STATE` or `--state` changes it.
 
 The hook can try a native agent Unix socket before falling back to NATS. A
-socket-only host omits `NATS_URL` from its hook configuration. Browser
-WebAuthn approval still needs the Oshioki server.
+socket-only host omits `NATS_URL` from its hook configuration. Browser WebAuthn
+approval still needs the Oshioki server.
 
-Use `tls://` for NATS outside loopback. Set
-`OSHIOKI_ALLOW_PLAINTEXT_NATS=1` only in the component's development
-configuration. Keep hook, agent, and server credentials separate.
+Use `tls://` for NATS outside loopback. Set `OSHIOKI_ALLOW_PLAINTEXT_NATS=1`
+only in the component's development configuration. Keep hook, agent, and server
+credentials separate.
 
 See [configuration](docs/configuration.md) for environment variables,
 [architecture](docs/architecture.md) for the request flow, and
@@ -177,3 +176,6 @@ scripts/dev test --quick
 
 The [runbook](RUNBOOK.md) covers supervised acceptance sessions and host
 installation details. [CHANGELOG.md](CHANGELOG.md) records release changes.
+
+Licensed under MIT OR Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).

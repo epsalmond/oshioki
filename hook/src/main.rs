@@ -2,7 +2,7 @@
 
 use anyhow::{Context as _, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, Parser, Subcommand};
 use futures::StreamExt as _;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -172,7 +172,12 @@ struct ServerHealthV1 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    terminal_logo::maybe_print_for_help();
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if terminal_logo::is_top_level_help(&arguments) {
+        terminal_logo::maybe_print_for_arguments(&arguments);
+        Cli::command().print_help()?;
+        return Ok(());
+    }
     let cli = Cli::parse();
     // Both privileged sudo verbs share the terminal/audit split and the
     // exit-status contract; only their payloads differ.
@@ -3480,7 +3485,6 @@ mod tests {
             );
         }
     }
-    use clap::CommandFactory as _;
     use p256::ecdsa::SigningKey;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[test]

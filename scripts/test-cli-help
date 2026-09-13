@@ -17,6 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 GRAPHICS = b"\x1b_G"
 
 
+def terminal_text(output: bytes) -> bytes:
+    return output.replace(b"\r\n", b"\n")
+
+
 def environment(term_program: str = "kitty", term: str = "xterm-kitty") -> dict[str, str]:
     result = dict(os.environ)
     result["TERM_PROGRAM"] = term_program
@@ -87,18 +91,35 @@ def check_binary(binary: Path, subcommand: str) -> None:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise SystemExit(f"missing executable: {binary}; build the workspace first")
 
+    plain_help = None
+    for arguments in [[], ["help"], ["-h"], ["--help"]]:
+        output, error, status = run_pipe(binary, arguments, environment())
+        assert status == 0, (binary, arguments, status, error)
+        if plain_help is None:
+            plain_help = output
+        else:
+            assert output == plain_help, (binary, arguments, "help text differs")
+
     for term_program, term in [
         ("kitty", "xterm-kitty"),
         ("WezTerm", "xterm-256color"),
         ("ghostty", "xterm-ghostty"),
     ]:
-        output, status = run_pty(binary, ["--help"], environment(term_program, term))
-        assert status == 0, (binary, term_program, status)
-        assert GRAPHICS in output, (
-            binary,
-            term_program,
-            "graphics help did not contain a Kitty sequence",
-        )
+        for arguments in [[], ["help"], ["-h"], ["--help"]]:
+            output, status = run_pty(binary, arguments, environment(term_program, term))
+            assert status == 0, (binary, term_program, arguments, status)
+            assert GRAPHICS in output, (
+                binary,
+                term_program,
+                arguments,
+                "graphics help did not contain a Kitty sequence",
+            )
+            assert plain_help and plain_help in terminal_text(output), (
+                binary,
+                term_program,
+                arguments,
+                "help text missing after logo",
+            )
 
     for arguments, env, expected_status in [
         (["--help"], environment("kitty", "dumb"), 0),
@@ -106,8 +127,8 @@ def check_binary(binary: Path, subcommand: str) -> None:
         (["--help"], {**environment(), "STY": "screen"}, 0),
         (["--version"], environment(), 0),
         ([subcommand, "--help"], environment(), 0),
+        (["help", subcommand], environment(), 0),
         (["not-a-command"], environment(), 2),
-        ([], environment(), 2),
     ]:
         output, status = run_pty(binary, arguments, env)
         assert status == expected_status, (binary, arguments, status)
