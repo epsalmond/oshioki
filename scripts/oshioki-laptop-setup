@@ -425,7 +425,9 @@ cleanup_run() {
 }
 trap cleanup_run EXIT
 
-# Does install.env exist? Ask the same way env_key() reads it. /etc/oshioki is
+# Does install.env exist? Ask through sudo, the same way the snapshot above
+# takes it -- and as one plain top-level command, so it rides the same ticket.
+# /etc/oshioki is
 # root-owned 0700 and install.env inside it 0600, so a bare `[ -f ]` run as
 # the laptop user answers "missing" for a file that is there (issue #88): the
 # run then takes the write branch and overwrites a good config, or dies
