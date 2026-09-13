@@ -199,6 +199,7 @@ die_keychain_locked() {
 SUDO="${SUDO:-sudo}"
 LAUNCHCTL="${LAUNCHCTL:-launchctl}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+PLUTIL="${PLUTIL:-plutil}"
 
 INSTALL_ENV="${OSHIOKI_INSTALL_ENV:-/etc/oshioki/install.env}"
 AGENT_STATE="${OSHIOKI_AGENT_STATE:-$HOME/.config/oshioki}"
@@ -864,32 +865,44 @@ case "$(uname -s)" in
     mkdir -p "$plist_dir"
     plist="$plist_dir/$LABEL.plist"
     xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+    json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
     # An existing plist that already names a NATS_URL or NATS_USER is either
     # a prior correct run of this same script or a hand-maintained one; both
     # are the operator's real, working configuration for this device's own
-    # role. Reuse its whole EnvironmentVariables block verbatim rather than
-    # recompute it -- only ProgramArguments (the agent binary, which moves
-    # on every brew upgrade) is refreshed. Without this, an ordinary re-run
-    # -- brew upgrade, laptop-setup re-invoked for any reason -- would
-    # silently overwrite a real device credential with whatever this run
-    # staged, which may be blank, may name a different bus, or may (the bug
-    # this whole block exists to prevent) be the hook's own role. Only
-    # --reconfigure is allowed to replace it.
-    preserved_env=""
+    # role. Leave the file otherwise untouched and refresh only
+    # ProgramArguments (the agent binary, which moves on every brew upgrade).
+    # Without this, an ordinary re-run -- brew upgrade, laptop-setup
+    # re-invoked for any reason -- would silently overwrite a real device
+    # credential with whatever this run staged, which may be blank, may name
+    # a different bus, or may (the bug this whole block exists to prevent)
+    # be the hook's own role. Only --reconfigure is allowed to replace it.
+    preserving=0
     if [ -f "$plist" ] && [ "$RECONFIGURE" -eq 0 ] && grep -Eq '<key>NATS_(URL|USER)</key>' "$plist"; then
-      preserved_env="$(sed -n '/<key>EnvironmentVariables<\/key><dict>/,/<\/dict>/p' "$plist" | sed '1d;$d')"
+      preserving=1
       info "preserving existing NATS/agent environment in $plist (pass --reconfigure to replace it)"
     fi
-    {
-      printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
-      printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
-      printf '%s\n' '<plist version="1.0"><dict>'
-      printf '  <key>Label</key><string>%s</string>\n' "$LABEL"
-      printf '  <key>ProgramArguments</key><array><string>%s</string><string>run</string></array>\n' "$(xml_escape "$AGENT_BIN")"
-      printf '%s\n' '  <key>EnvironmentVariables</key><dict>'
-      if [ -n "$preserved_env" ]; then
-        printf '%s\n' "$preserved_env"
-      else
+    if [ "$preserving" -eq 1 ]; then
+      # plutil -replace edits the file's own existing structure in place, so
+      # every other key -- EnvironmentVariables, KeepAlive, RunAtLoad, the
+      # log paths, anything a future version adds -- survives verbatim
+      # regardless of formatting. A prior version of this code instead tried
+      # to re-emit a parsed copy of EnvironmentVariables using a same-line
+      # sed extraction that only matched the script's own single-line
+      # output; against a normally formatted plist (hand-written, or written
+      # by plutil/PlistBuddy, which put each key on its own line) the grep
+      # above still matched and this still announced preserving, but the
+      # extraction came back empty, so the file written carried an EMPTY
+      # EnvironmentVariables dict -- silently dropping the agent's real NATS
+      # credentials to socket-only.
+      "$PLUTIL" -replace ProgramArguments -json "[\"$(json_escape "$AGENT_BIN")\",\"run\"]" "$plist"
+    else
+      {
+        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+        printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+        printf '%s\n' '<plist version="1.0"><dict>'
+        printf '  <key>Label</key><string>%s</string>\n' "$LABEL"
+        printf '  <key>ProgramArguments</key><array><string>%s</string><string>run</string></array>\n' "$(xml_escape "$AGENT_BIN")"
+        printf '%s\n' '  <key>EnvironmentVariables</key><dict>'
         # Socket-only writes no NATS keys at all: the agent would otherwise
         # log an authorization failure on every start against a server that
         # was never there. The agent's OWN role goes here -- AGENT_NATS_*,
@@ -903,14 +916,14 @@ case "$(uname -s)" in
         fi
         printf '    <key>OSHIOKI_AGENT_SOCKET</key><string>%s</string>\n' "$(xml_escape "$AGENT_SOCKET_V")"
         printf '    <key>OSHIOKI_AGENT_STATE</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE")"
-      fi
-      printf '%s\n' '  </dict>'
-      printf '%s\n' '  <key>RunAtLoad</key><true/>'
-      printf '%s\n' '  <key>KeepAlive</key><true/>'
-      printf '  <key>StandardOutPath</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE/agent.log")"
-      printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE/agent.log")"
-      printf '%s\n' '</dict></plist>'
-    } > "$plist"
+        printf '%s\n' '  </dict>'
+        printf '%s\n' '  <key>RunAtLoad</key><true/>'
+        printf '%s\n' '  <key>KeepAlive</key><true/>'
+        printf '  <key>StandardOutPath</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE/agent.log")"
+        printf '  <key>StandardErrorPath</key><string>%s</string>\n' "$(xml_escape "$AGENT_STATE/agent.log")"
+        printf '%s\n' '</dict></plist>'
+      } > "$plist"
+    fi
     chmod 0600 "$plist"
     # Line count taken before the restart, not the file's mtime: launchd
     # appends to the same log across restarts, and a prior run's own
@@ -928,7 +941,7 @@ case "$(uname -s)" in
     # runs when this run's (or the preserved) environment names a NATS at
     # all; a socket-only agent never touches NATS and there is nothing here
     # to wait for.
-    if [ -n "$preserved_env" ] || [ -n "$AGENT_NATS_URL_V" ]; then
+    if [ "$preserving" -eq 1 ] || [ -n "$AGENT_NATS_URL_V" ]; then
       violation=0
       connected=0
       for _ in $(seq 1 "${OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT:-5}"); do

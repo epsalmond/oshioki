@@ -225,6 +225,49 @@ cat > "$TEST_ROOT/fake-bin/uname" <<'SH'
 #!/usr/bin/env bash
 echo "${FAKE_UNAME:?FAKE_UNAME not set}"
 SH
+# Real macOS always has plutil; this sandbox may not be a Mac, so stand in
+# with just enough of it to exercise the one invocation the real script
+# makes: `plutil -replace KEY -json JSON FILE`. Real plutil reformats the
+# whole file into its own canonical style; this fake only replaces the
+# named key's XML in place (whatever line layout it already has, single- or
+# multi-line) and leaves every other byte untouched, which is the property
+# the preservation tests actually check.
+cat > "$TEST_ROOT/fake-bin/plutil" <<'SH'
+#!/usr/bin/env python3
+import json, re, sys
+
+def die(msg):
+    sys.stderr.write("fake plutil: %s\n" % msg)
+    sys.exit(1)
+
+argv = sys.argv[1:]
+if len(argv) != 5 or argv[0] != "-replace" or argv[2] != "-json":
+    die("unsupported invocation: %r" % (argv,))
+key, value_json, path = argv[1], argv[3], argv[4]
+try:
+    value = json.loads(value_json)
+except ValueError as exc:
+    die("invalid -json value: %s" % exc)
+if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+    die("this fake only supports a JSON array of strings")
+
+def xml_escape(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+with open(path, "r") as f:
+    content = f.read()
+
+array_xml = "<key>%s</key><array>%s</array>" % (
+    xml_escape(key), "".join("<string>%s</string>" % xml_escape(v) for v in value)
+)
+pattern = re.compile(r"<key>%s</key>\s*<array>.*?</array>" % re.escape(key), re.DOTALL)
+new_content, n = pattern.subn(array_xml, content, count=1)
+if n != 1:
+    die("key %r not found as an array in %s" % (key, path))
+
+with open(path, "w") as f:
+    f.write(new_content)
+SH
 chmod 0755 "$TEST_ROOT/fake-bin"/*
 
 export APPLIED_CONFIG="$TEST_ROOT/applied-config.env"
@@ -881,6 +924,86 @@ FAKE_UNAME=Darwin DEVICES_ACTIVE=1 \
   run_setup --yes >"$TEST_ROOT/violation.log" 2>&1 || violation_rc=$?
 [ "$violation_rc" -ne 0 ] || fail "a permissions violation did not fail the autostart step"
 grep -Fiq 'permissions violation' "$TEST_ROOT/violation.log" || fail "the violation failure did not explain itself"
+
+# Scenario N (Darwin, forced): an existing plist in NORMAL multi-line
+# format -- <key>EnvironmentVariables</key> and <dict> on separate lines,
+# one <key>/<string> pair per line -- exactly what `plutil -convert xml1`,
+# PlistBuddy, or a human editing the file by hand produces, survives an
+# ordinary re-run just like scenario L's single-line seed. This is the
+# regression check for the bug this fix addresses: a same-line sed
+# extraction only matched the script's OWN single-line output, so against
+# this format it still announced preserving, then wrote an EMPTY
+# EnvironmentVariables dict, silently dropping the real NATS credentials to
+# socket-only.
+plist_n="$plist_k"
+mkdir -p "$(dirname "$plist_n")"
+old_bin_n="$TEST_ROOT/fake-bin/oshioki-agent-old-n"
+cp "$TEST_ROOT/fake-bin/oshioki-agent" "$old_bin_n"
+chmod 0755 "$old_bin_n"
+cat > "$plist_n" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>NATS_PASS</key>
+		<string>real-secret-N</string>
+		<key>NATS_URL</key>
+		<string>tls://example.invalid:4231</string>
+		<key>NATS_USER</key>
+		<string>oshioki-agent</string>
+		<key>OSHIOKI_AGENT_SOCKET</key>
+		<string>$AGENT_STATE/agent.sock</string>
+		<key>OSHIOKI_AGENT_STATE</key>
+		<string>$AGENT_STATE</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.oshioki.agent</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$old_bin_n</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>$AGENT_STATE/agent.log</string>
+	<key>StandardOutPath</key>
+	<string>$AGENT_STATE/agent.log</string>
+</dict>
+</plist>
+PLIST
+chmod 0600 "$plist_n"
+rm -f "$AGENT_STATE/agent.log" "$TEST_ROOT/etc/install.env"
+: > "$CALL_LOG"
+FAKE_UNAME=Darwin DEVICES_ACTIVE=1 run_setup --yes >"$TEST_ROOT/preserve-multiline.log" 2>&1 \
+  || fail "plist-preservation (multi-line format) setup failed"
+grep -Fq 'preserving existing NATS/agent environment' "$TEST_ROOT/preserve-multiline.log" \
+  || fail "setup never announced preserving the multi-line-format plist"
+grep -Fq "<string>$TEST_ROOT/fake-bin/oshioki-agent</string>" "$plist_n" \
+  || fail "plist-preservation (multi-line): ProgramArguments was not refreshed to the current agent binary"
+if grep -Fq "<string>$old_bin_n</string>" "$plist_n"; then
+  fail "plist-preservation (multi-line): ProgramArguments still points at the old binary"
+fi
+grep -Fq '<string>tls://example.invalid:4231</string>' "$plist_n" \
+  || fail "plist-preservation (multi-line): real NATS_URL was lost"
+grep -Fq '<string>oshioki-agent</string>' "$plist_n" \
+  || fail "plist-preservation (multi-line): real NATS_USER was lost"
+grep -Fq '<string>real-secret-N</string>' "$plist_n" \
+  || fail "plist-preservation (multi-line): real NATS_PASS was lost"
+# The actual failure mode this fix targets: EnvironmentVariables must not
+# collapse to an empty dict while the script claims it preserved it.
+python3 -c '
+import re, sys
+content = open(sys.argv[1]).read()
+m = re.search(r"<key>EnvironmentVariables</key>\s*<dict>(.*?)</dict>", content, re.S)
+sys.exit(0 if m and m.group(1).strip() else 1)
+' "$plist_n" || fail "plist-preservation (multi-line): EnvironmentVariables dict is empty despite claiming to preserve it"
+grep -Fq 'agent connected to its NATS bus' "$TEST_ROOT/preserve-multiline.log" \
+  || fail "plist-preservation (multi-line): verify never confirmed the NATS connection"
 
 # Self-policing teardown: the EXIT trap removes the tree, but rm succeeds
 # even with live holders (open files unlink), so leaked processes would go
