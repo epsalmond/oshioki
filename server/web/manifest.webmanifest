@@ -1,0 +1,24 @@
+{
+  "id": "/setup",
+  "name": "Oshioki",
+  "short_name": "Oshioki",
+  "start_url": "/setup",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#08783e",
+  "background_color": "#ffffff",
+  "icons": [
+    {
+      "src": "/assets/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "test": "npm run test:unit",
-    "test:unit": "node test-vectors.cjs && node --check app.js",
+    "test:unit": "node test-vectors.cjs && node test-push.cjs && node --check app.js && node --check service-worker.js",
     "test:e2e": "playwright test --config=playwright.config.mjs"
   },
   "dependencies": {

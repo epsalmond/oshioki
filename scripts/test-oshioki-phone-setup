@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import shlex
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 
@@ -55,6 +57,20 @@ class PhoneSetupTests(unittest.TestCase):
             self.assert_setup_error(phone._origin_parts, value)
         for value in ("http://nats.example:4222", "nats://nats.example:4222", "nats://u:p@127.0.0.1:4222", "nats://127.0.0.1/path"):
             self.assert_setup_error(phone._nats_parts, value)
+
+    def test_reports_web_push_readiness_separately_from_delivery(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            phone._report_web_push({
+                "web_push": {
+                    "key_loaded": True,
+                    "public_key_available": True,
+                    "worker_running": True,
+                }
+            })
+        self.assertIn("key=ready", output.getvalue())
+        self.assertIn("worker=ready", output.getvalue())
+        self.assertIn("delivery is not proven", output.getvalue())
 
     def test_external_mode_never_queries_tailscale_and_stages_real_values(self) -> None:
         sudo_calls: list[tuple[Path, Path]] = []

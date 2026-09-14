@@ -70,6 +70,13 @@ See [phone setup](docs/phone-enrollment.md) for prerequisites and service
 management. A `localhost` enrollment URL only works on the host itself;
 `enroll` now explains how to configure phone access instead of printing one.
 
+For iPhone or iPad, add Oshioki to the Home Screen before completing the
+enrollment. Open the installed app, paste the complete enrollment URL into
+`/setup`, complete the passkey ceremony, and then tap Enable notifications.
+The URL expires after five minutes; rerun `sudo oshioki enroll` if it expires.
+The phone must be able to reach the configured HTTPS/Tailscale origin when a
+notification is tapped. Existing ntfy remains an optional independent path.
+
 ### Transport
 
 You need a reachable NATS server with JetStream alongside the Oshioki server. `OSHIOKI_TRANSPORT` selects the transport; the default is `nats`. Others are planned (#6, #7).

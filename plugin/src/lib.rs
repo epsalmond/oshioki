@@ -1934,6 +1934,7 @@ mod tests {
         path
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn contextual_pam_lane_detected_only_on_a_live_auth_line() {
         let live = temp_pam_file(

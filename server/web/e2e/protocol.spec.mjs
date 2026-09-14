@@ -116,7 +116,7 @@ async function virtualProfile(browser, consoleErrors) {
 async function enrolledDevice(page) {
   return page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {
-      const request = indexedDB.open("oshioki", 1);
+      const request = indexedDB.open("oshioki", 2);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });

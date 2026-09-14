@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use db::{InsertResult, RequestLifecycle, Store};
 use futures::StreamExt as _;
@@ -20,9 +20,12 @@ use oshioki_protocol::{
     RequestEnvelopeV1, SealedDeviceBodyV1,
 };
 use oshioki_transport::{Ack, JetStreamMessage, NatsTransport, ServerTransport};
-use serde::Serialize;
+use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path as FsPath, PathBuf},
     sync::{
         Arc,
@@ -33,6 +36,8 @@ use std::{
 use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
+use web_push_native::jwt_simple::algorithms::ECDSAP256PublicKeyLike as _;
+use web_push_native::{Auth as WebPushAuth, WebPushBuilder};
 
 /// Every path the authentication lane serves. The router is built from this
 /// list and from nothing else, so the lane's route table is this array: a
@@ -60,6 +65,8 @@ const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 /// How many artifact streams run at once; the rest get 503. Streaming bounds
 /// each response to its buffer, and this bounds their count (and open files).
 const MAX_CONCURRENT_ARTIFACTS: usize = 8;
+const PUSH_PROVIDER_TTL_CAP_SECS: i64 = 300;
+const PUSH_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -72,6 +79,34 @@ struct AppState {
     origin: Arc<String>,
     rp_id: Arc<String>,
     ntfy_url: Option<Arc<String>>,
+    vapid: Arc<VapidConfig>,
+}
+
+#[derive(Clone)]
+struct VapidConfig {
+    private_key: Arc<Vec<u8>>,
+    public_key: String,
+    subject: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PushSubscriptionRequest {
+    version: u8,
+    endpoint: String,
+    expiration_time: Option<i64>,
+    keys: PushSubscriptionKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct PushSubscriptionKeys {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PushSubscriptionResponse {
+    version: u8,
+    subscription_id: String,
 }
 
 #[derive(Debug)]
@@ -105,7 +140,7 @@ async fn main() -> Result<()> {
         version: 1,
         origin: origin.clone(),
         rp_id: required_env("OSHIOKI_RP_ID")?,
-        server_base_url: origin,
+        server_base_url: origin.clone(),
     };
     runtime_config
         .validate()
@@ -113,6 +148,7 @@ async fn main() -> Result<()> {
     info!(origin=%runtime_config.origin, rp_id=%runtime_config.rp_id, "validated server WebAuthn configuration");
     let store = Arc::new(Store::open(FsPath::new(&database_path))?);
     store.ready()?;
+    let vapid = Arc::new(load_vapid_config(FsPath::new(&database_path), &origin)?);
     let state = AppState {
         store,
         transport: transport_from_env().await?,
@@ -123,15 +159,22 @@ async fn main() -> Result<()> {
         origin: Arc::new(runtime_config.origin),
         rp_id: Arc::new(runtime_config.rp_id),
         ntfy_url: std::env::var("OSHIOKI_NTFY_URL").ok().map(Arc::new),
+        vapid,
     };
     spawn_workers(&state);
     let app = Router::new()
         .route("/r/:id", get(request_page))
         .route("/a/:id", get(authentication_page))
         .route("/enroll/:id", get(enrollment_page))
+        .route("/setup", get(setup_page))
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/service-worker.js", get(service_worker))
         .route("/assets/app.js", get(app_js))
         .route("/assets/app.css", get(app_css))
         .route("/assets/libsodium.js", get(libsodium_js))
+        .route("/assets/icon-192.png", get(icon_192))
+        .route("/assets/icon-512.png", get(icon_512))
+        .route("/assets/apple-touch-icon.png", get(apple_touch_icon))
         .route("/api/v1/requests/:id", get(get_request))
         .route("/api/v1/requests/:id/ack", post(acknowledge_request))
         .route("/api/v1/requests/:id/approve", post(approve_request))
@@ -146,6 +189,16 @@ async fn main() -> Result<()> {
             post(submit_enrollment),
         )
         .route("/api/v1/enrollments/:id/status", get(enrollment_status))
+        .route("/api/v1/push/config", get(push_config))
+        .route("/api/v1/push/status", get(push_status))
+        .route(
+            "/api/v1/push/subscriptions",
+            post(register_push_subscription),
+        )
+        .route(
+            "/api/v1/push/subscriptions/:id",
+            delete(delete_push_subscription),
+        )
         .route("/api/v1/devices/:fingerprint", get(get_device))
         .route("/healthz", get(health))
         .route("/dist/v1/darwin-arm64/*path", get(dist_file))
@@ -156,6 +209,76 @@ async fn main() -> Result<()> {
     info!(listen, "sudo approval server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn load_vapid_config(state_path: &FsPath, origin: &str) -> Result<VapidConfig> {
+    let path = std::env::var_os("OSHIOKI_VAPID_KEY_PATH").map_or_else(
+        || {
+            state_path
+                .parent()
+                .unwrap_or_else(|| FsPath::new("."))
+                .join("vapid-private.pem")
+        },
+        PathBuf::from,
+    );
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create VAPID key directory {}", parent.display()))?;
+    }
+    let private_pem = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let key = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+            let pem = key
+                .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+                .context("encode VAPID private key")?;
+            let bytes = pem.as_bytes().to_vec();
+            let temp_path = path.with_extension(format!("pem.tmp-{}", std::process::id()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .with_context(|| format!("create VAPID key {}", temp_path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temp_path, &path)
+                .with_context(|| format!("install VAPID key {}", path.display()))?;
+            bytes
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read VAPID key {}", path.display()));
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    let key = p256::SecretKey::from_pkcs8_pem(
+        std::str::from_utf8(&private_pem).context("VAPID key is not UTF-8")?,
+    )
+    .context("parse VAPID private key")?;
+    let key_pair =
+        web_push_native::jwt_simple::algorithms::ES256KeyPair::from_bytes(key.to_bytes().as_ref())
+            .context("load VAPID private key")?;
+    let public_key = oshioki_protocol::encode_base64url(
+        &key_pair.public_key().public_key().to_bytes_uncompressed(),
+    );
+    let subject = std::env::var("OSHIOKI_VAPID_SUBJECT").unwrap_or_else(|_| origin.to_owned());
+    let parsed_subject = url::Url::parse(&subject).context("parse OSHIOKI_VAPID_SUBJECT")?;
+    if !matches!(parsed_subject.scheme(), "https" | "mailto") {
+        bail!("OSHIOKI_VAPID_SUBJECT must be an https or mailto URI");
+    }
+    Ok(VapidConfig {
+        private_key: Arc::new(key.to_bytes().to_vec()),
+        public_key,
+        subject,
+    })
 }
 
 fn spawn_workers(state: &AppState) {
@@ -180,7 +303,9 @@ fn spawn_workers(state: &AppState) {
     let verdict_state = state.clone();
     tokio::spawn(async move { verdict_worker(verdict_state).await });
     let notification_state = state.clone();
-    tokio::spawn(async move { notification_worker(notification_state).await });
+    tokio::spawn(async move { ntfy_worker(notification_state).await });
+    let push_state = state.clone();
+    tokio::spawn(async move { push_worker(push_state).await });
     let cleanup_store = state.store.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -445,8 +570,12 @@ async fn verdict_worker(state: AppState) {
 /// Delivers notifications on their own cadence with bounded backoff. A
 /// failure here sleeps this worker only: verdicts keep flowing, and the
 /// health check (driven by the verdict lane) stays green.
-async fn notification_worker(state: AppState) {
-    let http = reqwest::Client::new();
+async fn ntfy_worker(state: AppState) {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("valid ntfy HTTP client");
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     let mut consecutive_failures: u32 = 0;
     loop {
@@ -484,6 +613,221 @@ async fn notification_worker(state: AppState) {
                 }
             }
             Err(error) => warn!(%error, "ntfy outbox read failed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushDeliveryResult {
+    Sent,
+    Gone,
+    Retry,
+    Abandon,
+}
+
+async fn push_worker(state: AppState) {
+    loop {
+        let item = match state.store.claim_push(now(), db::PUSH_LEASE_SECS) {
+            Ok(Some(item)) => item,
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            Err(error) => {
+                warn!(%error, "Web Push outbox claim failed");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let result = send_push(&state, &item).await;
+        let current = now();
+        let update = match result {
+            Ok(PushDeliveryResult::Sent) => {
+                state
+                    .store
+                    .mark_push_sent(item.id, &item.claim_token, current)
+            }
+            Ok(PushDeliveryResult::Gone) => state.store.disable_push_for_claim(
+                item.id,
+                &item.subscription_id,
+                &item.claim_token,
+                current,
+                "endpoint_gone",
+            ),
+            Ok(PushDeliveryResult::Retry) => {
+                state
+                    .store
+                    .retry_push(item.id, &item.claim_token, current, "provider_retry")
+            }
+            Ok(PushDeliveryResult::Abandon) => {
+                state
+                    .store
+                    .abandon_push(item.id, &item.claim_token, current, "provider_rejected")
+            }
+            Err(error) => state.store.retry_push(
+                item.id,
+                &item.claim_token,
+                current,
+                &classify_push_error(&error),
+            ),
+        };
+        if let Err(error) = update {
+            warn!(%error, push_outbox_id=item.id, "Web Push result update failed");
+        }
+    }
+}
+
+async fn send_push(state: &AppState, item: &db::PushItem) -> Result<PushDeliveryResult> {
+    if !matches!(item.request_kind.as_str(), "request" | "auth")
+        || item.request_id.is_empty()
+        || !(1..=db::PUSH_MAX_ATTEMPTS).contains(&item.attempts)
+    {
+        bail!("invalid push outbox row");
+    }
+    if push_ttl(item.expires_at, now()).is_none() {
+        return Ok(PushDeliveryResult::Abandon);
+    }
+    if db::validate_push_endpoint(&item.endpoint).is_err() {
+        return Ok(PushDeliveryResult::Abandon);
+    }
+    let Ok(endpoint_url) = url::Url::parse(&item.endpoint) else {
+        return Ok(PushDeliveryResult::Abandon);
+    };
+    let Some(host) = endpoint_url.host_str() else {
+        return Ok(PushDeliveryResult::Abandon);
+    };
+    let Some(port) = endpoint_url.port_or_known_default() else {
+        return Ok(PushDeliveryResult::Abandon);
+    };
+    let addresses: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .context("resolve push endpoint timed out")?
+    .context("resolve push endpoint")?
+    .collect();
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Ok(PushDeliveryResult::Abandon);
+    }
+    let pinned = addresses[0];
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .resolve(host, pinned)
+        .build()
+        .context("build pinned push client")?;
+
+    let Some(ttl) = push_ttl(item.expires_at, now()) else {
+        return Ok(PushDeliveryResult::Abandon);
+    };
+    let ua_public = web_push_native::p256::PublicKey::from_sec1_bytes(&item.p256dh)
+        .map_err(|_| anyhow::anyhow!("invalid stored p256dh key"))?;
+    let ua_auth = WebPushAuth::clone_from_slice(&item.auth);
+    let vapid_key = web_push_native::jwt_simple::algorithms::ES256KeyPair::from_bytes(
+        state.vapid.private_key.as_slice(),
+    )
+    .context("load VAPID private key")?;
+    let message = WebPushBuilder::new(item.endpoint.parse()?, ua_public, ua_auth)
+        .with_valid_duration(Duration::from_secs(u64::from(ttl)))
+        .with_vapid(&vapid_key, state.vapid.subject.as_str())
+        .build(item.payload.clone())
+        .context("encrypt and sign Web Push payload")?;
+    let mut request = client
+        .post(item.endpoint.as_str())
+        .body(message.body().clone());
+    for (key, value) in message.headers() {
+        request = request.header(key.as_str(), value.as_bytes());
+    }
+    let response = request.send().await.context("send Web Push request")?;
+    let status = response.status();
+    read_bounded_response(response).await?;
+    Ok(if status.is_success() {
+        PushDeliveryResult::Sent
+    } else if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+        PushDeliveryResult::Gone
+    } else if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        PushDeliveryResult::Retry
+    } else {
+        PushDeliveryResult::Abandon
+    })
+}
+
+fn push_ttl(expires_at: i64, now: i64) -> Option<u32> {
+    let remaining = expires_at.saturating_sub(now);
+    if remaining <= 0 {
+        return None;
+    }
+    Some(
+        u32::try_from(remaining.min(PUSH_PROVIDER_TTL_CAP_SECS))
+            .expect("documented push TTL cap fits u32"),
+    )
+}
+
+async fn read_bounded_response(response: reqwest::Response) -> Result<()> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > PUSH_RESPONSE_MAX_BYTES as u64)
+    {
+        bail!("Web Push response too large");
+    }
+    let mut body_size = 0usize;
+    let mut body_stream = response.bytes_stream();
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = chunk.context("read Web Push response")?;
+        body_size = body_size.saturating_add(chunk.len());
+        if body_size > PUSH_RESPONSE_MAX_BYTES {
+            bail!("Web Push response too large");
+        }
+    }
+    Ok(())
+}
+
+fn classify_push_error(error: &anyhow::Error) -> String {
+    let text = error.to_string();
+    if text.contains("non-public") {
+        "endpoint_private_address".into()
+    } else if text.contains("resolve") {
+        "dns_failure".into()
+    } else if text.contains("timeout") || text.contains("timed out") {
+        "timeout".into()
+    } else {
+        "transport_failure".into()
+    }
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(octets[0] == 0
+                || octets[0] == 10
+                || octets[0] == 127
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 224)
+        }
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
         }
     }
 }
@@ -532,6 +876,117 @@ async fn authentication_page(Path(_id): Path<String>) -> Response {
 async fn enrollment_page(Path(_id): Path<String>) -> Response {
     html(include_str!("../web/enroll.html"))
 }
+async fn setup_page() -> Response {
+    html(include_str!("../web/setup.html"))
+}
+async fn manifest() -> Response {
+    asset(
+        "application/manifest+json",
+        include_bytes!("../web/manifest.webmanifest"),
+        false,
+    )
+}
+async fn service_worker() -> Response {
+    asset(
+        "application/javascript",
+        include_bytes!("../web/service-worker.js"),
+        false,
+    )
+}
+async fn push_config(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({
+        "version": 1,
+        "enabled": true,
+        "vapid_public_key": state.vapid.public_key,
+    }))
+}
+
+async fn push_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<db::PushStatus>, ApiError> {
+    let token = bearer_token(&headers)?;
+    state
+        .store
+        .push_status(token.as_bytes())
+        .map(Json)
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                ApiError(StatusCode::UNAUTHORIZED)
+            } else {
+                ApiError(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        })
+}
+
+async fn register_push_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<PushSubscriptionRequest>,
+) -> Result<Json<PushSubscriptionResponse>, ApiError> {
+    if input.version != 1 {
+        return Err(ApiError(StatusCode::BAD_REQUEST));
+    }
+    let token = bearer_token(&headers)?;
+    let p256dh = oshioki_protocol::decode_base64url(&input.keys.p256dh)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let auth = oshioki_protocol::decode_base64url(&input.keys.auth)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let expiration_time = input.expiration_time.map(|value| {
+        if value > 100_000_000_000 {
+            value / 1000
+        } else {
+            value
+        }
+    });
+    let id = state
+        .store
+        .register_push_subscription(
+            token.as_bytes(),
+            &input.endpoint,
+            &p256dh,
+            &auth,
+            expiration_time,
+            now(),
+        )
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("active WebAuthn") {
+                ApiError(StatusCode::UNAUTHORIZED)
+            } else if message.contains("another active") {
+                ApiError(StatusCode::CONFLICT)
+            } else {
+                ApiError(StatusCode::BAD_REQUEST)
+            }
+        })?;
+    Ok(Json(PushSubscriptionResponse {
+        version: 1,
+        subscription_id: id,
+    }))
+}
+
+async fn delete_push_subscription(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let token = bearer_token(&headers)?;
+    let deleted = state
+        .store
+        .delete_push_subscription(token.as_bytes(), &id, now())
+        .map_err(|error| {
+            if error.to_string().contains("active WebAuthn") {
+                ApiError(StatusCode::UNAUTHORIZED)
+            } else {
+                ApiError(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        })?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND))
+    }
+}
 async fn app_js() -> Response {
     asset(
         "application/javascript",
@@ -547,6 +1002,27 @@ async fn libsodium_js() -> Response {
         "application/javascript",
         include_bytes!("../web/vendor/libsodium.js"),
         false,
+    )
+}
+async fn icon_192() -> Response {
+    asset(
+        "image/png",
+        include_bytes!("../web/assets/icon-192.png"),
+        true,
+    )
+}
+async fn icon_512() -> Response {
+    asset(
+        "image/png",
+        include_bytes!("../web/assets/icon-512.png"),
+        true,
+    )
+}
+async fn apple_touch_icon() -> Response {
+    asset(
+        "image/png",
+        include_bytes!("../web/assets/apple-touch-icon.png"),
+        true,
     )
 }
 
@@ -911,6 +1387,11 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
         "outbox_age_seconds":outbox_age,
         "origin":state.origin.as_str(),
         "rp_id":state.rp_id.as_str(),
+        "web_push": {
+            "key_loaded": true,
+            "public_key_available": !state.vapid.public_key.is_empty(),
+            "worker_running": true,
+        },
     })))
 }
 async fn dist_file(
@@ -1084,6 +1565,27 @@ mod tests {
     use super::*;
     use sha2::Digest as _;
 
+    fn test_vapid() -> VapidConfig {
+        let key = p256::SecretKey::from_slice(&[7; 32]).unwrap();
+        let pem = key
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let key = p256::SecretKey::from_pkcs8_pem(std::str::from_utf8(&pem).unwrap()).unwrap();
+        let key_pair = web_push_native::jwt_simple::algorithms::ES256KeyPair::from_bytes(
+            key.to_bytes().as_ref(),
+        )
+        .unwrap();
+        VapidConfig {
+            private_key: Arc::new(key.to_bytes().to_vec()),
+            public_key: oshioki_protocol::encode_base64url(
+                &key_pair.public_key().public_key().to_bytes_uncompressed(),
+            ),
+            subject: "https://sudo.test".into(),
+        }
+    }
+
     fn dist_root(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("oshioki-dist-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1116,6 +1618,7 @@ mod tests {
                 origin: Arc::new("https://sudo.test:8443".into()),
                 rp_id: Arc::new("sudo.test".into()),
                 ntfy_url: None,
+                vapid: Arc::new(test_vapid()),
             },
         )
     }
@@ -1136,6 +1639,38 @@ mod tests {
         let error = health(State(state)).await.unwrap_err();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn vapid_key_persists_across_config_loads() {
+        let dir = std::env::temp_dir().join(format!(
+            "oshioki-vapid-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let state_path = dir.join("server").join("state.sqlite3");
+        let first = load_vapid_config(&state_path, "https://sudo.test").unwrap();
+        let second = load_vapid_config(&state_path, "https://sudo.test").unwrap();
+        assert_eq!(first.public_key, second.public_key);
+        assert_eq!(first.private_key, second.private_key);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.join("server/vapid-private.pem"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn push_ttl_never_outlives_the_request_or_provider_cap() {
+        assert_eq!(push_ttl(25, 20), Some(5));
+        assert_eq!(push_ttl(20, 20), None);
+        assert_eq!(push_ttl(20, 21), None);
+        assert_eq!(push_ttl(20 + PUSH_PROVIDER_TTL_CAP_SECS + 1, 20), Some(300));
     }
 
     async fn status(root: &std::path::Path, path: &str, permits: &Arc<Semaphore>) -> StatusCode {
@@ -1382,6 +1917,7 @@ mod tests {
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
+            vapid: Arc::new(test_vapid()),
         };
         let worker = tokio::spawn(verdict_worker(state));
         let store_check = Arc::clone(&store);
@@ -1440,6 +1976,7 @@ mod tests {
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
+            vapid: Arc::new(test_vapid()),
         };
         handle_revocation(
             &state,
@@ -1547,6 +2084,7 @@ mod tests {
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
+            vapid: Arc::new(test_vapid()),
         };
         let worker = tokio::spawn(request_consumer(state));
         // Oversized → term; malformed → term; valid → ack; conflict → term.
@@ -1592,6 +2130,7 @@ mod tests {
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
+            vapid: Arc::new(test_vapid()),
         };
         (dir, state, transport, token)
     }
@@ -1844,6 +2383,7 @@ mod tests {
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
+            vapid: Arc::new(test_vapid()),
         };
         let worker = tokio::spawn(request_consumer(state));
         wait_for(&command_rx, "command envelope ack").await;
@@ -2162,6 +2702,7 @@ mod tests {
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
+            vapid: Arc::new(test_vapid()),
         };
         assert!(transport.published().is_empty());
 

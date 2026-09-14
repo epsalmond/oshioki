@@ -11,12 +11,19 @@ values are for production to choose; see [requirements.md](requirements.md).
 | `OSHIOKI_RP_ID` | `sudo.test` | WebAuthn relying-party ID. |
 | `OSHIOKI_LISTEN` | `0.0.0.0:8443` | Bind address; the binary defaults to `127.0.0.1:8443`. |
 | `OSHIOKI_STATE_PATH` | `/state/state.sqlite3` | Writable SQLite path; one active server per database file. |
+| `OSHIOKI_VAPID_KEY_PATH` | `dirname(OSHIOKI_STATE_PATH)/vapid-private.pem` | Optional 0600 persistent P-256 VAPID private key. The server creates it atomically on first start and never returns it. |
+| `OSHIOKI_VAPID_SUBJECT` | `OSHIOKI_ORIGIN` | Optional `https:` or `mailto:` contact URI used in VAPID claims. |
 | `OSHIOKI_DARWIN_DIST` | unset | Optional directory of Darwin packages served as immutable artifacts. |
 | `OSHIOKI_NTFY_URL` | unset | Optional ntfy broker URL. Messages carry host, user, request ID, and `/r/<id>` URL only — never request plaintext. |
 | `OSHIOKI_TRANSPORT` | `nats` | Transport backend; the only value today. |
 | `NATS_URL` | `nats://nats:4222` | JetStream server. Production uses `tls://` to any non-loopback host: plaintext `nats://` is refused past `localhost`, `127.0.0.0/8`, and `::1` unless the opt-out below is set. TLS validates against the system roots with hostname verification, so the server needs a publicly trusted certificate (on a tailnet, the node's MagicDNS certificate works). |
 | `NATS_USER` / `NATS_PASS` | `oshioki` / `test-only` | Set both together or neither. Production gives each role its own user — e.g. `oshioki-server` here, `oshioki-hook` on hosts, `oshioki-agent` on devices — so one leaked credential does not open the whole control plane. Per-role publish/subscribe restrictions on the NATS server itself are planned (#20). |
 | `OSHIOKI_ALLOW_PLAINTEXT_NATS` | unset | Testing opt-out for plaintext `nats://` past loopback: `1`, `true`, or `yes`. Honors Compose hostnames and tailnet addresses without certificates. Never set in production. |
+
+Web Push readiness is reported separately in `/healthz` under `web_push`.
+Those fields describe the persisted key, public key, and worker process; they
+do not prove that a provider delivered a notification or that a phone opened
+it. The optional `OSHIOKI_NTFY_URL` path remains independent.
 
 ## Hook (`oshioki` binary)
 

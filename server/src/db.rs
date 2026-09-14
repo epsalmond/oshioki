@@ -8,11 +8,18 @@ use oshioki_protocol::{
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use url::Url;
 
 /// The server keeps request state only briefly after its local receipt time.
 /// This bound is intentionally independent of timestamps supplied by a
 /// publisher, including timestamps in a conflicting redelivery.
 pub const SERVER_REQUEST_RETENTION_SECS: i64 = 5 * 60;
+pub const PUSH_MAX_ENDPOINT_BYTES: usize = 2048;
+pub const PUSH_AUTH_BYTES: usize = 16;
+pub const PUSH_P256DH_BYTES: usize = 65;
+pub const PUSH_MAX_ATTEMPTS: i64 = 5;
+pub const PUSH_LEASE_SECS: i64 = 30;
+pub const PUSH_DISABLED_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
 pub struct Store {
     connection: Mutex<Connection>,
@@ -38,6 +45,42 @@ pub struct OutboxItem {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PushStatus {
+    pub version: u8,
+    pub enabled: bool,
+    pub registered: bool,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PushItem {
+    pub id: i64,
+    pub subscription_id: String,
+    pub endpoint: String,
+    pub p256dh: Vec<u8>,
+    pub auth: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub request_kind: String,
+    pub request_id: String,
+    pub expires_at: i64,
+    pub claim_token: String,
+    pub attempts: i64,
+}
+
+type PushClaimRow = (
+    i64,
+    String,
+    String,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    String,
+    i64,
+    i64,
+);
+
 #[derive(Debug, Serialize)]
 pub struct EnrollmentView {
     pub status: EnrollmentStatusV1,
@@ -61,7 +104,16 @@ impl Store {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        connection.execute_batch(MIGRATION_V1)?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        match version {
+            0 => {
+                connection.execute_batch(MIGRATION_V1)?;
+                connection.execute_batch(MIGRATION_V2)?;
+            }
+            1 => connection.execute_batch(MIGRATION_V2)?,
+            2 => {}
+            newer => bail!("unsupported database schema version {newer}"),
+        }
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -72,6 +124,7 @@ impl Store {
         let connection = Connection::open_in_memory()?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.execute_batch(MIGRATION_V1)?;
+        connection.execute_batch(MIGRATION_V2)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -80,7 +133,7 @@ impl Store {
     pub fn ready(&self) -> Result<()> {
         let connection = self.lock()?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 1 {
+        if version != 2 {
             bail!("unsupported database schema version {version}");
         }
         Ok(())
@@ -116,10 +169,158 @@ impl Store {
     }
 
     pub fn set_device_active(&self, fingerprint: &str, active: bool) -> Result<bool> {
-        Ok(self.lock()?.execute(
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE devices SET active=?2, updated_at=unixepoch() WHERE fingerprint=?1",
             params![fingerprint, active],
-        )? == 1)
+        )?;
+        if !active && changed != 0 {
+            transaction.execute(
+                "UPDATE push_subscriptions SET disabled_at=unixepoch(), updated_at=unixepoch()
+                 WHERE device_fingerprint=?1 AND disabled_at IS NULL",
+                [fingerprint],
+            )?;
+            transaction.execute(
+                "UPDATE push_outbox SET abandoned_at=unixepoch(), claim_token=NULL, claimed_until=NULL
+                 WHERE subscription_id IN (SELECT id FROM push_subscriptions WHERE device_fingerprint=?1)
+                   AND sent_at IS NULL AND abandoned_at IS NULL",
+                [fingerprint],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn register_push_subscription(
+        &self,
+        token: &[u8],
+        endpoint: &str,
+        p256dh: &[u8],
+        auth: &[u8],
+        expiration_at: Option<i64>,
+        now: i64,
+    ) -> Result<String> {
+        validate_push_endpoint(endpoint)?;
+        if p256dh.len() != PUSH_P256DH_BYTES || p256dh.first() != Some(&4) {
+            bail!("invalid p256dh key");
+        }
+        if p256::PublicKey::from_sec1_bytes(p256dh).is_err() {
+            bail!("invalid p256dh key");
+        }
+        if auth.len() != PUSH_AUTH_BYTES {
+            bail!("invalid auth secret");
+        }
+        if let Some(expiration_at) = expiration_at {
+            if expiration_at <= now {
+                bail!("expired subscription");
+            }
+        }
+        let token_hash = Sha256::digest(token).to_vec();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let fingerprint: String = transaction
+            .query_row(
+                "SELECT fingerprint FROM devices WHERE api_token_hash=?1 AND active=1
+                 AND COALESCE(json_extract(public_record_json, '$.kind'), 'webauthn')='webauthn'",
+                [&token_hash],
+                |row| row.get(0),
+            )
+            .optional()?
+            .context("active WebAuthn device not found")?;
+        let existing: Option<(String, String, Option<i64>, bool)> = transaction
+            .query_row(
+                "SELECT p.id, p.device_fingerprint, p.disabled_at, COALESCE(d.active, 0)
+                 FROM push_subscriptions p LEFT JOIN devices d ON d.fingerprint=p.device_fingerprint
+                 WHERE p.endpoint=?1",
+                [endpoint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let id = if let Some((id, owner, disabled_at, owner_active)) = existing {
+            if owner != fingerprint && disabled_at.is_none() && owner_active {
+                bail!("push endpoint belongs to another active device");
+            }
+            transaction.execute(
+                "UPDATE push_subscriptions SET device_fingerprint=?2, p256dh=?3, auth=?4,
+                 expiration_at=?5, updated_at=?6, disabled_at=NULL, last_error=NULL
+                 WHERE id=?1",
+                params![id, fingerprint, p256dh, auth, expiration_at, now],
+            )?;
+            id
+        } else {
+            let id = format!("ps_{}", uuid::Uuid::new_v4().simple());
+            transaction.execute(
+                "INSERT INTO push_subscriptions
+                 (id, device_fingerprint, endpoint, p256dh, auth, expiration_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![id, fingerprint, endpoint, p256dh, auth, expiration_at, now],
+            )?;
+            id
+        };
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    pub fn push_status(&self, token: &[u8]) -> Result<PushStatus> {
+        let token_hash = Sha256::digest(token).to_vec();
+        let connection = self.lock()?;
+        let owner: Option<String> = connection
+            .query_row(
+                "SELECT fingerprint FROM devices WHERE api_token_hash=?1 AND active=1
+                 AND COALESCE(json_extract(public_record_json, '$.kind'), 'webauthn')='webauthn'",
+                [&token_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(owner) = owner else {
+            bail!("active WebAuthn device not found");
+        };
+        let count: usize = connection
+            .query_row(
+                "SELECT COUNT(*) FROM push_subscriptions
+                 WHERE device_fingerprint=?1 AND disabled_at IS NULL",
+                [owner],
+                |row| row.get::<_, i64>(0),
+            )?
+            .try_into()
+            .context("push subscription count overflow")?;
+        Ok(PushStatus {
+            version: 1,
+            enabled: true,
+            registered: count != 0,
+            count,
+        })
+    }
+
+    pub fn delete_push_subscription(&self, token: &[u8], id: &str, now: i64) -> Result<bool> {
+        let token_hash = Sha256::digest(token).to_vec();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE api_token_hash=?1 AND active=1
+             AND COALESCE(json_extract(public_record_json, '$.kind'), 'webauthn')='webauthn')",
+            [&token_hash],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !owner_exists {
+            bail!("active WebAuthn device not found");
+        }
+        let changed = transaction.execute(
+            "UPDATE push_subscriptions SET disabled_at=?3, updated_at=?3
+             WHERE id=?1 AND disabled_at IS NULL AND device_fingerprint IN
+               (SELECT fingerprint FROM devices WHERE api_token_hash=?2 AND active=1)",
+            params![id, token_hash, now],
+        )?;
+        if changed != 0 {
+            transaction.execute(
+                "UPDATE push_outbox SET abandoned_at=?2, claim_token=NULL, claimed_until=NULL
+                 WHERE subscription_id=?1 AND sent_at IS NULL AND abandoned_at IS NULL",
+                params![id, now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
     }
 
     pub fn create_enrollment(
@@ -441,6 +642,22 @@ impl Store {
                 ],
             )?;
         }
+        let push_payload = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "lane": "request",
+            "request_id": envelope.request_id,
+        }))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO push_outbox
+             (request_kind, request_id, subscription_id, payload, created_at, available_at)
+             SELECT 'request', ?1, p.id, ?2, ?3, ?3
+             FROM push_subscriptions p
+             JOIN devices d ON d.fingerprint=p.device_fingerprint
+             JOIN sealed_bodies b ON b.fingerprint=d.fingerprint AND b.request_id=?1
+             WHERE d.active=1 AND p.disabled_at IS NULL
+               AND (p.expiration_at IS NULL OR p.expiration_at>?3)",
+            params![envelope.request_id, push_payload, now],
+        )?;
         // Routing is part of the same durable transaction as the request:
         // only an active device record already bound to one of the sealed
         // bodies can cause a server delivery receipt. A browser receipt is a
@@ -543,6 +760,22 @@ impl Store {
                 ],
             )?;
         }
+        let push_payload = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "lane": "auth",
+            "request_id": envelope.request_id,
+        }))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO push_outbox
+             (request_kind, request_id, subscription_id, payload, created_at, available_at)
+             SELECT 'auth', ?1, p.id, ?2, ?3, ?3
+             FROM push_subscriptions p
+             JOIN devices d ON d.fingerprint=p.device_fingerprint
+             JOIN auth_sealed_bodies b ON b.fingerprint=d.fingerprint AND b.request_id=?1
+             WHERE d.active=1 AND p.disabled_at IS NULL
+               AND (p.expiration_at IS NULL OR p.expiration_at>?3)",
+            params![envelope.request_id, push_payload, now],
+        )?;
         // Same rule as the command lane: a delivery receipt is a relay
         // commitment for an enrolled browser recipient, never evidence that
         // a browser opened anything. The authenticated AliveV1 POST remains
@@ -816,6 +1049,179 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Claims one eligible push row. The validity check and lease update are
+    /// one SQLite transaction, so two worker loops cannot send the same row
+    /// concurrently. A stale lease is reclaimable after a worker crash.
+    pub fn claim_push(&self, now: i64, lease_secs: i64) -> Result<Option<PushItem>> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<PushClaimRow> =
+            transaction
+                .query_row(
+                    "SELECT p.id, p.subscription_id, s.endpoint, s.p256dh, s.auth, p.payload,
+                            p.request_kind, p.request_id,
+                            CASE p.request_kind WHEN 'request' THEN r.expires_at ELSE a.expires_at END,
+                            p.attempts
+                     FROM push_outbox p
+                     JOIN push_subscriptions s ON s.id=p.subscription_id
+                     LEFT JOIN requests r ON p.request_kind='request' AND r.id=p.request_id
+                     LEFT JOIN auth_requests a ON p.request_kind='auth' AND a.id=p.request_id
+                     JOIN devices d ON d.fingerprint=s.device_fingerprint
+                     WHERE p.sent_at IS NULL AND p.abandoned_at IS NULL
+                       AND p.available_at<=?1
+                       AND (p.claimed_until IS NULL OR p.claimed_until<=?1)
+                       AND p.attempts < ?2
+                       AND d.active=1 AND s.disabled_at IS NULL
+                       AND (s.expiration_at IS NULL OR s.expiration_at>?1)
+                       AND ((p.request_kind='request' AND r.state='pending' AND r.expires_at>?1)
+                            OR (p.request_kind='auth' AND a.state='pending' AND a.expires_at>?1))
+                     ORDER BY p.id LIMIT 1",
+                    params![now, PUSH_MAX_ATTEMPTS],
+                    |row| {
+                        Ok((
+                            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                            row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                        ))
+                    },
+                )
+                .optional()?;
+        let Some((
+            id,
+            subscription_id,
+            endpoint,
+            p256dh,
+            auth,
+            payload,
+            request_kind,
+            request_id,
+            expires_at,
+            attempts,
+        )) = row
+        else {
+            transaction.execute(
+                "UPDATE push_outbox SET abandoned_at=?1, claim_token=NULL, claimed_until=NULL,
+                 last_error='attempt_limit' WHERE sent_at IS NULL AND abandoned_at IS NULL
+                 AND attempts>=?2 AND (claimed_until IS NULL OR claimed_until<=?1)",
+                params![now, PUSH_MAX_ATTEMPTS],
+            )?;
+            transaction.execute(
+                "UPDATE push_outbox SET abandoned_at=?1 WHERE sent_at IS NULL AND abandoned_at IS NULL
+                 AND ((request_kind='request' AND NOT EXISTS
+                      (SELECT 1 FROM requests r WHERE r.id=push_outbox.request_id AND r.state='pending' AND r.expires_at>?1))
+                   OR (request_kind='auth' AND NOT EXISTS
+                      (SELECT 1 FROM auth_requests a WHERE a.id=push_outbox.request_id AND a.state='pending' AND a.expires_at>?1))
+                   OR NOT EXISTS (SELECT 1 FROM devices d JOIN push_subscriptions s ON s.device_fingerprint=d.fingerprint
+                                  WHERE s.id=push_outbox.subscription_id AND d.active=1 AND s.disabled_at IS NULL
+                                    AND (s.expiration_at IS NULL OR s.expiration_at>?1)))",
+                [now],
+            )?;
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let claim_token = format!("pc_{}", uuid::Uuid::new_v4().simple());
+        let changed = transaction.execute(
+            "UPDATE push_outbox SET claim_token=?2, claimed_until=?3, attempts=attempts+1
+             WHERE id=?1 AND sent_at IS NULL AND abandoned_at IS NULL
+               AND (claimed_until IS NULL OR claimed_until<=?4)",
+            params![id, claim_token, now.saturating_add(lease_secs), now],
+        )?;
+        if changed != 1 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        transaction.commit()?;
+        Ok(Some(PushItem {
+            id,
+            subscription_id,
+            endpoint,
+            p256dh,
+            auth,
+            payload,
+            request_kind,
+            request_id,
+            expires_at,
+            claim_token,
+            attempts: attempts + 1,
+        }))
+    }
+
+    pub fn mark_push_sent(&self, id: i64, claim_token: &str, now: i64) -> Result<bool> {
+        Ok(self.lock()?.execute(
+            "UPDATE push_outbox SET sent_at=?3, claim_token=NULL, claimed_until=NULL
+             WHERE id=?1 AND claim_token=?2 AND sent_at IS NULL AND abandoned_at IS NULL",
+            params![id, claim_token, now],
+        )? == 1)
+    }
+
+    pub fn retry_push(&self, id: i64, claim_token: &str, now: i64, error: &str) -> Result<bool> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempts: Option<i64> = transaction
+            .query_row(
+                "SELECT attempts FROM push_outbox WHERE id=?1 AND claim_token=?2
+                 AND sent_at IS NULL AND abandoned_at IS NULL",
+                params![id, claim_token],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(attempts) = attempts else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        if attempts >= PUSH_MAX_ATTEMPTS {
+            transaction.execute(
+                "UPDATE push_outbox SET abandoned_at=?3, claim_token=NULL, claimed_until=NULL, last_error=?4
+                 WHERE id=?1 AND claim_token=?2 AND sent_at IS NULL AND abandoned_at IS NULL",
+                params![id, claim_token, now, error],
+            )?;
+        } else {
+            let delay = 1_i64 << (attempts - 1).clamp(0, 4);
+            transaction.execute(
+                "UPDATE push_outbox SET available_at=?3, claim_token=NULL, claimed_until=NULL, last_error=?4
+                 WHERE id=?1 AND claim_token=?2 AND sent_at IS NULL AND abandoned_at IS NULL",
+                params![id, claim_token, now.saturating_add(delay), error],
+            )?;
+        }
+        let changed = transaction.changes() == 1;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn abandon_push(&self, id: i64, claim_token: &str, now: i64, error: &str) -> Result<bool> {
+        Ok(self.lock()?.execute(
+            "UPDATE push_outbox SET abandoned_at=?3, claim_token=NULL, claimed_until=NULL, last_error=?4
+             WHERE id=?1 AND claim_token=?2 AND sent_at IS NULL AND abandoned_at IS NULL",
+            params![id, claim_token, now, error],
+        )? == 1)
+    }
+
+    pub fn disable_push_for_claim(
+        &self,
+        id: i64,
+        subscription_id: &str,
+        claim_token: &str,
+        now: i64,
+        error: &str,
+    ) -> Result<bool> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE push_outbox SET abandoned_at=?4, claim_token=NULL, claimed_until=NULL, last_error=?5
+             WHERE id=?1 AND subscription_id=?2 AND claim_token=?3
+               AND sent_at IS NULL AND abandoned_at IS NULL",
+            params![id, subscription_id, claim_token, now, error],
+        )?;
+        if changed == 1 {
+            transaction.execute(
+                "UPDATE push_subscriptions SET disabled_at=?2, updated_at=?2, last_error=?3
+                 WHERE id=?1 AND disabled_at IS NULL",
+                params![subscription_id, now, error],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
     /// Verdicts, delivery receipts, and enrollment relays publish to NATS.
     /// Notifications are deliberately not here: one failed ntfy delivery
     /// must never hold up the approval path, so each lane drains its own rows.
@@ -892,6 +1298,15 @@ impl Store {
             "DELETE FROM outbox WHERE sent_at IS NOT NULL AND sent_at < ?1",
             [now - 86_400],
         )?;
+        connection.execute(
+            "DELETE FROM push_outbox WHERE (sent_at IS NOT NULL OR abandoned_at IS NOT NULL) AND
+             COALESCE(sent_at, abandoned_at) < ?1",
+            [now - SERVER_REQUEST_RETENTION_SECS],
+        )?;
+        connection.execute(
+            "DELETE FROM push_subscriptions WHERE disabled_at IS NOT NULL AND disabled_at < ?1",
+            [now - PUSH_DISABLED_RETENTION_SECS],
+        )?;
         Ok(())
     }
 
@@ -900,6 +1315,33 @@ impl Store {
             .lock()
             .map_err(|_| anyhow::anyhow!("SQLite mutex poisoned"))
     }
+}
+
+pub fn validate_push_endpoint(endpoint: &str) -> Result<()> {
+    if endpoint.is_empty()
+        || endpoint.len() > PUSH_MAX_ENDPOINT_BYTES
+        || endpoint.chars().any(char::is_control)
+    {
+        bail!("invalid push endpoint");
+    }
+    let url = Url::parse(endpoint).context("parse push endpoint")?;
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("invalid push endpoint policy");
+    }
+    let Some(host) = url.host_str() else {
+        bail!("push endpoint has no host");
+    };
+    if matches!(url.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)))
+        || host.parse::<std::net::IpAddr>().is_ok()
+        || url.port().is_some_and(|port| port == 0)
+    {
+        bail!("push endpoint host is not allowed");
+    }
+    Ok(())
 }
 
 /// The schema, applied on every open. It is additive only and stays at
@@ -957,6 +1399,57 @@ CREATE INDEX IF NOT EXISTS auth_requests_expiry_idx ON auth_requests(expires_at)
 CREATE INDEX IF NOT EXISTS auth_requests_created_idx ON auth_requests(created_at);
 CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox(sent_at, id);
 PRAGMA user_version = 1;
+COMMIT;
+";
+
+const MIGRATION_V2: &str = r"
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS auth_requests (
+  id TEXT PRIMARY KEY, envelope_hash BLOB NOT NULL, envelope_json BLOB NOT NULL,
+  host TEXT NOT NULL, issued_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL, state TEXT NOT NULL, decision_hash BLOB,
+  created_at INTEGER NOT NULL, resolved_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS auth_sealed_bodies (
+  request_id TEXT NOT NULL REFERENCES auth_requests(id) ON DELETE CASCADE,
+  fingerprint TEXT NOT NULL, body_json BLOB NOT NULL,
+  PRIMARY KEY(request_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS auth_requests_expiry_idx ON auth_requests(expires_at);
+CREATE INDEX IF NOT EXISTS auth_requests_created_idx ON auth_requests(created_at);
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id TEXT PRIMARY KEY,
+  device_fingerprint TEXT NOT NULL REFERENCES devices(fingerprint),
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh BLOB NOT NULL,
+  auth BLOB NOT NULL,
+  expiration_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  disabled_at INTEGER,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS push_subscriptions_device_idx
+  ON push_subscriptions(device_fingerprint, disabled_at);
+CREATE TABLE IF NOT EXISTS push_outbox (
+  id INTEGER PRIMARY KEY,
+  request_kind TEXT NOT NULL CHECK(request_kind IN ('request','auth')),
+  request_id TEXT NOT NULL,
+  subscription_id TEXT NOT NULL REFERENCES push_subscriptions(id) ON DELETE CASCADE,
+  payload BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  available_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  sent_at INTEGER,
+  abandoned_at INTEGER,
+  claim_token TEXT,
+  claimed_until INTEGER,
+  last_error TEXT,
+  UNIQUE(request_kind, request_id, subscription_id)
+);
+CREATE INDEX IF NOT EXISTS push_outbox_pending_idx
+  ON push_outbox(sent_at, abandoned_at, available_at, id);
+PRAGMA user_version = 2;
 COMMIT;
 ";
 
@@ -1037,6 +1530,18 @@ mod tests {
             sign_count: 0,
             active: true,
         }
+    }
+
+    fn alternate_device(token: &[u8]) -> DevicePublicRecordV1 {
+        let mut value = device(token);
+        let credential_id = vec![2; 16];
+        value.credential_id = encode_base64url(&credential_id);
+        value.fingerprint = oshioki_protocol::device_fingerprint(
+            &credential_id,
+            &oshioki_protocol::decode_base64url(&value.credential_public_key).unwrap(),
+            &oshioki_protocol::decode_base64url(&value.box_public_key).unwrap(),
+        );
+        value
     }
 
     fn envelope(fingerprint: &str) -> RequestEnvelopeV1 {
@@ -1127,10 +1632,243 @@ COMMIT;
         }
     }
 
+    fn push_material() -> (Vec<u8>, Vec<u8>) {
+        let signing = SigningKey::from_bytes((&[8; 32]).into()).unwrap();
+        let point = signing.verifying_key().to_encoded_point(false);
+        let mut p256dh = vec![4];
+        p256dh.extend_from_slice(point.x().unwrap());
+        p256dh.extend_from_slice(point.y().unwrap());
+        (p256dh, vec![9; PUSH_AUTH_BYTES])
+    }
+
+    #[test]
+    fn v1_upgrade_is_exact_and_newer_versions_are_refused() {
+        let path = temporary_database();
+        remove_database(&path);
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(MIGRATION_V1).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        store.ready().unwrap();
+        let version: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        drop(store);
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.pragma_update(None, "user_version", 99).unwrap();
+        }
+        assert!(Store::open(&path).is_err());
+        remove_database(&path);
+    }
+
+    #[test]
+    fn push_registration_is_owned_and_redelivery_is_deduplicated() {
+        let store = Store::memory().unwrap();
+        let token = b"push-token";
+        let browser = device(token);
+        store.put_device(&browser).unwrap();
+        let (p256dh, auth) = push_material();
+        let id = store
+            .register_push_subscription(
+                token,
+                "https://push.example.test/send/1",
+                &p256dh,
+                &auth,
+                None,
+                20,
+            )
+            .unwrap();
+        assert_eq!(store.push_status(token).unwrap().count, 1);
+        assert_eq!(
+            store
+                .register_push_subscription(
+                    token,
+                    "https://push.example.test/send/1",
+                    &p256dh,
+                    &auth,
+                    None,
+                    20,
+                )
+                .unwrap(),
+            id
+        );
+        let envelope = envelope(&browser.fingerprint);
+        let raw = serde_json::to_vec(&envelope).unwrap();
+        store.ingest_request(&raw, &envelope, 20).unwrap();
+        store.ingest_request(&raw, &envelope, 20).unwrap();
+        let item = store.claim_push(20, PUSH_LEASE_SECS).unwrap().unwrap();
+        assert_eq!(item.subscription_id, id);
+        let payload: serde_json::Value = serde_json::from_slice(&item.payload).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"version":1,"lane":"request","request_id":"request-1"})
+        );
+        assert!(store.claim_push(20, PUSH_LEASE_SECS).unwrap().is_none());
+        assert!(
+            store
+                .mark_push_sent(item.id, &item.claim_token, 20)
+                .unwrap()
+        );
+        let id2 = store
+            .register_push_subscription(
+                token,
+                "https://push.example.test/send/2",
+                &p256dh,
+                &auth,
+                None,
+                20,
+            )
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO push_outbox(request_kind, request_id, subscription_id, payload, created_at, available_at)
+                 VALUES ('request', ?1, ?2, ?3, ?4, ?4)",
+                params!["request-1", id2, serde_json::to_vec(&payload).unwrap(), 20],
+            )
+            .unwrap();
+        let item2 = store.claim_push(20, PUSH_LEASE_SECS).unwrap().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE push_outbox SET attempts=?2, claimed_until=?1 WHERE id=?3",
+                params![20, PUSH_MAX_ATTEMPTS, item2.id],
+            )
+            .unwrap();
+        assert!(store.claim_push(20, PUSH_LEASE_SECS).unwrap().is_none());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT abandoned_at IS NOT NULL FROM push_outbox WHERE id=?1",
+                    [item2.id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .mark_push_sent(item2.id, &item2.claim_token, 20)
+                .unwrap()
+        );
+        assert!(store.push_status(b"wrong-token").is_err());
+    }
+
+    #[test]
+    fn push_endpoint_policy_rejects_private_forms_and_key_bounds() {
+        for endpoint in [
+            "http://push.example.test/send",
+            "https://user:pass@push.example.test/send",
+            "https://push.example.test/send#fragment",
+            "https://127.0.0.1/send",
+            "https://[::1]/send",
+        ] {
+            assert!(validate_push_endpoint(endpoint).is_err(), "{endpoint}");
+        }
+        let store = Store::memory().unwrap();
+        let token = b"push-key-token";
+        store.put_device(&device(token)).unwrap();
+        let (p256dh, auth) = push_material();
+        assert!(
+            store
+                .register_push_subscription(
+                    token,
+                    "https://push.example.test/send",
+                    &p256dh[..64],
+                    &auth,
+                    None,
+                    20,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn push_endpoint_ownership_allows_inactive_reassignment_and_revoke_cleanup() {
+        let store = Store::memory().unwrap();
+        let first_token = b"first-push-owner";
+        let second_token = b"second-push-owner";
+        let first = device(first_token);
+        let second = alternate_device(second_token);
+        store.put_device(&first).unwrap();
+        store.put_device(&second).unwrap();
+        let (p256dh, auth) = push_material();
+        let endpoint = "https://push.example.test/owned";
+        let id = store
+            .register_push_subscription(first_token, endpoint, &p256dh, &auth, None, 20)
+            .unwrap();
+        assert!(
+            store
+                .register_push_subscription(second_token, endpoint, &p256dh, &auth, None, 20)
+                .is_err()
+        );
+        assert!(store.set_device_active(&first.fingerprint, false).unwrap());
+        assert_eq!(
+            store
+                .register_push_subscription(second_token, endpoint, &p256dh, &auth, None, 20)
+                .unwrap(),
+            id
+        );
+        let envelope = envelope(&second.fingerprint);
+        store
+            .ingest_request(&serde_json::to_vec(&envelope).unwrap(), &envelope, 20)
+            .unwrap();
+        assert!(store.set_device_active(&second.fingerprint, false).unwrap());
+        assert!(store.push_status(second_token).is_err());
+        assert!(store.claim_push(20, PUSH_LEASE_SECS).unwrap().is_none());
+        let disabled: bool = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT disabled_at IS NOT NULL FROM push_subscriptions WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(disabled);
+    }
+
+    #[test]
+    fn auth_fanout_payload_is_minimal_and_lane_specific() {
+        let store = Store::memory().unwrap();
+        let token = b"auth-push-token";
+        let browser = device(token);
+        store.put_device(&browser).unwrap();
+        let (p256dh, auth) = push_material();
+        store
+            .register_push_subscription(
+                token,
+                "https://push.example.test/auth",
+                &p256dh,
+                &auth,
+                None,
+                20,
+            )
+            .unwrap();
+        let envelope = auth_envelope(&browser.fingerprint, "auth-push", 20);
+        store
+            .ingest_auth_request(&serde_json::to_vec(&envelope).unwrap(), &envelope, 20)
+            .unwrap();
+        let item = store.claim_push(20, PUSH_LEASE_SECS).unwrap().unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&item.payload).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"version":1,"lane":"auth","request_id":"auth-push"})
+        );
+    }
+
     /// A database written by a server that predates the authentication lane
-    /// gains the new tables on the next open, keeps every command-lane row
-    /// it already held, and stays at schema version 1. Opening it twice more
-    /// changes nothing: the migration is additive and idempotent.
+    /// gains the new lane and push tables on the next open, keeps every
+    /// command-lane row it already held, and advances to schema version 2.
+    /// Opening it twice more changes nothing: the migration is idempotent.
     #[test]
     fn an_existing_database_gains_the_authentication_tables_in_place() {
         let path = temporary_database();
