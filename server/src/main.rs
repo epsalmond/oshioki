@@ -14,6 +14,9 @@ use axum::{
 };
 use db::{InsertResult, RequestLifecycle, Store};
 use futures::StreamExt as _;
+use jwt_compact::{
+    AlgorithmExt as _, Claims as JwtClaims, Header as JwtHeader, TimeOptions, alg::Es256,
+};
 use oshioki_protocol::{
     AUTH_ENVELOPE_TYPE, ActivationV1, AliveV1, ApproveV1, AuthApproveWebauthnV1, AuthDecisionV1,
     AuthEnvelopeV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
@@ -36,7 +39,6 @@ use std::{
 use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
-use web_push_native::jwt_simple::algorithms::ECDSAP256PublicKeyLike as _;
 use web_push_native::{Auth as WebPushAuth, WebPushBuilder};
 
 /// Every path the authentication lane serves. The router is built from this
@@ -91,6 +93,12 @@ struct VapidConfig {
     private_key: Arc<Vec<u8>>,
     public_key: String,
     subject: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VapidClaims {
+    aud: String,
+    sub: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,11 +248,13 @@ fn load_vapid_config(state_path: &FsPath, origin: &str) -> Result<VapidConfig> {
         std::str::from_utf8(&private_pem).context("VAPID key is not UTF-8")?,
     )
     .context("parse VAPID private key")?;
-    let key_pair =
-        web_push_native::jwt_simple::algorithms::ES256KeyPair::from_bytes(key.to_bytes().as_ref())
-            .context("load VAPID private key")?;
+    let signing_key = p256::ecdsa::SigningKey::from_slice(key.to_bytes().as_ref())
+        .context("load VAPID private key")?;
     let public_key = oshioki_protocol::encode_base64url(
-        &key_pair.public_key().public_key().to_bytes_uncompressed(),
+        signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes(),
     );
     let subject = std::env::var("OSHIOKI_VAPID_SUBJECT").unwrap_or_else(|_| origin.to_owned());
     let parsed_subject = url::Url::parse(&subject).context("parse OSHIOKI_VAPID_SUBJECT")?;
@@ -807,23 +817,63 @@ fn build_push_request(
     let ua_public = web_push_native::p256::PublicKey::from_sec1_bytes(&item.p256dh)
         .map_err(|_| anyhow::anyhow!("invalid stored p256dh key"))?;
     let ua_auth = WebPushAuth::clone_from_slice(&item.auth);
-    let vapid_key = web_push_native::jwt_simple::algorithms::ES256KeyPair::from_bytes(
-        vapid.private_key.as_slice(),
-    )
-    .context("load VAPID private key")?;
     let message = WebPushBuilder::new(item.endpoint.parse()?, ua_public, ua_auth)
         .with_valid_duration(Duration::from_secs(u64::from(ttl)))
-        .with_vapid(&vapid_key, vapid.subject.as_str())
         .build(item.payload.clone())
         .context("encrypt and sign Web Push payload")?;
+    let mut headers: Vec<_> = message
+        .headers()
+        .iter()
+        .map(|(key, value)| (key.as_str().to_owned(), value.as_bytes().to_vec()))
+        .collect();
+    headers.push((
+        "authorization".into(),
+        vapid_authorization(vapid, &item.endpoint, ttl)?.into_bytes(),
+    ));
     Ok(BuiltPushRequest {
         body: message.body().clone(),
-        headers: message
-            .headers()
-            .iter()
-            .map(|(key, value)| (key.as_str().to_owned(), value.as_bytes().to_vec()))
-            .collect(),
+        headers,
     })
+}
+
+fn vapid_authorization(vapid: &VapidConfig, endpoint: &str, ttl: u32) -> Result<String> {
+    let signing_key = p256::ecdsa::SigningKey::from_slice(vapid.private_key.as_slice())
+        .context("load VAPID signing key")?;
+    let claims = JwtClaims::new(VapidClaims {
+        aud: endpoint_audience(endpoint)?,
+        sub: vapid.subject.clone(),
+    })
+    .set_duration(
+        &TimeOptions::from_leeway(chrono::Duration::zero()),
+        chrono::Duration::seconds(i64::from(ttl)),
+    );
+    let token = Es256
+        .token(&JwtHeader::empty(), &claims, &signing_key)
+        .context("sign VAPID JWT")?;
+    let public_key = oshioki_protocol::encode_base64url(
+        signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+    Ok(format!("vapid t={token}, k={public_key}"))
+}
+
+fn endpoint_audience(endpoint: &str) -> Result<String> {
+    let url = url::Url::parse(endpoint).context("parse push endpoint for VAPID audience")?;
+    let host = url
+        .host_str()
+        .context("push endpoint has no VAPID audience host")?;
+    let default_port = match url.scheme() {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    };
+    let authority = match url.port() {
+        Some(port) if Some(port) != default_port => format!("{host}:{port}"),
+        _ => host.to_owned(),
+    };
+    Ok(format!("{}://{authority}", url.scheme()))
 }
 
 fn classify_provider_response(
@@ -1649,14 +1699,14 @@ mod tests {
             .as_bytes()
             .to_vec();
         let key = p256::SecretKey::from_pkcs8_pem(std::str::from_utf8(&pem).unwrap()).unwrap();
-        let key_pair = web_push_native::jwt_simple::algorithms::ES256KeyPair::from_bytes(
-            key.to_bytes().as_ref(),
-        )
-        .unwrap();
+        let signing_key = p256::ecdsa::SigningKey::from_slice(key.to_bytes().as_ref()).unwrap();
         VapidConfig {
             private_key: Arc::new(key.to_bytes().to_vec()),
             public_key: oshioki_protocol::encode_base64url(
-                &key_pair.public_key().public_key().to_bytes_uncompressed(),
+                signing_key
+                    .verifying_key()
+                    .to_encoded_point(false)
+                    .as_bytes(),
             ),
             subject: "https://sudo.test".into(),
         }
@@ -1888,7 +1938,8 @@ mod tests {
 
     #[test]
     fn push_builder_emits_encrypted_payload_vapid_crypto_headers_and_ttl() {
-        let message = build_push_request(&test_vapid(), &test_push_item(), 7).unwrap();
+        let vapid = test_vapid();
+        let message = build_push_request(&vapid, &test_push_item(), 7).unwrap();
         assert!(!message.body.is_empty());
         assert!(
             message
@@ -1899,11 +1950,31 @@ mod tests {
         assert!(message.headers.iter().any(|(key, value)| {
             key.eq_ignore_ascii_case("content-encoding") && value == b"aes128gcm"
         }));
+        let authorization = message
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| std::str::from_utf8(value).unwrap())
+            .unwrap();
         assert!(message.headers.iter().any(|(key, value)| {
             key.eq_ignore_ascii_case("authorization")
                 && value.starts_with(b"vapid t=")
                 && value.windows(2).any(|part| part == b"k=")
         }));
+        let token = authorization
+            .strip_prefix("vapid t=")
+            .and_then(|value| value.split_once(", k=").map(|(token, _)| token))
+            .unwrap();
+        let untrusted = jwt_compact::UntrustedToken::new(token).unwrap();
+        let signing_key =
+            p256::ecdsa::SigningKey::from_slice(vapid.private_key.as_slice()).unwrap();
+        let verified = Es256
+            .validator::<VapidClaims>(signing_key.verifying_key())
+            .validate(&untrusted)
+            .unwrap();
+        assert_eq!(verified.claims().custom.aud, "https://push.example.test");
+        assert_eq!(verified.claims().custom.sub, vapid.subject);
+        assert!(verified.claims().expiration.is_some());
         assert!(message.headers.iter().any(|(key, value)| {
             key.eq_ignore_ascii_case("content-type") && value == b"application/octet-stream"
         }));
