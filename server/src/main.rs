@@ -24,7 +24,7 @@ use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path as FsPath, PathBuf},
     sync::{
@@ -66,7 +66,10 @@ const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 /// each response to its buffer, and this bounds their count (and open files).
 const MAX_CONCURRENT_ARTIFACTS: usize = 8;
 const PUSH_PROVIDER_TTL_CAP_SECS: i64 = 300;
-const PUSH_RESPONSE_MAX_BYTES: usize = 16 * 1024;
+const MAX_PUSH_HTTP_BODY: usize = 8 * 1024;
+const MAX_PUSH_P256DH_B64: usize = 128;
+const MAX_PUSH_AUTH_B64: usize = 64;
+static VAPID_TEMP_COUNTER: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Clone)]
 struct AppState {
@@ -76,6 +79,7 @@ struct AppState {
     artifact_permits: Arc<Semaphore>,
     consumer_last_ok: Arc<AtomicI64>,
     outbox_last_ok: Arc<AtomicI64>,
+    push_worker_last_ok: Arc<AtomicI64>,
     origin: Arc<String>,
     rp_id: Arc<String>,
     ntfy_url: Option<Arc<String>>,
@@ -156,6 +160,7 @@ async fn main() -> Result<()> {
         artifact_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_ARTIFACTS)),
         consumer_last_ok: Arc::new(AtomicI64::new(0)),
         outbox_last_ok: Arc::new(AtomicI64::new(now())),
+        push_worker_last_ok: Arc::new(AtomicI64::new(now())),
         origin: Arc::new(runtime_config.origin),
         rp_id: Arc::new(runtime_config.rp_id),
         ntfy_url: std::env::var("OSHIOKI_NTFY_URL").ok().map(Arc::new),
@@ -193,7 +198,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/push/status", get(push_status))
         .route(
             "/api/v1/push/subscriptions",
-            post(register_push_subscription),
+            post(register_push_subscription).layer(DefaultBodyLimit::max(MAX_PUSH_HTTP_BODY)),
         )
         .route(
             "/api/v1/push/subscriptions/:id",
@@ -225,35 +230,7 @@ fn load_vapid_config(state_path: &FsPath, origin: &str) -> Result<VapidConfig> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create VAPID key directory {}", parent.display()))?;
     }
-    let private_pem = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let key = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
-            let pem = key
-                .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
-                .context("encode VAPID private key")?;
-            let bytes = pem.as_bytes().to_vec();
-            let temp_path = path.with_extension(format!("pem.tmp-{}", std::process::id()));
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)
-                .with_context(|| format!("create VAPID key {}", temp_path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            }
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temp_path, &path)
-                .with_context(|| format!("install VAPID key {}", path.display()))?;
-            bytes
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("read VAPID key {}", path.display()));
-        }
-    };
+    let private_pem = load_or_create_vapid_pem(&path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -279,6 +256,87 @@ fn load_vapid_config(state_path: &FsPath, origin: &str) -> Result<VapidConfig> {
         public_key,
         subject,
     })
+}
+
+fn load_or_create_vapid_pem(path: &FsPath) -> Result<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => return Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("read VAPID key {}", path.display()));
+        }
+    }
+
+    let key = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+    let pem = key
+        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+        .context("encode VAPID private key")?;
+    let bytes = pem.as_bytes().to_vec();
+    let parent = path.parent().unwrap_or_else(|| FsPath::new("."));
+    for _ in 0..8 {
+        let counter = VAPID_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = path.with_extension(format!(
+            "pem.tmp-{}-{}-{}",
+            std::process::id(),
+            counter,
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create VAPID key {}", temp_path.display()));
+            }
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+
+        match fs::hard_link(&temp_path, path) {
+            Ok(()) => {
+                sync_parent_directory(parent)?;
+                let _ = fs::remove_file(&temp_path);
+                sync_parent_directory(parent)?;
+                return Ok(bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp_path);
+                match fs::read(path) {
+                    Ok(winner) => return Ok(winner),
+                    Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(read_error) => {
+                        return Err(read_error)
+                            .with_context(|| format!("read VAPID key winner {}", path.display()));
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error).with_context(|| format!("install VAPID key {}", path.display()));
+            }
+        }
+    }
+    bail!(
+        "could not install VAPID key {} after concurrent initialization",
+        path.display()
+    )
+}
+
+fn sync_parent_directory(parent: &FsPath) -> Result<()> {
+    File::open(parent)
+        .with_context(|| format!("open VAPID key directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync VAPID key directory {}", parent.display()))?;
+    Ok(())
 }
 
 fn spawn_workers(state: &AppState) {
@@ -625,8 +683,14 @@ enum PushDeliveryResult {
     Abandon,
 }
 
+struct BuiltPushRequest {
+    body: Vec<u8>,
+    headers: Vec<(String, Vec<u8>)>,
+}
+
 async fn push_worker(state: AppState) {
     loop {
+        state.push_worker_last_ok.store(now(), Ordering::Relaxed);
         let item = match state.store.claim_push(now(), db::PUSH_LEASE_SECS) {
             Ok(Some(item)) => item,
             Ok(None) => {
@@ -640,6 +704,7 @@ async fn push_worker(state: AppState) {
             }
         };
         let result = send_push(&state, &item).await;
+        state.push_worker_last_ok.store(now(), Ordering::Relaxed);
         let current = now();
         let update = match result {
             Ok(PushDeliveryResult::Sent) => {
@@ -723,28 +788,49 @@ async fn send_push(state: &AppState, item: &db::PushItem) -> Result<PushDelivery
     let Some(ttl) = push_ttl(item.expires_at, now()) else {
         return Ok(PushDeliveryResult::Abandon);
     };
+    let message = build_push_request(&state.vapid, item, ttl)?;
+    let mut request = client.post(item.endpoint.as_str()).body(message.body);
+    for (key, value) in message.headers {
+        request = request.header(key, value);
+    }
+    let response = request.send().await.context("send Web Push request")?;
+    let status = response.status();
+    drop(response);
+    Ok(classify_provider_response(status, &[]))
+}
+
+fn build_push_request(
+    vapid: &VapidConfig,
+    item: &db::PushItem,
+    ttl: u32,
+) -> Result<BuiltPushRequest> {
     let ua_public = web_push_native::p256::PublicKey::from_sec1_bytes(&item.p256dh)
         .map_err(|_| anyhow::anyhow!("invalid stored p256dh key"))?;
     let ua_auth = WebPushAuth::clone_from_slice(&item.auth);
     let vapid_key = web_push_native::jwt_simple::algorithms::ES256KeyPair::from_bytes(
-        state.vapid.private_key.as_slice(),
+        vapid.private_key.as_slice(),
     )
     .context("load VAPID private key")?;
     let message = WebPushBuilder::new(item.endpoint.parse()?, ua_public, ua_auth)
         .with_valid_duration(Duration::from_secs(u64::from(ttl)))
-        .with_vapid(&vapid_key, state.vapid.subject.as_str())
+        .with_vapid(&vapid_key, vapid.subject.as_str())
         .build(item.payload.clone())
         .context("encrypt and sign Web Push payload")?;
-    let mut request = client
-        .post(item.endpoint.as_str())
-        .body(message.body().clone());
-    for (key, value) in message.headers() {
-        request = request.header(key.as_str(), value.as_bytes());
-    }
-    let response = request.send().await.context("send Web Push request")?;
-    let status = response.status();
-    read_bounded_response(response).await?;
-    Ok(if status.is_success() {
+    Ok(BuiltPushRequest {
+        body: message.body().clone(),
+        headers: message
+            .headers()
+            .iter()
+            .map(|(key, value)| (key.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect(),
+    })
+}
+
+fn classify_provider_response(
+    status: reqwest::StatusCode,
+    _diagnostic_body: &[u8],
+) -> PushDeliveryResult {
+    if status.is_success() {
         PushDeliveryResult::Sent
     } else if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
         PushDeliveryResult::Gone
@@ -755,7 +841,7 @@ async fn send_push(state: &AppState, item: &db::PushItem) -> Result<PushDelivery
         PushDeliveryResult::Retry
     } else {
         PushDeliveryResult::Abandon
-    })
+    }
 }
 
 fn push_ttl(expires_at: i64, now: i64) -> Option<u32> {
@@ -767,25 +853,6 @@ fn push_ttl(expires_at: i64, now: i64) -> Option<u32> {
         u32::try_from(remaining.min(PUSH_PROVIDER_TTL_CAP_SECS))
             .expect("documented push TTL cap fits u32"),
     )
-}
-
-async fn read_bounded_response(response: reqwest::Response) -> Result<()> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > PUSH_RESPONSE_MAX_BYTES as u64)
-    {
-        bail!("Web Push response too large");
-    }
-    let mut body_size = 0usize;
-    let mut body_stream = response.bytes_stream();
-    while let Some(chunk) = body_stream.next().await {
-        let chunk = chunk.context("read Web Push response")?;
-        body_size = body_size.saturating_add(chunk.len());
-        if body_size > PUSH_RESPONSE_MAX_BYTES {
-            bail!("Web Push response too large");
-        }
-    }
-    Ok(())
 }
 
 fn classify_push_error(error: &anyhow::Error) -> String {
@@ -925,6 +992,12 @@ async fn register_push_subscription(
     Json(input): Json<PushSubscriptionRequest>,
 ) -> Result<Json<PushSubscriptionResponse>, ApiError> {
     if input.version != 1 {
+        return Err(ApiError(StatusCode::BAD_REQUEST));
+    }
+    if input.endpoint.len() > db::PUSH_MAX_ENDPOINT_BYTES
+        || input.keys.p256dh.len() > MAX_PUSH_P256DH_B64
+        || input.keys.auth.len() > MAX_PUSH_AUTH_B64
+    {
         return Err(ApiError(StatusCode::BAD_REQUEST));
     }
     let token = bearer_token(&headers)?;
@@ -1378,19 +1451,21 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
     let current = now();
     let consumer_age = current - state.consumer_last_ok.load(Ordering::Relaxed);
     let outbox_age = current - state.outbox_last_ok.load(Ordering::Relaxed);
+    let push_worker_age = current - state.push_worker_last_ok.load(Ordering::Relaxed);
     if consumer_age > 30 || outbox_age > 30 {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE));
     }
     Ok(Json(json!({
         "status":"ok",
         "consumer_age_seconds":consumer_age,
-        "outbox_age_seconds":outbox_age,
+            "outbox_age_seconds":outbox_age,
+            "push_worker_age_seconds":push_worker_age,
         "origin":state.origin.as_str(),
         "rp_id":state.rp_id.as_str(),
         "web_push": {
             "key_loaded": true,
             "public_key_available": !state.vapid.public_key.is_empty(),
-            "worker_running": true,
+            "worker_running": push_worker_age <= 30,
         },
     })))
 }
@@ -1564,6 +1639,7 @@ fn now() -> i64 {
 mod tests {
     use super::*;
     use sha2::Digest as _;
+    use tower::util::ServiceExt as _;
 
     fn test_vapid() -> VapidConfig {
         let key = p256::SecretKey::from_slice(&[7; 32]).unwrap();
@@ -1583,6 +1659,27 @@ mod tests {
                 &key_pair.public_key().public_key().to_bytes_uncompressed(),
             ),
             subject: "https://sudo.test".into(),
+        }
+    }
+
+    fn test_push_item() -> db::PushItem {
+        let signing = p256::ecdsa::SigningKey::from_bytes((&[8; 32]).into()).unwrap();
+        let point = signing.verifying_key().to_encoded_point(false);
+        let mut p256dh = vec![4];
+        p256dh.extend_from_slice(point.x().unwrap());
+        p256dh.extend_from_slice(point.y().unwrap());
+        db::PushItem {
+            id: 1,
+            subscription_id: "ps_test".into(),
+            endpoint: "https://push.example.test/send".into(),
+            p256dh,
+            auth: vec![9; db::PUSH_AUTH_BYTES],
+            payload: br#"{"version":1,"lane":"request","request_id":"req-test"}"#.to_vec(),
+            request_kind: "request".into(),
+            request_id: "req-test".into(),
+            expires_at: 100,
+            claim_token: "claim".into(),
+            attempts: 1,
         }
     }
 
@@ -1615,6 +1712,7 @@ mod tests {
                 artifact_permits: Arc::new(Semaphore::new(1)),
                 consumer_last_ok: Arc::new(AtomicI64::new(current - consumer_age)),
                 outbox_last_ok: Arc::new(AtomicI64::new(current - outbox_age)),
+                push_worker_last_ok: Arc::new(AtomicI64::new(current)),
                 origin: Arc::new("https://sudo.test:8443".into()),
                 rp_id: Arc::new("sudo.test".into()),
                 ntfy_url: None,
@@ -1638,6 +1736,88 @@ mod tests {
         let (dir, state) = health_state("stale", 31, 0);
         let error = health(State(state)).await.unwrap_err();
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn health_reports_dead_push_worker_without_claiming_it_is_running() {
+        let (dir, state) = health_state("dead-push", 0, 0);
+        state
+            .push_worker_last_ok
+            .store(now() - 31, Ordering::Relaxed);
+        let Json(body) = health(State(state)).await.unwrap();
+        assert_eq!(body["web_push"]["worker_running"], false);
+        assert!(body["push_worker_age_seconds"].as_i64().unwrap() >= 31);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn push_handlers_reject_unknown_bearers_and_unbounded_keys() {
+        let (dir, state) = health_state("push-api-rejections", 0, 0);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static(
+                "Bearer 012345678901234567890123456789012345678901234567890123456789",
+            ),
+        );
+        assert_eq!(
+            push_status(State(state.clone()), headers.clone())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let oversized_key = PushSubscriptionRequest {
+            version: 1,
+            endpoint: "https://push.example.test/send".into(),
+            expiration_time: None,
+            keys: PushSubscriptionKeys {
+                p256dh: "x".repeat(MAX_PUSH_P256DH_B64 + 1),
+                auth: "y".into(),
+            },
+        };
+        assert_eq!(
+            register_push_subscription(State(state.clone()), headers.clone(), Json(oversized_key))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            delete_push_subscription(State(state), Path("ps_missing".into()), headers)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn push_subscription_route_returns_413_before_json_decode() {
+        let (dir, state) = health_state("push-api-body-limit", 0, 0);
+        let app = Router::new()
+            .route(
+                "/api/v1/push/subscriptions",
+                post(register_push_subscription).layer(DefaultBodyLimit::max(MAX_PUSH_HTTP_BODY)),
+            )
+            .with_state(state);
+        let body = serde_json::to_vec(&json!({
+            "version": 1,
+            "endpoint": "https://push.example.test/send",
+            "expiration_time": null,
+            "keys": {"p256dh": "x".repeat(MAX_PUSH_HTTP_BODY), "auth": "y"}
+        }))
+        .unwrap();
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/push/subscriptions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1666,11 +1846,115 @@ mod tests {
     }
 
     #[test]
+    fn vapid_initialization_is_noreplace_under_concurrency_and_ignores_stale_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "oshioki-vapid-race-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let state_path = dir.join("server").join("state.sqlite3");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let stale_temp = state_path
+            .parent()
+            .unwrap()
+            .join(format!("vapid-private.pem.tmp-{}", std::process::id()));
+        std::fs::write(&stale_temp, b"stale initializer artifact").unwrap();
+
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let path = state_path.clone();
+                    scope.spawn(move || load_vapid_config(&path, "https://sudo.test"))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap().unwrap().public_key)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.len(), 8);
+        assert!(results.iter().all(|key| key == &results[0]));
+        assert!(stale_temp.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn push_ttl_never_outlives_the_request_or_provider_cap() {
         assert_eq!(push_ttl(25, 20), Some(5));
         assert_eq!(push_ttl(20, 20), None);
         assert_eq!(push_ttl(20, 21), None);
         assert_eq!(push_ttl(20 + PUSH_PROVIDER_TTL_CAP_SECS + 1, 20), Some(300));
+    }
+
+    #[test]
+    fn push_builder_emits_encrypted_payload_vapid_crypto_headers_and_ttl() {
+        let message = build_push_request(&test_vapid(), &test_push_item(), 7).unwrap();
+        assert!(!message.body.is_empty());
+        assert!(
+            message
+                .headers
+                .iter()
+                .any(|(key, value)| { key.eq_ignore_ascii_case("ttl") && value == b"7" })
+        );
+        assert!(message.headers.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("content-encoding") && value == b"aes128gcm"
+        }));
+        assert!(message.headers.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("authorization")
+                && value.starts_with(b"vapid t=")
+                && value.windows(2).any(|part| part == b"k=")
+        }));
+        assert!(message.headers.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("content-type") && value == b"application/octet-stream"
+        }));
+        assert!(message.headers.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("content-length") && !value.is_empty()
+        }));
+    }
+
+    #[test]
+    fn provider_statuses_map_to_delivery_lifecycle() {
+        assert_eq!(
+            classify_provider_response(StatusCode::CREATED, &[]),
+            PushDeliveryResult::Sent
+        );
+        assert_eq!(
+            classify_provider_response(StatusCode::NOT_FOUND, &[]),
+            PushDeliveryResult::Gone
+        );
+        assert_eq!(
+            classify_provider_response(StatusCode::GONE, &[]),
+            PushDeliveryResult::Gone
+        );
+        assert_eq!(
+            classify_provider_response(StatusCode::TOO_MANY_REQUESTS, &[]),
+            PushDeliveryResult::Retry
+        );
+        assert_eq!(
+            classify_provider_response(StatusCode::BAD_GATEWAY, &[]),
+            PushDeliveryResult::Retry
+        );
+        assert_eq!(
+            classify_provider_response(StatusCode::BAD_REQUEST, &[]),
+            PushDeliveryResult::Abandon
+        );
+    }
+
+    #[test]
+    fn provider_status_remains_authoritative_with_oversized_diagnostic_data() {
+        let diagnostic = vec![b'x'; 4 * 1024 * 1024];
+        assert_eq!(
+            classify_provider_response(StatusCode::CREATED, &diagnostic),
+            PushDeliveryResult::Sent
+        );
+        assert_eq!(
+            classify_provider_response(StatusCode::NOT_FOUND, &diagnostic),
+            PushDeliveryResult::Gone
+        );
+        assert_eq!(
+            classify_provider_response(StatusCode::GONE, &diagnostic),
+            PushDeliveryResult::Gone
+        );
     }
 
     async fn status(root: &std::path::Path, path: &str, permits: &Arc<Semaphore>) -> StatusCode {
@@ -1914,6 +2198,7 @@ mod tests {
             artifact_permits: Arc::new(Semaphore::new(1)),
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            push_worker_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
@@ -1973,6 +2258,7 @@ mod tests {
             artifact_permits: Arc::new(Semaphore::new(1)),
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            push_worker_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
@@ -2081,6 +2367,7 @@ mod tests {
             artifact_permits: Arc::new(Semaphore::new(1)),
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            push_worker_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
@@ -2127,6 +2414,7 @@ mod tests {
             artifact_permits: Arc::new(Semaphore::new(1)),
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            push_worker_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
@@ -2380,6 +2668,7 @@ mod tests {
             artifact_permits: Arc::new(Semaphore::new(1)),
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            push_worker_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,
@@ -2699,6 +2988,7 @@ mod tests {
             artifact_permits: Arc::new(Semaphore::new(1)),
             consumer_last_ok: Arc::new(AtomicI64::new(0)),
             outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            push_worker_last_ok: Arc::new(AtomicI64::new(0)),
             origin: Arc::new("https://sudo.test".into()),
             rp_id: Arc::new("sudo.test".into()),
             ntfy_url: None,

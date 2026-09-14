@@ -28,7 +28,7 @@ tokio-util = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 url = "2"
 web-push-native = "0.5.0"
 p256 = { workspace = true }
@@ -40,3 +40,4 @@ workspace = true
 [dev-dependencies]
 p256 = { workspace = true }
 ciborium = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
