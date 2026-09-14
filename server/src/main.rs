@@ -861,19 +861,13 @@ fn vapid_authorization(vapid: &VapidConfig, endpoint: &str, ttl: u32) -> Result<
 
 fn endpoint_audience(endpoint: &str) -> Result<String> {
     let url = url::Url::parse(endpoint).context("parse push endpoint for VAPID audience")?;
-    let host = url
-        .host_str()
-        .context("push endpoint has no VAPID audience host")?;
-    let default_port = match url.scheme() {
-        "https" => Some(443),
-        "http" => Some(80),
-        _ => None,
-    };
-    let authority = match url.port() {
-        Some(port) if Some(port) != default_port => format!("{host}:{port}"),
-        _ => host.to_owned(),
-    };
-    Ok(format!("{}://{authority}", url.scheme()))
+    if url.scheme() != "https" {
+        bail!("push endpoint VAPID audience must use HTTPS");
+    }
+    if url.host_str().is_none() {
+        bail!("push endpoint has no VAPID audience host");
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 fn classify_provider_response(
@@ -2026,6 +2020,23 @@ mod tests {
             classify_provider_response(StatusCode::GONE, &diagnostic),
             PushDeliveryResult::Gone
         );
+    }
+
+    #[test]
+    fn endpoint_audience_uses_canonical_https_origin() {
+        assert_eq!(
+            endpoint_audience("https://push.example.test/send").unwrap(),
+            "https://push.example.test"
+        );
+        assert_eq!(
+            endpoint_audience("https://push.example.test:8443/send").unwrap(),
+            "https://push.example.test:8443"
+        );
+        assert_eq!(
+            endpoint_audience("https://[2001:db8::1]/send").unwrap(),
+            "https://[2001:db8::1]"
+        );
+        assert!(endpoint_audience("http://push.example.test/send").is_err());
     }
 
     async fn status(root: &std::path::Path, path: &str, permits: &Arc<Semaphore>) -> StatusCode {
