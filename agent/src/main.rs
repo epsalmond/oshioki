@@ -20,7 +20,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 #[cfg(feature = "unattended")]
 use clap::ValueEnum;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, Parser, Subcommand};
 use futures::StreamExt as _;
 use oshioki_agent::{Identity, OpenedRequest, SignerKind, parse_enrollment_url, remaining_until};
 use oshioki_protocol::{
@@ -31,6 +31,9 @@ use oshioki_protocol::{
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{info, warn};
+
+#[path = "../../cli/terminal_logo.rs"]
+mod terminal_logo;
 
 const PAIR_TIMEOUT: Duration = Duration::from_secs(300);
 /// Maximum number of request handlers, across both transports, that may be
@@ -107,7 +110,11 @@ impl RequestPermit {
 }
 
 #[derive(Parser)]
-#[command(name = "oshioki-agent", version, about)]
+#[command(
+    name = "oshioki-agent",
+    version,
+    about = "Run a native Oshioki approval agent"
+)]
 struct Cli {
     /// Directory holding the agent identity (default: `$OSHIOKI_AGENT_STATE`,
     /// then ~/.config/oshioki).
@@ -121,7 +128,8 @@ struct Cli {
 enum Verb {
     /// Enroll this device with a host using the URL printed by `oshioki enroll`.
     Pair {
-        #[arg(allow_hyphen_values = true)]
+        /// Enrollment URL printed by `oshioki enroll`.
+        #[arg(value_name = "ENROLLMENT_URL", allow_hyphen_values = true)]
         enrollment_url: String,
         /// Label shown on the host's device list.
         #[arg(long)]
@@ -136,17 +144,18 @@ enum Verb {
         #[arg(long)]
         force: bool,
     },
-    /// Watch for requests and decide them.
+    /// Watch for sudo requests and ask for approval.
     Run {
         /// Decide every request without asking. For tests only.
         #[cfg(feature = "unattended")]
         #[arg(long, value_enum)]
         auto: Option<Auto>,
     },
-    /// Print this device's fingerprint.
+    /// Print this device's fingerprint and signer.
     Show,
-    /// Create this device's identity without enrolling it. For offline
-    /// pairing: `device-record` reads what `init` writes.
+    /// Create a native identity.
+    ///
+    /// For offline pairing, `device-record` reads what `init` writes.
     Init {
         /// Where the signing key lives. Defaults to the Secure Enclave on
         /// macOS and to a software key everywhere else. Ignored when this
@@ -158,8 +167,9 @@ enum Verb {
         #[arg(long)]
         force: bool,
     },
-    /// Print this device's public record for offline pairing (`oshioki
-    /// pin-record`). Read-only: no NATS, no server, no prompt.
+    /// Print a public device record.
+    ///
+    /// This is read-only. It does not contact NATS or the server.
     DeviceRecord {
         /// Label shown on the host's device list.
         #[arg(long)]
@@ -206,6 +216,12 @@ fn requested_signer_kind(flag: Option<SignerArg>) -> Option<SignerKind> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if terminal_logo::is_top_level_help(&arguments) {
+        terminal_logo::maybe_print_for_arguments(&arguments);
+        Cli::command().print_help()?;
+        return Ok(());
+    }
     // Silent by default hid a day of "NATS unreachable" from the LaunchAgent
     // log; RUST_LOG still overrides.
     tracing_subscriber::fmt()

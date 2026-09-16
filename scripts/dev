@@ -29,6 +29,8 @@ compose() {
 local_checks() {
   cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --locked
   cargo clippy --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --all-targets --locked -- -D warnings
+  cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --locked -p oshioki-hook -p oshioki-agent
+  "$REPO_ROOT/scripts/test-cli-help"
   npm --prefix "$REPO_ROOT/server/web" ci
   npm --prefix "$REPO_ROOT/server/web" test
   if [ "$(uname -s)" = Linux ]; then
