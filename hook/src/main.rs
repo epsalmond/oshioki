@@ -796,9 +796,7 @@ async fn execute_request_at(
     )
     .await?
     {
-        SocketOutcome::Verdict(bytes) => {
-            serde_json::from_slice(&bytes).context("decode socket decision")?
-        }
+        SocketOutcome::Verdict(bytes) => decode_socket_command_decision(&bytes)?,
         SocketOutcome::Unconfigured => match &nats_url {
             Some(url) => {
                 debug!("no agent socket configured; trying NATS");
@@ -1088,10 +1086,17 @@ enum SocketSilence {
 
 /// Ask the local agent over its Unix socket, if one is configured.
 ///
-/// Only a missing or unreachable socket, or an agent that hangs up before
-/// acknowledging falls back: in those cases no agent took responsibility for
-/// the request. A verdict, a malformed reply, or the deadline expiring while
-/// an agent holds the request is final and fails closed on error.
+/// A missing or unreachable socket, or an agent that hangs up before
+/// acknowledging, falls back: in those cases no agent took responsibility for
+/// the request. A decode fault -- a message this build does not recognize,
+/// garbage bytes, or a truncated frame, at either the acknowledgement or the
+/// verdict position -- is also not evidence of anything (issues #66 and #68):
+/// it comes back as `Err(ApprovalUnavailable)`, which leaves password
+/// fallback eligible instead of failing closed. A verdict that decodes but
+/// then fails its own shape or signature validation, an explicit `Deny`, or a
+/// message that decodes fine as the wrong kind for its position, all remain
+/// ordinary errors and keep failing closed exactly as before; the deadline
+/// expiring while an agent holds the request is also unavailable, not closed.
 ///
 /// A post-ack hangup is reported as `Dropped` rather than decided here. It is
 /// the one post-ack outcome in which no bytes arrived at all, so it carries no
@@ -1198,9 +1203,34 @@ async fn try_agent_socket(
             }));
         }
     };
-    let acknowledgement: oshioki_protocol::AliveV1 = serde_json::from_slice(&bytes).context(
-        "decode socket daemon acknowledgement; upgrade oshioki-agent before using this hook",
-    )?;
+    let acknowledgement = match oshioki_protocol::decode_control_message(&bytes) {
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(
+            oshioki_protocol::ControlMessageV1::Alive(alive),
+        )) => alive,
+        // A message decoded fine but is not an alive acknowledgement at the
+        // point in the exchange where one is required. That is evidence of a
+        // broken or cross-lane peer, not a local fault, so it keeps failing
+        // closed.
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => {
+            bail!("expected a socket daemon acknowledgement but got a different control message");
+        }
+        // A kind this build does not recognize is not evidence of anything:
+        // the caller has not yet been answered. Issue #66.
+        Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(kind)) => {
+            return Err(approval_unavailable(format!(
+                "socket daemon sent an unrecognized control message kind {kind:?} \
+                 before acknowledging"
+            )));
+        }
+        // A decode fault against the host's own local agent is a local
+        // software fault (version skew, a bug), not a denial. Issue #68.
+        Err(error) => {
+            return Err(approval_unavailable(format!(
+                "decode socket daemon acknowledgement: {error}; \
+                 upgrade oshioki-agent before using this hook"
+            )));
+        }
+    };
     acknowledgement.validate(request_id).context(
         "invalid socket daemon acknowledgement; upgrade oshioki-agent before using this hook",
     )?;
@@ -1226,26 +1256,33 @@ async fn try_agent_socket(
             });
         }
         Ok(Ok(Frame::Truncated)) => {
-            // Bytes arrived and did not form a frame. That is malformed input,
-            // not a silent disconnect, so it keeps the #68 treatment and fails
-            // closed on both lanes.
-            return Err(anyhow::anyhow!(
-                "agent sent a truncated decision frame after acknowledging"
+            // Bytes arrived and did not form a complete frame: framing
+            // corruption or a truncated write, not evidence about the
+            // request. Per #68 this is a local fault like a dropped socket,
+            // not a denial, so it leaves password fallback eligible instead
+            // of failing closed.
+            return Err(approval_unavailable(
+                "agent sent a truncated decision frame after acknowledging",
             ));
         }
         Ok(Err(error)) => {
             // A transport-level read failure (ECONNRESET, EPIPE, a socket
             // closed under us) is the same event as the EOF above: the
-            // connection went away. A framing error is not — those bytes
-            // arrived and did not decode, which stays a hard failure.
-            let Some(io_error) = error.downcast_ref::<io::Error>() else {
-                return Err(error);
-            };
-            let detail = io_error.to_string();
-            return Ok(SocketOutcome::Dropped {
-                path,
-                error: detail,
-            });
+            // connection went away.
+            if let Some(io_error) = error.downcast_ref::<io::Error>() {
+                let detail = io_error.to_string();
+                return Ok(SocketOutcome::Dropped {
+                    path,
+                    error: detail,
+                });
+            }
+            // Anything else here is `decode_frame_len` refusing a claimed
+            // length (oversized or otherwise malformed): bytes arrived and
+            // did not form a valid frame, the same local fault as
+            // `Frame::Truncated` above. Issue #68.
+            return Err(approval_unavailable(format!(
+                "agent sent a malformed decision frame after acknowledging: {error:#}"
+            )));
         }
         Err(_) => {
             return Err(approval_unavailable(
@@ -1313,6 +1350,54 @@ async fn read_frame(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<Fram
         Err(error) => return Err(error.into()),
     }
     Ok(Frame::Payload(payload))
+}
+
+/// Decode the socket's post-ack verdict as a command-approval `DecisionV1`.
+///
+/// A message that decodes fine as a different kind (an authentication
+/// decision, an alive, a delivery receipt) is evidence of a cross-lane bug
+/// and keeps failing closed. A message this build does not recognize, or one
+/// that fails to decode at all, is a local fault per issues #66 and #68 and
+/// leaves password fallback eligible instead.
+fn decode_socket_command_decision(bytes: &[u8]) -> Result<DecisionV1> {
+    match oshioki_protocol::decode_control_message(bytes) {
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(
+            oshioki_protocol::ControlMessageV1::Decision(decision),
+        )) => Ok(decision),
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => {
+            bail!("expected a socket decision but got a different control message")
+        }
+        Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(kind)) => {
+            Err(approval_unavailable(format!(
+                "socket agent sent an unrecognized control message kind {kind:?} instead of a decision"
+            )))
+        }
+        Err(error) => Err(approval_unavailable(format!(
+            "decode socket decision: {error}"
+        ))),
+    }
+}
+
+/// Decode the socket's post-ack verdict as a contextual `AuthDecisionV1`.
+/// See [`decode_socket_command_decision`] for the same reasoning applied to
+/// the authentication lane.
+fn decode_socket_auth_decision(bytes: &[u8]) -> Result<AuthDecisionV1> {
+    match oshioki_protocol::decode_control_message(bytes) {
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(
+            oshioki_protocol::ControlMessageV1::AuthDecision(decision),
+        )) => Ok(decision),
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => {
+            bail!("expected a socket authentication decision but got a different control message")
+        }
+        Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(kind)) => {
+            Err(approval_unavailable(format!(
+                "socket agent sent an unrecognized control message kind {kind:?} instead of an authentication decision"
+            )))
+        }
+        Err(error) => Err(approval_unavailable(format!(
+            "decode socket authentication decision: {error}"
+        ))),
+    }
 }
 
 /// Applies one decision to a request. Invalid decisions fail closed.
@@ -1972,8 +2057,7 @@ async fn await_auth_decision(
         match try_agent_socket(directory, &request.request_id, &payload, deadline, progress).await?
         {
             SocketOutcome::Verdict(bytes) => {
-                return serde_json::from_slice(&bytes)
-                    .context("decode socket authentication decision");
+                return decode_socket_auth_decision(&bytes);
             }
             SocketOutcome::Unconfigured => None,
             SocketOutcome::Silent(SocketSilence::NoAgent { path, error }) => {
@@ -3460,6 +3544,9 @@ mod tests {
             anyhow::Error::new(HookTransportFailure::Expired(
                 "request expired without a verdict".into(),
             )),
+            anyhow::Error::new(HookTransportFailure::Protocol(
+                "decode decision: missing field `action`".into(),
+            )),
         ];
         for error in unavailable {
             assert_eq!(
@@ -4453,8 +4540,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// This is issue #66/#68's own reported evidence: an old hook reading a
+    /// new agent's first frame as something it cannot decode. A decode fault
+    /// at the acknowledgement position is a local software fault (version
+    /// skew, a bug), not evidence the request was answered, so it leaves
+    /// password fallback eligible instead of denying sudo outright.
     #[tokio::test]
-    async fn malformed_socket_reply_fails_closed_without_fallback() {
+    async fn malformed_socket_reply_falls_back_to_password() {
         let dir = socket_test_dir("malformed");
         let socket_path = dir.join("agent.sock");
         socket_test_config(&dir, Some(&socket_path));
@@ -4465,20 +4557,109 @@ mod tests {
             AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
         });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        assert!(
-            try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
-                .await
-                .is_err()
+        let Err(error) = try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress()).await
+        else {
+            panic!("garbage acknowledgement was accepted")
+        };
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
         );
         serve.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Once an agent has acknowledged, a malformed verdict frame is a
-    /// terminal protocol failure. It cannot fall back to another transport or
-    /// become a password-eligible unavailable result.
+    /// An acknowledgement position message whose `type` this build does not
+    /// recognize is not evidence of anything -- a newer agent may add a
+    /// message kind an older hook predates -- so it is skipped rather than
+    /// treated as a decode error. Issue #66.
     #[tokio::test]
-    async fn malformed_socket_verdict_after_ack_fails_closed() {
+    async fn unrecognized_kind_before_acknowledging_falls_back_to_password() {
+        let dir = socket_test_dir("unknown-kind-ack");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let frame = oshioki_protocol::socket_v1::encode_frame(
+                br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#,
+            )
+            .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let Err(error) = try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress()).await
+        else {
+            panic!("unrecognized kind was accepted as an acknowledgement")
+        };
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same unrecognized-kind treatment at the verdict position, after a
+    /// real acknowledgement. Issue #66.
+    #[tokio::test]
+    async fn unrecognized_kind_after_acknowledging_falls_back_to_password() {
+        let dir = socket_test_dir("unknown-kind-verdict");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            AsyncReadExt::read_exact(&mut stream, &mut prefix)
+                .await
+                .unwrap();
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut request = vec![0u8; len];
+            AsyncReadExt::read_exact(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let alive = oshioki_protocol::AliveV1::for_request("req-1");
+            let alive_frame =
+                oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+                    .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &alive_frame)
+                .await
+                .unwrap();
+            let unknown_frame = oshioki_protocol::socket_v1::encode_frame(
+                br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#,
+            )
+            .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &unknown_frame)
+                .await
+                .unwrap();
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let error = match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress()).await
+        {
+            Ok(SocketOutcome::Verdict(bytes)) => {
+                decode_socket_command_decision(&bytes).expect_err("unrecognized kind was accepted")
+            }
+            Ok(_) => panic!("expected a verdict, got a different socket outcome"),
+            Err(error) => panic!("try_agent_socket failed before reaching the verdict: {error:#}"),
+        };
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once an agent has acknowledged, a malformed verdict frame is a local
+    /// software fault per #66/#68 -- not evidence that the request was
+    /// answered -- so it leaves password fallback eligible instead of
+    /// failing closed.
+    #[tokio::test]
+    async fn malformed_socket_verdict_after_ack_falls_back_to_password() {
         for (name, prefix) in [
             (
                 "oversized",
@@ -4510,19 +4691,17 @@ mod tests {
             // The frame layer and the verdict decode are separate steps, as
             // they are in `execute_request_at`: an oversized frame is
             // rejected by the reader, an empty one decodes to nothing. Both
-            // must reach the same closed-fail exit class.
-            let error = match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
-                .await
-            {
-                Err(error) => error,
-                Ok(SocketOutcome::Verdict(bytes)) => serde_json::from_slice::<DecisionV1>(&bytes)
-                    .context("decode socket decision")
-                    .expect_err("malformed verdict was accepted"),
-                Ok(_) => panic!("malformed {name} verdict was ignored"),
-            };
+            // must reach the same fallback-eligible exit class.
+            let error =
+                match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress()).await {
+                    Err(error) => error,
+                    Ok(SocketOutcome::Verdict(bytes)) => decode_socket_command_decision(&bytes)
+                        .expect_err("malformed verdict was accepted"),
+                    Ok(_) => panic!("malformed {name} verdict was ignored"),
+                };
             assert_eq!(
                 check_error_exit_code(&error),
-                CHECK_RC_DENIED,
+                CHECK_RC_UNAVAILABLE,
                 "{name}: {error:#}"
             );
             serve.await.unwrap();
@@ -6000,12 +6179,13 @@ mod auth_tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// The #68 boundary, on the other side of the same event: bytes that
-    /// arrive and do not decode as an `AuthDecisionV1` are evidence of a
-    /// broken or hostile peer and stay a hard failure, even though the same
+    /// The #66/#68 boundary, on the other side of the same event: bytes that
+    /// arrive and do not decode as any recognized control message are a
+    /// local software fault (version skew, a bug), not evidence of a denial,
+    /// so they leave password fallback eligible even though the same
     /// connection is dropped immediately afterwards.
     #[tokio::test]
-    async fn garbage_after_an_acknowledgement_still_fails_closed() {
+    async fn garbage_after_an_acknowledgement_falls_back_to_password() {
         let directory = auth_socket_dir("ack-garbage");
         let listener = tokio::net::UnixListener::bind(directory.join("agent.sock")).unwrap();
         let garbage = oshioki_protocol::socket_v1::encode_frame(b"{not a decision").unwrap();
@@ -6014,7 +6194,7 @@ mod auth_tests {
             execute_auth_request_at(auth_request(), Duration::from_secs(30), &directory, None)
                 .await
                 .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
         assert!(
             display_error(&error).contains("decode socket authentication decision"),
             "{error:#}"
@@ -6024,11 +6204,12 @@ mod auth_tests {
     }
 
     /// A frame that starts and does not finish is malformed input, not a
-    /// dropped connection: bytes arrived and did not form a decision. It must
-    /// stay on the closed-fail side of the #68 boundary even though the
-    /// connection also goes away immediately afterwards.
+    /// dropped connection: bytes arrived and did not form a decision. Per
+    /// #68 that is a local fault like a dropped socket, not a denial, so it
+    /// leaves password fallback eligible even though the connection also
+    /// goes away immediately afterwards.
     #[tokio::test]
-    async fn a_truncated_frame_after_an_acknowledgement_still_fails_closed() {
+    async fn a_truncated_frame_after_an_acknowledgement_falls_back_to_password() {
         for (name, trailing) in [
             ("partial-prefix", vec![0u8, 0u8]),
             ("missing-payload", vec![0u8, 0u8, 0u8, 32u8]),
@@ -6041,7 +6222,11 @@ mod auth_tests {
                 execute_auth_request_at(auth_request(), Duration::from_secs(30), &directory, None)
                     .await
                     .unwrap_err();
-            assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED, "{name}");
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_UNAVAILABLE,
+                "{name}"
+            );
             assert!(
                 display_error(&error).contains("truncated decision frame"),
                 "{name}: {error:#}"
@@ -6079,7 +6264,7 @@ mod auth_tests {
             .unwrap_err();
         assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
         assert!(
-            display_error(&error).contains("decode socket authentication decision"),
+            display_error(&error).contains("different control message"),
             "{error:#}"
         );
         serve.await.unwrap();
