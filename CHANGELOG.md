@@ -11,9 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The legacy sudo approval plugin's password-race `SIGINT` guard now saves
   and restores the complete disposition with `sigaction` instead of
-  `signal`, so a handler's flags (e.g. `SA_RESTART`) and blocked-signal mask
-  installed by sudo are no longer silently dropped and reinstalled bare on
-  every exit path -- approval, denial, cancellation, timeout, or error.
+  `signal`, on every exit path -- approval, denial, cancellation, timeout, or
+  error. glibc's `signal` has BSD semantics and re-applies `SA_RESTART` on
+  install and restore, so that flag was not actually being lost; what it
+  silently dropped was the blocked-signal mask and any other flag, most
+  dangerously `SA_SIGINFO` -- a three-argument `sa_sigaction` handler
+  restored through `signal` comes back registered as a one-argument
+  `sa_handler`, which is called with the wrong signature.
 - The legacy plugin's password fallback resolves the real terminal behind
   its open descriptor with `ttyname_r` and passes that path (e.g.
   `/dev/pts/3`) as `PAM_TTY`, instead of always passing the literal string
