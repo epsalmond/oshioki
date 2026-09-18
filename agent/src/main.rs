@@ -859,25 +859,35 @@ async fn resolve_command_claim(
     opened: &OpenedRequest,
     payload_hash: [u8; 32],
 ) -> Result<Option<DecisionV1>> {
-    let claim = match claim {
-        Claim::Duplicate => return Ok(None),
-        Claim::Owner(lease) => Claim::Owner(lease),
-        Claim::Attach(mut waiter) => match waiter.wait(opened.request.expires_at).await {
-            Relay::Answer(outcome) => {
-                return Ok(match outcome.as_ref() {
-                    RequestOutcome::Command(decision) => Some(decision.as_ref().clone()),
-                    // The two lanes claim under separate keys, so an
-                    // authentication answer can never surface here; relaying
-                    // nothing is the only safe reading of one that did.
-                    RequestOutcome::Authentication(_) | RequestOutcome::Unanswered => None,
-                });
+    // Each turn of this loop either ends with an answer or hands the claim on.
+    // Taking a claim over needs the previous owner to have died holding it, so
+    // the loop cannot spin: it follows the request, it does not retry it.
+    let mut claim = claim;
+    let lease = loop {
+        match claim {
+            Claim::Duplicate => return Ok(None),
+            Claim::Owner(lease) => break lease,
+            Claim::Attach(mut waiter) => {
+                claim = match waiter.wait(opened.request.expires_at).await {
+                    Relay::Answer(outcome) => {
+                        return Ok(match outcome.as_ref() {
+                            RequestOutcome::Command(decision) => Some(decision.as_ref().clone()),
+                            // The two lanes claim under separate keys, so an
+                            // authentication answer can never surface here;
+                            // relaying nothing is the only safe reading of one
+                            // that did.
+                            RequestOutcome::Authentication(_) | RequestOutcome::Unanswered => None,
+                        });
+                    }
+                    Relay::Expired => return Ok(None),
+                    // The owner died holding the request. Whoever holds it now
+                    // — this lane, or a delivery that got there first — is the
+                    // one this lane waits on, so no transport is left
+                    // unanswered.
+                    Relay::Abandoned => waiter.reclaim(&opened.request.request_id, payload_hash),
+                };
             }
-            Relay::Expired => return Ok(None),
-            Relay::Abandoned => waiter.reclaim(&opened.request.request_id, payload_hash),
-        },
-    };
-    let Claim::Owner(lease) = claim else {
-        return Ok(None);
+        }
     };
     let decision = decide(identity, decider, opened).await?;
     lease.answered(match &decision {
@@ -983,24 +993,28 @@ async fn resolve_authentication_claim(
     opened: &OpenedAuthRequestV1,
     payload_hash: [u8; 32],
 ) -> Result<Option<AuthDecisionV1>> {
-    let claim = match claim {
-        Claim::Duplicate => return Ok(None),
-        Claim::Owner(lease) => Claim::Owner(lease),
-        Claim::Attach(mut waiter) => match waiter.wait(opened.request.expires_at).await {
-            Relay::Answer(outcome) => {
-                return Ok(match outcome.as_ref() {
-                    RequestOutcome::Authentication(decision) => Some(decision.as_ref().clone()),
-                    RequestOutcome::Command(_) | RequestOutcome::Unanswered => None,
-                });
+    let mut claim = claim;
+    let lease = loop {
+        match claim {
+            Claim::Duplicate => return Ok(None),
+            Claim::Owner(lease) => break lease,
+            Claim::Attach(mut waiter) => {
+                claim = match waiter.wait(opened.request.expires_at).await {
+                    Relay::Answer(outcome) => {
+                        return Ok(match outcome.as_ref() {
+                            RequestOutcome::Authentication(decision) => {
+                                Some(decision.as_ref().clone())
+                            }
+                            RequestOutcome::Command(_) | RequestOutcome::Unanswered => None,
+                        });
+                    }
+                    Relay::Expired => return Ok(None),
+                    Relay::Abandoned => {
+                        waiter.reclaim(&auth_dedupe_key(&opened.request.request_id), payload_hash)
+                    }
+                };
             }
-            Relay::Expired => return Ok(None),
-            Relay::Abandoned => {
-                waiter.reclaim(&auth_dedupe_key(&opened.request.request_id), payload_hash)
-            }
-        },
-    };
-    let Claim::Owner(lease) = claim else {
-        return Ok(None);
+        }
     };
     let decision = decide_authentication(identity, decider, opened).await?;
     lease.answered(match &decision {
@@ -2388,6 +2402,52 @@ mod tests {
             waiter.reclaim("request-abandoned", body),
             Claim::Owner(_)
         ));
+    }
+
+    /// And when another delivery took the abandoned request over first, the
+    /// waiter attaches to that new owner instead of being left with nothing
+    /// to deliver: whichever transport the hook is listening on still gets
+    /// the answer.
+    #[tokio::test]
+    async fn a_waiter_attaches_to_whoever_took_the_abandoned_request_over() {
+        let admission = RequestAdmission::new();
+        let body = payload_hash(b"one body");
+        let Claim::Owner(owner) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-taken-over", body)
+        else {
+            panic!("an unclaimed id belongs to the lane that claims it");
+        };
+        let Claim::Attach(mut waiter) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-taken-over", body)
+        else {
+            panic!("a retry for an in-flight request must attach to it");
+        };
+        drop(owner);
+        assert!(matches!(waiter.wait(now() + 60).await, Relay::Abandoned));
+
+        let Claim::Owner(successor) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-taken-over", body)
+        else {
+            panic!("an abandoned request belongs to the next lane that claims it");
+        };
+        let Claim::Attach(mut waiter) = waiter.reclaim("request-taken-over", body) else {
+            panic!("the waiter must attach to the lane that now holds the request");
+        };
+        let decision = test_decision("request-taken-over");
+        successor.answered(RequestOutcome::Command(Box::new(decision.clone())));
+        match waiter.wait(now() + 60).await {
+            Relay::Answer(outcome) => match outcome.as_ref() {
+                RequestOutcome::Command(relayed) => assert_eq!(relayed.as_ref(), &decision),
+                other => panic!("expected the successor's decision, got {other:?}"),
+            },
+            _ => panic!("the successor answered; the waiter must see that answer"),
+        }
     }
 
     /// The same reconciliation across the real socket lane: the socket holds

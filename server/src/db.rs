@@ -1296,7 +1296,8 @@ impl Store {
     /// refused before it can queue a second one.
     pub fn expire_stale_deliveries(&self, now: i64) -> Result<usize> {
         let dropped = self.lock()?.execute(
-            "DELETE FROM outbox WHERE sent_at IS NULL AND expires_at IS NOT NULL AND expires_at<=?1",
+            "DELETE FROM outbox WHERE kind='delivery' AND sent_at IS NULL
+             AND expires_at IS NOT NULL AND expires_at<=?1",
             [now],
         )?;
         Ok(dropped)
@@ -2181,6 +2182,18 @@ COMMIT;
         let live_raw = serde_json::to_vec(&live).unwrap();
         store.ingest_request(&live_raw, &live, 200).unwrap();
 
+        // A row of another kind carrying a deadline: only receipts expire,
+        // whatever else a future lane may date its rows with.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at, expires_at)
+                 VALUES ('decision', 'request-dated', 'oshioki.verdict.request-dated', x'7b7d', 20, 110)",
+                [],
+            )
+            .unwrap();
+
         store.expire_stale_deliveries(200).unwrap();
         let pending = store.pending_verdicts(10).unwrap();
         assert!(
@@ -2189,6 +2202,12 @@ COMMIT;
                 .all(|item| item.subject != "oshioki.delivery.request-1"),
             "a receipt past its request deadline is not worth delivering"
         );
+        assert!(
+            pending
+                .iter()
+                .any(|item| item.subject == "oshioki.verdict.request-dated"),
+            "expiry is keyed on the receipt lane, not on carrying a deadline"
+        );
         assert_eq!(
             pending
                 .iter()
@@ -2196,7 +2215,11 @@ COMMIT;
                 .collect::<Vec<_>>(),
             // The verdict for the dead request stays: expiry is for receipts
             // only, and a verdict is delivered whenever it can be.
-            vec!["oshioki.verdict.request-1", "oshioki.delivery.request-live"],
+            vec![
+                "oshioki.verdict.request-1",
+                "oshioki.delivery.request-live",
+                "oshioki.verdict.request-dated",
+            ],
             "the live receipt must not queue behind the outage backlog"
         );
     }

@@ -30,9 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The server state database moves to schema V3, which adds the receipt deadline
-  to the outbox. The upgrade runs in place on first start; rows queued before
-  it carry no deadline and are delivered as they always were.
+- The database schema advances to version 3 (the outbox gains the deadline a
+  delivery receipt is worth delivering until), applied automatically the next
+  time the server opens its database. Rows queued before the upgrade carry no
+  deadline and are delivered as they always were. **Back up the server database
+  before upgrading**: the upgrade is one way, so rolling back to an older binary
+  afterward requires restoring that backup, since older binaries refuse a
+  database at a newer schema version.
 
 ## [0.1.13] - 2026-09-13
 
