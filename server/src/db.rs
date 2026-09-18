@@ -109,9 +109,14 @@ impl Store {
             0 => {
                 connection.execute_batch(MIGRATION_V1)?;
                 connection.execute_batch(MIGRATION_V2)?;
+                connection.execute_batch(MIGRATION_V3)?;
             }
-            1 => connection.execute_batch(MIGRATION_V2)?,
-            2 => {}
+            1 => {
+                connection.execute_batch(MIGRATION_V2)?;
+                connection.execute_batch(MIGRATION_V3)?;
+            }
+            2 => connection.execute_batch(MIGRATION_V3)?,
+            3 => {}
             newer => bail!("unsupported database schema version {newer}"),
         }
         Ok(Self {
@@ -125,6 +130,7 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.execute_batch(MIGRATION_V1)?;
         connection.execute_batch(MIGRATION_V2)?;
+        connection.execute_batch(MIGRATION_V3)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -133,7 +139,7 @@ impl Store {
     pub fn ready(&self) -> Result<()> {
         let connection = self.lock()?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 2 {
+        if version != 3 {
             bail!("unsupported database schema version {version}");
         }
         Ok(())
@@ -676,12 +682,13 @@ impl Store {
         if has_active_browser {
             let delivery = serde_json::to_vec(&DeliveryV1::for_request(&envelope.request_id))?;
             transaction.execute(
-                "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at)
-                 VALUES ('delivery', ?1, ?2, ?3, unixepoch())",
+                "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at, expires_at)
+                 VALUES ('delivery', ?1, ?2, ?3, unixepoch(), ?4)",
                 params![
                     envelope.request_id,
                     format!("oshioki.delivery.{}", envelope.request_id),
-                    delivery
+                    delivery,
+                    envelope.expires_at
                 ],
             )?;
         }
@@ -793,12 +800,13 @@ impl Store {
         if has_active_browser {
             let delivery = serde_json::to_vec(&DeliveryV1::for_request(&envelope.request_id))?;
             transaction.execute(
-                "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at)
-                 VALUES ('delivery', ?1, ?2, ?3, unixepoch())",
+                "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at, expires_at)
+                 VALUES ('delivery', ?1, ?2, ?3, unixepoch(), ?4)",
                 params![
                     envelope.request_id,
                     format!("oshioki.delivery.{}", envelope.request_id),
-                    delivery
+                    delivery,
+                    envelope.expires_at
                 ],
             )?;
         }
@@ -1271,6 +1279,29 @@ impl Store {
         }))
     }
 
+    /// Drops undelivered rows whose request deadline has passed.
+    ///
+    /// Only browser delivery receipts carry a deadline. A receipt says a
+    /// relay committed a request to an enrolled browser while that request
+    /// could still be answered; past its deadline it says nothing anyone can
+    /// act on. The lane drains in id order, so after a NATS outage a backlog
+    /// of dead receipts would sit in front of the live request the hook is
+    /// waiting on, which is exactly the delay this removes. Verdicts and
+    /// enrollment relays carry no deadline and are never touched: a verdict
+    /// is delivered whenever it can be.
+    ///
+    /// Dropping the row rather than marking it keeps request idempotency
+    /// intact: the row is the receipt's one-per-request guard only while the
+    /// request is still ingestible, and an envelope past its deadline is
+    /// refused before it can queue a second one.
+    pub fn expire_stale_deliveries(&self, now: i64) -> Result<usize> {
+        let dropped = self.lock()?.execute(
+            "DELETE FROM outbox WHERE sent_at IS NULL AND expires_at IS NOT NULL AND expires_at<=?1",
+            [now],
+        )?;
+        Ok(dropped)
+    }
+
     pub fn mark_outbox_sent(&self, id: i64) -> Result<()> {
         self.lock()?.execute(
             "UPDATE outbox SET sent_at=unixepoch(), attempts=attempts+1 WHERE id=?1",
@@ -1280,6 +1311,7 @@ impl Store {
     }
 
     pub fn cleanup(&self, now: i64) -> Result<()> {
+        self.expire_stale_deliveries(now)?;
         let connection = self.lock()?;
         connection.execute(
             "UPDATE enrollments SET status='expired' WHERE status='pending' AND expires_at<=?1",
@@ -1399,6 +1431,20 @@ CREATE INDEX IF NOT EXISTS auth_requests_expiry_idx ON auth_requests(expires_at)
 CREATE INDEX IF NOT EXISTS auth_requests_created_idx ON auth_requests(created_at);
 CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox(sent_at, id);
 PRAGMA user_version = 1;
+COMMIT;
+";
+
+/// Adds the deadline an outbox row is worth delivering until.
+///
+/// `ALTER TABLE ... ADD COLUMN` is not idempotent, so unlike V1 and V2 this
+/// step runs exactly once, on the 2 -> 3 upgrade. The column is nullable and
+/// only browser delivery receipts carry a value: a verdict or an enrollment
+/// relay has no deadline of its own and is delivered whenever it can be.
+const MIGRATION_V3: &str = r"
+BEGIN IMMEDIATE;
+ALTER TABLE outbox ADD COLUMN expires_at INTEGER;
+CREATE INDEX IF NOT EXISTS outbox_expiry_idx ON outbox(sent_at, expires_at);
+PRAGMA user_version = 3;
 COMMIT;
 ";
 
@@ -1656,7 +1702,7 @@ COMMIT;
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         drop(store);
         {
             let connection = Connection::open(&path).unwrap();
@@ -2053,6 +2099,105 @@ COMMIT;
                 .unwrap()
                 .iter()
                 .any(|item| item.subject == "oshioki.delivery.request-legacy")
+        );
+    }
+
+    /// #59: a NATS outage leaves the outbox holding receipts for requests
+    /// that died while it was down. The lane drains in id order, so those
+    /// receipts would sit in front of the one the hook is waiting on now.
+    /// A database carrying the V2 schema gains the receipt deadline in
+    /// place, keeps the rows it already held, and dates the receipts it
+    /// queues from then on. Rows written before the upgrade have no deadline
+    /// and are delivered as they always were.
+    #[test]
+    fn a_v2_database_gains_the_receipt_deadline_in_place() {
+        let path = temporary_database();
+        remove_database(&path);
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(MIGRATION_V1).unwrap();
+            old.execute_batch(MIGRATION_V2).unwrap();
+            old.execute(
+                "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at)
+                 VALUES ('delivery', 'request-before', 'oshioki.delivery.request-before', x'7b7d', 20)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        store.ready().unwrap();
+        let version: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+
+        let browser = device(b"upgrade-token");
+        store.put_device(&browser).unwrap();
+        let envelope = envelope(&browser.fingerprint);
+        store
+            .ingest_request(&serde_json::to_vec(&envelope).unwrap(), &envelope, 20)
+            .unwrap();
+        store.expire_stale_deliveries(200).unwrap();
+        let pending = store.pending_verdicts(10).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|item| item.subject.as_str())
+                .collect::<Vec<_>>(),
+            // The row from before the upgrade carries no deadline, so it is
+            // not expired; the one queued after it is, at 110.
+            vec!["oshioki.delivery.request-before"]
+        );
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn expired_delivery_receipts_do_not_delay_live_ones() {
+        let store = Store::memory().unwrap();
+        let browser = device(b"outage-token");
+        store.put_device(&browser).unwrap();
+        let stale = envelope(&browser.fingerprint);
+        let stale_raw = serde_json::to_vec(&stale).unwrap();
+        store.ingest_request(&stale_raw, &stale, 20).unwrap();
+        // A verdict for that same dead request: it is not a receipt and must
+        // still be delivered whenever the transport comes back.
+        let decision = DecisionV1::Deny(DenyV1 {
+            version: 1,
+            request_id: stale.request_id.clone(),
+            device_fingerprint: browser.fingerprint.clone(),
+            signature: None,
+        });
+        store
+            .queue_decision(&stale.request_id, &browser.fingerprint, &decision, 30)
+            .unwrap();
+
+        let mut live = envelope(&browser.fingerprint);
+        live.request_id = "request-live".into();
+        live.issued_at = 200;
+        live.expires_at = 260;
+        let live_raw = serde_json::to_vec(&live).unwrap();
+        store.ingest_request(&live_raw, &live, 200).unwrap();
+
+        store.expire_stale_deliveries(200).unwrap();
+        let pending = store.pending_verdicts(10).unwrap();
+        assert!(
+            pending
+                .iter()
+                .all(|item| item.subject != "oshioki.delivery.request-1"),
+            "a receipt past its request deadline is not worth delivering"
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .map(|item| item.subject.as_str())
+                .collect::<Vec<_>>(),
+            // The verdict for the dead request stays: expiry is for receipts
+            // only, and a verdict is delivered whenever it can be.
+            vec!["oshioki.verdict.request-1", "oshioki.delivery.request-live"],
+            "the live receipt must not queue behind the outage backlog"
         );
     }
 
