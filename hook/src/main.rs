@@ -1181,19 +1181,30 @@ async fn try_agent_socket(
     }
     drop(writer);
     // A kind this build does not recognize before acknowledging is not
-    // evidence of anything: read another frame instead of failing, bounded
-    // by the same deadline. Issue #66.
+    // evidence of anything: read another frame instead of failing. The wait
+    // for the *first* acknowledgement is still one DAEMON_ACK_TIMEOUT window
+    // (or whatever is left of the outer deadline, if shorter) measured from
+    // here, not reset on every frame -- otherwise a peer drip-feeding
+    // unknown-kind frames faster than the timeout could hold the socket for
+    // the whole approval deadline instead of the short ack budget. Running
+    // out of that budget is `NoAck`, exactly like any other pre-ack silence:
+    // no agent has taken responsibility yet, so the caller still tries NATS
+    // when one is configured. Issue #66.
+    let ack_deadline = deadline.min(tokio::time::Instant::now() + DAEMON_ACK_TIMEOUT);
     let acknowledgement = loop {
-        let remaining = deadline
+        let remaining = ack_deadline
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or(Duration::ZERO);
         if remaining.is_zero() {
-            return Err(approval_unavailable(
-                "sudo decision deadline exceeded waiting for the local agent",
-            ));
+            return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                path,
+                error: format!(
+                    "daemon acknowledgement timed out after {}ms",
+                    DAEMON_ACK_TIMEOUT.as_millis()
+                ),
+            }));
         }
-        let ack_wait = remaining.min(DAEMON_ACK_TIMEOUT);
-        let bytes = match tokio::time::timeout(ack_wait, read_frame(&mut reader)).await {
+        let bytes = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
             Ok(Ok(Frame::Payload(bytes))) => bytes,
             // Before an acknowledgement, a clean hangup and a half-sent frame mean
             // the same thing: nothing took responsibility for the request, so the
@@ -1216,7 +1227,7 @@ async fn try_agent_socket(
                     path,
                     error: format!(
                         "daemon acknowledgement timed out after {}ms",
-                        ack_wait.as_millis()
+                        DAEMON_ACK_TIMEOUT.as_millis()
                     ),
                 }));
             }
@@ -4888,50 +4899,30 @@ mod tests {
     /// (`execute_request_at`) is the one that turns that into
     /// `CHECK_RC_UNAVAILABLE`. An empty payload is a well-formed frame whose
     /// content does not decode as anything, so it fails directly out of
-    /// `try_agent_socket`.
+    /// `try_agent_socket`. Routed through `execute_request_at` end to end,
+    /// not reconstructed from the outcome, so this exercises the real
+    /// `Dropped`/decode-fault arms rather than asserting a value this test
+    /// built itself.
     #[tokio::test]
     async fn malformed_socket_verdict_after_ack_falls_back_to_password() {
-        for (name, prefix) in [
+        for (name, after_ack) in [
             (
                 "oversized",
                 u32::try_from(oshioki_protocol::socket_v1::MAX_FRAME_BYTES + 1)
                     .unwrap()
-                    .to_be_bytes(),
+                    .to_be_bytes()
+                    .to_vec(),
             ),
-            ("empty", 0u32.to_be_bytes()),
+            ("empty", 0u32.to_be_bytes().to_vec()),
         ] {
-            let dir = socket_test_dir(name);
+            let (dir, request) = decided_test_dir(name);
             let socket_path = dir.join("agent.sock");
-            socket_test_config(&dir, Some(&socket_path));
-            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-            let serve = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request_prefix = [0u8; 4];
-                stream.read_exact(&mut request_prefix).await.unwrap();
-                let request_len = u32::from_be_bytes(request_prefix) as usize;
-                let mut request = vec![0u8; request_len];
-                stream.read_exact(&mut request).await.unwrap();
-                let alive = oshioki_protocol::AliveV1::for_request("req-1");
-                let alive_frame =
-                    oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
-                        .unwrap();
-                stream.write_all(&alive_frame).await.unwrap();
-                stream.write_all(&prefix).await.unwrap();
-            });
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            // The frame layer and the verdict decode are separate steps, as
-            // they are in `execute_request_at`: an oversized frame is
-            // rejected by the reader, an empty one decodes to nothing. Both
-            // must reach the same fallback-eligible exit class once routed
-            // the way `execute_request_at` routes them.
-            let error =
-                match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress()).await {
-                    Err(error) => error,
-                    Ok(SocketOutcome::Dropped { error, .. }) => approval_unavailable(error),
-                    Ok(SocketOutcome::Verdict(bytes)) => decode_socket_command_decision(&bytes)
-                        .expect_err("malformed verdict was accepted"),
-                    Ok(_) => panic!("malformed {name} verdict was ignored"),
-                };
+            socket_test_config_no_nats(&dir, Some(&socket_path));
+            let listener = hangup_listener(&socket_path);
+            let serve = tokio::spawn(acknowledged_then_stub(listener, after_ack));
+            let error = execute_request_at(request, Duration::from_secs(30), &dir, false)
+                .await
+                .unwrap_err();
             assert_eq!(
                 check_error_exit_code(&error),
                 CHECK_RC_UNAVAILABLE,
@@ -4948,58 +4939,38 @@ mod tests {
     /// `Frame::Truncated` both carry zero evidence about the request, so
     /// `try_agent_socket` must produce the identical `SocketOutcome::Dropped`
     /// classification for both, and every caller's exit code for `Dropped`
-    /// must therefore be identical too. Issues #66 and #68.
+    /// must therefore be identical too. Routed through `execute_request_at`
+    /// end to end (not reconstructed from the outcome by the test) so this
+    /// exercises the real `Dropped` arm rather than asserting a value this
+    /// test built itself. Issues #66 and #68.
     #[tokio::test]
     async fn eof_and_truncated_after_ack_produce_the_same_outcome() {
-        async fn dropped_error(after_ack: Vec<u8>, name: &str) -> anyhow::Error {
-            let dir = socket_test_dir(name);
+        async fn dropped_exit_code(after_ack: Vec<u8>, name: &str) -> (i32, anyhow::Error) {
+            let (dir, request) = decided_test_dir(name);
             let socket_path = dir.join("agent.sock");
-            socket_test_config(&dir, Some(&socket_path));
-            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-            let serve = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request_prefix = [0u8; 4];
-                stream.read_exact(&mut request_prefix).await.unwrap();
-                let request_len = u32::from_be_bytes(request_prefix) as usize;
-                let mut request = vec![0u8; request_len];
-                stream.read_exact(&mut request).await.unwrap();
-                let alive = oshioki_protocol::AliveV1::for_request("req-1");
-                let alive_frame =
-                    oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
-                        .unwrap();
-                stream.write_all(&alive_frame).await.unwrap();
-                if !after_ack.is_empty() {
-                    stream.write_all(&after_ack).await.unwrap();
-                }
-                // Dropping `stream` here closes the connection, whether or
-                // not any trailing bytes were written above.
-            });
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            let error =
-                match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress()).await {
-                    Ok(SocketOutcome::Dropped { error, .. }) => approval_unavailable(error),
-                    other => panic!("{name}: expected SocketOutcome::Dropped, got {other:?}"),
-                };
+            socket_test_config_no_nats(&dir, Some(&socket_path));
+            let listener = hangup_listener(&socket_path);
+            let serve = tokio::spawn(acknowledged_then_stub(listener, after_ack));
+            let error = execute_request_at(request, Duration::from_secs(30), &dir, false)
+                .await
+                .unwrap_err();
             serve.await.unwrap();
             let _ = std::fs::remove_dir_all(&dir);
-            error
+            let code = check_error_exit_code(&error);
+            (code, error)
         }
 
-        let eof_error = dropped_error(Vec::new(), "eof-drop").await;
+        let (eof_code, eof_error) = dropped_exit_code(Vec::new(), "eof-drop").await;
         // A truncated frame: a length prefix claiming 32 bytes with none of
         // the payload sent.
-        let truncated_error = dropped_error(vec![0u8, 0u8, 0u8, 32u8], "truncated-drop").await;
+        let (truncated_code, truncated_error) =
+            dropped_exit_code(vec![0u8, 0u8, 0u8, 32u8], "truncated-drop").await;
 
         assert_eq!(
-            check_error_exit_code(&eof_error),
-            check_error_exit_code(&truncated_error),
+            eof_code, truncated_code,
             "eof: {eof_error:#}\ntruncated: {truncated_error:#}"
         );
-        assert_eq!(
-            check_error_exit_code(&eof_error),
-            CHECK_RC_UNAVAILABLE,
-            "{eof_error:#}"
-        );
+        assert_eq!(eof_code, CHECK_RC_UNAVAILABLE, "{eof_error:#}");
     }
 
     #[tokio::test]
@@ -5211,6 +5182,33 @@ mod tests {
         tokio::net::UnixListener::bind(socket_path).unwrap()
     }
 
+    /// A stub agent that acknowledges the real request (reading it off the
+    /// wire so the acknowledgement's `request_id` actually matches) and then
+    /// writes `after_ack` before disconnecting. Empty `after_ack` is a clean
+    /// post-ack hangup (`Frame::Eof`); a partial length prefix is a
+    /// truncated frame; an oversized claimed length is framing corruption
+    /// `decode_frame_len` refuses; a valid zero-length frame is a
+    /// well-formed frame whose content does not decode as anything. Every
+    /// one of these is a host-local fault per issues #66 and #68.
+    async fn acknowledged_then_stub(listener: tokio::net::UnixListener, after_ack: Vec<u8>) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let length = oshioki_protocol::socket_v1::decode_frame_len(prefix).unwrap();
+        let mut request = vec![0u8; length];
+        stream.read_exact(&mut request).await.unwrap();
+        let request: oshioki_protocol::RequestEnvelopeV1 =
+            serde_json::from_slice(&request).unwrap();
+        let alive = oshioki_protocol::AliveV1::for_request(&request.request_id);
+        let frame = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+            .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        if !after_ack.is_empty() {
+            stream.write_all(&after_ack).await.unwrap();
+        }
+        stream.flush().await.unwrap();
+    }
+
     /// Socket-only hangup denies at once with no NATS attempt: nothing else
     /// could answer, so waiting out the deadline would only stall the sudo.
     #[tokio::test]
@@ -5308,6 +5306,77 @@ mod tests {
         );
         assert!(!text.contains("NATS_PASS"), "{text}");
         serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer that only ever sends unknown-kind frames before acknowledging
+    /// must not be able to hold the socket for the whole approval deadline
+    /// by drip-feeding them faster than a per-iteration timeout: the ack
+    /// phase is one fixed `DAEMON_ACK_TIMEOUT` window from the first read,
+    /// so running it out is `NoAck`, and (unlike the old `Err` this used to
+    /// return) `execute_request_at` still tries NATS afterwards. Issue #66.
+    #[tokio::test]
+    async fn unrecognized_kinds_past_the_ack_timeout_still_try_nats() {
+        let (dir, request) = decided_test_dir("unknown-kind-ack-timeout");
+        let socket_path = dir.join("agent.sock");
+        let port = closed_loopback_port();
+        std::fs::write(
+            dir.join("config.env"),
+            format!(
+                "NATS_URL=nats://127.0.0.1:{port}\nOSHIOKI_AGENT_SOCKET={}\n",
+                socket_path.display()
+            ),
+        )
+        .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            AsyncReadExt::read_exact(&mut stream, &mut prefix)
+                .await
+                .unwrap();
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut request = vec![0u8; len];
+            AsyncReadExt::read_exact(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let unknown_frame = oshioki_protocol::socket_v1::encode_frame(
+                br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#,
+            )
+            .unwrap();
+            // Every 300ms is faster than any single read's own timeout would
+            // be if it were still capped per iteration, so this only ends at
+            // DAEMON_ACK_TIMEOUT if the ack budget is a fixed window rather
+            // than reset on every frame.
+            for _ in 0..12 {
+                if AsyncWriteExt::write_all(&mut stream, &unknown_frame)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = execute_request_at(request, Duration::from_secs(30), &dir, false)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= DAEMON_ACK_TIMEOUT,
+            "ack timeout fired early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < DAEMON_ACK_TIMEOUT + Duration::from_secs(3),
+            "ack timeout should fire close to DAEMON_ACK_TIMEOUT, not wait out all 12 frames: {elapsed:?}"
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("NATS fallback to nats://127.0.0.1:{port} failed")),
+            "NoAck must still try NATS: {text}"
+        );
+        serve.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
