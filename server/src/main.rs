@@ -63,6 +63,7 @@ const MAX_HTTP_BODY: usize = 3 * 1024 * 1024;
 /// and refusing it before reading a byte keeps one request from eating the
 /// server's memory.
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /// How many artifact streams run at once; the rest get 503. Streaming bounds
 /// each response to its buffer, and this bounds their count (and open files).
@@ -1599,7 +1600,10 @@ async fn dist_response(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
     Ok(response)
 }
 
@@ -1629,7 +1633,10 @@ fn asset(content_type: &str, body: &[u8], immutable: bool) -> Response {
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
     response
 }
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
@@ -1651,7 +1658,10 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert("content-security-policy", HeaderValue::from_static("default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
     response
 }
 fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
@@ -1793,6 +1803,19 @@ mod tests {
         assert_eq!(body["web_push"]["worker_running"], false);
         assert!(body["push_worker_age_seconds"].as_i64().unwrap() >= 31);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn setup_page_csp_allows_same_origin_manifest() {
+        let response = setup_page().await;
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("csp")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("manifest-src 'self'"));
     }
 
     #[tokio::test]

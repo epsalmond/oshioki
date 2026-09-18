@@ -239,20 +239,12 @@ async function enablePushForDevice(device) {
     if (!oldDevice || !settings.pushSubscriptionId) {
       throw new Error("notification ownership is unavailable; revoke the old device before re-enrolling");
     }
-    // The old bearer must remove its own registration before this browser
-    // origin can be assigned to a new enrolled device.
-    // A 401 means the old device was explicitly revoked; a 404 means its
-    // local subscription record is stale. Both still require local
-    // unsubscribe and a fresh endpoint below, never endpoint takeover.
+    // Do not reuse the old endpoint; the new bearer needs a fresh subscription.
     retiredEndpoint = subscription?.endpoint;
     await deletePushSubscription(oldDevice, settings.pushSubscriptionId);
     if (subscription && !(await subscription.unsubscribe())) throw new Error("could not remove the old browser subscription");
     subscription = null;
     await clearPushOwner();
-    // A revoked old device returns 401 because its bearer is no longer
-    // accepted. The local PushManager subscription still belongs to that
-    // device, so it must be unsubscribed and replaced before registration.
-    // Never let the new bearer take over the old endpoint.
   } else if (!settings.pushOwnerFingerprint && subscription) {
     // A subscription with no recorded owner could belong to another device
     // from a lost browser profile. Never attempt an endpoint takeover.
