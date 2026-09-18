@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A protocol decode fault against the host's own local agent -- version
+  skew, a truncated frame, garbage bytes -- no longer denies sudo outright.
+  It now maps to the same `CHECK_RC_UNAVAILABLE` path as a dropped socket or
+  an unreachable transport, leaving PAM's password fallback eligible on
+  Linux instead of locking the user out. This covers the socket
+  acknowledgement and post-acknowledgement verdict frames in `hook`'s
+  `try_agent_socket`, and the equivalent NATS acknowledgement, delivery
+  receipt, and decision decodes in `oshioki-transport`. An explicit `Deny`,
+  a verdict that decodes but fails shape or signature validation, and a
+  message that decodes fine as the wrong kind for its position (e.g. a
+  command-approval decision arriving on the authentication socket) are
+  unaffected and continue to fail closed: none of those is a decode fault.
+  (#68)
+- Control messages on the channels the liveness acknowledgement and the
+  signed verdict share -- the socket frame stream after the request
+  envelope, and the equivalent NATS acknowledgement subject -- are now
+  checked by kind before a reader commits to a type-specific decode. A kind
+  this build does not recognize (for example a message type a newer peer
+  added) is treated as not yet answered instead of a decode error. Wire
+  compatibility: an old peer's untagged `DecisionV1` (no `type` field, only
+  `action`) still decodes exactly as before; a peer sending a kind this
+  build predates no longer gets denied for it, and instead leaves the
+  request outstanding until it times out or a recognized message arrives.
+  No previously wire-compatible message changes shape. (#66)
+
 ## [0.1.13] - 2026-09-13
 
 ### Fixed
