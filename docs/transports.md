@@ -17,7 +17,18 @@ The outbox wording matters because the hook's verdict wait is a live hold, not a
 
 ## Transports
 
-`nats` is the only transport this issue ships. Device-side delivery is out of scope here: the agent keeps talking to NATS directly until a device-side transport lands in #6/#7.
+`OSHIOKI_TRANSPORT=nats` is the only configured transport backend. It selects
+NATS and JetStream for hook and server traffic. Native agents also serve local
+hook requests over a Unix socket, which sits beside this transport seam.
+
+When `OSHIOKI_AGENT_SOCKET` is configured, the hook tries that socket first.
+If it is unavailable, or closes or stays silent before its `AliveV1`
+acknowledgement, the hook can fall back to NATS when `NATS_URL` is set. A
+malformed protocol reply, a socket decision, or any failure after a valid
+acknowledgement is final and never falls back. Without `NATS_URL` in the hook
+configuration, that hook uses the socket only. An agent with no `NATS_URL` in
+its own runtime environment answers socket requests only. Browser approval
+still uses the server and NATS path.
 
 The existing v1 request and decision JSON fields stay unchanged. Native enrollment records additionally distinguish software keys from Secure Enclave keys. `AliveV1` is a versioned control message with `type: "alive"`, `version: 1`, and the request ID. `DeliveryV1` has `type: "delivery"` with the same version and ID and is published only on the server delivery subject. Socket peers exchange `AliveV1` as the first response frame; NATS and the browser use the dedicated acknowledgement subject. The hook never treats either receipt as a signed decision. Native socket control requires a coordinated hook and agent upgrade: either old side can reject the new first frame, and the diagnostic names `oshioki-agent` so an operator can repair the pair. Browser-capable NATS approval additionally requires the upgraded server and browser bundle, because an older server does not publish `DeliveryV1`; deploy those components as one compatibility set rather than relying on rolling negotiation.
 
