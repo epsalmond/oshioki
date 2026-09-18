@@ -1395,6 +1395,10 @@ fn read_and_authenticate_password(
     ready: &OwnedFd,
 ) -> PasswordResult {
     let fd = tty.as_raw_fd();
+    // Resolved once, before any password bytes are read, from the same
+    // descriptor the prompt and input are read from -- the terminal PAM
+    // should see is this session's, not a generic alias.
+    let tty_name = resolve_tty_name(fd).unwrap_or_else(fallback_tty_name);
     let mut tty_file = unsafe { std::fs::File::from_raw_fd(tty.into_raw_fd()) };
     // Declare the file before the guard so Rust drops the guard first; its
     // restore operation therefore always sees a live tty descriptor.
@@ -1471,7 +1475,7 @@ fn read_and_authenticate_password(
                     authenticate_password_line(
                         username,
                         &input[..password_end],
-                        authenticate_with_pam,
+                        |username, password| authenticate_with_pam(username, password, &tty_name),
                     )
                 };
                 zeroize_bytes(&mut input);
@@ -1506,9 +1510,36 @@ fn zeroize_bytes(bytes: &mut [u8]) {
     std::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
+/// Fallback `PAM_TTY` value used only when [`resolve_tty_name`] cannot
+/// resolve the real terminal from the open descriptor (e.g. `ttyname_r`
+/// fails on a stripped-down `/proc`). PAM requires a non-null item, and the
+/// literal string is the best available hint at this session's controlling
+/// terminal; it is not itself opened or passed to any syscall.
 #[cfg(target_os = "linux")]
-fn authenticate_with_pam(username: &str, password: &[u8]) -> PasswordResult {
-    pam::authenticate(username, password)
+fn fallback_tty_name() -> CString {
+    CString::new("/dev/tty").expect("fallback tty path contains no NUL")
+}
+
+/// Resolve the real terminal path (e.g. `/dev/pts/3`) behind an open
+/// descriptor with `ttyname_r`, so PAM's terminal-specific policies and audit
+/// records see the actual invocation terminal instead of the generic
+/// `/dev/tty` alias.
+#[cfg(target_os = "linux")]
+fn resolve_tty_name(fd: RawFd) -> Option<CString> {
+    let mut buffer = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: buffer is stack storage of the declared length, and fd is a
+    // terminal descriptor owned by the caller for the duration of this call.
+    let result = unsafe { libc::ttyname_r(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|byte| *byte == 0)?;
+    CString::new(&buffer[..end]).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn authenticate_with_pam(username: &str, password: &[u8], tty: &CStr) -> PasswordResult {
+    pam::authenticate(username, password, tty)
 }
 
 #[cfg(target_os = "linux")]
@@ -1733,7 +1764,7 @@ mod pam {
         unsafe { libc::free(responses.cast()) };
     }
 
-    pub(super) fn authenticate(username: &str, password: &[u8]) -> PasswordResult {
+    pub(super) fn authenticate(username: &str, password: &[u8], tty: &CStr) -> PasswordResult {
         let Some(api) = PamApi::load() else {
             return PasswordResult::Unavailable;
         };
@@ -1774,9 +1805,10 @@ mod pam {
         if handle.is_null() {
             return PasswordResult::Rejected;
         }
-        let tty = CString::new("/dev/tty").expect("PAM tty contains no NUL");
         // Keep the host's sudo PAM service while supplying the same context
-        // that sudo supplies to its own PAM conversation.
+        // that sudo supplies to its own PAM conversation: the caller resolved
+        // this from the actual descriptor with `ttyname_r`, falling back to
+        // the literal "/dev/tty" only when that resolution failed.
         let tty_result = unsafe { (api.set_item)(handle, PAM_TTY, tty.as_ptr().cast()) };
         let ruser_result =
             unsafe { (api.set_item)(handle, PAM_RUSER, data.username.as_ptr().cast()) };
@@ -2627,6 +2659,53 @@ mod tests {
         .expect("valid sudo arrays must yield a context");
         let payload = String::from_utf8(context.payload).unwrap();
         assert!(payload.contains("session.OSHIOKI_SESSION=claude-1b\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_tty_name_returns_the_real_pty_path() {
+        // SAFETY: posix_openpt/grantpt/unlockpt/ptsname_r are standard POSIX
+        // calls operating on locally owned descriptors and buffers; every
+        // descriptor opened here is closed before the test returns.
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(master >= 0, "posix_openpt failed");
+            assert_eq!(libc::grantpt(master), 0, "grantpt failed");
+            assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
+
+            let mut name_buffer = [0u8; 64];
+            assert_eq!(
+                libc::ptsname_r(master, name_buffer.as_mut_ptr().cast(), name_buffer.len()),
+                0,
+                "ptsname_r failed"
+            );
+            let end = name_buffer.iter().position(|byte| *byte == 0).unwrap();
+            let slave_path = std::str::from_utf8(&name_buffer[..end]).unwrap();
+            let slave_cpath = CString::new(slave_path).unwrap();
+            let slave_fd = libc::open(slave_cpath.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+            assert!(slave_fd >= 0, "opening the slave pty failed");
+
+            let resolved =
+                resolve_tty_name(slave_fd).expect("ttyname_r must resolve a real pty slave");
+            assert_eq!(resolved.to_str().unwrap(), slave_path);
+
+            libc::close(slave_fd);
+            libc::close(master);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_tty_name_returns_none_for_a_non_terminal_descriptor() {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create a pipe");
+        assert!(resolve_tty_name(read_fd.as_raw_fd()).is_none());
+        drop(write_fd);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_tty_name_is_the_documented_last_resort_path() {
+        assert_eq!(fallback_tty_name().to_str().unwrap(), "/dev/tty");
     }
 
     /// Serializes tests that touch the process-wide `SIGINT` disposition, so

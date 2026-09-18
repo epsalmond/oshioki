@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `signal`, so a handler's flags (e.g. `SA_RESTART`) and blocked-signal mask
   installed by sudo are no longer silently dropped and reinstalled bare on
   every exit path -- approval, denial, cancellation, timeout, or error.
+- The legacy plugin's password fallback resolves the real terminal behind
+  its open descriptor with `ttyname_r` and passes that path (e.g.
+  `/dev/pts/3`) as `PAM_TTY`, instead of always passing the literal string
+  `/dev/tty`. Terminal-specific PAM policies and authentication records now
+  see the invocation's actual terminal; `/dev/tty` remains a documented
+  last-resort fallback for when resolution fails.
 
 ## [0.1.13] - 2026-09-13
 
