@@ -34,6 +34,7 @@ fn failure(kind: FailureKind, error: &anyhow::Error) -> anyhow::Error {
         FailureKind::Transport => HookTransportFailure::Transport(detail),
         FailureKind::Daemon => HookTransportFailure::Daemon(detail),
         FailureKind::Expired => HookTransportFailure::Expired(detail),
+        FailureKind::Protocol => HookTransportFailure::Protocol(detail),
     };
     anyhow::Error::new(error)
 }
@@ -42,6 +43,9 @@ enum FailureKind {
     Transport,
     Daemon,
     Expired,
+    /// A message arrived and did not decode as the control message this
+    /// point in the exchange expects. See [`HookTransportFailure::Protocol`].
+    Protocol,
 }
 
 enum InitialReceipt {
@@ -331,7 +335,10 @@ impl NatsTransport {
                         Err(error) => {
                             let detail = format!("{error:#}");
                             progress(HookProgress::ProtocolFailed(detail));
-                            return Err(error);
+                            // A decode fault against the host's own local
+                            // agent is a local software fault (version skew,
+                            // a bug), not evidence of a denial. Issue #68.
+                            return Err(failure(FailureKind::Protocol, &error));
                         }
                     };
                     if let Err(error) = acknowledgement
@@ -352,7 +359,7 @@ impl NatsTransport {
                         Err(error) => {
                             let detail = format!("{error:#}");
                             progress(HookProgress::ProtocolFailed(detail));
-                            return Err(error);
+                            return Err(failure(FailureKind::Protocol, &error));
                         }
                     };
                     if let Err(error) = delivery
@@ -393,7 +400,7 @@ impl NatsTransport {
                         Err(error) => {
                             let detail = format!("{error:#}");
                             progress(HookProgress::ProtocolFailed(detail));
-                            return Err(error);
+                            return Err(failure(FailureKind::Protocol, &error));
                         }
                     };
                     if let Err(error) = acknowledgement
@@ -459,7 +466,19 @@ impl HookTransport for NatsTransport {
             has_browser_recipient,
             progress,
         );
-        Box::pin(async move { serde_json::from_slice(&verdict.await?).context("decode decision") })
+        Box::pin(async move {
+            let bytes = verdict.await?;
+            serde_json::from_slice(&bytes).map_err(|error| {
+                // A decode fault here is version skew or a bug, not evidence
+                // of a denial: issue #68. An explicit `Deny` and a verdict
+                // that decodes but fails shape or signature validation are
+                // unaffected -- those happen after this call returns.
+                failure(
+                    FailureKind::Protocol,
+                    &anyhow::Error::new(error).context("decode decision"),
+                )
+            })
+        })
     }
 
     fn request_authentication(
@@ -480,7 +499,17 @@ impl HookTransport for NatsTransport {
             progress,
         );
         Box::pin(async move {
-            serde_json::from_slice(&verdict.await?).context("decode authentication decision")
+            let bytes = verdict.await?;
+            serde_json::from_slice(&bytes).map_err(|error| {
+                // See `request_decision`: a decode fault is a local software
+                // fault, not a denial. The auth lane has no explicit `Deny`
+                // at all (see `AuthDecisionV1`), so a decode failure is the
+                // only way this call can end without an approval.
+                failure(
+                    FailureKind::Protocol,
+                    &anyhow::Error::new(error).context("decode authentication decision"),
+                )
+            })
         })
     }
 
