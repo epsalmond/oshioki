@@ -32,7 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `action`) still decodes exactly as before; a peer sending a kind this
   build predates no longer gets denied for it, and instead leaves the
   request outstanding until it times out or a recognized message arrives.
-  No previously wire-compatible message changes shape. (#66)
+  No previously wire-compatible message changes shape. The socket path and
+  the NATS ack/decision subjects both skip an unrecognized kind and keep
+  reading the next message, bounded by the same deadline, rather than
+  treating its mere presence as an answer or a fault. (#66)
+- The command-approval lane's post-acknowledgement socket hangup now
+  agrees with the authentication lane's: unavailable, not denied. A
+  truncated frame or an oversized claimed length after acknowledging get
+  the identical `Dropped` classification as a clean hangup, so a socket
+  squatter can no longer trade an honest hangup for a more favorable
+  outcome by sending garbage instead. (#66, #68)
 
 ## [0.1.13] - 2026-09-13
 
