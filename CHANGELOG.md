@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The legacy sudo approval plugin's password-race `SIGINT` guard now saves
+  and restores the complete disposition with `sigaction` instead of
+  `signal`, so a handler's flags (e.g. `SA_RESTART`) and blocked-signal mask
+  installed by sudo are no longer silently dropped and reinstalled bare on
+  every exit path -- approval, denial, cancellation, timeout, or error.
+
 ## [0.1.13] - 2026-09-13
 
 ### Fixed

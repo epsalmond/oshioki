@@ -617,28 +617,56 @@ extern "C" fn interrupt_handler(_signal: c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
+/// Saves and restores the complete `SIGINT` disposition — handler, flags and
+/// blocked-signal mask — around the approval wait.
+///
+/// `signal()` only exchanges the handler pointer: it silently drops whatever
+/// flags (e.g. `SA_RESTART`) and mask the caller had installed, so restoring
+/// through it can hand sudo back a different disposition than the one it set
+/// up itself. `sigaction()` reads and writes the whole `struct sigaction`, so
+/// the saved value here is byte-for-byte what gets reinstalled.
+///
+/// This is RAII specifically so every exit path out of the guarded section —
+/// approval, explicit denial, cancellation, timeout, or an early return on
+/// error — restores the disposition via `Drop`, including an unwinding panic
+/// (the plugin still runs inside sudo's process, so a caught panic at the FFI
+/// boundary must not leave `SIGINT` pointed at our handler).
 struct InterruptGuard {
-    previous: libc::sighandler_t,
+    previous: libc::sigaction,
 }
 
 impl InterruptGuard {
     fn install() -> Option<Self> {
-        // SAFETY: The handler only performs an atomic store, which is
-        // async-signal-safe. The returned disposition is restored on drop.
-        let previous = unsafe {
-            libc::signal(
-                libc::SIGINT,
-                interrupt_handler as *const () as libc::sighandler_t,
-            )
-        };
-        (previous != libc::SIG_ERR).then_some(Self { previous })
+        // SAFETY: `action` and `previous` are stack-local and fully
+        // initialized before `sigaction` reads or writes them. The handler
+        // only performs an atomic store, which is async-signal-safe. The
+        // previous disposition is restored on drop.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = interrupt_handler as *const () as libc::sighandler_t;
+            if libc::sigemptyset(&raw mut action.sa_mask) != 0 {
+                return None;
+            }
+            action.sa_flags = 0;
+
+            let mut previous = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+            if libc::sigaction(libc::SIGINT, &raw const action, previous.as_mut_ptr()) != 0 {
+                return None;
+            }
+            Some(Self {
+                previous: previous.assume_init(),
+            })
+        }
     }
 }
 
 impl Drop for InterruptGuard {
     fn drop(&mut self) {
-        // SAFETY: Restore the disposition that was active before this check.
-        unsafe { libc::signal(libc::SIGINT, self.previous) };
+        // SAFETY: `self.previous` is the exact disposition captured by
+        // `install` before this guard replaced it.
+        unsafe {
+            let _ = libc::sigaction(libc::SIGINT, &raw const self.previous, std::ptr::null_mut());
+        }
     }
 }
 
@@ -2599,5 +2627,101 @@ mod tests {
         .expect("valid sudo arrays must yield a context");
         let payload = String::from_utf8(context.payload).unwrap();
         assert!(payload.contains("session.OSHIOKI_SESSION=claude-1b\n"));
+    }
+
+    /// Serializes tests that touch the process-wide `SIGINT` disposition, so
+    /// two runs of this test (or a future one) never race each other's
+    /// `sigaction` calls.
+    static SIGINT_TEST: Mutex<()> = Mutex::new(());
+
+    extern "C" fn custom_handler_for_interrupt_guard_test(_signal: c_int) {}
+
+    #[test]
+    fn interrupt_guard_restores_the_exact_prior_disposition() {
+        let _serial = SIGINT_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // SAFETY: every value is stack-local and fully initialized before
+        // `sigaction` reads it; `SIGINT`'s disposition is restored to its
+        // original baseline before this test returns.
+        unsafe {
+            // Install a disposition with a non-default handler, SA_RESTART,
+            // and a non-empty mask (SIGTERM blocked while SIGINT runs) — the
+            // exact kind of disposition a plain `signal()` swap would lose.
+            let mut prior_mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut prior_mask);
+            libc::sigaddset(&raw mut prior_mask, libc::SIGTERM);
+
+            let mut prior_action: libc::sigaction = std::mem::zeroed();
+            prior_action.sa_sigaction =
+                custom_handler_for_interrupt_guard_test as *const () as libc::sighandler_t;
+            prior_action.sa_mask = prior_mask;
+            prior_action.sa_flags = libc::SA_RESTART;
+
+            let mut baseline = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+            assert_eq!(
+                libc::sigaction(libc::SIGINT, &raw const prior_action, baseline.as_mut_ptr()),
+                0,
+                "install the prior test disposition"
+            );
+
+            // glibc's sigaction() wrapper implicitly ORs in SA_RESTORER when
+            // installing a handler, so the ground truth to restore against is
+            // what the kernel now actually reports, not the literal struct
+            // this test asked for above.
+            let mut prior_installed = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+            assert_eq!(
+                libc::sigaction(libc::SIGINT, ptr::null(), prior_installed.as_mut_ptr()),
+                0
+            );
+            let prior_installed = prior_installed.assume_init();
+
+            {
+                let _guard = InterruptGuard::install().expect("install the interrupt guard");
+
+                let mut during = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+                assert_eq!(
+                    libc::sigaction(libc::SIGINT, ptr::null(), during.as_mut_ptr()),
+                    0
+                );
+                let during = during.assume_init();
+                assert_ne!(
+                    during.sa_sigaction, prior_installed.sa_sigaction,
+                    "the guard must install its own handler while active"
+                );
+                // Guard drops here, at the end of this block.
+            }
+
+            let mut restored = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+            assert_eq!(
+                libc::sigaction(libc::SIGINT, ptr::null(), restored.as_mut_ptr()),
+                0
+            );
+            let restored = restored.assume_init();
+
+            assert_eq!(
+                restored.sa_sigaction, prior_installed.sa_sigaction,
+                "the handler must be restored exactly"
+            );
+            assert_eq!(
+                restored.sa_flags, prior_installed.sa_flags,
+                "SA_RESTART must be restored, not dropped"
+            );
+            assert_eq!(
+                libc::sigismember(&raw const restored.sa_mask, libc::SIGTERM),
+                1,
+                "the prior mask's SIGTERM member must be restored"
+            );
+            assert_eq!(
+                libc::sigismember(&raw const restored.sa_mask, libc::SIGINT),
+                0,
+                "the prior mask must not have grown a spurious SIGINT member"
+            );
+
+            // Restore whatever disposition the test runner actually had
+            // before this test touched SIGINT, so later tests are unaffected.
+            libc::sigaction(libc::SIGINT, baseline.as_ptr(), ptr::null_mut());
+        }
     }
 }
