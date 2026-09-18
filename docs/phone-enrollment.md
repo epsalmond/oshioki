@@ -52,9 +52,22 @@ These are user services: the hosting user's service manager must be running
 for the server to be available. An always-on server is preferable if other
 hosts need approval while the laptop is asleep.
 
-The printed enrollment URL expires after five minutes. Leave `enroll`
-running while you open the URL and complete the browser's WebAuthn prompt.
-Enrollment is complete when the host confirms the device was enrolled.
+The printed enrollment URL expires after five minutes. On an iPhone or iPad,
+add the Oshioki origin to the Home Screen before completing enrollment, then
+open the installed Oshioki app. In `/setup`, paste the complete enrollment URL
+including its `#secret` fragment. The app validates the origin and enrollment
+path locally and does not upload or persist that fragment. Leave `enroll`
+running while you tap Continue and complete the browser's WebAuthn prompt.
+After activation, tap Enable notifications as a separate user action.
+
+If enrollment was completed in a normal browser tab, reopen `/setup` in the
+installed Home Screen app and paste a fresh URL. Safari may give the installed
+app separate IndexedDB storage, and an enrollment URL cannot be extended after
+its five-minute lifetime; rerun `sudo oshioki enroll` when it has expired.
+Enrollment, passkey status, push permission, and server registration are
+reported separately. A denied or unsupported notification API does not prevent
+passkey enrollment, but no request-triggered notification can arrive until a
+browser subscription is registered.
 
 ## An existing HTTPS server
 
@@ -105,6 +118,12 @@ enrollment requires planning for new browser credentials.
 enrollment. If it reports that the server is unavailable, fix server or
 network access first. A successful host check cannot prove the phone's
 network access; check that the phone is on the tailnet when using Serve.
+
+When a notification is tapped, the phone must still be able to reach the same
+configured HTTPS/Tailscale origin. A stored subscription or healthy `/healthz`
+response is not evidence that a real phone received a notification. Notification
+taps only open `/r/<id>` or `/a/<id>`; the existing local decryption and
+WebAuthn ceremony remains required.
 
 For deliberate local browser development, use
 `sudo oshioki enroll --allow-localhost`. This permits a loopback origin;

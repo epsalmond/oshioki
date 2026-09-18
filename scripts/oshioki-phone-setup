@@ -347,6 +347,23 @@ def _health_request(base_url: str, *, expected_origin: str, expected_rp_id: str,
     return health
 
 
+def _report_web_push(health: dict[str, Any]) -> None:
+    """Report push configuration separately from HTTPS/NATS reachability."""
+    value = health.get("web_push")
+    if not isinstance(value, dict):
+        print("Web Push readiness: server does not report Web Push configuration")
+        return
+    key_loaded = value.get("key_loaded") is True
+    public_key = value.get("public_key_available") is True
+    worker = value.get("worker_running") is True
+    print(
+        "Web Push readiness: "
+        f"key={'ready' if key_loaded else 'missing'}, "
+        f"public-key={'ready' if public_key else 'missing'}, "
+        f"worker={'ready' if worker else 'stopped'}; delivery is not proven by health"
+    )
+
+
 def _nats_read_line(sock: socket.socket, buffer: bytearray, deadline: float) -> bytes:
     while b"\r\n" not in buffer:
         remaining = deadline - time.monotonic()
@@ -899,6 +916,7 @@ def _run_service(role: str, state: Path) -> int:
             "OSHIOKI_LISTEN": f"127.0.0.1:{runtime['server_port']}",
             "OSHIOKI_ORIGIN": runtime["origin"],
             "OSHIOKI_RP_ID": runtime["rp_id"],
+            "OSHIOKI_VAPID_SUBJECT": runtime["origin"],
             "RUST_LOG": "info",
         }
     os.execve(argv[0], argv, env)
@@ -917,12 +935,11 @@ def _wait_nats(url: str, user: str, password: str, *, ensure_stream: bool) -> No
     fail(f"NATS did not become ready: {last}")
 
 
-def _wait_health(base_url: str, origin: str, rp_id: str, tls: bool) -> None:
+def _wait_health(base_url: str, origin: str, rp_id: str, tls: bool) -> dict[str, Any]:
     last: str = "not attempted"
     for _ in range(30):
         try:
-            _health_request(base_url, expected_origin=origin, expected_rp_id=rp_id, tls=tls)
-            return
+            return _health_request(base_url, expected_origin=origin, expected_rp_id=rp_id, tls=tls)
         except SetupError as exc:
             last = str(exc)
             time.sleep(0.25)
@@ -1091,11 +1108,12 @@ def _external_mode(args: argparse.Namespace, config_dir: Path) -> None:
         fail("external setup requires both --server-url and --nats-config")
     origin, host, _ = _origin_parts(args.server_url)
     nats = _parse_nats_env(Path(args.nats_config))
-    _health_request(origin, expected_origin=origin, expected_rp_id=host, tls=True)
+    health = _health_request(origin, expected_origin=origin, expected_rp_id=host, tls=True)
     _nats_probe(nats["NATS_URL"], nats["NATS_USER"], nats["NATS_PASS"])
     if args.check:
         print(f"External Oshioki server is ready at {origin} (RP ID {host})")
         print("NATS credentials authenticated; no files were changed")
+        _report_web_push(health)
         return
     state = _owned_directory(Path(args.state_dir or os.environ.get(STATE_ENV, Path.home() / ".local" / "share" / "oshioki" / "phone-server")), "phone setup state", 0o700)
     staging = _staging_file(state, {"origin": origin, "rp_id": host, "nats_url": nats["NATS_URL"], "nats_user": nats["NATS_USER"], "nats_pass": nats["NATS_PASS"]})
@@ -1107,6 +1125,7 @@ def _external_mode(args: argparse.Namespace, config_dir: Path) -> None:
         except OSError:
             pass
     print(f"Phone setup complete for {origin} (RP ID {host}).")
+    _report_web_push(health)
     print("Next: sudo oshioki enroll")
 
 
@@ -1157,7 +1176,7 @@ def _local_mode(args: argparse.Namespace, config_dir: Path) -> None:
                 route_added = True
                 if not _check_serve_route(tailscale, expected):
                     fail("Tailscale Serve did not report the owned route after configuration; no hook configuration was changed")
-        _wait_health(origin, origin, rp_id, tls=True)
+        health = _wait_health(origin, origin, rp_id, tls=True)
         staging = _staging_file(state, {"origin": origin, "rp_id": rp_id, "nats_url": nats_url, "nats_user": credentials["hook_user"], "nats_pass": credentials["hook_pass"]})
         try:
             _sudo_install(staging, config_dir, args.sudo_bin)
@@ -1176,6 +1195,7 @@ def _local_mode(args: argparse.Namespace, config_dir: Path) -> None:
                 pass
         raise
     print(f"Phone setup complete for {origin} (RP ID {rp_id}).")
+    _report_web_push(health)
     print("The phone must be connected to this Tailscale tailnet.")
     print("Next: sudo oshioki enroll")
 

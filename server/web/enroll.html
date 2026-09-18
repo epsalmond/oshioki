@@ -3,11 +3,27 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08783e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Oshioki">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
   <title>Enroll sudo approval</title>
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body data-page="enroll">
-  <main><h1>Enroll this browser</h1><p id="status">Preparing secure enrollment…</p><button id="enroll" type="button" hidden>Continue</button></main>
+  <main>
+    <h1>Enroll this browser</h1>
+    <p id="status">Preparing secure enrollment…</p>
+    <button id="enroll" type="button" hidden>Continue</button>
+    <section id="push-panel" hidden aria-labelledby="push-heading">
+      <h2 id="push-heading">Notifications</h2>
+      <p id="push-support">Checking browser notification support…</p>
+      <p id="push-server">Server registration has not been checked.</p>
+      <button id="enable-notifications" type="button">Enable notifications</button>
+      <p id="push-help">Enable this separately after passkey enrollment. If permission changes, return here to re-enable notifications.</p>
+    </section>
+  </main>
   <script src="/assets/libsodium.js"></script><script src="/assets/app.js"></script>
 </body>
 </html>

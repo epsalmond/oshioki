@@ -1923,6 +1923,7 @@ mod tests {
     /// A unique path under the system temp directory. The detection function
     /// takes its paths as an argument precisely so the test never has to
     /// touch /etc/pam.d.
+    #[cfg(target_os = "linux")]
     fn temp_pam_file(tag: &str, contents: &str) -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -1934,6 +1935,7 @@ mod tests {
         path
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn contextual_pam_lane_detected_only_on_a_live_auth_line() {
         let live = temp_pam_file(

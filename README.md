@@ -75,6 +75,13 @@ oshioki-phone-setup \
 sudo oshioki enroll
 ```
 
+For iPhone or iPad, add Oshioki to the Home Screen before completing the
+enrollment. Open the installed app, paste the complete enrollment URL into
+`/setup`, complete the passkey ceremony, and then tap Enable notifications.
+The URL expires after five minutes; rerun `sudo oshioki enroll` if it expires.
+The phone must be able to reach the configured HTTPS/Tailscale origin when a
+notification is tapped. Existing ntfy remains an optional independent path.
+
 See [phone enrollment](docs/phone-enrollment.md) for prerequisites, service
 management, and the HTTPS server option.
 

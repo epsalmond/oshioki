@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08783e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Oshioki">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
+  <link rel="stylesheet" href="/assets/app.css">
+  <title>Set up Oshioki</title>
+</head>
+<body data-page="setup">
+  <main>
+    <h1>Set up Oshioki</h1>
+    <p id="status">Paste the complete enrollment URL printed by <code>sudo oshioki enroll</code>.</p>
+    <label for="enrollment-url">Enrollment URL</label>
+    <input id="enrollment-url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://…/enroll/…#…">
+    <button id="continue-enrollment" type="button">Continue</button>
+    <p>On iPhone or iPad, add Oshioki to the Home Screen before completing enrollment. The enrollment secret stays in the URL fragment and is cleared after the enrollment page opens.</p>
+    <p>After enrollment, enable notifications as a separate action. If this browser cannot use Web Push, the passkey enrollment still works.</p>
+  </main>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

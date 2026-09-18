@@ -39,8 +39,11 @@ async function sha256(...parts) { return new Uint8Array(await crypto.subtle.dige
 
 function openDb() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("oshioki", 1);
-    request.onupgradeneeded = () => request.result.createObjectStore("devices", { keyPath: "fingerprint" });
+    const request = indexedDB.open("oshioki", 2);
+    request.onupgradeneeded = (event) => {
+      if (event.oldVersion < 1) request.result.createObjectStore("devices", { keyPath: "fingerprint" });
+      if (event.oldVersion < 2) request.result.createObjectStore("settings", { keyPath: "key" });
+    };
     request.onerror = () => reject(request.error); request.onsuccess = () => resolve(request.result);
   });
 }
@@ -53,6 +56,289 @@ async function allDevices() {
   const db = await openDb();
   const devices = await new Promise((resolve, reject) => { const request = db.transaction("devices").objectStore("devices").getAll(); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
   db.close(); return devices;
+}
+async function deviceByFingerprint(fingerprint) {
+  if (typeof fingerprint !== "string" || !fingerprint) return null;
+  const db = await openDb();
+  const device = await new Promise((resolve, reject) => {
+    const request = db.transaction("devices").objectStore("devices").get(fingerprint);
+    request.onsuccess = () => resolve(request.result || null); request.onerror = () => reject(request.error);
+  });
+  db.close(); return device;
+}
+async function getSetting(key) {
+  const db = await openDb();
+  const setting = await new Promise((resolve, reject) => {
+    const request = db.transaction("settings").objectStore("settings").get(key);
+    request.onsuccess = () => resolve(request.result?.value); request.onerror = () => reject(request.error);
+  });
+  db.close(); return setting;
+}
+async function setSetting(key, value) {
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction("settings", "readwrite");
+    tx.objectStore("settings").put({ key, value });
+    tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || new Error("settings transaction aborted"));
+  });
+  db.close();
+}
+async function deleteSetting(key) {
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction("settings", "readwrite"); tx.objectStore("settings").delete(key);
+    tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || new Error("settings transaction aborted"));
+  });
+  db.close();
+}
+async function pushSettings() {
+  return {
+    pushOwnerFingerprint: await getSetting("pushOwnerFingerprint"),
+    pushSubscriptionId: await getSetting("pushSubscriptionId"),
+  };
+}
+
+const PUSH_VERSION = 1;
+const MAX_PUSH_REQUEST_ID = 128;
+const SAFE_PUSH_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+function pushSupport() {
+  const root = typeof globalThis === "object" ? globalThis : {};
+  const secure = typeof root.isSecureContext === "boolean"
+    ? root.isSecureContext
+    : typeof location === "object" && (location.protocol === "https:" || location.hostname === "localhost");
+  const nav = root.navigator;
+  const notification = root.Notification;
+  const pushManager = root.PushManager;
+  const supported = secure && !!nav?.serviceWorker && !!pushManager && !!notification;
+  return { secure, supported, serviceWorker: !!nav?.serviceWorker, pushManager: !!pushManager, notification: !!notification };
+}
+
+let pushWorkerPromise;
+function registerPushWorker() {
+  const support = pushSupport();
+  if (!support.supported) return Promise.resolve(null);
+  if (!pushWorkerPromise) {
+    pushWorkerPromise = navigator.serviceWorker.register("/service-worker.js", { scope: "/" }).catch((error) => {
+      pushWorkerPromise = undefined;
+      throw error;
+    });
+  }
+  return pushWorkerPromise;
+}
+
+function bytesToBase64Url(bytes) {
+  const value = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let binary = "";
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function base64UrlToBytes(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("invalid VAPID public key");
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, character => character.charCodeAt(0));
+}
+async function pushSubscriptionRequest(subscription) {
+  if (!subscription || typeof subscription.endpoint !== "string" || !subscription.endpoint) {
+    throw new Error("browser did not return a push endpoint");
+  }
+  const json = typeof subscription.toJSON === "function" ? subscription.toJSON() : {};
+  let p256dh = json.keys?.p256dh;
+  let auth = json.keys?.auth;
+  if ((!p256dh || !auth) && typeof subscription.getKey === "function") {
+    p256dh ||= bytesToBase64Url(await subscription.getKey("p256dh"));
+    auth ||= bytesToBase64Url(await subscription.getKey("auth"));
+  }
+  if (typeof p256dh !== "string" || typeof auth !== "string") throw new Error("browser returned incomplete push keys");
+  const expiration = subscription.expirationTime ?? json.expirationTime;
+  return {
+    version: PUSH_VERSION,
+    endpoint: subscription.endpoint,
+    expiration_time: typeof expiration === "number" && Number.isFinite(expiration) ? Math.floor(expiration / 1000) : null,
+    keys: { p256dh, auth },
+  };
+}
+async function pushConfig() {
+  const response = await fetch("/api/v1/push/config", { cache: "no-store" });
+  if (!response.ok) throw new Error(`push configuration failed ${response.status}`);
+  const config = await response.json();
+  if (config.version !== PUSH_VERSION || typeof config.enabled !== "boolean") throw new Error("invalid push configuration");
+  return config;
+}
+async function pushStatusForDevice(device) {
+  const response = await fetch("/api/v1/push/status", { cache: "no-store", headers: { authorization: `Bearer ${device.apiToken}` } });
+  if (!response.ok) throw new Error(`push status failed ${response.status}`);
+  const status = await response.json();
+  if (status.version !== PUSH_VERSION || typeof status.registered !== "boolean" || !Number.isInteger(status.count)) throw new Error("invalid push status");
+  return status;
+}
+async function postPushSubscription(device, subscription) {
+  const response = await fetch("/api/v1/push/subscriptions", {
+    method: "POST", cache: "no-store",
+    headers: { authorization: `Bearer ${device.apiToken}`, "content-type": "application/json" },
+    body: JSON.stringify(await pushSubscriptionRequest(subscription)),
+  });
+  if (!response.ok) throw new Error(`push registration failed ${response.status}`);
+  const result = await response.json();
+  if (result.version !== PUSH_VERSION || typeof result.subscription_id !== "string" || !result.subscription_id) throw new Error("invalid push registration response");
+  return result.subscription_id;
+}
+async function deletePushSubscription(device, subscriptionId) {
+  const response = await fetch(`/api/v1/push/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+    method: "DELETE", cache: "no-store", headers: { authorization: `Bearer ${device.apiToken}` },
+  });
+  if (response.status === 401) return "unauthorized";
+  if (response.status === 404) return "missing";
+  if (!response.ok) throw new Error(`push removal failed ${response.status}`);
+  return "deleted";
+}
+async function clearPushOwner() {
+  await deleteSetting("pushOwnerFingerprint");
+  await deleteSetting("pushSubscriptionId");
+}
+async function setPushOwner(fingerprint, subscriptionId) {
+  await setSetting("pushOwnerFingerprint", fingerprint);
+  await setSetting("pushSubscriptionId", subscriptionId);
+}
+async function syncOwnedPushSubscription() {
+  const support = pushSupport();
+  if (!support.supported || Notification.permission !== "granted") return null;
+  const registration = await registerPushWorker();
+  const subscription = await registration.pushManager.getSubscription();
+  const settings = await pushSettings();
+  if (!settings.pushOwnerFingerprint) {
+    if (subscription) throw new Error("this browser has an unowned notification subscription; revoke the old device before re-enrolling");
+    return null;
+  }
+  const device = await deviceByFingerprint(settings.pushOwnerFingerprint);
+  if (!device) throw new Error("notification ownership is unavailable; revoke the old device before re-enrolling");
+  if (!subscription) return null;
+  const subscriptionId = await postPushSubscription(device, subscription);
+  await setPushOwner(device.fingerprint, subscriptionId);
+  return { device, status: await pushStatusForDevice(device) };
+}
+
+async function enablePushForDevice(device) {
+  const support = pushSupport();
+  if (!support.supported) throw new Error("This browser cannot enable Web Push; enrollment remains available without notifications");
+  // Keep this as the first asynchronous operation in the click handler. iOS
+  // requires the permission prompt to be caused by a direct user gesture.
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") throw new Error(permission === "denied"
+    ? "Notifications are blocked. Allow them in browser settings, then use Re-enable notifications."
+    : "Notification permission was not granted");
+  const config = await pushConfig();
+  if (!config.enabled || typeof config.vapid_public_key !== "string") throw new Error("server notifications are not configured");
+  const settings = await pushSettings();
+  const registration = await registerPushWorker();
+  let subscription = await registration.pushManager.getSubscription();
+  let retiredEndpoint;
+  if (settings.pushOwnerFingerprint && settings.pushOwnerFingerprint !== device.fingerprint) {
+    const oldDevice = await deviceByFingerprint(settings.pushOwnerFingerprint);
+    if (!oldDevice || !settings.pushSubscriptionId) {
+      throw new Error("notification ownership is unavailable; revoke the old device before re-enrolling");
+    }
+    // Do not reuse the old endpoint; the new bearer needs a fresh subscription.
+    retiredEndpoint = subscription?.endpoint;
+    await deletePushSubscription(oldDevice, settings.pushSubscriptionId);
+    if (subscription && !(await subscription.unsubscribe())) throw new Error("could not remove the old browser subscription");
+    subscription = null;
+    await clearPushOwner();
+  } else if (!settings.pushOwnerFingerprint && subscription) {
+    // A subscription with no recorded owner could belong to another device
+    // from a lost browser profile. Never attempt an endpoint takeover.
+    throw new Error("this browser has an unowned notification subscription; revoke the old device before re-enrolling");
+  }
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlToBytes(config.vapid_public_key) });
+  }
+  if (retiredEndpoint && subscription.endpoint === retiredEndpoint) {
+    await subscription.unsubscribe();
+    throw new Error("browser did not create a fresh notification subscription for the new owner");
+  }
+  const subscriptionId = await postPushSubscription(device, subscription);
+  await setPushOwner(device.fingerprint, subscriptionId);
+  return { device, status: await pushStatusForDevice(device) };
+}
+
+function pushStatusText(status) {
+  if (!status) return "Server registration has not been checked.";
+  return status.registered ? `Server registration active (${status.count} subscription${status.count === 1 ? "" : "s"}).` : "Browser permission is ready, but this device is not registered on the server.";
+}
+function setPushText(id, value) {
+  const element = typeof document !== "undefined" ? document.getElementById(id) : null;
+  if (element) element.textContent = value;
+}
+async function updatePushUi(device) {
+  const support = pushSupport();
+  if (!support.supported) {
+    setPushText("push-support", "Web Push is unavailable in this browser or context. Enrollment still works; use a supported HTTPS browser or Home Screen app for notifications.");
+    const button = document.getElementById("enable-notifications"); if (button) button.hidden = true;
+    return;
+  }
+  setPushText("push-support", Notification.permission === "granted" ? "Browser notification permission is granted." : "Notifications are separate from passkey enrollment and require a button tap.");
+  const button = document.getElementById("enable-notifications"); if (button) button.hidden = false;
+  try {
+    const settings = await pushSettings();
+    if (settings.pushOwnerFingerprint && settings.pushOwnerFingerprint !== device.fingerprint) {
+      setPushText("push-server", "Another enrolled device owns browser notifications. Enable notifications here to transfer ownership safely.");
+    } else {
+      const result = await syncOwnedPushSubscription();
+      if (result) setPushText("push-server", pushStatusText(result.status));
+      else if (Notification.permission === "granted") setPushText("push-server", "Browser permission is granted; tap Enable notifications to register this device.");
+    }
+  } catch (error) {
+    console.error(error); setPushText("push-server", error.message || "Notification registration needs attention.");
+  }
+  if (button && !button.dataset.pushBound) {
+    button.dataset.pushBound = "true";
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        const result = await enablePushForDevice(device);
+        setPushText("push-support", "Browser notification permission is granted.");
+        setPushText("push-server", pushStatusText(result.status));
+        setPushText("push-help", "Notifications can be re-enabled here after browser settings change.");
+      } catch (error) {
+        console.error(error); setPushText("push-server", error.message || "Notification registration failed.");
+      } finally { button.disabled = false; }
+    });
+  }
+}
+
+function parseEnrollmentUrl(value, origin = location.origin) {
+  if (typeof value !== "string" || !value.trim()) throw new Error("paste the complete enrollment URL");
+  let parsed;
+  try { parsed = new URL(value.trim()); } catch { throw new Error("that is not a valid enrollment URL"); }
+  let expectedOrigin;
+  try { expectedOrigin = new URL(origin).origin; } catch { throw new Error("this Oshioki origin is invalid"); }
+  if (parsed.origin !== expectedOrigin) throw new Error("the enrollment URL must use this Oshioki origin");
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (parts.length !== 2 || parts[0] !== "enroll" || !SAFE_PUSH_ID.test(parts[1])) throw new Error("the URL must point to /enroll/<id>");
+  if (parsed.search || !parsed.hash.slice(1) || !/^[A-Za-z0-9_-]{1,256}$/.test(parsed.hash.slice(1))) throw new Error("the enrollment URL must include its fragment secret");
+  return `${parsed.pathname}${parsed.hash}`;
+}
+async function setupPage() {
+  await registerPushWorker().catch(error => console.error(error));
+  const input = document.getElementById("enrollment-url");
+  const button = document.getElementById("continue-enrollment");
+  button.addEventListener("click", () => {
+    try {
+      const target = parseEnrollmentUrl(input.value);
+      input.value = "";
+      // Keep the secret in the fragment until enrollment() immediately
+      // consumes it; the next history entry has no fragment and no storage.
+      location.assign(target);
+    } catch (error) { text("status", error.message); }
+  });
+}
+
+function initializePushPage() {
+  void registerPushWorker().catch(error => console.error(error));
+  if (pushSupport().supported && Notification.permission === "granted") {
+    void syncOwnedPushSubscription().catch(error => console.error(error));
+  }
 }
 function requestId() { return location.pathname.split("/").filter(Boolean).at(-1); }
 // The target account is what the approval grants, so it is always shown,
@@ -103,9 +389,12 @@ function text(id, value) { document.getElementById(id).textContent = value; }
 function failure(error) { console.error(error); text("status", "This request could not be verified."); }
 
 async function enrollment() {
-  await sodium.ready;
   const enrollmentId = requestId();
-  const fragment = location.hash.slice(1); history.replaceState(null, "", location.pathname);
+  // Remove the enrollment secret before any asynchronous initialization. A
+  // crash or closed tab during sodium startup must not leave it in history.
+  const fragment = location.hash.slice(1);
+  history.replaceState(null, "", location.pathname);
+  await sodium.ready;
   if (!fragment) throw new Error("missing enrollment secret");
   const secret = unb64(fragment); if (secret.length !== 32) throw new Error("bad enrollment secret");
   const button = document.getElementById("enroll"); button.hidden = false; text("status", "Touch ID or Face ID will create a credential for this browser profile.");
@@ -139,11 +428,25 @@ async function enrollment() {
         await new Promise(resolve => setTimeout(resolve, 1000));
         const statusResponse = await fetch(`/api/v1/enrollments/${enrollmentId}/status`);
         if (!statusResponse.ok) throw new Error("status failed"); const status = await statusResponse.json();
-        if (status.status === "active") { await putDevice({ fingerprint: status.fingerprint, credentialId: b64(credential.rawId), boxSecret: b64(box.privateKey), apiToken }); text("status", `Enrolled as ${status.fingerprint}`); button.hidden = true; return; }
+        if (status.status === "active") {
+          const device = { fingerprint: status.fingerprint, credentialId: b64(credential.rawId), boxSecret: b64(box.privateKey), apiToken };
+          await putDevice(device);
+          text("status", `Enrolled as ${status.fingerprint}. Passkey enrollment is complete.`); button.hidden = true;
+          const panel = document.getElementById("push-panel"); if (panel) panel.hidden = false;
+          await updatePushUi(device);
+          return;
+        }
         if (status.status === "expired" || status.status === "rejected") throw new Error(`enrollment ${status.status}`);
       }
       throw new Error("activation timeout");
-    } catch (error) { button.disabled = false; failure(error); }
+    } catch (error) {
+      button.disabled = false;
+      if (String(error?.message || error).includes("enrollment expired")) {
+        text("status", "This enrollment URL expired. Run sudo oshioki enroll again to get a fresh five-minute URL.");
+      } else if (String(error?.message || error).includes("enrollment rejected")) {
+        text("status", "The server rejected this enrollment. Run sudo oshioki enroll again.");
+      } else failure(error);
+    }
   }, { once: true });
 }
 
@@ -272,12 +575,20 @@ async function authentication() {
 
 // Keep the formatter available to the small, DOM-free unit test as well as
 // the page. The approval flow still starts only in a browser document.
-if (typeof globalThis !== "undefined") globalThis.OshiokiApprovalReview = { formatEnvironment, quoteReviewString, formatInvocation };
+if (typeof globalThis !== "undefined") {
+  globalThis.OshiokiApprovalReview = { formatEnvironment, quoteReviewString, formatInvocation };
+  globalThis.OshiokiPush = {
+    parseEnrollmentUrl, pushSupport, pushSubscriptionRequest, pushStatusText,
+    deviceByFingerprint, getSetting, setSetting, syncOwnedPushSubscription, enablePushForDevice,
+  };
+}
 if (typeof document !== "undefined" && document.body) {
   const page = document.body.dataset.page;
   let flow;
-  if (page === "enroll") flow = enrollment();
+  initializePushPage();
+  if (page === "setup") flow = setupPage();
+  else if (page === "enroll") flow = enrollment();
   else if (page === "auth") flow = authentication();
   else flow = approval();
-  flow.catch(failure);
+  flow?.catch(failure);
 }

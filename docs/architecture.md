@@ -172,10 +172,25 @@ device once the server is healthy.
 ## Persistence
 
 SQLite uses WAL, foreign keys, a five-second busy timeout, and embedded schema
-version 1. Tables cover devices, enrollments, requests, sealed bodies,
-tombstones, and outbox work. Cleanup expires pending enrollment state and
-removes old resolved work. The expected runtime is one active server with one
-persistent database file.
+versions. Version 0 installs the existing V1 tables, version 1 adds the V2
+push subscription and push outbox tables in one transaction, and version 2
+opens directly; newer versions refuse startup. The V2 worker stores one
+device-owned subscription per browser endpoint and claims recipient rows with
+short leases before bounded Web Push attempts. Revocation and subscription
+deletion disable subscriptions and abandon pending rows transactionally.
+Cleanup expires pending enrollment state, removes old resolved work, and
+eventually removes abandoned push rows and disabled subscriptions. The VAPID
+P-256 key persists beside the state database (or at `OSHIOKI_VAPID_KEY_PATH`)
+with owner-only permissions. The expected runtime is one active server with
+one persistent database file.
+
+Push payloads contain only a version, lane (`request` or `auth`), and request
+identifier. The service worker maps those fields to exact same-origin routes;
+it never receives a command, environment, enrollment secret, or bearer token.
+The server validates subscription destinations, resolves public DNS immediately
+before delivery, pins the checked address through the HTTPS client, disables
+redirects, and bounds connection and response time. Provider acceptance is
+at-least-once; the browser notification tag coalesces duplicate taps.
 
 `GET /healthz` checks the schema, durable request consumer progress, and
 outbox progress. Every browser response uses `Cache-Control: no-store`,
