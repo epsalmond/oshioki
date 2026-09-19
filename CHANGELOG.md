@@ -24,6 +24,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/dev/tty`. Terminal-specific PAM policies and authentication records now
   see the invocation's actual terminal; `/dev/tty` remains a documented
   last-resort fallback for when resolution fails.
+## [0.1.14] - 2026-09-18
+
+### Added
+
+- Enrolled phone browsers can now receive request-triggered Web Push
+  notifications for both legacy command approvals and contextual PAM
+  authentication, and open the existing encrypted request review and
+  passkey flow from the notification. iPhone onboarding walks through
+  Home Screen installation before enrollment, since iOS only delivers Web
+  Push to an installed app; desktop and Android browsers can enroll
+  directly. The server gains device-owned push subscriptions, persistent
+  VAPID keys, an independent delivery worker with bounded retries and
+  provider-expiry handling, revocation cleanup for dead subscriptions, and
+  same-origin notification click routing. Delivery validates subscription
+  endpoints and pins resolved addresses before sending. Existing ntfy
+  delivery remains available as an optional alternative.
+- Both CLIs now treat no arguments, `help`, `-h`, and `--help` as the same
+  successful top-level help request, and show the embedded Oshioki logo in
+  interactive Kitty-compatible terminals (Kitty, WezTerm, Ghostty); pipes
+  and tmux/screen sessions still get plain text. The `oshioki` CLI hides
+  its private sudo plugin handshake from that help output.
+
+### Changed
+
+- The README now leads with the supported setup paths and a compact
+  command reference, alongside the existing branding, transport, native
+  device pairing, offline-records, and credential-boundary explanations.
+
+### Security
+
+- The database schema advances to version 2 (additive: `auth_requests`,
+  `auth_sealed_bodies`, `push_subscriptions`, and `push_outbox` tables),
+  applied automatically the next time the server opens its database.
+  **Back up the server database before upgrading**: rolling back to an
+  older binary afterward requires restoring that backup, since older
+  binaries refuse a database at a newer schema version.
+- Web Push VAPID signing dropped its optional RSA-capable signer in favor
+  of `web-push-native` without RSA and `jwt-compact` restricted to P-256,
+  removing an unnecessary transitive RSA implementation flagged by the
+  dependency audit rather than suppressing the advisory.
 
 ## [0.1.13] - 2026-09-13
 
