@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The agent no longer drops a NATS retry for a request it is already holding
+  on the local socket. The hook falls back to NATS when the socket
+  acknowledgement arrives too late, republishing the same request id, and the
+  agent read that retry as a replay: the socket prompt stayed up and device
+  approval could recover on neither transport. The claim is now keyed on
+  whether the request was answered rather than on when it was first seen, so a
+  retry carrying the same body attaches to the one in-flight decision and gets
+  it back on its own transport, while an answered id stays a duplicate for the
+  whole protocol validity window. A lane that dies without answering leaves the
+  request claimable again, and a different body under a claimed id is still
+  refused. (#64)
+- Browser delivery receipts no longer delay live ones after a NATS outage.
+  Receipts share the verdict outbox lane, which drains in id order, so a
+  backlog of receipts for requests that had already expired was published ahead
+  of the receipt for the request the hook was waiting on. A receipt now carries
+  the deadline of its request and is dropped once that deadline passes, before
+  each drain and during cleanup. Verdicts and enrollment relays carry no
+  deadline and are delivered whenever they can be. (#59)
+
+### Changed
+
+- The database schema advances to version 3 (the outbox gains the deadline a
+  delivery receipt is worth delivering until), applied automatically the next
+  time the server opens its database. Rows queued before the upgrade carry no
+  deadline and are delivered as they always were. **Back up the server database
+  before upgrading**: the upgrade is one way, so rolling back to an older binary
+  afterward requires restoring that backup, since older binaries refuse a
+  database at a newer schema version.
 - A protocol decode fault against the host's own local agent -- version
   skew, a truncated frame, garbage bytes -- no longer denies sudo outright.
   It now maps to the same `CHECK_RC_UNAVAILABLE` path as a dropped socket or

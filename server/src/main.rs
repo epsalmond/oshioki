@@ -609,6 +609,12 @@ async fn verdict_worker(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     loop {
         interval.tick().await;
+        // Receipts for requests that died while the transport was down are
+        // dropped before the drain, so an outage backlog never sits in front
+        // of the request the hook is waiting on now (#59).
+        if let Err(error) = state.store.expire_stale_deliveries(now()) {
+            warn!(%error, "stale delivery receipt expiry failed");
+        }
         match state.store.pending_verdicts(32) {
             Ok(items) => {
                 let mut healthy = true;
@@ -2339,6 +2345,98 @@ mod tests {
         delivery.validate("req-1").unwrap();
         assert_eq!(published[1].0, "oshioki.verdict.req-1");
         assert_eq!(published[1].1, serde_json::to_vec(&decision).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #59 through the worker: after an outage the outbox holds a receipt
+    /// for a request whose deadline has passed and one for a request still
+    /// live. The live receipt goes out; the dead one is never published and
+    /// never delays it.
+    #[tokio::test]
+    async fn the_verdict_worker_drops_receipts_past_their_deadline() {
+        let dir = std::env::temp_dir().join(format!(
+            "oshioki-server-stale-delivery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("state.sqlite3")).unwrap());
+        store.ready().unwrap();
+        let device = test_device();
+        store.put_device(&device).unwrap();
+        let sealed = vec![SealedDeviceBodyV1 {
+            device_fingerprint: device.fingerprint.clone(),
+            ephemeral_pub: oshioki_protocol::v1::encode_base64url(&[4; 32]),
+            nonce: oshioki_protocol::v1::encode_base64url(&[5; 12]),
+            ciphertext: oshioki_protocol::v1::encode_base64url(&[6; 32]),
+        }];
+        // Ingested against a clock long past: the request, and so its
+        // receipt, died while the transport was unreachable.
+        let expired = RequestEnvelopeV1 {
+            version: 1,
+            request_id: "req-stale".into(),
+            host: "nas".into(),
+            user: "eric".into(),
+            issued_at: 1_000,
+            expires_at: 1_000 + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS,
+            sealed: sealed.clone(),
+        };
+        store
+            .ingest_request(&serde_json::to_vec(&expired).unwrap(), &expired, 1_000)
+            .unwrap();
+        let live = RequestEnvelopeV1 {
+            version: 1,
+            request_id: "req-live".into(),
+            host: "nas".into(),
+            user: "eric".into(),
+            issued_at: now(),
+            expires_at: now() + oshioki_protocol::MAX_REQUEST_LIFETIME_SECS,
+            sealed,
+        };
+        store
+            .ingest_request(&serde_json::to_vec(&live).unwrap(), &live, now())
+            .unwrap();
+
+        let transport = oshioki_transport::MockTransport::new();
+        let state = AppState {
+            store: Arc::clone(&store),
+            transport: Arc::new(transport.clone()),
+            dist_root: Arc::new(PathBuf::from("/nonexistent")),
+            artifact_permits: Arc::new(Semaphore::new(1)),
+            consumer_last_ok: Arc::new(AtomicI64::new(0)),
+            outbox_last_ok: Arc::new(AtomicI64::new(0)),
+            push_worker_last_ok: Arc::new(AtomicI64::new(0)),
+            origin: Arc::new("https://sudo.test".into()),
+            rp_id: Arc::new("sudo.test".into()),
+            ntfy_url: None,
+            vapid: Arc::new(test_vapid()),
+        };
+        let worker = tokio::spawn(verdict_worker(state));
+        let store_check = Arc::clone(&store);
+        let transport_check = transport.clone();
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            loop {
+                if store_check
+                    .pending_verdicts(32)
+                    .is_ok_and(|items| items.is_empty())
+                    && !transport_check.published().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("verdict worker never drained the outbox");
+        worker.abort();
+        let published = transport.published();
+        assert_eq!(
+            published
+                .iter()
+                .map(|(subject, _)| subject.as_str())
+                .collect::<Vec<_>>(),
+            vec!["oshioki.delivery.req-live"]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

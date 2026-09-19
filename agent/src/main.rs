@@ -28,8 +28,9 @@ use oshioki_protocol::{
     AuthEnvelopeV1, AuthInvocationV1, AuthRequestV1, DecisionV1, DeviceKindV1, OpenedAuthRequestV1,
     RequestEnvelopeV1, allow_plaintext_nats, check_nats_url, escape_for_terminal, nats_url_is_tls,
 };
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 #[path = "../../cli/terminal_logo.rs"]
@@ -52,18 +53,89 @@ const SEEN_REQUEST_RETENTION: Duration = Duration::from_secs(
 const SOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared request admission for NATS and the local socket. The semaphore
-/// bounds task and prompt work; the recent-ID set prevents one request from
-/// being presented twice while its first decision is in flight or shortly
-/// after it completes.
+/// bounds task and prompt work; the claim map holds one claim per request
+/// id, which is what keeps a replay from raising a second prompt.
 #[derive(Clone)]
 struct RequestAdmission {
     permits: Arc<Semaphore>,
-    request_ids: Arc<StdMutex<HashMap<String, Instant>>>,
+    request_ids: Arc<StdMutex<HashMap<String, SeenRequest>>>,
+}
+
+/// What a lane produced for one claimed request.
+///
+/// A retry that arrives on another transport delivers this instead of
+/// opening a decision of its own: one prompt and one signed answer, however
+/// many transports carried the same request.
+#[derive(Debug, Clone)]
+enum RequestOutcome {
+    Command(Box<DecisionV1>),
+    Authentication(Box<AuthDecisionV1>),
+    /// The lane finished with nothing to deliver: the prompt was skipped,
+    /// dismissed, or the deadline passed while it was up. There is no answer
+    /// to relay, and the claim still counts as answered, so a replay raises
+    /// nothing.
+    Unanswered,
+}
+
+/// One claimed request id: when it was claimed, what body claimed it, and
+/// where its answer will appear.
+struct SeenRequest {
+    seen_at: Instant,
+    /// Binds the id to the request body that claimed it. A delivery reusing
+    /// a claimed id with different plaintext never attaches to this decision
+    /// and never opens one of its own.
+    payload_hash: [u8; 32],
+    /// `None` until the owning lane answers. The channel closing while it is
+    /// still `None` means the owner died without answering, and the request
+    /// becomes claimable again: a request is answered at most once, but a
+    /// lane that abandoned one never answered it.
+    outcome: watch::Receiver<Option<Arc<RequestOutcome>>>,
+    /// Whether a second transport is already waiting on this answer. The
+    /// hook falls back once, so one waiter is all a genuine request needs,
+    /// and a replay flood can never hold more than one extra work slot per
+    /// request while the prompt is up.
+    attached: bool,
+}
+
+/// The result of claiming one request id.
+enum Claim {
+    /// This lane owns the request: it runs the decider and reports the
+    /// answer through the lease.
+    Owner(RequestLease),
+    /// Another lane already holds this exact request. This one waits for
+    /// that answer and delivers it on its own transport.
+    Attach(RequestWaiter),
+    /// Answered already, or the id is claimed by a different body. There is
+    /// nothing to decide and nothing to deliver.
+    Duplicate,
+}
+
+/// The owning lane's handle on one claimed request.
+struct RequestLease {
+    _permit: OwnedSemaphorePermit,
+    outcome: watch::Sender<Option<Arc<RequestOutcome>>>,
+}
+
+/// A delivery that arrived for a request another lane already holds.
+struct RequestWaiter {
+    permit: OwnedSemaphorePermit,
+    request_ids: Arc<StdMutex<HashMap<String, SeenRequest>>>,
+    outcome: watch::Receiver<Option<Arc<RequestOutcome>>>,
+}
+
+/// What a waiting delivery learned from the lane that owns its request.
+enum Relay {
+    /// The owner answered; this lane delivers exactly this.
+    Answer(Arc<RequestOutcome>),
+    /// The owner died without answering, so the claim is free again.
+    Abandoned,
+    /// The request's own deadline passed while the owner held it.
+    Expired,
 }
 
 struct RequestPermit {
-    _permit: OwnedSemaphorePermit,
-    request_ids: Arc<StdMutex<HashMap<String, Instant>>>,
+    permit: OwnedSemaphorePermit,
+    request_ids: Arc<StdMutex<HashMap<String, SeenRequest>>>,
 }
 
 impl RequestAdmission {
@@ -76,37 +148,134 @@ impl RequestAdmission {
 
     fn reserve(&self) -> Option<RequestPermit> {
         Some(RequestPermit {
-            _permit: Arc::clone(&self.permits).try_acquire_owned().ok()?,
+            permit: Arc::clone(&self.permits).try_acquire_owned().ok()?,
             request_ids: Arc::clone(&self.request_ids),
         })
     }
 }
 
 impl RequestPermit {
-    /// Claims an ID after the envelope is decoded. A duplicate releases its
-    /// permit when this lease is dropped and never reaches request opening or
-    /// a prompt. IDs remain remembered for the protocol validity window, so a
-    /// sequential replay cannot raise another prompt after the first ends.
-    fn claim(&self, request_id: &str) -> bool {
-        let Ok(mut request_ids) = self.request_ids.lock() else {
-            return false;
+    /// Claims an ID after the envelope is decoded and opened, binding the
+    /// claim to the plaintext that made it.
+    ///
+    /// The claim is keyed on completion, not on first sight. An id nobody has
+    /// answered yet belongs to its owner, and a second delivery of the same
+    /// body attaches to that owner's answer rather than prompting again — the
+    /// hook falls back from the socket to NATS with the same request id, and
+    /// that retry must still be answerable. An id whose answer is already
+    /// recorded is a duplicate for the rest of the protocol validity window,
+    /// so a sequential replay cannot raise another prompt after the first
+    /// ended.
+    fn claim(self, request_id: &str, payload_hash: [u8; 32]) -> Claim {
+        let request_ids = Arc::clone(&self.request_ids);
+        let Ok(mut claimed) = request_ids.lock() else {
+            return Claim::Duplicate;
         };
         let now = Instant::now();
-        request_ids.retain(|_, seen_at| now.duration_since(*seen_at) < SEEN_REQUEST_RETENTION);
-        if request_ids.contains_key(request_id) {
-            return false;
+        claimed.retain(|_, seen| now.duration_since(seen.seen_at) < SEEN_REQUEST_RETENTION);
+        if let Some(seen) = claimed.get_mut(request_id) {
+            if seen.payload_hash != payload_hash {
+                warn!(
+                    request_id = %escape_for_terminal(request_id),
+                    "discarding a request that reuses a claimed id with a different body"
+                );
+                return Claim::Duplicate;
+            }
+            if seen.outcome.borrow().is_some() {
+                return Claim::Duplicate;
+            }
+            if seen.outcome.has_changed().is_ok() {
+                if seen.attached {
+                    return Claim::Duplicate;
+                }
+                seen.attached = true;
+                return Claim::Attach(RequestWaiter {
+                    permit: self.permit,
+                    request_ids: Arc::clone(&self.request_ids),
+                    outcome: seen.outcome.clone(),
+                });
+            }
+            // The owner dropped its lease without answering. Nothing decided
+            // this request, so this lane may claim it below.
         }
-        if request_ids.len() >= MAX_SEEN_REQUEST_IDS
-            && let Some(oldest) = request_ids
+        if claimed.len() >= MAX_SEEN_REQUEST_IDS
+            && !claimed.contains_key(request_id)
+            && let Some(oldest) = claimed
                 .iter()
-                .min_by_key(|(_, seen_at)| **seen_at)
+                .min_by_key(|(_, seen)| seen.seen_at)
                 .map(|(request_id, _)| request_id.clone())
         {
-            request_ids.remove(&oldest);
+            claimed.remove(&oldest);
         }
-        request_ids.insert(request_id.to_owned(), now);
-        true
+        let (sender, receiver) = watch::channel(None);
+        claimed.insert(
+            request_id.to_owned(),
+            SeenRequest {
+                seen_at: now,
+                payload_hash,
+                outcome: receiver,
+                attached: false,
+            },
+        );
+        Claim::Owner(RequestLease {
+            _permit: self.permit,
+            outcome: sender,
+        })
     }
+}
+
+impl RequestLease {
+    /// Records this lane's answer. Anything waiting on another transport
+    /// delivers exactly this, and the id counts as answered from here on.
+    fn answered(&self, outcome: RequestOutcome) {
+        self.outcome.send_replace(Some(Arc::new(outcome)));
+    }
+}
+
+impl RequestWaiter {
+    /// Waits for the owning lane's answer, bounded by this request's own
+    /// deadline: a waiter never outlives the request it carries, so a prompt
+    /// nobody answers cannot hold an admission slot past it.
+    async fn wait(&mut self, expires_at: i64) -> Relay {
+        let Some(remaining) = remaining_until(expires_at) else {
+            return Relay::Expired;
+        };
+        let relayed = tokio::time::timeout(remaining, async {
+            loop {
+                let current = self.outcome.borrow_and_update().clone();
+                if let Some(outcome) = current {
+                    return Some(outcome);
+                }
+                if self.outcome.changed().await.is_err() {
+                    return None;
+                }
+            }
+        })
+        .await;
+        match relayed {
+            Ok(Some(outcome)) => Relay::Answer(outcome),
+            Ok(None) => Relay::Abandoned,
+            Err(_) => Relay::Expired,
+        }
+    }
+
+    /// Takes the claim over after the owning lane died without answering.
+    /// The request was never decided, so deciding it here is the first
+    /// answer, not a second one.
+    fn reclaim(self, request_id: &str, payload_hash: [u8; 32]) -> Claim {
+        RequestPermit {
+            permit: self.permit,
+            request_ids: self.request_ids,
+        }
+        .claim(request_id, payload_hash)
+    }
+}
+
+/// The claim key for one request body: its opened plaintext, not the sealed
+/// bytes, so the same request re-sealed for another transport hashes the
+/// same while a different body under the same id does not.
+fn payload_hash(raw: &[u8]) -> [u8; 32] {
+    Sha256::digest(raw).into()
 }
 
 #[derive(Parser)]
@@ -630,7 +799,9 @@ fn dispatch_nats_command(
             return;
         }
     };
-    if !permit.claim(&envelope.request_id) {
+    let payload_hash = payload_hash(&opened.raw);
+    let claim = permit.claim(&envelope.request_id, payload_hash);
+    if matches!(claim, Claim::Duplicate) {
         warn!(
             request_id = %escape_for_terminal(&envelope.request_id),
             "discarding duplicate request"
@@ -640,7 +811,6 @@ fn dispatch_nats_command(
     let identity = Arc::clone(identity);
     let decider = Arc::clone(decider);
     tokio::spawn(async move {
-        let _permit = permit;
         if let Some(nats) = &nats
             && let Err(error) = publish_alive(nats, &opened.request.request_id).await
         {
@@ -651,7 +821,8 @@ fn dispatch_nats_command(
             );
             return;
         }
-        let verdict = decide(&identity, &decider, &opened).await;
+        let verdict =
+            resolve_command_claim(claim, &identity, &decider, &opened, payload_hash).await;
         let result = match verdict {
             Ok(Some(decision)) => {
                 if let Some(nats) = nats {
@@ -671,6 +842,59 @@ fn dispatch_nats_command(
             );
         }
     });
+}
+
+/// Drives one claimed command request to the answer this lane delivers.
+///
+/// The owner runs the decider once and records what it produced. A delivery
+/// that attached to that claim relays the owner's answer on its own
+/// transport instead of raising a second prompt, and one whose owner died
+/// without answering takes the claim over: a request nobody answered is
+/// still unanswered, and this is what keeps the hook's socket-to-NATS
+/// fallback answerable after a late acknowledgement (#64).
+async fn resolve_command_claim(
+    claim: Claim,
+    identity: &Arc<Identity>,
+    decider: &Decider,
+    opened: &OpenedRequest,
+    payload_hash: [u8; 32],
+) -> Result<Option<DecisionV1>> {
+    // Each turn of this loop either ends with an answer or hands the claim on.
+    // Taking a claim over needs the previous owner to have died holding it, so
+    // the loop cannot spin: it follows the request, it does not retry it.
+    let mut claim = claim;
+    let lease = loop {
+        match claim {
+            Claim::Duplicate => return Ok(None),
+            Claim::Owner(lease) => break lease,
+            Claim::Attach(mut waiter) => {
+                claim = match waiter.wait(opened.request.expires_at).await {
+                    Relay::Answer(outcome) => {
+                        return Ok(match outcome.as_ref() {
+                            RequestOutcome::Command(decision) => Some(decision.as_ref().clone()),
+                            // The two lanes claim under separate keys, so an
+                            // authentication answer can never surface here;
+                            // relaying nothing is the only safe reading of one
+                            // that did.
+                            RequestOutcome::Authentication(_) | RequestOutcome::Unanswered => None,
+                        });
+                    }
+                    Relay::Expired => return Ok(None),
+                    // The owner died holding the request. Whoever holds it now
+                    // — this lane, or a delivery that got there first — is the
+                    // one this lane waits on, so no transport is left
+                    // unanswered.
+                    Relay::Abandoned => waiter.reclaim(&opened.request.request_id, payload_hash),
+                };
+            }
+        }
+    };
+    let decision = decide(identity, decider, opened).await?;
+    lease.answered(match &decision {
+        Some(decision) => RequestOutcome::Command(Box::new(decision.clone())),
+        None => RequestOutcome::Unanswered,
+    });
+    Ok(decision)
 }
 
 /// Decodes and admits one contextual sudo authentication delivery. It mirrors
@@ -717,7 +941,9 @@ fn dispatch_nats_authentication(
             return;
         }
     };
-    if !permit.claim(&auth_dedupe_key(&envelope.request_id)) {
+    let payload_hash = payload_hash(&opened.raw);
+    let claim = permit.claim(&auth_dedupe_key(&envelope.request_id), payload_hash);
+    if matches!(claim, Claim::Duplicate) {
         warn!(
             request_id = %escape_for_terminal(&envelope.request_id),
             "discarding duplicate authentication request"
@@ -727,7 +953,6 @@ fn dispatch_nats_authentication(
     let identity = Arc::clone(identity);
     let decider = Arc::clone(decider);
     tokio::spawn(async move {
-        let _permit = permit;
         if let Some(nats) = &nats
             && let Err(error) = publish_alive(nats, &opened.request.request_id).await
         {
@@ -738,7 +963,9 @@ fn dispatch_nats_authentication(
             );
             return;
         }
-        let result = match decide_authentication(&identity, &decider, &opened).await {
+        let assertion =
+            resolve_authentication_claim(claim, &identity, &decider, &opened, payload_hash).await;
+        let result = match assertion {
             Ok(Some(decision)) => match nats {
                 Some(nats) => publish_authentication(&nats, &opened.request, decision).await,
                 None => Ok(()),
@@ -754,6 +981,47 @@ fn dispatch_nats_authentication(
             );
         }
     });
+}
+
+/// The authentication lane's half of [`resolve_command_claim`], with the
+/// same rule: one prompt per request, whatever carried it, and a request an
+/// abandoned lane never answered stays answerable.
+async fn resolve_authentication_claim(
+    claim: Claim,
+    identity: &Arc<Identity>,
+    decider: &Decider,
+    opened: &OpenedAuthRequestV1,
+    payload_hash: [u8; 32],
+) -> Result<Option<AuthDecisionV1>> {
+    let mut claim = claim;
+    let lease = loop {
+        match claim {
+            Claim::Duplicate => return Ok(None),
+            Claim::Owner(lease) => break lease,
+            Claim::Attach(mut waiter) => {
+                claim = match waiter.wait(opened.request.expires_at).await {
+                    Relay::Answer(outcome) => {
+                        return Ok(match outcome.as_ref() {
+                            RequestOutcome::Authentication(decision) => {
+                                Some(decision.as_ref().clone())
+                            }
+                            RequestOutcome::Command(_) | RequestOutcome::Unanswered => None,
+                        });
+                    }
+                    Relay::Expired => return Ok(None),
+                    Relay::Abandoned => {
+                        waiter.reclaim(&auth_dedupe_key(&opened.request.request_id), payload_hash)
+                    }
+                };
+            }
+        }
+    };
+    let decision = decide_authentication(identity, decider, opened).await?;
+    lease.answered(match &decision {
+        Some(decision) => RequestOutcome::Authentication(Box::new(decision.clone())),
+        None => RequestOutcome::Unanswered,
+    });
+    Ok(decision)
 }
 
 /// The dedupe key for one authentication request.
@@ -1294,7 +1562,9 @@ async fn handle_socket(
             return Ok(());
         }
     };
-    if !permit.claim(&envelope.request_id) {
+    let payload_hash = payload_hash(&opened.raw);
+    let claim = permit.claim(&envelope.request_id, payload_hash);
+    if matches!(claim, Claim::Duplicate) {
         warn!(
             request_id = %escape_for_terminal(&envelope.request_id),
             "discarding duplicate socket request"
@@ -1312,7 +1582,9 @@ async fn handle_socket(
         .flush()
         .await
         .context("flush socket acknowledgement")?;
-    let Some(decision) = decide(identity, decider, &opened).await? else {
+    let Some(decision) =
+        resolve_command_claim(claim, identity, decider, &opened, payload_hash).await?
+    else {
         return Ok(());
     };
     let frame = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&decision)?)?;
@@ -1355,7 +1627,9 @@ async fn handle_socket_authentication(
             return Ok(());
         }
     };
-    if !permit.claim(&auth_dedupe_key(&envelope.request_id)) {
+    let payload_hash = payload_hash(&opened.raw);
+    let claim = permit.claim(&auth_dedupe_key(&envelope.request_id), payload_hash);
+    if matches!(claim, Claim::Duplicate) {
         warn!(
             request_id = %escape_for_terminal(&envelope.request_id),
             "discarding duplicate socket authentication request"
@@ -1373,7 +1647,9 @@ async fn handle_socket_authentication(
         .flush()
         .await
         .context("flush socket acknowledgement")?;
-    let Some(decision) = decide_authentication(identity, decider, &opened).await? else {
+    let Some(decision) =
+        resolve_authentication_claim(claim, identity, decider, &opened, payload_hash).await?
+    else {
         return Ok(());
     };
     let frame = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&decision)?)?;
@@ -1967,11 +2243,11 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Decider, MAX_APPROVAL_REASON_CHARS, MAX_IN_FLIGHT_REQUESTS, Pairing, Prompter,
-        RequestAdmission, Verb, approval_reason, authentication_prompt_output,
-        authentication_reason, authentication_summary, bind_socket, decide, decide_authentication,
-        dispatch_nats_request, format_env, load_or_create_with, now, prompt_output, quote_argv,
-        runas_label, socket_path,
+        Claim, Cli, Decider, MAX_APPROVAL_REASON_CHARS, MAX_IN_FLIGHT_REQUESTS, Pairing, Prompter,
+        Relay, RequestAdmission, RequestOutcome, Verb, approval_reason,
+        authentication_prompt_output, authentication_reason, authentication_summary, bind_socket,
+        decide, decide_authentication, dispatch_nats_request, format_env, load_or_create_with, now,
+        payload_hash, prompt_output, quote_argv, runas_label, socket_path,
     };
     use clap::Parser as _;
     use oshioki_agent::SignerKind;
@@ -1982,23 +2258,277 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::mpsc;
 
+    /// One test decision, distinct per request id so a relayed answer can be
+    /// told apart from a freshly minted one.
+    fn test_decision(request_id: &str) -> oshioki_protocol::DecisionV1 {
+        oshioki_protocol::DecisionV1::Deny(oshioki_protocol::DenyV1 {
+            version: VERSION_V1,
+            request_id: request_id.to_owned(),
+            device_fingerprint: "fingerprint".into(),
+            signature: None,
+        })
+    }
+
     #[test]
-    fn request_admission_is_bounded_and_deduplicates_ids() {
+    fn request_admission_is_bounded_and_deduplicates_answered_ids() {
         let admission = RequestAdmission::new();
+        let body = payload_hash(b"one body");
         let mut leases = Vec::new();
         for index in 0..MAX_IN_FLIGHT_REQUESTS {
-            let lease = admission.reserve().expect("capacity should be available");
-            assert!(lease.claim(&format!("request-{index}")));
+            let permit = admission.reserve().expect("capacity should be available");
+            let Claim::Owner(lease) = permit.claim(&format!("request-{index}"), body) else {
+                panic!("an unclaimed id belongs to the lane that claims it");
+            };
+            lease.answered(RequestOutcome::Unanswered);
             leases.push(lease);
         }
         assert!(admission.reserve().is_none());
 
         drop(leases.pop());
         let duplicate = admission.reserve().expect("one slot was released");
-        assert!(!duplicate.claim("request-0"));
-        drop(duplicate);
+        assert!(matches!(
+            duplicate.claim("request-0", body),
+            Claim::Duplicate
+        ));
         let replacement = admission.reserve().expect("duplicate released its slot");
-        assert!(replacement.claim("replacement"));
+        assert!(matches!(
+            replacement.claim("replacement", body),
+            Claim::Owner(_)
+        ));
+    }
+
+    /// #64 at the layer the drop happened: the socket lane holds the request
+    /// while its prompt is up, the hook's acknowledgement wait expires, and
+    /// the same request arrives again through NATS. The retry attaches to the
+    /// one decision instead of being discarded, and only once that decision
+    /// exists is the id a replay.
+    #[tokio::test]
+    async fn a_retry_on_another_transport_attaches_to_the_in_flight_decision() {
+        let admission = RequestAdmission::new();
+        let body = payload_hash(b"one body");
+        let Claim::Owner(owner) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-late-ack", body)
+        else {
+            panic!("an unclaimed id belongs to the lane that claims it");
+        };
+        let Claim::Attach(mut waiter) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-late-ack", body)
+        else {
+            panic!("a retry for an in-flight request must attach to it");
+        };
+        assert!(
+            matches!(
+                admission
+                    .reserve()
+                    .expect("capacity should be available")
+                    .claim("request-late-ack", body),
+                Claim::Duplicate
+            ),
+            "the hook falls back once: one waiter, so a replay flood holds no work slots"
+        );
+
+        let decision = test_decision("request-late-ack");
+        owner.answered(RequestOutcome::Command(Box::new(decision.clone())));
+        match waiter.wait(now() + 60).await {
+            Relay::Answer(outcome) => match outcome.as_ref() {
+                RequestOutcome::Command(relayed) => assert_eq!(relayed.as_ref(), &decision),
+                other => panic!("expected the owner's decision, got {other:?}"),
+            },
+            _ => panic!("the owner answered; the retry must see that answer"),
+        }
+
+        assert!(
+            matches!(
+                admission
+                    .reserve()
+                    .expect("capacity should be available")
+                    .claim("request-late-ack", body),
+                Claim::Duplicate
+            ),
+            "an answered request stays answered: a replay raises nothing"
+        );
+    }
+
+    /// Attachment is bound to the body that claimed the id, not to the id
+    /// alone: a different payload under a claimed id decides nothing and
+    /// relays nothing.
+    #[test]
+    fn a_different_body_under_a_claimed_id_is_discarded() {
+        let admission = RequestAdmission::new();
+        let Claim::Owner(_owner) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-1", payload_hash(b"the claimed body"))
+        else {
+            panic!("an unclaimed id belongs to the lane that claims it");
+        };
+        assert!(matches!(
+            admission
+                .reserve()
+                .expect("capacity should be available")
+                .claim("request-1", payload_hash(b"a different body")),
+            Claim::Duplicate
+        ));
+    }
+
+    /// A lane that dies without answering owes the request nothing: the
+    /// waiting retry learns the claim was abandoned and takes it over, so a
+    /// request nobody answered is still answerable.
+    #[tokio::test]
+    async fn a_lane_that_dies_without_answering_leaves_the_request_claimable() {
+        let admission = RequestAdmission::new();
+        let body = payload_hash(b"one body");
+        let Claim::Owner(owner) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-abandoned", body)
+        else {
+            panic!("an unclaimed id belongs to the lane that claims it");
+        };
+        let Claim::Attach(mut waiter) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-abandoned", body)
+        else {
+            panic!("a retry for an in-flight request must attach to it");
+        };
+        drop(owner);
+        assert!(matches!(waiter.wait(now() + 60).await, Relay::Abandoned));
+        assert!(matches!(
+            waiter.reclaim("request-abandoned", body),
+            Claim::Owner(_)
+        ));
+    }
+
+    /// And when another delivery took the abandoned request over first, the
+    /// waiter attaches to that new owner instead of being left with nothing
+    /// to deliver: whichever transport the hook is listening on still gets
+    /// the answer.
+    #[tokio::test]
+    async fn a_waiter_attaches_to_whoever_took_the_abandoned_request_over() {
+        let admission = RequestAdmission::new();
+        let body = payload_hash(b"one body");
+        let Claim::Owner(owner) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-taken-over", body)
+        else {
+            panic!("an unclaimed id belongs to the lane that claims it");
+        };
+        let Claim::Attach(mut waiter) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-taken-over", body)
+        else {
+            panic!("a retry for an in-flight request must attach to it");
+        };
+        drop(owner);
+        assert!(matches!(waiter.wait(now() + 60).await, Relay::Abandoned));
+
+        let Claim::Owner(successor) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim("request-taken-over", body)
+        else {
+            panic!("an abandoned request belongs to the next lane that claims it");
+        };
+        let Claim::Attach(mut waiter) = waiter.reclaim("request-taken-over", body) else {
+            panic!("the waiter must attach to the lane that now holds the request");
+        };
+        let decision = test_decision("request-taken-over");
+        successor.answered(RequestOutcome::Command(Box::new(decision.clone())));
+        match waiter.wait(now() + 60).await {
+            Relay::Answer(outcome) => match outcome.as_ref() {
+                RequestOutcome::Command(relayed) => assert_eq!(relayed.as_ref(), &decision),
+                other => panic!("expected the successor's decision, got {other:?}"),
+            },
+            _ => panic!("the successor answered; the waiter must see that answer"),
+        }
+    }
+
+    /// The same reconciliation across the real socket lane: the socket holds
+    /// the request with its prompt up, the hook falls back to NATS with the
+    /// same envelope, and both transports carry the one signed decision the
+    /// one prompt produced.
+    #[tokio::test]
+    async fn a_late_socket_acknowledgement_leaves_the_nats_retry_answerable() {
+        let dir = socket_test_dir("late-ack");
+        let store = MemoryStore::new();
+        let identity = std::sync::Arc::new(
+            oshioki_agent::Identity::generate_to_with(
+                &dir.join("agent.json"),
+                SignerKind::Software,
+                &store,
+            )
+            .unwrap(),
+        );
+        let mut request = request_for_log_probe();
+        request.request_id = "request-late-ack".into();
+        request.issued_at = now();
+        request.expires_at = now() + 60;
+        let envelope = sealed_envelope_bytes(&identity, &request);
+        let body = payload_hash(&request.raw_json().unwrap());
+
+        let (answers, lines) = mpsc::channel(8);
+        let decider = Decider::Prompt(Prompter::new(lines));
+        let admission = RequestAdmission::new();
+        let permit = admission.reserve().expect("capacity should be available");
+        let (mut hook_side, agent_side) = tokio::net::UnixStream::pair().unwrap();
+        let socket_identity = std::sync::Arc::clone(&identity);
+        let serve = tokio::spawn(async move {
+            super::handle_socket(agent_side, &socket_identity, &decider, permit).await
+        });
+
+        let frame = oshioki_protocol::socket_v1::encode_frame(&envelope).unwrap();
+        hook_side.write_all(&frame).await.unwrap();
+        let acknowledgement: oshioki_protocol::AliveV1 =
+            serde_json::from_slice(&read_socket_frame(&mut hook_side).await).unwrap();
+        acknowledgement.validate(&request.request_id).unwrap();
+
+        // The hook's acknowledgement wait had already expired, so the same
+        // request is now in flight on NATS as well.
+        let Claim::Attach(mut waiter) = admission
+            .reserve()
+            .expect("capacity should be available")
+            .claim(&request.request_id, body)
+        else {
+            panic!("the NATS retry must attach to the socket lane's decision");
+        };
+
+        // One prompt is up; answering it is the only decision made here.
+        let feeder = tokio::spawn(async move {
+            while answers.send("y".to_owned()).await.is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        let relayed = waiter.wait(request.expires_at).await;
+        let verdict: oshioki_protocol::DecisionV1 =
+            serde_json::from_slice(&read_socket_frame(&mut hook_side).await).unwrap();
+        serve.await.unwrap().unwrap();
+        feeder.abort();
+
+        match relayed {
+            Relay::Answer(outcome) => match outcome.as_ref() {
+                RequestOutcome::Command(decision) => assert_eq!(decision.as_ref(), &verdict),
+                other => panic!("expected the socket lane's decision, got {other:?}"),
+            },
+            _ => panic!("the NATS retry must receive the decision the prompt produced"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Read one length-delimited frame from a connected hook-side socket.
+    async fn read_socket_frame(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
+        let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let len = usize::try_from(u32::from_be_bytes(prefix)).unwrap();
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        payload
     }
 
     #[tokio::test]
