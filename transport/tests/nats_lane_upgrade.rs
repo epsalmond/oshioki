@@ -109,3 +109,50 @@ async fn a_legacy_stream_and_consumer_gain_the_authentication_lane() -> Result<(
         }
     }
 }
+
+#[tokio::test]
+async fn a_covering_wildcard_stream_is_left_alone() -> Result<()> {
+    if std::env::var_os("OSHIOKI_TEST_NATS_LANE").is_none() {
+        eprintln!("skipping: set OSHIOKI_TEST_NATS_LANE=1 and NATS_URL for a throwaway broker");
+        return Ok(());
+    }
+    let url = match std::env::var("NATS_URL") {
+        Ok(url) if !url.is_empty() => url,
+        _ => return Ok(()),
+    };
+    let user = std::env::var("NATS_USER").ok();
+    let pass = std::env::var("NATS_PASS").ok();
+    let mut options = async_nats::ConnectOptions::new();
+    if let (Some(user), Some(pass)) = (user, pass) {
+        options = options.user_and_password(user, pass);
+    }
+    let client = options.connect(&url).await?;
+    let jetstream = jetstream::new(client.clone());
+    let _ = jetstream.delete_stream(REQUEST_STREAM).await;
+    jetstream
+        .create_stream(stream::Config {
+            name: REQUEST_STREAM.into(),
+            subjects: vec!["oshioki.>".into()],
+            ..Default::default()
+        })
+        .await
+        .context("create covering wildcard stream")?;
+    let transport = NatsTransport::from_client(client);
+    let inbound = transport
+        .requests()
+        .await
+        .context("open consumer against covering wildcard stream")?;
+    drop(inbound);
+    let subjects = jetstream
+        .get_stream(REQUEST_STREAM)
+        .await?
+        .cached_info()
+        .config
+        .subjects
+        .clone();
+    anyhow::ensure!(
+        subjects == ["oshioki.>"],
+        "covering wildcard was rewritten: {subjects:?}"
+    );
+    Ok(())
+}

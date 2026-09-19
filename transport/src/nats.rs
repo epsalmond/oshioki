@@ -79,18 +79,55 @@ pub const REQUEST_CONSUMER_FILTERS: [&str; 2] = ["oshioki.request.>", "oshioki.a
 
 const CONSUMER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// True when `existing` already includes every required subject.
+/// True when `existing` already captures every message `required` would.
+/// `oshioki.>` covers `oshioki.request.>` and `oshioki.auth.>`; a lone
+/// `oshioki.request.>` does not cover the authentication lane.
+pub(crate) fn subject_covers(existing: &str, required: &str) -> bool {
+    token_covers(&split_subject(existing), &split_subject(required))
+}
+
+fn split_subject(subject: &str) -> Vec<&str> {
+    if subject.is_empty() {
+        Vec::new()
+    } else {
+        subject.split('.').collect()
+    }
+}
+
+fn token_covers(existing: &[&str], required: &[&str]) -> bool {
+    let Some((have, rest_have)) = existing.split_first() else {
+        return required.is_empty();
+    };
+    let Some((need, rest_need)) = required.split_first() else {
+        return false;
+    };
+    if *have == ">" {
+        return true;
+    }
+    if *have == "*" {
+        return *need != ">" && token_covers(rest_have, rest_need);
+    }
+    if *need == "*" || *need == ">" {
+        return false;
+    }
+    have == need && token_covers(rest_have, rest_need)
+}
+
+/// True when `existing` already includes every required subject, including
+/// by a broader NATS wildcard.
 pub(crate) fn subjects_cover(existing: &[String], required: &[&str]) -> bool {
     required
         .iter()
-        .all(|need| existing.iter().any(|have| have == need))
+        .all(|need| existing.iter().any(|have| subject_covers(have, need)))
 }
 
-/// Existing subjects first, then any required subject that was missing.
+/// Existing subjects first, then any required subject that no existing
+/// pattern already covers. Does not add a narrower subject that would
+/// overlap a covering wildcard (`oshioki.>` plus `oshioki.request.>`).
 pub(crate) fn merge_subjects(existing: &[String], required: &[&str]) -> Vec<String> {
     let mut subjects = existing.to_vec();
     for need in required {
-        if !subjects.iter().any(|have| have == need) {
+        if !subjects.iter().any(|have| subject_covers(have, need)) {
             subjects.push((*need).to_owned());
         }
     }
@@ -912,6 +949,19 @@ mod tests {
         let already = merge_subjects(&existing, &REQUEST_CONSUMER_FILTERS);
         assert!(subjects_cover(&already, &REQUEST_CONSUMER_FILTERS));
         assert_eq!(merge_subjects(&already, &REQUEST_CONSUMER_FILTERS), already);
+    }
+
+    #[test]
+    fn a_covering_wildcard_does_not_need_narrower_subjects() {
+        let existing = vec!["oshioki.>".into()];
+        assert!(subjects_cover(&existing, &REQUEST_CONSUMER_FILTERS));
+        assert_eq!(
+            merge_subjects(&existing, &REQUEST_CONSUMER_FILTERS),
+            existing
+        );
+        assert!(subject_covers(">", "oshioki.request.>"));
+        assert!(!subject_covers("oshioki.request.>", "oshioki.auth.>"));
+        assert!(!subject_covers("oshioki.*", "oshioki.request.>"));
     }
 
     #[test]

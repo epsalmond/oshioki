@@ -74,11 +74,15 @@ Two classes, no third:
    Old binaries keep working because every `SELECT` names columns. Do not
    bump `user_version` for this class.
 2. **Breaking (`user_version` bump).** Anything that would make an older
-   binary's SQL or `ready()` wrong. Before applying it, the server creates
-   and verifies a restore snapshot next to `OSHIOKI_STATE_PATH`, named
-   `<stem>.pre-v<from>.sqlite3` (for `state.sqlite3` at version 2,
-   `state.pre-v2.sqlite3`). Rollback is: stop the new binary, replace the
-   live database with that snapshot, start the previous binary.
+   binary's SQL or `ready()` wrong. Before applying it, the server writes a
+   verified restore snapshot of the **current** live file next to
+   `OSHIOKI_STATE_PATH`, named `<stem>.pre-v<from>.sqlite3` (for
+   `state.sqlite3` at version 2, `state.pre-v2.sqlite3`). A snapshot already
+   at that path is renamed aside (`<stem>.pre-v<from>.<timestamp>.sqlite3`)
+   so a second upgrade after rollback cannot rewind past enrollments made
+   on the older binary. The snapshot is accepted only if `PRAGMA
+   integrity_check` returns `ok`. Rollback is: stop the new binary, replace
+   the live database with that snapshot, start the previous binary.
 
 Schema version 3 (outbox `expires_at`) already shipped as class 2 in
 v0.1.14. Older binaries than that release cannot read a version-3 file;

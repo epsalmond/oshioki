@@ -1323,6 +1323,43 @@ mod tests {
             let restored = Identity::load_embedded(&prev).unwrap();
             assert_eq!(restored.fingerprint(), before.fingerprint());
         }
+        fs::copy(&prev, &path).unwrap();
+        let restored_store = secret_store::MemoryStore::new();
+        let restored = Identity::load_with(&path, &restored_store).unwrap();
+        assert_eq!(restored.fingerprint(), before.fingerprint());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Copying `agent.json.prev` back over the live file is the documented
+    /// restore: a fresh store loads the embedded secret and keeps the
+    /// fingerprint, which is what a rolled-back agent needs.
+    #[test]
+    fn restoring_agent_json_prev_recovers_the_legacy_identity() {
+        let dir = std::env::temp_dir().join(format!("oshioki-restore-{}", std::process::id()));
+        let path = dir.join("agent.json");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": VERSION_V1,
+                "signing": {"kind": "software", "key": encode_base64url(&[0x54; 32])},
+                "box_secret": encode_base64url(&[0x55; 32]),
+                "api_token_hash": encode_base64url(&[0x56; 32]),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = secret_store::MemoryStore::new();
+        let migrated = Identity::load_with(&path, &store).unwrap();
+        fs::copy(dir.join("agent.json.prev"), &path).unwrap();
+        let restored = Identity::load_with(&path, &secret_store::MemoryStore::new()).unwrap();
+        assert_eq!(restored.fingerprint(), migrated.fingerprint());
+        let live: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            live.get("box_secret").is_some() || live.get("box_secret_ref").is_some(),
+            "{live}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

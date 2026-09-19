@@ -36,6 +36,11 @@ cleanup() {
   set +e
   [ -z "${AGENT_PID:-}" ] || kill "$AGENT_PID" >/dev/null 2>&1 || true
   [ -z "${AGENT_PID:-}" ] || wait "$AGENT_PID" >/dev/null 2>&1 || true
+  [ -z "${SERVER_PID:-}" ] || kill "$SERVER_PID" >/dev/null 2>&1 || true
+  [ -z "${SERVER_PID:-}" ] || wait "$SERVER_PID" >/dev/null 2>&1 || true
+  [ -z "${NATS_PID:-}" ] || kill "$NATS_PID" >/dev/null 2>&1 || true
+  [ -z "${NATS_PID:-}" ] || wait "$NATS_PID" >/dev/null 2>&1 || true
+  [ -z "${NATS_CONTAINER:-}" ] || docker rm -f "$NATS_CONTAINER" >/dev/null 2>&1 || true
   if [ -d "$PREV_SRC" ]; then
     git -C "$REPO_ROOT" worktree remove --force "$PREV_SRC" >/dev/null 2>&1 || true
   fi
@@ -201,6 +206,188 @@ if [ "$mixed_status" -eq 124 ]; then
 fi
 if [ "$mixed_status" -ne 0 ]; then
   echo "mixed prev-hook/current-agent failed closed (status $mixed_status)"
+fi
+
+echo "identity restore through a test store"
+cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --locked -p oshioki-agent \
+  restoring_agent_json_prev_recovers_the_legacy_identity -- --exact
+
+echo "sqlite snapshot refresh and integrity"
+cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --locked -p oshioki-server \
+  a_second_upgrade_refreshes_the_restore_snapshot \
+  a_restore_snapshot_with_corrupt_data_pages_is_rejected
+
+free_port() {
+  python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+wait_for_http() {
+  local url="$1" attempt=0
+  while [ "$attempt" -lt 80 ]; do
+    if curl --fail --silent "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  echo "timed out waiting for $url" >&2
+  return 1
+}
+
+stop_server() {
+  [ -n "${SERVER_PID:-}" ] || return 0
+  kill "$SERVER_PID" >/dev/null 2>&1 || true
+  wait "$SERVER_PID" >/dev/null 2>&1 || true
+  SERVER_PID=""
+}
+
+start_server() {
+  local bin="$1" log="$2"
+  : >"$log"
+  NATS_URL="$NATS_URL" NATS_USER=oshioki NATS_PASS=test-only \
+    OSHIOKI_ALLOW_PLAINTEXT_NATS=1 \
+    OSHIOKI_STATE_PATH="$SERVER_DB" \
+    OSHIOKI_LISTEN="127.0.0.1:${SERVER_PORT}" \
+    OSHIOKI_ORIGIN=https://sudo.test \
+    OSHIOKI_RP_ID=sudo.test \
+    RUST_LOG=info "$bin" >"$log" 2>&1 &
+  SERVER_PID=$!
+  if ! wait_for_http "http://127.0.0.1:${SERVER_PORT}/healthz"; then
+    echo "server failed to become healthy" >&2
+    cat "$log" >&2 || true
+    return 1
+  fi
+}
+
+echo "server upgrade with enrolled state and an in-flight request"
+NATS_PORT="$(free_port)"
+SERVER_PORT="$(free_port)"
+while [ "$SERVER_PORT" = "$NATS_PORT" ]; do
+  SERVER_PORT="$(free_port)"
+done
+NATS_URL="nats://127.0.0.1:${NATS_PORT}"
+SERVER_DIR="$WORK/server"
+SERVER_DB="$SERVER_DIR/state.sqlite3"
+install -d -m 0700 "$SERVER_DIR"
+if command -v nats-server >/dev/null 2>&1; then
+  mkdir -p "$SERVER_DIR/nats"
+  nats-server -js -sd "$SERVER_DIR/nats" -p "$NATS_PORT" \
+    --user oshioki --pass test-only >"$SERVER_DIR/nats.log" 2>&1 &
+  NATS_PID=$!
+else
+  command -v docker >/dev/null 2>&1 || {
+    echo "test-compat-upgrade: need nats-server or docker for the server path" >&2
+    exit 2
+  }
+  NATS_CONTAINER="$(docker run -d --rm -p "127.0.0.1:${NATS_PORT}:4222" \
+    nats:2.11-alpine --jetstream --user oshioki --pass test-only)"
+fi
+for _ in $(seq 1 50); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$NATS_PORT") 2>/dev/null; then
+    exec 3>&-
+    break
+  fi
+  sleep 0.1
+done
+OSHIOKI_TEST_NATS_LANE=1 NATS_URL="$NATS_URL" NATS_USER=oshioki NATS_PASS=test-only \
+  cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --locked \
+    -p oshioki-transport --test nats_lane_upgrade -- --test-threads=1
+
+start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-1.log"
+stop_server
+python3 - "$SERVER_DB" "$REPO_ROOT/tests/compat/goldens" <<'PY'
+import base64, hashlib, json, sqlite3, sys, time
+db, goldens = sys.argv[1], sys.argv[2]
+def b64url(value):
+    pad = "=" * ((4 - len(value) % 4) % 4)
+    return base64.urlsafe_b64decode(value + pad)
+devices = json.loads(open(f"{goldens}/devices-v1.json", encoding="utf-8").read())
+device = devices["devices"][0]
+fp = device["fingerprint"]
+envelope = {
+    "version": 1,
+    "request_id": "compat-inflight",
+    "host": "host.example",
+    "user": "eric",
+    "issued_at": int(time.time()) - 1,
+    "expires_at": int(time.time()) + 600,
+    "sealed": [{
+        "device_fingerprint": fp,
+        "ephemeral_pub": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+        "nonce": "CQkJCQkJCQkJCQkJ",
+        "ciphertext": "CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo",
+    }],
+}
+raw = json.dumps(envelope, separators=(",", ":")).encode()
+conn = sqlite3.connect(db)
+conn.execute(
+    """INSERT OR REPLACE INTO devices(
+         fingerprint, credential_id, api_token_hash, public_record_json, active, updated_at)
+       VALUES (?, ?, ?, ?, 1, unixepoch())""",
+    (fp, device["credential_id"], b64url(device["api_token_hash"]), json.dumps(device)),
+)
+conn.execute(
+    """INSERT OR REPLACE INTO requests(
+         id, envelope_hash, envelope_json, host, user, issued_at, expires_at, state, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', unixepoch())""",
+    (
+        envelope["request_id"],
+        hashlib.sha256(raw).digest(),
+        raw,
+        envelope["host"],
+        envelope["user"],
+        envelope["issued_at"],
+        envelope["expires_at"],
+    ),
+)
+conn.execute(
+    "INSERT OR REPLACE INTO sealed_bodies(request_id, fingerprint, body_json) VALUES (?, ?, ?)",
+    (envelope["request_id"], fp, json.dumps(envelope["sealed"][0]).encode()),
+)
+conn.commit()
+print(fp)
+PY
+fingerprint="$(python3 -c "import json; print(json.load(open('$REPO_ROOT/tests/compat/goldens/devices-v1.json'))['devices'][0]['fingerprint'])")"
+start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-2.log"
+curl --fail --silent "http://127.0.0.1:${SERVER_PORT}/api/v1/devices/${fingerprint}" >/dev/null
+stop_server
+start_server "$CUR_BIN/oshioki-server" "$SERVER_DIR/current.log"
+curl --fail --silent "http://127.0.0.1:${SERVER_PORT}/api/v1/devices/${fingerprint}" >/dev/null
+python3 - "$SERVER_DB" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+state = conn.execute("SELECT state FROM requests WHERE id='compat-inflight'").fetchone()
+assert state == ("pending",), state
+print("in-flight request still pending")
+PY
+stop_server
+snapshot="$(python3 - "$SERVER_DB" <<'PY'
+import glob, os, sys
+path = sys.argv[1]
+stem, ext = os.path.splitext(path)
+matches = sorted(glob.glob(stem + ".pre-v*" + ext))
+print(matches[-1] if matches else "")
+PY
+)"
+if [ -n "$snapshot" ]; then
+  echo "restoring $snapshot"
+  cp "$snapshot" "$SERVER_DB"
+  rm -f "$SERVER_DB-wal" "$SERVER_DB-shm"
+  start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-3.log"
+  curl --fail --silent "http://127.0.0.1:${SERVER_PORT}/api/v1/devices/${fingerprint}" >/dev/null
+  stop_server
+  echo "previous server authenticated from the restore snapshot"
+else
+  start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-3.log"
+  curl --fail --silent "http://127.0.0.1:${SERVER_PORT}/api/v1/devices/${fingerprint}" >/dev/null
+  stop_server
+  echo "previous server still serves enrolled state after current (no schema bump)"
 fi
 
 TEST_OK=1

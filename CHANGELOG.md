@@ -12,11 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A release compatibility contract so `N-1 → N` upgrades keep enrolled
   devices, identity files, pending requests, and a tested restore path.
   Additive wire fields stay backward-readable; a breaking SQLite change
-  writes a verified `<stem>.pre-v<from>.sqlite3` snapshot before it
-  migrates; a legacy identity file keeps `agent.json.prev` until an
-  operator removes it; the server widens the `OSHIOKI` stream and recreates
+  writes a verified `<stem>.pre-v<from>.sqlite3` snapshot of the current
+  live file (archiving any previous snapshot at that path) before it
+  migrates, and rejects a snapshot whose `integrity_check` is not `ok`; a
+  legacy identity file keeps `agent.json.prev` until an operator removes
+  it; the server widens the `OSHIOKI` stream and recreates
   `oshioki-server-v1` when a new authentication lane needs filters the
-  running consumer does not have, instead of warning and serving. CI loads
+  running consumer does not have, instead of warning and serving. A stream
+  whose subjects already cover those lanes (`oshioki.>`) is left alone. CI loads
   previous-release goldens, exercises old-reader/new-writer pairs, upgrades
   with an enrolled credential and an in-flight request, and rolls back
   through those restore files. See `docs/compatibility.md`. (#110, #67)

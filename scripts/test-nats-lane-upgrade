@@ -62,6 +62,6 @@ done
 
 OSHIOKI_TEST_NATS_LANE=1 NATS_URL="$NATS_URL" NATS_USER=oshioki NATS_PASS=test-only \
   cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --locked \
-    -p oshioki-transport --test nats_lane_upgrade -- --nocapture
+    -p oshioki-transport --test nats_lane_upgrade -- --nocapture --test-threads=1
 
 TEST_OK=1
