@@ -42,6 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the identical `Dropped` classification as a clean hangup, so a socket
   squatter can no longer trade an honest hangup for a more favorable
   outcome by sending garbage instead. (#66, #68)
+- The legacy sudo approval plugin's password-race `SIGINT` guard now saves
+  and restores the complete disposition with `sigaction` instead of
+  `signal`, on every exit path -- approval, denial, cancellation, timeout, or
+  error. glibc's `signal` has BSD semantics and re-applies `SA_RESTART` on
+  install and restore, so that flag was not actually being lost; what it
+  silently dropped was the blocked-signal mask and any other flag, most
+  dangerously `SA_SIGINFO` -- a three-argument `sa_sigaction` handler
+  restored through `signal` comes back registered as a one-argument
+  `sa_handler`, which is called with the wrong signature.
+- The legacy plugin's password fallback resolves the real terminal behind
+  its open descriptor with `ttyname_r` and passes that path (e.g.
+  `/dev/pts/3`) as `PAM_TTY`, instead of always passing the literal string
+  `/dev/tty`. Terminal-specific PAM policies and authentication records now
+  see the invocation's actual terminal; `/dev/tty` remains a documented
+  last-resort fallback for when resolution fails.
 ## [0.1.14] - 2026-09-18
 
 ### Added
