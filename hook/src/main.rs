@@ -796,9 +796,7 @@ async fn execute_request_at(
     )
     .await?
     {
-        SocketOutcome::Verdict(bytes) => {
-            serde_json::from_slice(&bytes).context("decode socket decision")?
-        }
+        SocketOutcome::Verdict(bytes) => decode_socket_command_decision(&bytes)?,
         SocketOutcome::Unconfigured => match &nats_url {
             Some(url) => {
                 debug!("no agent socket configured; trying NATS");
@@ -891,18 +889,19 @@ async fn execute_request_at(
                 )));
             }
         },
-        // DELIBERATELY DIFFERENT FROM THE AUTHENTICATION LANE. On this lane an
-        // agent that acknowledges has taken responsibility for a command
-        // approval, and a connection that then disappears fails closed: the
-        // command is simply not run, which costs nothing but a retry. The
-        // authentication lane cannot do that — exit 1 there denies sudo under
-        // `default=die` with no password fallback — so it classifies the same
-        // event as a transport fault. See `await_auth_decision`.
-        // The message is the outcome's own text verbatim, so this lane's
-        // stderr and audit lines are byte-for-byte what they were before the
-        // outcome was split out.
+        // Same exit class as the authentication lane now (`await_auth_decision`):
+        // an agent that acknowledged and then produced no confirmed verdict --
+        // a hangup, a truncated frame, a claimed length this build refuses --
+        // is a host-local fault, not evidence the command was denied. Denying
+        // it here used to be cheap (the command simply does not run, costing
+        // only a retry), but that made an honest hangup strictly worse for the
+        // agent than sending garbage, which this PR's decode-fault handling
+        // left mapped to unavailable: a socket squatter could always get the
+        // more favorable outcome by never hanging up cleanly. The two must
+        // agree, so `Dropped` is unavailable on both lanes; only a decoded,
+        // validated decision approves or denies. Issues #66 and #68.
         SocketOutcome::Dropped { error, .. } => {
-            return Err(anyhow::anyhow!("{error}"));
+            return Err(approval_unavailable(error));
         }
     };
     apply_decision(
@@ -1055,6 +1054,7 @@ fn nats_display_url(url: &str) -> String {
 }
 
 /// What one attempt at the local agent socket concluded.
+#[derive(Debug)]
 enum SocketOutcome {
     /// An agent took the request; the verdict is final. The raw payload is
     /// kept undecoded so both hook lanes share this path and each decodes
@@ -1066,17 +1066,24 @@ enum SocketOutcome {
     /// back to NATS while the deadline allows, or denies at once when no
     /// NATS fallback is configured.
     Silent(SocketSilence),
-    /// An agent acknowledged the request and then the connection went away
-    /// without a verdict: EOF, a reset, or a closed socket. No bytes claiming
-    /// to be a decision ever arrived, so this is a transport fault and not
-    /// evidence about the request. The two lanes classify it differently and
-    /// each does so at its own call site.
+    /// An agent acknowledged the request and then no confirmed verdict ever
+    /// arrived: a clean hangup (EOF), a reset, a truncated frame, or a
+    /// claimed frame length this build refuses. None of these carries
+    /// evidence about the request -- unlike `Frame::Eof`, `Frame::Truncated`
+    /// and a malformed length prefix are bytes that arrived and did not form
+    /// a frame, but that is framing corruption, not a decoded and validated
+    /// decision, so it is exactly as inconclusive as silence. The one rule:
+    /// a host-local fault falls back; only a decoded, validated decision
+    /// terminates a request as approved or denied. Both hook lanes now
+    /// agree on `Dropped`'s exit class; see the `SocketOutcome::Dropped`
+    /// arms in `execute_request_at` and `await_auth_decision`.
     Dropped { path: PathBuf, error: String },
 }
 
 /// How a configured socket produced no verdict. The distinction decides the
 /// message, not the outcome: both fall back to NATS when one is configured
 /// and deny at once when none is.
+#[derive(Debug)]
 enum SocketSilence {
     /// Nothing answered at the path: missing or stale file, refused or
     /// timed-out connect, or a write that never landed.
@@ -1088,15 +1095,27 @@ enum SocketSilence {
 
 /// Ask the local agent over its Unix socket, if one is configured.
 ///
-/// Only a missing or unreachable socket, or an agent that hangs up before
-/// acknowledging falls back: in those cases no agent took responsibility for
-/// the request. A verdict, a malformed reply, or the deadline expiring while
-/// an agent holds the request is final and fails closed on error.
+/// The one coherent rule this function and its callers apply: **a host-local
+/// fault falls back; a decoded, validated decision either approves or
+/// denies.** A missing or unreachable socket, an agent that hangs up before
+/// acknowledging, a post-ack hangup or framing corruption (`Dropped`), an
+/// unrecognized message kind, and a message that fails to decode at all are
+/// every one of them host-local faults (issues #66 and #68): none is
+/// evidence that the request was answered, so none may deny sudo outright.
+/// A kind this build does not recognize -- at either the acknowledgement or
+/// the verdict position -- is treated as not yet answered and this function
+/// reads another frame instead, bounded by the same deadline; an
+/// acknowledgement-position "keepalive" re-ack or a delivery receipt arriving
+/// at the verdict position is skipped the same way. Only an explicit `Deny`,
+/// a verdict that decodes but then fails its own shape or signature
+/// validation, or a message that decodes fine as the wrong kind for its
+/// position (evidence of a real cross-lane bug) keep failing closed exactly
+/// as before.
 ///
-/// A post-ack hangup is reported as `Dropped` rather than decided here. It is
-/// the one post-ack outcome in which no bytes arrived at all, so it carries no
-/// evidence either way, and the two lanes answer it differently: see the
-/// `SocketOutcome::Dropped` arms in `execute_request_at` and
+/// A post-ack hangup or framing fault is reported as `Dropped` rather than
+/// decided here; the two lanes answer it identically (both fall back), but
+/// each does so at its own call site: see the `SocketOutcome::Dropped` arms
+/// in `execute_request_at` and
 /// `await_auth_decision`.
 #[allow(clippy::too_many_lines)]
 async fn try_agent_socket(
@@ -1161,96 +1180,186 @@ async fn try_agent_socket(
         }));
     }
     drop(writer);
-    let remaining = deadline
-        .checked_duration_since(tokio::time::Instant::now())
-        .unwrap_or(Duration::ZERO);
-    if remaining.is_zero() {
-        return Err(approval_unavailable(
-            "sudo decision deadline exceeded waiting for the local agent",
-        ));
-    }
-    let ack_wait = remaining.min(DAEMON_ACK_TIMEOUT);
-    let bytes = match tokio::time::timeout(ack_wait, read_frame(&mut reader)).await {
-        Ok(Ok(Frame::Payload(bytes))) => bytes,
-        // Before an acknowledgement, a clean hangup and a half-sent frame mean
-        // the same thing: nothing took responsibility for the request, so the
-        // caller may still fall back. This is the pre-#68 boundary and is
-        // deliberately unchanged.
-        Ok(Ok(Frame::Eof | Frame::Truncated)) => {
-            return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
-                path,
-                error: "agent closed before acknowledging".into(),
-            }));
-        }
-        Ok(Err(error)) => {
-            return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
-                path,
-                error: error.to_string(),
-            }));
-        }
-        Err(_) => {
+    // A kind this build does not recognize before acknowledging is not
+    // evidence of anything: read another frame instead of failing. The wait
+    // for the *first* acknowledgement is still one DAEMON_ACK_TIMEOUT window
+    // (or whatever is left of the outer deadline, if shorter) measured from
+    // here, not reset on every frame -- otherwise a peer drip-feeding
+    // unknown-kind frames faster than the timeout could hold the socket for
+    // the whole approval deadline instead of the short ack budget. Running
+    // out of that budget is `NoAck`, exactly like any other pre-ack silence:
+    // no agent has taken responsibility yet, so the caller still tries NATS
+    // when one is configured. Issue #66.
+    let ack_deadline = deadline.min(tokio::time::Instant::now() + DAEMON_ACK_TIMEOUT);
+    let acknowledgement = loop {
+        let remaining = ack_deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
             return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
                 path,
                 error: format!(
                     "daemon acknowledgement timed out after {}ms",
-                    ack_wait.as_millis()
+                    DAEMON_ACK_TIMEOUT.as_millis()
                 ),
             }));
         }
+        let bytes = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
+            Ok(Ok(Frame::Payload(bytes))) => bytes,
+            // Before an acknowledgement, a clean hangup and a half-sent frame mean
+            // the same thing: nothing took responsibility for the request, so the
+            // caller may still fall back. This is the pre-#68 boundary and is
+            // deliberately unchanged.
+            Ok(Ok(Frame::Eof | Frame::Truncated)) => {
+                return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                    path,
+                    error: "agent closed before acknowledging".into(),
+                }));
+            }
+            Ok(Err(error)) => {
+                return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                    path,
+                    error: error.to_string(),
+                }));
+            }
+            Err(_) => {
+                return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                    path,
+                    error: format!(
+                        "daemon acknowledgement timed out after {}ms",
+                        DAEMON_ACK_TIMEOUT.as_millis()
+                    ),
+                }));
+            }
+        };
+        match oshioki_protocol::decode_control_message(&bytes) {
+            Ok(oshioki_protocol::ControlMessageOutcome::Message(
+                oshioki_protocol::ControlMessageV1::Alive(alive),
+            )) => break alive,
+            // A message decoded fine but is not an alive acknowledgement at the
+            // point in the exchange where one is required. That is evidence of a
+            // broken or cross-lane peer, not a local fault, so it keeps failing
+            // closed.
+            Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => {
+                bail!(
+                    "expected a socket daemon acknowledgement but got a different control message"
+                );
+            }
+            // A kind this build does not recognize is not evidence of
+            // anything: keep waiting for the real acknowledgement instead of
+            // failing, subject to the deadline above. Issue #66.
+            Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(_kind)) => {}
+            // A decode fault against the host's own local agent is a local
+            // software fault (version skew, a bug), not a denial. Before an
+            // acknowledgement no agent has taken responsibility yet, so this
+            // falls back to NATS exactly like any other pre-ack silence
+            // instead of denying the request outright. Issue #68.
+            Err(error) => {
+                return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                    path,
+                    error: format!(
+                        "decode socket daemon acknowledgement: {error}; \
+                         upgrade oshioki-agent before using this hook"
+                    ),
+                }));
+            }
+        }
     };
-    let acknowledgement: oshioki_protocol::AliveV1 = serde_json::from_slice(&bytes).context(
-        "decode socket daemon acknowledgement; upgrade oshioki-agent before using this hook",
-    )?;
     acknowledgement.validate(request_id).context(
         "invalid socket daemon acknowledgement; upgrade oshioki-agent before using this hook",
     )?;
     progress(HookProgress::WaitingForApproval);
-    let remaining = deadline
-        .checked_duration_since(tokio::time::Instant::now())
-        .unwrap_or(Duration::ZERO);
-    if remaining.is_zero() {
-        return Err(approval_unavailable(
-            "sudo decision deadline exceeded waiting for the local agent",
-        ));
-    }
-    let bytes = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
-        Ok(Ok(Frame::Payload(bytes))) => bytes,
-        Ok(Ok(Frame::Eof)) => {
-            // The agent acknowledged and then the connection ended without
-            // sending any part of a verdict. Nothing claiming to be a decision
-            // was ever received, so the caller decides what that means for its
-            // lane.
-            return Ok(SocketOutcome::Dropped {
-                path,
-                error: "agent closed after acknowledging without a verdict".to_owned(),
-            });
-        }
-        Ok(Ok(Frame::Truncated)) => {
-            // Bytes arrived and did not form a frame. That is malformed input,
-            // not a silent disconnect, so it keeps the #68 treatment and fails
-            // closed on both lanes.
-            return Err(anyhow::anyhow!(
-                "agent sent a truncated decision frame after acknowledging"
-            ));
-        }
-        Ok(Err(error)) => {
-            // A transport-level read failure (ECONNRESET, EPIPE, a socket
-            // closed under us) is the same event as the EOF above: the
-            // connection went away. A framing error is not — those bytes
-            // arrived and did not decode, which stays a hard failure.
-            let Some(io_error) = error.downcast_ref::<io::Error>() else {
-                return Err(error);
-            };
-            let detail = io_error.to_string();
-            return Ok(SocketOutcome::Dropped {
-                path,
-                error: detail,
-            });
-        }
-        Err(_) => {
+    // The one coherent rule for everything past this point: a host-local
+    // fault (a hangup, framing corruption, an unrecognized or merely
+    // informational message) leaves the request unanswered and falls back;
+    // only a decoded, validated decision terminates it. Issues #66 and #68.
+    let bytes = loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
             return Err(approval_unavailable(
                 "sudo decision deadline exceeded waiting for the local agent",
             ));
+        }
+        let frame_bytes = match tokio::time::timeout(remaining, read_frame(&mut reader)).await {
+            Ok(Ok(Frame::Payload(bytes))) => bytes,
+            Ok(Ok(Frame::Eof)) => {
+                // The agent acknowledged and then the connection ended without
+                // sending any part of a verdict. Nothing claiming to be a decision
+                // was ever received, so the caller decides what that means for its
+                // lane.
+                return Ok(SocketOutcome::Dropped {
+                    path,
+                    error: "agent closed after acknowledging without a verdict".to_owned(),
+                });
+            }
+            Ok(Ok(Frame::Truncated)) => {
+                // Bytes arrived and did not form a complete frame: framing
+                // corruption or a truncated write, not evidence about the
+                // request. This is exactly as inconclusive as the EOF case
+                // above, so it gets the identical `Dropped` treatment: a
+                // socket squatter must not be able to trade a clean hangup
+                // (which one lane denies) for a more favorable outcome by
+                // sending garbage instead.
+                return Ok(SocketOutcome::Dropped {
+                    path,
+                    error: "agent sent a truncated decision frame after acknowledging".to_owned(),
+                });
+            }
+            Ok(Err(error)) => {
+                // A transport-level read failure (ECONNRESET, EPIPE, a socket
+                // closed under us) is the same event as the EOF above: the
+                // connection went away.
+                if let Some(io_error) = error.downcast_ref::<io::Error>() {
+                    let detail = io_error.to_string();
+                    return Ok(SocketOutcome::Dropped {
+                        path,
+                        error: detail,
+                    });
+                }
+                // Anything else here is `decode_frame_len` refusing a claimed
+                // length (oversized or otherwise malformed): bytes arrived
+                // and did not form a valid frame, exactly as inconclusive as
+                // `Frame::Truncated` above, so it gets the same `Dropped`
+                // treatment.
+                return Ok(SocketOutcome::Dropped {
+                    path,
+                    error: format!(
+                        "agent sent a malformed decision frame after acknowledging: {error:#}"
+                    ),
+                });
+            }
+            Err(_) => {
+                return Err(approval_unavailable(
+                    "sudo decision deadline exceeded waiting for the local agent",
+                ));
+            }
+        };
+        // Peek at the kind before deciding whether this frame is the
+        // verdict, an informational message we can keep waiting past, or an
+        // outright decode fault.
+        match oshioki_protocol::decode_control_message(&frame_bytes) {
+            Ok(oshioki_protocol::ControlMessageOutcome::Message(
+                oshioki_protocol::ControlMessageV1::Decision(_)
+                | oshioki_protocol::ControlMessageV1::AuthDecision(_),
+            )) => break frame_bytes,
+            // An informational message (a keepalive re-ack, a delivery
+            // receipt) or a kind this build does not recognize is not
+            // evidence of anything at the verdict position either: keep
+            // waiting, bounded by the same deadline. Issue #66.
+            Ok(
+                oshioki_protocol::ControlMessageOutcome::Message(
+                    oshioki_protocol::ControlMessageV1::Alive(_)
+                    | oshioki_protocol::ControlMessageV1::Delivery(_),
+                )
+                | oshioki_protocol::ControlMessageOutcome::UnknownKind(_),
+            ) => {}
+            Err(error) => {
+                return Err(approval_unavailable(format!(
+                    "agent sent an undecodable decision frame after acknowledging: {error}"
+                )));
+            }
         }
     };
     Ok(SocketOutcome::Verdict(bytes))
@@ -1313,6 +1422,54 @@ async fn read_frame(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<Fram
         Err(error) => return Err(error.into()),
     }
     Ok(Frame::Payload(payload))
+}
+
+/// Decode the socket's post-ack verdict as a command-approval `DecisionV1`.
+///
+/// A message that decodes fine as a different kind (an authentication
+/// decision, an alive, a delivery receipt) is evidence of a cross-lane bug
+/// and keeps failing closed. A message this build does not recognize, or one
+/// that fails to decode at all, is a local fault per issues #66 and #68 and
+/// leaves password fallback eligible instead.
+fn decode_socket_command_decision(bytes: &[u8]) -> Result<DecisionV1> {
+    match oshioki_protocol::decode_control_message(bytes) {
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(
+            oshioki_protocol::ControlMessageV1::Decision(decision),
+        )) => Ok(decision),
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => {
+            bail!("expected a socket decision but got a different control message")
+        }
+        Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(kind)) => {
+            Err(approval_unavailable(format!(
+                "socket agent sent an unrecognized control message kind {kind:?} instead of a decision"
+            )))
+        }
+        Err(error) => Err(approval_unavailable(format!(
+            "decode socket decision: {error}"
+        ))),
+    }
+}
+
+/// Decode the socket's post-ack verdict as a contextual `AuthDecisionV1`.
+/// See [`decode_socket_command_decision`] for the same reasoning applied to
+/// the authentication lane.
+fn decode_socket_auth_decision(bytes: &[u8]) -> Result<AuthDecisionV1> {
+    match oshioki_protocol::decode_control_message(bytes) {
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(
+            oshioki_protocol::ControlMessageV1::AuthDecision(decision),
+        )) => Ok(decision),
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => {
+            bail!("expected a socket authentication decision but got a different control message")
+        }
+        Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(kind)) => {
+            Err(approval_unavailable(format!(
+                "socket agent sent an unrecognized control message kind {kind:?} instead of an authentication decision"
+            )))
+        }
+        Err(error) => Err(approval_unavailable(format!(
+            "decode socket authentication decision: {error}"
+        ))),
+    }
 }
 
 /// Applies one decision to a request. Invalid decisions fail closed.
@@ -1972,8 +2129,7 @@ async fn await_auth_decision(
         match try_agent_socket(directory, &request.request_id, &payload, deadline, progress).await?
         {
             SocketOutcome::Verdict(bytes) => {
-                return serde_json::from_slice(&bytes)
-                    .context("decode socket authentication decision");
+                return decode_socket_auth_decision(&bytes);
             }
             SocketOutcome::Unconfigured => None,
             SocketOutcome::Silent(SocketSilence::NoAgent { path, error }) => {
@@ -1995,21 +2151,21 @@ async fn await_auth_decision(
                     path.display()
                 ))
             }
-            // An agent acknowledged and then the connection went away without
-            // a verdict. On this lane that must not become exit 1: a PAM stack
-            // written as `default=die` turns a hard failure into "sudo is
-            // denied and there is no password prompt", so a dropped socket
-            // would lock the operator out over an agent crash or a restart.
-            // A connection that disappears is a transport fault, so it is
-            // unavailable and the stack keeps its password path.
+            // An agent acknowledged and then produced no confirmed verdict: a
+            // clean hangup, a truncated frame, or a claimed length this build
+            // refuses (`try_agent_socket`'s `Dropped` arms). On this lane that
+            // must not become exit 1: a PAM stack written as `default=die`
+            // turns a hard failure into "sudo is denied and there is no
+            // password prompt", so any of these would lock the operator out
+            // over an agent crash, a restart, or a corrupted write. None of
+            // them is evidence about the request, so all of them are
+            // unavailable and the stack keeps its password path -- the
+            // command-approval lane now agrees (see its own `Dropped` arm).
             //
-            // The #68 boundary is untouched: this arm is only reached for a
-            // hangup on a frame boundary, with not one byte of a verdict sent
-            // (`Frame::Eof`). Bytes that arrive and do not produce a valid
-            // `AuthDecisionV1` are evidence and still fail closed — a
-            // truncated frame inside `read_frame`, and a malformed or
-            // cross-lane decision at the `SocketOutcome::Verdict` decode
-            // above.
+            // A message that arrives and decodes as something other than the
+            // expected `AuthDecisionV1` is not folded in here: it is evidence
+            // (a malformed or cross-lane decision) and still fails closed at
+            // the `SocketOutcome::Verdict` decode above.
             //
             // NATS is not tried afterwards. An agent that answered the socket
             // is the transport this host is using, and re-publishing would
@@ -3460,6 +3616,9 @@ mod tests {
             anyhow::Error::new(HookTransportFailure::Expired(
                 "request expired without a verdict".into(),
             )),
+            anyhow::Error::new(HookTransportFailure::Protocol(
+                "decode decision: missing field `action`".into(),
+            )),
         ];
         for error in unavailable {
             assert_eq!(
@@ -4453,8 +4612,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// This is issue #66/#68's own reported evidence: an old hook reading a
+    /// new agent's first frame as something it cannot decode. A decode fault
+    /// at the acknowledgement position is a local software fault (version
+    /// skew, a bug), not evidence the request was answered. Before an
+    /// acknowledgement no agent has taken responsibility yet, so per #68 it
+    /// is `NoAck`, exactly like any other pre-ack silence: `execute_request_at`
+    /// still tries NATS when one is configured, and denies at once (exit 2,
+    /// not 1) only when none is.
     #[tokio::test]
-    async fn malformed_socket_reply_fails_closed_without_fallback() {
+    async fn malformed_socket_reply_falls_back_to_password() {
         let dir = socket_test_dir("malformed");
         let socket_path = dir.join("agent.sock");
         socket_test_config(&dir, Some(&socket_path));
@@ -4465,69 +4632,345 @@ mod tests {
             AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
         });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        assert!(
-            try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
-                .await
-                .is_err()
-        );
+        match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+            .await
+            .expect("a pre-ack decode fault must not be a hard error")
+        {
+            SocketOutcome::Silent(SocketSilence::NoAck { .. }) => {}
+            other => panic!("expected NoAck so NATS fallback is still tried, got {other:?}"),
+        }
         serve.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Once an agent has acknowledged, a malformed verdict frame is a
-    /// terminal protocol failure. It cannot fall back to another transport or
-    /// become a password-eligible unavailable result.
+    /// An acknowledgement position message whose `type` this build does not
+    /// recognize is not evidence of anything -- a newer agent may add a
+    /// message kind an older hook predates -- so it is skipped: the reader
+    /// keeps waiting for the real acknowledgement instead of treating it as
+    /// a decode error. Issue #66.
     #[tokio::test]
-    async fn malformed_socket_verdict_after_ack_fails_closed() {
-        for (name, prefix) in [
+    async fn unrecognized_kind_before_acknowledging_is_skipped_and_the_real_ack_still_wins() {
+        let dir = socket_test_dir("unknown-kind-ack");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            AsyncReadExt::read_exact(&mut stream, &mut prefix)
+                .await
+                .unwrap();
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut request = vec![0u8; len];
+            AsyncReadExt::read_exact(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let unknown_frame = oshioki_protocol::socket_v1::encode_frame(
+                br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#,
+            )
+            .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &unknown_frame)
+                .await
+                .unwrap();
+            let alive = oshioki_protocol::AliveV1::for_request("req-1");
+            let alive_frame =
+                oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+                    .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &alive_frame)
+                .await
+                .unwrap();
+            let decision = DecisionV1::Deny(oshioki_protocol::DenyV1 {
+                version: VERSION_V1,
+                request_id: "req-1".into(),
+                device_fingerprint: "fp".into(),
+                signature: None,
+            });
+            let frame =
+                oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&decision).unwrap())
+                    .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+            .await
+            .expect("an unrecognized kind before the real ack must not be a hard error")
+        {
+            SocketOutcome::Verdict(bytes) => {
+                let decision =
+                    decode_socket_command_decision(&bytes).expect("the real decision still wins");
+                assert!(matches!(decision, DecisionV1::Deny(_)));
+            }
+            other => panic!("expected the verdict past the unrecognized kind, got {other:?}"),
+        }
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// If nothing but unrecognized kinds ever arrive before acknowledging,
+    /// skipping them must not turn into an infinite wait: the outer deadline
+    /// still applies, and running it out is the fallback-eligible deadline
+    /// outcome, not a denial. Issue #66.
+    #[tokio::test]
+    async fn unrecognized_kinds_before_acknowledging_still_respect_the_deadline() {
+        let dir = socket_test_dir("unknown-kind-ack-deadline");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            AsyncReadExt::read_exact(&mut stream, &mut prefix)
+                .await
+                .unwrap();
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut request = vec![0u8; len];
+            AsyncReadExt::read_exact(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let unknown_frame = oshioki_protocol::socket_v1::encode_frame(
+                br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#,
+            )
+            .unwrap();
+            // Keep sending unknown-kind frames faster than the deadline, so
+            // the loop never idles into a per-read timeout: only the outer
+            // deadline can end this.
+            loop {
+                if AsyncWriteExt::write_all(&mut stream, &unknown_frame)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        // Before an acknowledgement, running out of time on a single read
+        // resolves to `NoAck` (the pre-#66 boundary, unchanged) rather than a
+        // hard error; either that or the outer deadline check firing directly
+        // is the fallback-eligible outcome this test cares about -- neither
+        // is a denial.
+        match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress()).await {
+            Ok(SocketOutcome::Silent(SocketSilence::NoAck { .. })) => {}
+            Err(error) => {
+                assert_eq!(
+                    check_error_exit_code(&error),
+                    CHECK_RC_UNAVAILABLE,
+                    "{error:#}"
+                );
+                assert!(
+                    display_error(&error).contains("deadline exceeded"),
+                    "{error:#}"
+                );
+            }
+            Ok(_) => {
+                panic!("an endless stream of unrecognized kinds must not be accepted as an answer")
+            }
+        }
+        serve.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same unrecognized-kind treatment at the verdict position, after a
+    /// real acknowledgement: an extra unrecognized frame must not prevent the
+    /// real verdict right behind it from being read. Issue #66.
+    #[tokio::test]
+    async fn unrecognized_kind_after_acknowledging_is_skipped_and_the_real_verdict_still_wins() {
+        let dir = socket_test_dir("unknown-kind-verdict");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            AsyncReadExt::read_exact(&mut stream, &mut prefix)
+                .await
+                .unwrap();
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut request = vec![0u8; len];
+            AsyncReadExt::read_exact(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let alive = oshioki_protocol::AliveV1::for_request("req-1");
+            let alive_frame =
+                oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+                    .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &alive_frame)
+                .await
+                .unwrap();
+            let unknown_frame = oshioki_protocol::socket_v1::encode_frame(
+                br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#,
+            )
+            .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &unknown_frame)
+                .await
+                .unwrap();
+            let decision = DecisionV1::Deny(oshioki_protocol::DenyV1 {
+                version: VERSION_V1,
+                request_id: "req-1".into(),
+                device_fingerprint: "fp".into(),
+                signature: None,
+            });
+            let frame =
+                oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&decision).unwrap())
+                    .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &frame).await.unwrap();
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+            .await
+            .expect("an unrecognized kind at the verdict position must not be a hard error")
+        {
+            SocketOutcome::Verdict(bytes) => {
+                let decision =
+                    decode_socket_command_decision(&bytes).expect("the real verdict still wins");
+                assert!(matches!(decision, DecisionV1::Deny(_)));
+            }
+            other => panic!("expected the verdict past the unrecognized kind, got {other:?}"),
+        }
+        serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// If nothing but unrecognized kinds ever arrive at the verdict position,
+    /// the outer deadline still ends the wait as unavailable, not a denial.
+    /// Issue #66.
+    #[tokio::test]
+    async fn unrecognized_kinds_after_acknowledging_still_respect_the_deadline() {
+        let dir = socket_test_dir("unknown-kind-verdict-deadline");
+        let socket_path = dir.join("agent.sock");
+        socket_test_config(&dir, Some(&socket_path));
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            AsyncReadExt::read_exact(&mut stream, &mut prefix)
+                .await
+                .unwrap();
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut request = vec![0u8; len];
+            AsyncReadExt::read_exact(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let alive = oshioki_protocol::AliveV1::for_request("req-1");
+            let alive_frame =
+                oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+                    .unwrap();
+            AsyncWriteExt::write_all(&mut stream, &alive_frame)
+                .await
+                .unwrap();
+            let unknown_frame = oshioki_protocol::socket_v1::encode_frame(
+                br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#,
+            )
+            .unwrap();
+            loop {
+                if AsyncWriteExt::write_all(&mut stream, &unknown_frame)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        let error = try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+            .await
+            .expect_err("an endless stream of unrecognized kinds must still end at the deadline");
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        assert!(
+            display_error(&error).contains("deadline exceeded"),
+            "{error:#}"
+        );
+        serve.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once an agent has acknowledged, a malformed verdict frame is a local
+    /// software fault per #66/#68 -- not evidence that the request was
+    /// answered -- so it leaves password fallback eligible instead of
+    /// failing closed. An oversized claimed length is framing corruption
+    /// (`decode_frame_len` refuses it before a payload is even read), so it
+    /// is `Dropped` exactly like a hangup or a truncated frame -- the caller
+    /// (`execute_request_at`) is the one that turns that into
+    /// `CHECK_RC_UNAVAILABLE`. An empty payload is a well-formed frame whose
+    /// content does not decode as anything, so it fails directly out of
+    /// `try_agent_socket`. Routed through `execute_request_at` end to end,
+    /// not reconstructed from the outcome, so this exercises the real
+    /// `Dropped`/decode-fault arms rather than asserting a value this test
+    /// built itself.
+    #[tokio::test]
+    async fn malformed_socket_verdict_after_ack_falls_back_to_password() {
+        for (name, after_ack) in [
             (
                 "oversized",
                 u32::try_from(oshioki_protocol::socket_v1::MAX_FRAME_BYTES + 1)
                     .unwrap()
-                    .to_be_bytes(),
+                    .to_be_bytes()
+                    .to_vec(),
             ),
-            ("empty", 0u32.to_be_bytes()),
+            ("empty", 0u32.to_be_bytes().to_vec()),
         ] {
-            let dir = socket_test_dir(name);
+            let (dir, request) = decided_test_dir(name);
             let socket_path = dir.join("agent.sock");
-            socket_test_config(&dir, Some(&socket_path));
-            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-            let serve = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request_prefix = [0u8; 4];
-                stream.read_exact(&mut request_prefix).await.unwrap();
-                let request_len = u32::from_be_bytes(request_prefix) as usize;
-                let mut request = vec![0u8; request_len];
-                stream.read_exact(&mut request).await.unwrap();
-                let alive = oshioki_protocol::AliveV1::for_request("req-1");
-                let alive_frame =
-                    oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
-                        .unwrap();
-                stream.write_all(&alive_frame).await.unwrap();
-                stream.write_all(&prefix).await.unwrap();
-            });
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            // The frame layer and the verdict decode are separate steps, as
-            // they are in `execute_request_at`: an oversized frame is
-            // rejected by the reader, an empty one decodes to nothing. Both
-            // must reach the same closed-fail exit class.
-            let error = match try_agent_socket(&dir, "req-1", b"ping", deadline, &test_progress())
+            socket_test_config_no_nats(&dir, Some(&socket_path));
+            let listener = hangup_listener(&socket_path);
+            let serve = tokio::spawn(acknowledged_then_stub(listener, after_ack));
+            let error = execute_request_at(request, Duration::from_secs(30), &dir, false)
                 .await
-            {
-                Err(error) => error,
-                Ok(SocketOutcome::Verdict(bytes)) => serde_json::from_slice::<DecisionV1>(&bytes)
-                    .context("decode socket decision")
-                    .expect_err("malformed verdict was accepted"),
-                Ok(_) => panic!("malformed {name} verdict was ignored"),
-            };
+                .unwrap_err();
             assert_eq!(
                 check_error_exit_code(&error),
-                CHECK_RC_DENIED,
+                CHECK_RC_UNAVAILABLE,
                 "{name}: {error:#}"
             );
             serve.await.unwrap();
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// The asymmetry this test guards against: a socket squatter must not be
+    /// able to trade a clean hangup for a more favorable outcome by sending
+    /// garbage instead. A post-ack `Frame::Eof` and a post-ack
+    /// `Frame::Truncated` both carry zero evidence about the request, so
+    /// `try_agent_socket` must produce the identical `SocketOutcome::Dropped`
+    /// classification for both, and every caller's exit code for `Dropped`
+    /// must therefore be identical too. Routed through `execute_request_at`
+    /// end to end (not reconstructed from the outcome by the test) so this
+    /// exercises the real `Dropped` arm rather than asserting a value this
+    /// test built itself. Issues #66 and #68.
+    #[tokio::test]
+    async fn eof_and_truncated_after_ack_produce_the_same_outcome() {
+        async fn dropped_exit_code(after_ack: Vec<u8>, name: &str) -> (i32, anyhow::Error) {
+            let (dir, request) = decided_test_dir(name);
+            let socket_path = dir.join("agent.sock");
+            socket_test_config_no_nats(&dir, Some(&socket_path));
+            let listener = hangup_listener(&socket_path);
+            let serve = tokio::spawn(acknowledged_then_stub(listener, after_ack));
+            let error = execute_request_at(request, Duration::from_secs(30), &dir, false)
+                .await
+                .unwrap_err();
+            serve.await.unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            let code = check_error_exit_code(&error);
+            (code, error)
+        }
+
+        let (eof_code, eof_error) = dropped_exit_code(Vec::new(), "eof-drop").await;
+        // A truncated frame: a length prefix claiming 32 bytes with none of
+        // the payload sent.
+        let (truncated_code, truncated_error) =
+            dropped_exit_code(vec![0u8, 0u8, 0u8, 32u8], "truncated-drop").await;
+
+        assert_eq!(
+            eof_code, truncated_code,
+            "eof: {eof_error:#}\ntruncated: {truncated_error:#}"
+        );
+        assert_eq!(eof_code, CHECK_RC_UNAVAILABLE, "{eof_error:#}");
     }
 
     #[tokio::test]
@@ -4739,6 +5182,33 @@ mod tests {
         tokio::net::UnixListener::bind(socket_path).unwrap()
     }
 
+    /// A stub agent that acknowledges the real request (reading it off the
+    /// wire so the acknowledgement's `request_id` actually matches) and then
+    /// writes `after_ack` before disconnecting. Empty `after_ack` is a clean
+    /// post-ack hangup (`Frame::Eof`); a partial length prefix is a
+    /// truncated frame; an oversized claimed length is framing corruption
+    /// `decode_frame_len` refuses; a valid zero-length frame is a
+    /// well-formed frame whose content does not decode as anything. Every
+    /// one of these is a host-local fault per issues #66 and #68.
+    async fn acknowledged_then_stub(listener: tokio::net::UnixListener, after_ack: Vec<u8>) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let length = oshioki_protocol::socket_v1::decode_frame_len(prefix).unwrap();
+        let mut request = vec![0u8; length];
+        stream.read_exact(&mut request).await.unwrap();
+        let request: oshioki_protocol::RequestEnvelopeV1 =
+            serde_json::from_slice(&request).unwrap();
+        let alive = oshioki_protocol::AliveV1::for_request(&request.request_id);
+        let frame = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+            .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        if !after_ack.is_empty() {
+            stream.write_all(&after_ack).await.unwrap();
+        }
+        stream.flush().await.unwrap();
+    }
+
     /// Socket-only hangup denies at once with no NATS attempt: nothing else
     /// could answer, so waiting out the deadline would only stall the sudo.
     #[tokio::test]
@@ -4764,8 +5234,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A post-ack hangup on the command-approval lane now agrees with the
+    /// authentication lane (`an_acknowledged_socket_that_drops_is_unavailable`):
+    /// an agent that acknowledged and then produced no confirmed verdict is a
+    /// host-local fault, not a denial. Making the command lane keep denying
+    /// this while a truncated frame after the same acknowledgement fell back
+    /// would let a socket squatter trade an honest hangup for a more
+    /// favorable outcome by sending garbage instead. Issues #66 and #68.
     #[tokio::test]
-    async fn post_ack_socket_hangup_is_a_terminal_denial() {
+    async fn post_ack_socket_hangup_falls_back_to_password() {
         let (dir, request) = decided_test_dir("post-ack-hangup-deny");
         let socket_path = dir.join("agent.sock");
         socket_test_config_no_nats(&dir, Some(&socket_path));
@@ -4775,7 +5252,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(6));
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
         assert!(
             format!("{error:#}").contains("closed after acknowledging"),
             "{error:#}"
@@ -4829,6 +5306,77 @@ mod tests {
         );
         assert!(!text.contains("NATS_PASS"), "{text}");
         serve.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A peer that only ever sends unknown-kind frames before acknowledging
+    /// must not be able to hold the socket for the whole approval deadline
+    /// by drip-feeding them faster than a per-iteration timeout: the ack
+    /// phase is one fixed `DAEMON_ACK_TIMEOUT` window from the first read,
+    /// so running it out is `NoAck`, and (unlike the old `Err` this used to
+    /// return) `execute_request_at` still tries NATS afterwards. Issue #66.
+    #[tokio::test]
+    async fn unrecognized_kinds_past_the_ack_timeout_still_try_nats() {
+        let (dir, request) = decided_test_dir("unknown-kind-ack-timeout");
+        let socket_path = dir.join("agent.sock");
+        let port = closed_loopback_port();
+        std::fs::write(
+            dir.join("config.env"),
+            format!(
+                "NATS_URL=nats://127.0.0.1:{port}\nOSHIOKI_AGENT_SOCKET={}\n",
+                socket_path.display()
+            ),
+        )
+        .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let serve = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            AsyncReadExt::read_exact(&mut stream, &mut prefix)
+                .await
+                .unwrap();
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut request = vec![0u8; len];
+            AsyncReadExt::read_exact(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let unknown_frame = oshioki_protocol::socket_v1::encode_frame(
+                br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#,
+            )
+            .unwrap();
+            // Every 300ms is faster than any single read's own timeout would
+            // be if it were still capped per iteration, so this only ends at
+            // DAEMON_ACK_TIMEOUT if the ack budget is a fixed window rather
+            // than reset on every frame.
+            for _ in 0..12 {
+                if AsyncWriteExt::write_all(&mut stream, &unknown_frame)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = execute_request_at(request, Duration::from_secs(30), &dir, false)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= DAEMON_ACK_TIMEOUT,
+            "ack timeout fired early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < DAEMON_ACK_TIMEOUT + Duration::from_secs(3),
+            "ack timeout should fire close to DAEMON_ACK_TIMEOUT, not wait out all 12 frames: {elapsed:?}"
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("NATS fallback to nats://127.0.0.1:{port} failed")),
+            "NoAck must still try NATS: {text}"
+        );
+        serve.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6000,12 +6548,13 @@ mod auth_tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// The #68 boundary, on the other side of the same event: bytes that
-    /// arrive and do not decode as an `AuthDecisionV1` are evidence of a
-    /// broken or hostile peer and stay a hard failure, even though the same
+    /// The #66/#68 boundary, on the other side of the same event: bytes that
+    /// arrive and do not decode as any recognized control message are a
+    /// local software fault (version skew, a bug), not evidence of a denial,
+    /// so they leave password fallback eligible even though the same
     /// connection is dropped immediately afterwards.
     #[tokio::test]
-    async fn garbage_after_an_acknowledgement_still_fails_closed() {
+    async fn garbage_after_an_acknowledgement_falls_back_to_password() {
         let directory = auth_socket_dir("ack-garbage");
         let listener = tokio::net::UnixListener::bind(directory.join("agent.sock")).unwrap();
         let garbage = oshioki_protocol::socket_v1::encode_frame(b"{not a decision").unwrap();
@@ -6014,9 +6563,9 @@ mod auth_tests {
             execute_auth_request_at(auth_request(), Duration::from_secs(30), &directory, None)
                 .await
                 .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
         assert!(
-            display_error(&error).contains("decode socket authentication decision"),
+            display_error(&error).contains("undecodable decision frame"),
             "{error:#}"
         );
         serve.await.unwrap();
@@ -6024,11 +6573,12 @@ mod auth_tests {
     }
 
     /// A frame that starts and does not finish is malformed input, not a
-    /// dropped connection: bytes arrived and did not form a decision. It must
-    /// stay on the closed-fail side of the #68 boundary even though the
-    /// connection also goes away immediately afterwards.
+    /// dropped connection: bytes arrived and did not form a decision. Per
+    /// #68 that is a local fault like a dropped socket, not a denial, so it
+    /// leaves password fallback eligible even though the connection also
+    /// goes away immediately afterwards.
     #[tokio::test]
-    async fn a_truncated_frame_after_an_acknowledgement_still_fails_closed() {
+    async fn a_truncated_frame_after_an_acknowledgement_falls_back_to_password() {
         for (name, trailing) in [
             ("partial-prefix", vec![0u8, 0u8]),
             ("missing-payload", vec![0u8, 0u8, 0u8, 32u8]),
@@ -6041,7 +6591,11 @@ mod auth_tests {
                 execute_auth_request_at(auth_request(), Duration::from_secs(30), &directory, None)
                     .await
                     .unwrap_err();
-            assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED, "{name}");
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_UNAVAILABLE,
+                "{name}"
+            );
             assert!(
                 display_error(&error).contains("truncated decision frame"),
                 "{name}: {error:#}"
@@ -6079,7 +6633,7 @@ mod auth_tests {
             .unwrap_err();
         assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
         assert!(
-            display_error(&error).contains("decode socket authentication decision"),
+            display_error(&error).contains("different control message"),
             "{error:#}"
         );
         serve.await.unwrap();

@@ -37,6 +37,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading**: the upgrade is one way, so rolling back to an older binary
   afterward requires restoring that backup, since older binaries refuse a
   database at a newer schema version.
+- A protocol decode fault against the host's own local agent -- version
+  skew, a truncated frame, garbage bytes -- no longer denies sudo outright.
+  It now maps to the same `CHECK_RC_UNAVAILABLE` path as a dropped socket or
+  an unreachable transport, leaving PAM's password fallback eligible on
+  Linux instead of locking the user out. This covers the socket
+  acknowledgement and post-acknowledgement verdict frames in `hook`'s
+  `try_agent_socket`, and the equivalent NATS acknowledgement, delivery
+  receipt, and decision decodes in `oshioki-transport`. An explicit `Deny`,
+  a verdict that decodes but fails shape or signature validation, and a
+  message that decodes fine as the wrong kind for its position (e.g. a
+  command-approval decision arriving on the authentication socket) are
+  unaffected and continue to fail closed: none of those is a decode fault.
+  (#68)
+- Control messages on the channels the liveness acknowledgement and the
+  signed verdict share -- the socket frame stream after the request
+  envelope, and the equivalent NATS acknowledgement subject -- are now
+  checked by kind before a reader commits to a type-specific decode. A kind
+  this build does not recognize (for example a message type a newer peer
+  added) is treated as not yet answered instead of a decode error. Wire
+  compatibility: an old peer's untagged `DecisionV1` (no `type` field, only
+  `action`) still decodes exactly as before; a peer sending a kind this
+  build predates no longer gets denied for it, and instead leaves the
+  request outstanding until it times out or a recognized message arrives.
+  No previously wire-compatible message changes shape. The socket path and
+  the NATS ack/decision subjects both skip an unrecognized kind and keep
+  reading the next message, bounded by the same deadline, rather than
+  treating its mere presence as an answer or a fault. (#66)
+- The command-approval lane's post-acknowledgement socket hangup now
+  agrees with the authentication lane's: unavailable, not denied. A
+  truncated frame or an oversized claimed length after acknowledging get
+  the identical `Dropped` classification as a clean hangup, so a socket
+  squatter can no longer trade an honest hangup for a more favorable
+  outcome by sending garbage instead. (#66, #68)
+- The legacy sudo approval plugin's password-race `SIGINT` guard now saves
+  and restores the complete disposition with `sigaction` instead of
+  `signal`, on every exit path -- approval, denial, cancellation, timeout, or
+  error. glibc's `signal` has BSD semantics and re-applies `SA_RESTART` on
+  install and restore, so that flag was not actually being lost; what it
+  silently dropped was the blocked-signal mask and any other flag, most
+  dangerously `SA_SIGINFO` -- a three-argument `sa_sigaction` handler
+  restored through `signal` comes back registered as a one-argument
+  `sa_handler`, which is called with the wrong signature.
+- The legacy plugin's password fallback resolves the real terminal behind
+  its open descriptor with `ttyname_r` and passes that path (e.g.
+  `/dev/pts/3`) as `PAM_TTY`, instead of always passing the literal string
+  `/dev/tty`. Terminal-specific PAM policies and authentication records now
+  see the invocation's actual terminal; `/dev/tty` remains a documented
+  last-resort fallback for when resolution fails.
 ## [0.1.14] - 2026-09-18
 
 ### Added
