@@ -1,0 +1,27 @@
+[package]
+name = "oshioki-browser-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Opt-in Google browser ceremony relay over NATS"
+
+[dependencies]
+anyhow.workspace = true
+async-nats.workspace = true
+clap.workspace = true
+futures.workspace = true
+oshioki-protocol = { path = "../protocol" }
+p256.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+url = "2"
+nix = { workspace = true, features = ["signal"] }
+
+[lints]
+workspace = true

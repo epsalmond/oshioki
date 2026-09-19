@@ -23,6 +23,7 @@ scripts/dev build          # workspace build + browser unit tests
 scripts/dev test --quick   # Rust suite, browser vectors, installer checks (host only)
 scripts/dev test --browser # browser protocol against local NATS + SQLite
 scripts/dev test           # full E2E: disposable Compose project + real sudo plugin path
+scripts/test-browser-relay # opt-in NAS-to-Mac gcloud relay tests (nats-server + Python)
 scripts/dev up [--state-dir PATH]  # retained dev server on http://127.0.0.1:8443
 scripts/dev status
 scripts/dev down
@@ -55,3 +56,8 @@ use `scripts/dev-acceptance`; see the [runbook](RUNBOOK.md).
   affected `docs/` page when the workflow changes.
 - Security-sensitive change? Read [SECURITY.md](SECURITY.md) first and
   report vulnerabilities privately, never in a public issue or PR.
+
+The optional NAS-to-Mac browser ceremony relay is documented in
+[docs/browser-ceremony-relay.md](docs/browser-ceremony-relay.md). Its dedicated
+script runs ignored broker and subprocess tests; those tests simulate the
+Google and Mac boundaries and do not replace real Google or Touch ID acceptance.

@@ -125,6 +125,10 @@ hostname-matched certificate. The plaintext opt-out is for local testing only.
 See [production requirements](docs/requirements.md),
 [configuration](docs/configuration.md), and the [runbook](RUNBOOK.md).
 
+For the separate opt-in NAS-to-Mac `gcloud auth login` browser ceremony relay,
+see [browser ceremony relay](docs/browser-ceremony-relay.md). It uses its own
+scoped NATS lane and signing keys and does not participate in sudo approval.
+
 ## Command reference
 
 Run host commands as root because they read or update `/etc/oshioki`.

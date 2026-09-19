@@ -9,6 +9,7 @@ members = [
     "agent",
     "enclave",
     "pam",
+    "relay",
 ]
 
 # All version numbers and shared features live here. Member crates reference
