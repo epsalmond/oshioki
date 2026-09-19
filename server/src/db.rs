@@ -1666,13 +1666,24 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "oshioki-db-test-{}-{nonce}.sqlite3",
-            std::process::id()
-        ))
+        let dir =
+            std::env::temp_dir().join(format!("oshioki-db-test-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("state.sqlite3")
     }
 
     fn remove_database(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let name = parent
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.starts_with("oshioki-db-test-") {
+                let _ = std::fs::remove_dir_all(parent);
+                let _ = std::fs::create_dir_all(parent);
+                return;
+            }
+        }
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
@@ -2359,17 +2370,6 @@ mod tests {
         let mut expected = vec![first.fingerprint.clone(), later.fingerprint.clone()];
         expected.sort();
         assert_eq!(fingerprints, expected);
-        let _ = std::fs::remove_file(&snapshot);
-        if let Some(parent) = path.parent() {
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.contains(".pre-v2.") {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-            }
-        }
         remove_database(&path);
     }
 
