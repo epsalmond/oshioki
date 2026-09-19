@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+command -v nats-server >/dev/null || { echo 'nats-server is required' >&2; exit 1; }
+command -v python3 >/dev/null || { echo 'python3 is required' >&2; exit 1; }
+cargo test --locked -p oshioki-browser-relay -- --include-ignored
