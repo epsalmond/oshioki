@@ -280,6 +280,102 @@ start_nats_agent() {
   wait_for_line "$log" 'NATS connected; watching for requests'
 }
 
+SERVER_TOKEN="compat-server-token-0123456789ab"
+
+seed_server_enrollment() {
+  python3 - "$SERVER_DB" "$REPO_ROOT/tests/compat/goldens/devices-v1.json" "$SERVER_TOKEN" <<'PY'
+import base64, hashlib, json, sqlite3, sys
+db, devices_path, token = sys.argv[1], sys.argv[2], sys.argv[3]
+def b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+devices = json.loads(open(devices_path, encoding="utf-8").read())
+device = devices["devices"][0]
+token_hash = hashlib.sha256(token.encode()).digest()
+device["api_token_hash"] = b64url_encode(token_hash)
+if "kind" not in device:
+    device["kind"] = "webauthn"
+conn = sqlite3.connect(db, timeout=10)
+conn.execute(
+    """INSERT OR REPLACE INTO devices(
+         fingerprint, credential_id, api_token_hash, public_record_json, active, updated_at)
+       VALUES (?, ?, ?, ?, 1, unixepoch())""",
+    (device["fingerprint"], device["credential_id"], token_hash, json.dumps(device)),
+)
+conn.commit()
+print(device["fingerprint"])
+PY
+}
+
+insert_server_request() {
+  python3 - "$SERVER_DB" "$1" "$2" <<'PY'
+import hashlib, json, sqlite3, sys, time
+db, request_id, fingerprint = sys.argv[1], sys.argv[2], sys.argv[3]
+now = int(time.time())
+envelope = {
+    "version": 1,
+    "request_id": request_id,
+    "host": "host.example",
+    "user": "eric",
+    "issued_at": now - 1,
+    "expires_at": now + 600,
+    "sealed": [{
+        "device_fingerprint": fingerprint,
+        "ephemeral_pub": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+        "nonce": "CQkJCQkJCQkJCQkJ",
+        "ciphertext": "CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo",
+    }],
+}
+raw = json.dumps(envelope, separators=(",", ":")).encode()
+body = json.dumps(envelope["sealed"][0]).encode()
+conn = sqlite3.connect(db, timeout=10)
+conn.execute("DELETE FROM sealed_bodies WHERE request_id=?", (request_id,))
+conn.execute("DELETE FROM requests WHERE id=?", (request_id,))
+conn.execute(
+    """INSERT INTO requests(
+         id, envelope_hash, envelope_json, host, user, issued_at, expires_at, state, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', unixepoch())""",
+    (
+        request_id,
+        hashlib.sha256(raw).digest(),
+        raw,
+        envelope["host"],
+        envelope["user"],
+        envelope["issued_at"],
+        envelope["expires_at"],
+    ),
+)
+conn.execute(
+    "INSERT INTO sealed_bodies(request_id, fingerprint, body_json) VALUES (?, ?, ?)",
+    (request_id, fingerprint, body),
+)
+conn.commit()
+PY
+}
+
+assert_server_enrollment() {
+  local request_id="$1" label="$2"
+  insert_server_request "$request_id" "$SERVER_FP"
+  local url="http://127.0.0.1:${SERVER_PORT}/api/v1/requests/${request_id}"
+  if ! curl --fail --silent -H "Authorization: Bearer ${SERVER_TOKEN}" "$url" | grep -F "$SERVER_FP" >/dev/null; then
+    echo "server enrollment missing for $label: GET $url with the enrolled token failed" >&2
+    return 1
+  fi
+  local wrong
+  wrong="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer wrong-token-012345678901234567890" "$url")"
+  if [ "$wrong" != "401" ]; then
+    echo "server enrollment for $label accepted a wrong token (HTTP $wrong)" >&2
+    return 1
+  fi
+  curl --fail --silent -X POST \
+    -H "Authorization: Bearer ${SERVER_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"action\":\"deny\",\"version\":1,\"request_id\":\"${request_id}\",\"device_fingerprint\":\"${SERVER_FP}\"}" \
+    "${url}/deny" >/dev/null
+  curl --fail --silent "${url}/verdict" | grep -F '"action":"deny"' >/dev/null
+  echo "server request/verdict API authenticated $label ($request_id)"
+}
+
 wait_for_pending_request() {
   python3 - "$SERVER_DB" "$1" <<'PY'
 import sqlite3, sys, time
@@ -352,6 +448,10 @@ OSHIOKI_TEST_NATS_LANE=1 NATS_URL="$NATS_URL" NATS_USER=oshioki NATS_PASS=test-o
     -p oshioki-transport --test nats_lane_upgrade -- --test-threads=1
 
 start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-1.log"
+stop_server
+SERVER_FP="$(seed_server_enrollment)"
+start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-1.log"
+assert_server_enrollment "compat-prev-1" "previous server"
 start_nats_agent "$PREV_BIN/oshioki-agent" "$SERVER_DIR/agent-prev-1.log"
 approve_status=0
 OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 20 "$PREV_BIN/oshioki" test || approve_status=$?
@@ -374,6 +474,7 @@ wait "$HOOK_PID" >/dev/null 2>&1 || true
 HOOK_PID=""
 stop_server
 start_server "$CUR_BIN/oshioki-server" "$SERVER_DIR/current.log"
+assert_server_enrollment "compat-current-1" "current server"
 python3 - "$SERVER_DB" "$cutoff" <<'PY'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
@@ -414,6 +515,7 @@ if [ -n "$snapshot" ]; then
   rm -f "$SERVER_DB-wal" "$SERVER_DB-shm"
 fi
 start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-3.log"
+assert_server_enrollment "compat-prev-restore" "previous server after restore"
 start_nats_agent "$PREV_BIN/oshioki-agent" "$SERVER_DIR/agent-prev-3.log"
 approve_status=0
 OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 20 "$PREV_BIN/oshioki" test || approve_status=$?
