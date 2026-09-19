@@ -50,6 +50,15 @@ pub enum HookTransportFailure {
     Transport(String),
     Daemon(String),
     Expired(String),
+    /// A message that arrived did not decode as any control message this
+    /// build recognizes: version skew, a truncated frame, or a bug -- never
+    /// evidence that the request was answered. Per issue #68 this is a local
+    /// fault like a dropped connection, not a denial, so it leaves the
+    /// password branch eligible exactly as the other variants here do.
+    /// Distinct from an explicit `Deny`, or a verdict that decodes but fails
+    /// shape or signature validation: those remain ordinary errors with no
+    /// `HookTransportFailure` marker and keep failing closed.
+    Protocol(String),
 }
 
 impl fmt::Display for HookTransportFailure {
@@ -58,6 +67,7 @@ impl fmt::Display for HookTransportFailure {
             Self::Transport(detail) => write!(formatter, "transport failed: {detail}"),
             Self::Daemon(detail) => write!(formatter, "daemon not responding: {detail}"),
             Self::Expired(detail) => write!(formatter, "approval expired: {detail}"),
+            Self::Protocol(detail) => write!(formatter, "protocol decode failed: {detail}"),
         }
     }
 }

@@ -27,6 +27,17 @@ use crate::{
 
 const DAEMON_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// True when `bytes` name a control-message kind this build does not
+/// recognize. Not evidence of anything -- a newer agent or server may add a
+/// kind this build predates -- so the ack/delivery race and the decision
+/// read both keep waiting instead of treating it as the answer. Issue #66.
+fn is_unrecognized_control_kind(bytes: &[u8]) -> bool {
+    matches!(
+        oshioki_protocol::decode_control_message(bytes),
+        Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(_))
+    )
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn failure(kind: FailureKind, error: &anyhow::Error) -> anyhow::Error {
     let detail = format!("{error:#}");
@@ -34,6 +45,7 @@ fn failure(kind: FailureKind, error: &anyhow::Error) -> anyhow::Error {
         FailureKind::Transport => HookTransportFailure::Transport(detail),
         FailureKind::Daemon => HookTransportFailure::Daemon(detail),
         FailureKind::Expired => HookTransportFailure::Expired(detail),
+        FailureKind::Protocol => HookTransportFailure::Protocol(detail),
     };
     anyhow::Error::new(error)
 }
@@ -42,6 +54,9 @@ enum FailureKind {
     Transport,
     Daemon,
     Expired,
+    /// A message arrived and did not decode as the control message this
+    /// point in the exchange expects. See [`HookTransportFailure::Protocol`].
+    Protocol,
 }
 
 enum InitialReceipt {
@@ -279,22 +294,39 @@ impl NatsTransport {
                 progress(HookProgress::DaemonNotResponding(format!("{error:#}")));
                 return Err(error);
             }
+            // A kind this build does not recognize on either subject is not
+            // evidence of anything -- a newer agent or server may add a
+            // message kind this build predates -- so it is skipped: the loop
+            // reads the next message on the same race instead of treating it
+            // as the receipt. The outer `tokio::time::timeout` above still
+            // bounds the whole loop, so an endless stream of unrecognized
+            // kinds still ends at the deadline rather than waiting forever.
+            // Issue #66.
             let receipt = tokio::time::timeout(receipt_wait, async {
-                if let Some(deliveries) = deliveries.as_mut() {
-                    tokio::select! {
-                        message = acknowledgements.next() => message
+                loop {
+                    let next = if let Some(deliveries) = deliveries.as_mut() {
+                        tokio::select! {
+                            message = acknowledgements.next() => message
+                                .map(|message| InitialReceipt::Alive(message.payload.to_vec()))
+                                .ok_or_else(|| anyhow::anyhow!("daemon acknowledgement stream closed")),
+                            message = deliveries.next() => message
+                                .map(|message| InitialReceipt::Delivery(message.payload.to_vec()))
+                                .ok_or_else(|| anyhow::anyhow!("server delivery receipt stream closed")),
+                        }
+                    } else {
+                        acknowledgements
+                            .next()
+                            .await
                             .map(|message| InitialReceipt::Alive(message.payload.to_vec()))
-                            .ok_or_else(|| anyhow::anyhow!("daemon acknowledgement stream closed")),
-                        message = deliveries.next() => message
-                            .map(|message| InitialReceipt::Delivery(message.payload.to_vec()))
-                            .ok_or_else(|| anyhow::anyhow!("server delivery receipt stream closed")),
+                            .ok_or_else(|| anyhow::anyhow!("daemon acknowledgement stream closed"))
+                    }?;
+                    let bytes = match &next {
+                        InitialReceipt::Alive(bytes) | InitialReceipt::Delivery(bytes) => bytes,
+                    };
+                    if is_unrecognized_control_kind(bytes) {
+                        continue;
                     }
-                } else {
-                    acknowledgements
-                        .next()
-                        .await
-                        .map(|message| InitialReceipt::Alive(message.payload.to_vec()))
-                        .ok_or_else(|| anyhow::anyhow!("daemon acknowledgement stream closed"))
+                    return Ok::<_, anyhow::Error>(next);
                 }
             })
             .await;
@@ -331,7 +363,10 @@ impl NatsTransport {
                         Err(error) => {
                             let detail = format!("{error:#}");
                             progress(HookProgress::ProtocolFailed(detail));
-                            return Err(error);
+                            // A decode fault against the host's own local
+                            // agent is a local software fault (version skew,
+                            // a bug), not evidence of a denial. Issue #68.
+                            return Err(failure(FailureKind::Protocol, &error));
                         }
                     };
                     if let Err(error) = acknowledgement
@@ -352,7 +387,7 @@ impl NatsTransport {
                         Err(error) => {
                             let detail = format!("{error:#}");
                             progress(HookProgress::ProtocolFailed(detail));
-                            return Err(error);
+                            return Err(failure(FailureKind::Protocol, &error));
                         }
                     };
                     if let Err(error) = delivery
@@ -393,7 +428,7 @@ impl NatsTransport {
                         Err(error) => {
                             let detail = format!("{error:#}");
                             progress(HookProgress::ProtocolFailed(detail));
-                            return Err(error);
+                            return Err(failure(FailureKind::Protocol, &error));
                         }
                     };
                     if let Err(error) = acknowledgement
@@ -417,12 +452,22 @@ impl NatsTransport {
                 );
                 return Err(failure(FailureKind::Expired, &detail));
             }
+            // Skip an unrecognized kind on the decision subject the same way
+            // as the ack/delivery race above: it is not evidence the request
+            // was answered, so the loop keeps waiting for the next message,
+            // bounded by the same outer timeout. Issue #66.
             let result = tokio::time::timeout(remaining, async {
-                let message = subscription.next().await.ok_or_else(|| {
-                    let error = anyhow::anyhow!("decision stream closed");
-                    failure(FailureKind::Daemon, &error)
-                })?;
-                Ok::<_, anyhow::Error>(message.payload.to_vec())
+                loop {
+                    let message = subscription.next().await.ok_or_else(|| {
+                        let error = anyhow::anyhow!("decision stream closed");
+                        failure(FailureKind::Daemon, &error)
+                    })?;
+                    let bytes = message.payload.to_vec();
+                    if is_unrecognized_control_kind(&bytes) {
+                        continue;
+                    }
+                    return Ok::<_, anyhow::Error>(bytes);
+                }
             })
             .await;
             match result {
@@ -459,7 +504,19 @@ impl HookTransport for NatsTransport {
             has_browser_recipient,
             progress,
         );
-        Box::pin(async move { serde_json::from_slice(&verdict.await?).context("decode decision") })
+        Box::pin(async move {
+            let bytes = verdict.await?;
+            serde_json::from_slice(&bytes).map_err(|error| {
+                // A decode fault here is version skew or a bug, not evidence
+                // of a denial: issue #68. An explicit `Deny` and a verdict
+                // that decodes but fails shape or signature validation are
+                // unaffected -- those happen after this call returns.
+                failure(
+                    FailureKind::Protocol,
+                    &anyhow::Error::new(error).context("decode decision"),
+                )
+            })
+        })
     }
 
     fn request_authentication(
@@ -480,7 +537,17 @@ impl HookTransport for NatsTransport {
             progress,
         );
         Box::pin(async move {
-            serde_json::from_slice(&verdict.await?).context("decode authentication decision")
+            let bytes = verdict.await?;
+            serde_json::from_slice(&bytes).map_err(|error| {
+                // See `request_decision`: a decode fault is a local software
+                // fault, not a denial. The auth lane has no explicit `Deny`
+                // at all (see `AuthDecisionV1`), so a decode failure is the
+                // only way this call can end without an approval.
+                failure(
+                    FailureKind::Protocol,
+                    &anyhow::Error::new(error).context("decode authentication decision"),
+                )
+            })
         })
     }
 
@@ -676,5 +743,50 @@ impl ServerTransport for NatsTransport {
             self.client.flush().await?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `is_unrecognized_control_kind` is the exact check the ack/delivery
+    /// race and the decision read use to decide "skip and keep waiting" vs.
+    /// "this is the answer". No live NATS connection is needed to exercise
+    /// it: `request_verdict_bytes` itself is not unit-testable without a
+    /// broker, but this is the whole of the kind-sniffing logic it adds.
+    #[test]
+    fn a_future_kind_on_either_subject_is_skipped() {
+        let future_kind = br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#;
+        assert!(is_unrecognized_control_kind(future_kind));
+    }
+
+    #[test]
+    fn a_recognized_alive_message_is_not_skipped() {
+        let alive = oshioki_protocol::AliveV1::for_request("req-1");
+        let bytes = serde_json::to_vec(&alive).unwrap();
+        assert!(!is_unrecognized_control_kind(&bytes));
+    }
+
+    #[test]
+    fn a_recognized_decision_message_is_not_skipped() {
+        let decision = DecisionV1::Deny(oshioki_protocol::DenyV1 {
+            version: oshioki_protocol::VERSION_V1,
+            request_id: "req-1".into(),
+            device_fingerprint: "fp".into(),
+            signature: None,
+        });
+        let bytes = serde_json::to_vec(&decision).unwrap();
+        assert!(!is_unrecognized_control_kind(&bytes));
+    }
+
+    /// A genuine decode fault (garbage, not merely an unfamiliar kind) is
+    /// not treated as "skip and keep waiting": it stays a fault the caller
+    /// maps to `HookTransportFailure::Protocol` downstream. Confirms the two
+    /// are not conflated by this check.
+    #[test]
+    fn garbage_bytes_are_not_treated_as_an_unrecognized_kind() {
+        assert!(!is_unrecognized_control_kind(b"not json"));
+        assert!(!is_unrecognized_control_kind(b""));
     }
 }
