@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A release compatibility contract so `N-1 → N` upgrades keep enrolled
+  devices, identity files, pending requests, and a tested restore path.
+  Additive wire fields stay backward-readable; a breaking SQLite change
+  writes a verified `<stem>.pre-v<from>.sqlite3` snapshot of the current
+  live file (archiving any previous snapshot at that path) before it
+  migrates, and rejects a snapshot whose `integrity_check` is not `ok`; a
+  legacy identity file keeps `agent.json.prev` until an operator removes
+  it; the server widens the `OSHIOKI` stream and recreates
+  `oshioki-server-v1` when a new authentication lane needs filters the
+  running consumer does not have, instead of warning and serving. A stream
+  whose subjects already cover those lanes (`oshioki.>`) is left alone. CI loads
+  previous-release goldens, exercises old-reader/new-writer pairs, upgrades
+  with an enrolled credential and an in-flight request, and rolls back
+  through those restore files. See `docs/compatibility.md`. (#110, #67)
+
 ### Fixed
 
 - The agent no longer drops a NATS retry for a request it is already holding
@@ -33,10 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The database schema advances to version 3 (the outbox gains the deadline a
   delivery receipt is worth delivering until), applied automatically the next
   time the server opens its database. Rows queued before the upgrade carry no
-  deadline and are delivered as they always were. **Back up the server database
-  before upgrading**: the upgrade is one way, so rolling back to an older binary
-  afterward requires restoring that backup, since older binaries refuse a
-  database at a newer schema version.
+  deadline and are delivered as they always were. Before that bump the server
+  writes a verified `<stem>.pre-v<from>.sqlite3` snapshot next to the live
+  file; rolling back to an older binary means restoring that snapshot, since
+  older binaries refuse a database at a newer schema version.
 - A protocol decode fault against the host's own local agent -- version
   skew, a truncated frame, garbage bytes -- no longer denies sudo outright.
   It now maps to the same `CHECK_RC_UNAVAILABLE` path as a dropped socket or

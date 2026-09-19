@@ -35,6 +35,8 @@ cargo build --locked --release --workspace
 ```
 
 Follow the [runbook](RUNBOOK.md) to install the hook from a source build.
+Upgrade compatibility (what must survive `N-1 → N`, and how to restore) is
+in [docs/compatibility.md](docs/compatibility.md).
 
 ## Choose a setup
 

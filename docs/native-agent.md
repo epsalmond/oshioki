@@ -25,7 +25,9 @@ too, which is what the tests use. Software enrollments are recorded as
 password authentication for them. On a Mac the file holds only a keychain
 reference for the X25519 box secret, which lives in the login keychain;
 anywhere else the file carries the secret itself. Pre-move files migrate on
-first load, keeping the fingerprint.
+first load, keeping the fingerprint, and leave `agent.json.prev` beside the
+rewritten file so an older agent can be restored; see
+[compatibility.md](compatibility.md).
 
 One identity serves every host this device pairs with, so pairing again
 reuses it. A `--signer` that disagrees with the identity already there is an

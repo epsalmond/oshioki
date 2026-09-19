@@ -542,40 +542,33 @@ restore routing, and confirm ordinary sudo behavior.
 
 Contextual sudo authentication (`oshioki authenticate`, the PAM helper verb)
 publishes on `oshioki.auth.<host>`, a separate subject tree from command
-approval's `oshioki.request.<host>`. Two things in a NATS deployment predate
-it and are **not** updated automatically:
+approval's `oshioki.request.<host>`. The server updates two things on start
+when a deployment predates that lane:
 
 1. The `OSHIOKI` stream's subject list. A stream created for
-   `oshioki.request.>` alone silently discards everything published on
-   `oshioki.auth.>`.
-2. The durable `oshioki-server-v1` consumer's filter. `get_or_create_consumer`
-   returns an existing durable exactly as it is and never rewrites its
-   configuration, so a consumer created before this lane existed keeps its old
-   single filter no matter what the binary asks for.
+   `oshioki.request.>` alone would otherwise silently discard everything
+   published on `oshioki.auth.>`.
+2. The durable `oshioki-server-v1` consumer's filter. Recreating it can drop
+   in-flight command-lane deliveries; the hook then hits unavailable /
+   password fallback rather than a silent authentication-lane black hole.
 
-The server logs a warning at startup naming this section when the running consumer's
-filters do not match the build. To fix a deployment (NATS 2.10 or newer):
+A missing stream is still a misconfiguration: the server does not create one.
+If start fails because repair could not update the stream or recreate the
+durable (NATS 2.10 or newer), do it by hand and restart:
 
 ```sh
 nats stream update OSHIOKI --subjects 'oshioki.request.>,oshioki.auth.>'
 # The durable's filter cannot be widened in place; recreate it. Do this while
 # no request is in flight: pending deliveries are lost with the consumer.
 nats consumer rm OSHIOKI oshioki-server-v1
-# The server recreates it with both filters on its next start.
 systemctl restart oshioki-server
 ```
 
 Verify with `nats consumer info OSHIOKI oshioki-server-v1`: the filter list
 must show both `oshioki.request.>` and `oshioki.auth.>`.
 
-This widening is required, not preparatory: the server already consumes
-`oshioki.auth.>`. Its JetStream handler routes on the envelope's own `type`
-tag (`server/src/main.rs`, the `envelope_type` match), hands an
-`AUTH_ENVELOPE_TYPE` envelope to `ingest_auth_envelope`, and serves the
-stored request to a `WebAuthn` browser at the `/a/:id` route
-(`authentication_page`). A consumer whose filters still list only
-`oshioki.request.>` therefore never delivers an authentication request, and
-every contextual sudo falls back to a password.
+The contract for this repair, SQLite restore snapshots, and
+`agent.json.prev` is in `docs/compatibility.md`.
 
 ## Logs
 

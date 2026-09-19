@@ -1,4 +1,8 @@
-use std::{path::Path, sync::Mutex, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use oshioki_protocol::{
@@ -20,6 +24,9 @@ pub const PUSH_P256DH_BYTES: usize = 65;
 pub const PUSH_MAX_ATTEMPTS: i64 = 5;
 pub const PUSH_LEASE_SECS: i64 = 30;
 pub const PUSH_DISABLED_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+/// Schema version this binary writes after migrate. Older files snapshot,
+/// then move forward; newer files refuse to open. See `docs/compatibility.md`.
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub struct Store {
     connection: Mutex<Connection>,
@@ -106,17 +113,23 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         match version {
-            0 => {
-                connection.execute_batch(MIGRATION_V1)?;
-                connection.execute_batch(MIGRATION_V2)?;
-                connection.execute_batch(MIGRATION_V3)?;
+            0..=2 => {
+                create_verified_restore_snapshot(&connection, path, version)?;
+                match version {
+                    0 => {
+                        connection.execute_batch(MIGRATION_V1)?;
+                        connection.execute_batch(MIGRATION_V2)?;
+                        connection.execute_batch(MIGRATION_V3)?;
+                    }
+                    1 => {
+                        connection.execute_batch(MIGRATION_V2)?;
+                        connection.execute_batch(MIGRATION_V3)?;
+                    }
+                    2 => connection.execute_batch(MIGRATION_V3)?,
+                    _ => unreachable!("matched 0|1|2"),
+                }
             }
-            1 => {
-                connection.execute_batch(MIGRATION_V2)?;
-                connection.execute_batch(MIGRATION_V3)?;
-            }
-            2 => connection.execute_batch(MIGRATION_V3)?,
-            3 => {}
+            SCHEMA_VERSION => {}
             newer => bail!("unsupported database schema version {newer}"),
         }
         Ok(Self {
@@ -139,7 +152,7 @@ impl Store {
     pub fn ready(&self) -> Result<()> {
         let connection = self.lock()?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 3 {
+        if version != SCHEMA_VERSION {
             bail!("unsupported database schema version {version}");
         }
         Ok(())
@@ -1377,6 +1390,140 @@ pub fn validate_push_endpoint(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
+/// Restore snapshot beside the live database: `state.sqlite3` at version 2
+/// becomes `state.pre-v2.sqlite3`. Each upgrade attempt writes a fresh copy
+/// of the current live file; a previous snapshot at that path is renamed
+/// aside so a later rollback cannot rewind past intervening enrollments.
+pub fn restore_snapshot_path(path: &Path, from_version: i64) -> PathBuf {
+    sibling_with_name(path, &restore_snapshot_name(path, from_version))
+}
+
+fn restore_snapshot_name(path: &Path, from_version: i64) -> String {
+    let file_name = path.file_name().map_or_else(
+        || "state.sqlite3".into(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}.pre-v{from_version}.{ext}"),
+        None => format!("{file_name}.pre-v{from_version}"),
+    }
+}
+
+fn sibling_with_name(path: &Path, name: &str) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+fn archive_restore_snapshot_path(snapshot: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let file_name = snapshot.file_name().map_or_else(
+        || "state.pre-v.sqlite3".into(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) => sibling_with_name(snapshot, &format!("{stem}.{stamp}.{ext}")),
+        None => sibling_with_name(snapshot, &format!("{file_name}.{stamp}")),
+    }
+}
+
+fn create_verified_restore_snapshot(
+    connection: &Connection,
+    live_path: &Path,
+    from_version: i64,
+) -> Result<()> {
+    let snapshot = restore_snapshot_path(live_path, from_version);
+    let staging = sibling_with_name(
+        &snapshot,
+        &format!(
+            "{}.creating",
+            snapshot.file_name().map_or_else(
+                || "state.pre-v.sqlite3".into(),
+                |name| name.to_string_lossy().into_owned()
+            )
+        ),
+    );
+    if staging.exists() {
+        std::fs::remove_file(&staging)
+            .with_context(|| format!("remove leftover snapshot staging {}", staging.display()))?;
+    }
+    let dest = staging
+        .to_str()
+        .with_context(|| format!("restore snapshot path {} is not UTF-8", staging.display()))?;
+    connection
+        .execute("VACUUM INTO ?1", [dest])
+        .with_context(|| format!("create restore snapshot {}", staging.display()))?;
+    if let Err(error) = verify_restore_snapshot(&staging, from_version) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error).context(format!(
+            "restore snapshot {} failed verification; left the live database unmigrated",
+            staging.display()
+        ));
+    }
+    if snapshot.exists() {
+        let archived = archive_restore_snapshot_path(&snapshot);
+        std::fs::rename(&snapshot, &archived).with_context(|| {
+            format!(
+                "archive previous restore snapshot {} to {}",
+                snapshot.display(),
+                archived.display()
+            )
+        })?;
+    }
+    std::fs::rename(&staging, &snapshot).with_context(|| {
+        format!(
+            "install restore snapshot {} from {}",
+            snapshot.display(),
+            staging.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn verify_restore_snapshot(path: &Path, expected_version: i64) -> Result<()> {
+    let connection = Connection::open(path)
+        .with_context(|| format!("open restore snapshot {}", path.display()))?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != expected_version {
+        bail!(
+            "restore snapshot {} has schema version {version}, expected {expected_version}",
+            path.display()
+        );
+    }
+    if expected_version >= 1 {
+        let tables: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='devices'",
+            [],
+            |row| row.get(0),
+        )?;
+        if tables != 1 {
+            bail!(
+                "restore snapshot {} is missing the devices table",
+                path.display()
+            );
+        }
+    }
+    let mut statement = connection
+        .prepare("PRAGMA integrity_check")
+        .with_context(|| format!("prepare integrity_check for {}", path.display()))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .with_context(|| format!("run integrity_check for {}", path.display()))?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .with_context(|| format!("read integrity_check for {}", path.display()))?;
+    if rows != ["ok"] {
+        bail!(
+            "restore snapshot {} failed integrity_check: {}",
+            path.display(),
+            rows.join("; ")
+        );
+    }
+    Ok(())
+}
+
 /// The schema, applied on every open. It is additive only and stays at
 /// `user_version = 1`: every statement is `CREATE ... IF NOT EXISTS`, so an
 /// existing database gains the authentication tables on the next start
@@ -1510,7 +1657,7 @@ mod tests {
     };
     use p256::ecdsa::SigningKey;
     use std::{
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1519,13 +1666,24 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "oshioki-db-test-{}-{nonce}.sqlite3",
-            std::process::id()
-        ))
+        let dir =
+            std::env::temp_dir().join(format!("oshioki-db-test-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("state.sqlite3")
     }
 
     fn remove_database(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let name = parent
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.starts_with("oshioki-db-test-") {
+                let _ = std::fs::remove_dir_all(parent);
+                let _ = std::fs::create_dir_all(parent);
+                return;
+            }
+        }
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
@@ -1610,45 +1768,7 @@ mod tests {
 
     /// The schema a server carried before the authentication lane existed:
     /// the command-lane statements verbatim, with no `auth_*` tables.
-    const COMMAND_ONLY_SCHEMA_V1: &str = r"
-BEGIN IMMEDIATE;
-CREATE TABLE IF NOT EXISTS devices (
-  fingerprint TEXT PRIMARY KEY, credential_id TEXT NOT NULL UNIQUE,
-  api_token_hash BLOB NOT NULL UNIQUE, public_record_json TEXT NOT NULL,
-  active INTEGER NOT NULL CHECK(active IN (0,1)), updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS enrollments (
-  id TEXT PRIMARY KEY, secret_hash BLOB NOT NULL, status TEXT NOT NULL,
-  expires_at INTEGER NOT NULL, reply_subject TEXT NOT NULL, submission_hash BLOB, submission_json BLOB,
-  fingerprint TEXT REFERENCES devices(fingerprint), updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS requests (
-  id TEXT PRIMARY KEY, envelope_hash BLOB NOT NULL, envelope_json BLOB NOT NULL,
-  host TEXT NOT NULL, user TEXT NOT NULL, issued_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL, state TEXT NOT NULL, decision_hash BLOB,
-  created_at INTEGER NOT NULL, resolved_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS sealed_bodies (
-  request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
-  fingerprint TEXT NOT NULL, body_json BLOB NOT NULL,
-  PRIMARY KEY(request_id, fingerprint)
-);
-CREATE TABLE IF NOT EXISTS tombstones (
-  kind TEXT NOT NULL, object_id TEXT NOT NULL, payload_hash BLOB NOT NULL,
-  expires_at INTEGER NOT NULL, PRIMARY KEY(kind, object_id, payload_hash)
-);
-CREATE TABLE IF NOT EXISTS outbox (
-  id INTEGER PRIMARY KEY, kind TEXT NOT NULL, dedupe_key TEXT NOT NULL,
-  subject TEXT NOT NULL, payload BLOB NOT NULL, created_at INTEGER NOT NULL,
-  sent_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
-  UNIQUE(kind, dedupe_key)
-);
-CREATE INDEX IF NOT EXISTS requests_expiry_idx ON requests(expires_at);
-CREATE INDEX IF NOT EXISTS requests_created_idx ON requests(created_at);
-CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox(sent_at, id);
-PRAGMA user_version = 1;
-COMMIT;
-";
+    const COMMAND_ONLY_SCHEMA_V1: &str = include_str!("../../tests/compat/goldens/state-v1.sql");
 
     fn table_names(store: &Store) -> Vec<String> {
         let connection = store.lock().unwrap();
@@ -1705,6 +1825,10 @@ COMMIT;
             .unwrap();
         assert_eq!(version, 3);
         drop(store);
+        let snapshot = restore_snapshot_path(&path, 1);
+        assert!(snapshot.exists(), "{}", snapshot.display());
+        verify_restore_snapshot(&snapshot, 1).unwrap();
+        let _ = std::fs::remove_file(&snapshot);
         {
             let connection = Connection::open(&path).unwrap();
             connection.pragma_update(None, "user_version", 99).unwrap();
@@ -2152,7 +2276,168 @@ COMMIT;
             vec!["oshioki.delivery.request-before"]
         );
         drop(store);
+        let snapshot = restore_snapshot_path(&path, 2);
+        assert!(snapshot.exists(), "{}", snapshot.display());
+        verify_restore_snapshot(&snapshot, 2).unwrap();
+        let old = Connection::open(&snapshot).unwrap();
+        let snapshot_version: i64 = old
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(snapshot_version, 2);
+        let subject: String = old
+            .query_row(
+                "SELECT subject FROM outbox WHERE dedupe_key='request-before'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(subject, "oshioki.delivery.request-before");
+        let _ = std::fs::remove_file(&snapshot);
         remove_database(&path);
+    }
+
+    fn insert_device_on(connection: &Connection, device: &DevicePublicRecordV1) {
+        let api_token_hash = oshioki_protocol::decode_base64url(&device.api_token_hash).unwrap();
+        connection
+            .execute(
+                "INSERT INTO devices(fingerprint, credential_id, api_token_hash, public_record_json, active, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, unixepoch())",
+                rusqlite::params![
+                    device.fingerprint,
+                    device.credential_id,
+                    api_token_hash,
+                    serde_json::to_string(device).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn device_fingerprints(path: &Path) -> Vec<String> {
+        let connection = Connection::open(path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT fingerprint FROM devices ORDER BY fingerprint")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_second_upgrade_refreshes_the_restore_snapshot() {
+        let path = temporary_database();
+        remove_database(&path);
+        let first = device(b"first-enroll");
+        let later = alternate_device(b"later-enroll");
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(MIGRATION_V1).unwrap();
+            old.execute_batch(MIGRATION_V2).unwrap();
+            insert_device_on(&old, &first);
+        }
+        let snapshot = restore_snapshot_path(&path, 2);
+        {
+            let store = Store::open(&path).unwrap();
+            store.ready().unwrap();
+            drop(store);
+        }
+        assert_eq!(
+            device_fingerprints(&snapshot),
+            vec![first.fingerprint.clone()]
+        );
+        std::fs::copy(&snapshot, &path).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        {
+            let old = Connection::open(&path).unwrap();
+            assert_eq!(
+                old.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            insert_device_on(&old, &later);
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            store.ready().unwrap();
+            assert!(store.active_device(&later.fingerprint).unwrap().is_some());
+            drop(store);
+        }
+        let mut fingerprints = device_fingerprints(&snapshot);
+        fingerprints.sort();
+        let mut expected = vec![first.fingerprint.clone(), later.fingerprint.clone()];
+        expected.sort();
+        assert_eq!(fingerprints, expected);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn a_restore_snapshot_with_corrupt_data_pages_is_rejected() {
+        let path = temporary_database();
+        remove_database(&path);
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(MIGRATION_V1).unwrap();
+            old.execute_batch(MIGRATION_V2).unwrap();
+            let device = device(b"corrupt-me");
+            let api_token_hash =
+                oshioki_protocol::decode_base64url(&device.api_token_hash).unwrap();
+            old.execute(
+                "INSERT INTO devices(fingerprint, credential_id, api_token_hash, public_record_json, active, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, unixepoch())",
+                rusqlite::params![
+                    device.fingerprint,
+                    device.credential_id,
+                    api_token_hash,
+                    serde_json::to_string(&device).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+        let snapshot = restore_snapshot_path(&path, 2);
+        {
+            let live = Connection::open(&path).unwrap();
+            live.execute("VACUUM INTO ?1", [snapshot.to_str().unwrap()])
+                .unwrap();
+        }
+        verify_restore_snapshot(&snapshot, 2).unwrap();
+        let mut bytes = std::fs::read(&snapshot).unwrap();
+        let offset = if bytes.len() > 8192 {
+            4096
+        } else {
+            bytes.len() / 2
+        };
+        assert!(offset >= 100, "snapshot too small to corrupt a data page");
+        for byte in bytes.iter_mut().skip(offset).take(64) {
+            *byte ^= 0xff;
+        }
+        std::fs::write(&snapshot, bytes).unwrap();
+        let result = verify_restore_snapshot(&snapshot, 2);
+        let error = result.expect_err("corrupt snapshot must not verify");
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("integrity_check")
+                || detail.contains("malformed")
+                || detail.contains("corrupt")
+                || detail.contains("disk image"),
+            "{detail}"
+        );
+        let _ = std::fs::remove_file(&snapshot);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn restore_snapshot_path_keeps_the_live_stem() {
+        assert_eq!(
+            restore_snapshot_path(Path::new("/var/lib/oshioki/state.sqlite3"), 2),
+            PathBuf::from("/var/lib/oshioki/state.pre-v2.sqlite3")
+        );
+        assert_eq!(
+            restore_snapshot_path(Path::new("state.sqlite3"), 1),
+            PathBuf::from("state.pre-v1.sqlite3")
+        );
     }
 
     #[test]

@@ -23,6 +23,20 @@ sodium.ready.then(() => {
   );
   assert.equal(quoteReviewString("suffix\u202e-hidden"), '"suffix\\u202e-hidden"');
 
+  const requestGolden = JSON.parse(fs.readFileSync(
+    `${__dirname}/../../tests/compat/goldens/request-v1.json`,
+    "utf8",
+  ));
+  assert.equal(requestGolden.version, 1);
+  assert.equal(requestGolden.request_id, "req-1");
+  assert.equal(requestGolden.command, "/usr/bin/apt");
+  const authGolden = JSON.parse(fs.readFileSync(
+    `${__dirname}/../../tests/compat/goldens/auth-envelope-v2.json`,
+    "utf8",
+  ));
+  assert.equal(authGolden.type, "sudo_authentication");
+  assert.equal(authGolden.version, 2);
+
   const raw = Buffer.from('{"version":1,"request_id":"vector-1"}');
   const challenge = crypto.createHash("sha256")
     .update(Buffer.from("oshioki/approve/v1\0"))

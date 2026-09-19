@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+# N-1 → N upgrade and mixed hook/agent socket matrix against the previous
+# tagged release. Builds both sides from source so the Linux agent (not in
+# the Debian package) is included.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+cd "$REPO_ROOT"
+
+head_commit="$(git rev-parse HEAD)"
+PREV_TAG=""
+while read -r tag; do
+  [ -n "$tag" ] || continue
+  if [ "$(git rev-parse "${tag}^{commit}")" != "$head_commit" ]; then
+    PREV_TAG="$tag"
+    break
+  fi
+done < <(git tag --sort=-v:refname)
+
+if [ -z "$PREV_TAG" ]; then
+  echo "test-compat-upgrade: no previous tag to test against" >&2
+  exit 2
+fi
+
+echo "previous release: $PREV_TAG"
+
+TEMP_ROOT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+WORK="$(mktemp -d "$TEMP_ROOT/oshioki-compat-upgrade.XXXXXX")"
+PREV_SRC="$WORK/prev-src"
+PREV_BIN="$WORK/prev"
+CUR_BIN="$WORK/current"
+TEST_OK=0
+
+cleanup() {
+  set +e
+  [ -z "${AGENT_PID:-}" ] || kill "$AGENT_PID" >/dev/null 2>&1 || true
+  [ -z "${AGENT_PID:-}" ] || wait "$AGENT_PID" >/dev/null 2>&1 || true
+  [ -z "${HOOK_PID:-}" ] || kill "$HOOK_PID" >/dev/null 2>&1 || true
+  [ -z "${HOOK_PID:-}" ] || wait "$HOOK_PID" >/dev/null 2>&1 || true
+  [ -z "${SERVER_PID:-}" ] || kill "$SERVER_PID" >/dev/null 2>&1 || true
+  [ -z "${SERVER_PID:-}" ] || wait "$SERVER_PID" >/dev/null 2>&1 || true
+  [ -z "${NATS_PID:-}" ] || kill "$NATS_PID" >/dev/null 2>&1 || true
+  [ -z "${NATS_PID:-}" ] || wait "$NATS_PID" >/dev/null 2>&1 || true
+  [ -z "${NATS_CONTAINER:-}" ] || docker rm -f "$NATS_CONTAINER" >/dev/null 2>&1 || true
+  if [ -d "$PREV_SRC" ]; then
+    git -C "$REPO_ROOT" worktree remove --force "$PREV_SRC" >/dev/null 2>&1 || true
+  fi
+  if [ "$TEST_OK" -eq 1 ]; then
+    rm -rf -- "$WORK"
+  else
+    printf 'retained failed compat-upgrade state: %s\n' "$WORK" >&2
+  fi
+}
+trap cleanup EXIT
+
+git fetch --tags --force >/dev/null 2>&1 || true
+git worktree add --detach "$PREV_SRC" "$PREV_TAG"
+
+build_side() {
+  local src="$1" dest="$2"
+  mkdir -p "$dest"
+  cargo build --manifest-path "$src/Cargo.toml" --locked --release \
+    -p oshioki-hook -p oshioki-server
+  cargo build --manifest-path "$src/Cargo.toml" --locked --release \
+    -p oshioki-agent --features unattended --target-dir "$src/target/unattended"
+  install -m 0755 "$src/target/release/oshioki" "$dest/oshioki"
+  install -m 0755 "$src/target/release/oshioki-server" "$dest/oshioki-server"
+  install -m 0755 "$src/target/unattended/release/oshioki-agent" "$dest/oshioki-agent"
+}
+
+echo "building $PREV_TAG"
+build_side "$PREV_SRC" "$PREV_BIN"
+echo "building current"
+build_side "$REPO_ROOT" "$CUR_BIN"
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+    return $?
+  fi
+  "$@" &
+  local pid=$!
+  local elapsed=0
+  while [ "$elapsed" -lt "$seconds" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"
+      return $?
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 124
+}
+
+wait_for_line() {
+  local file="$1" pattern="$2" attempt=0
+  while [ "$attempt" -lt 100 ]; do
+    if grep -Eq -- "$pattern" "$file" 2>/dev/null; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  echo "timed out waiting for /$pattern/ in $file" >&2
+  cat "$file" >&2 || true
+  return 1
+}
+
+stop_agent() {
+  [ -n "${AGENT_PID:-}" ] || return 0
+  kill "$AGENT_PID" >/dev/null 2>&1 || true
+  wait "$AGENT_PID" >/dev/null 2>&1 || true
+  AGENT_PID=""
+}
+
+# Socket-only: init a software identity, pin it, auto-approve a synthetic request.
+run_socket_pair() {
+  local hook_bin="$1" agent_bin="$2" label="$3"
+  local state="$WORK/$label"
+  rm -rf "$state"
+  local agent_state="$state/agent"
+  local hook_dir="$state/hook"
+  install -d -m 0700 "$agent_state" "$hook_dir"
+  "$agent_bin" init --signer software --state "$agent_state"
+  "$agent_bin" device-record --label "compat-$label" --state "$agent_state" \
+    >"$state/device.json"
+  fingerprint="$("$agent_bin" show --state "$agent_state" | head -n1)"
+  printf '{"version":1,"origin":"https://sudo.test","rp_id":"sudo.test","server_base_url":"https://sudo.test"}\n' \
+    >"$hook_dir/hook.json"
+  printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$agent_state/agent.sock" >"$hook_dir/config.env"
+  printf '{"version":1,"devices":[]}\n' >"$hook_dir/devices.json"
+  chmod 0600 "$hook_dir"/*
+  printf '%s\n' "$fingerprint" | OSHIOKI_CONFIG_DIR="$hook_dir" "$hook_bin" pin-record "$state/device.json"
+  : >"$state/agent.log"
+  RUST_LOG=info "$agent_bin" run --state "$agent_state" --auto approve >"$state/agent.log" 2>&1 &
+  AGENT_PID=$!
+  wait_for_line "$state/agent.log" 'agent socket listening'
+  local status=0
+  OSHIOKI_CONFIG_DIR="$hook_dir" run_with_timeout 15 "$hook_bin" test || status=$?
+  stop_agent
+  if [ "$status" -ne 0 ]; then
+    echo "socket pair $label failed with status $status" >&2
+    cat "$state/agent.log" >&2 || true
+    return "$status"
+  fi
+  echo "socket pair $label: approved ($fingerprint)"
+}
+
+echo "same-version current hook/agent"
+run_socket_pair "$CUR_BIN/oshioki" "$CUR_BIN/oshioki-agent" current-current
+
+echo "upgrade: previous identity, current agent/hook"
+# Previous agent writes the identity; current agent must load it and approve.
+upgrade_state="$WORK/upgrade"
+rm -rf "$upgrade_state"
+install -d -m 0700 "$upgrade_state/agent" "$upgrade_state/hook"
+"$PREV_BIN/oshioki-agent" init --signer software --state "$upgrade_state/agent"
+"$PREV_BIN/oshioki-agent" device-record --label upgrade --state "$upgrade_state/agent" \
+  >"$upgrade_state/device.json"
+fingerprint="$("$PREV_BIN/oshioki-agent" show --state "$upgrade_state/agent" | head -n1)"
+printf '{"version":1,"origin":"https://sudo.test","rp_id":"sudo.test","server_base_url":"https://sudo.test"}\n' \
+  >"$upgrade_state/hook/hook.json"
+printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$upgrade_state/agent/agent.sock" >"$upgrade_state/hook/config.env"
+printf '{"version":1,"devices":[]}\n' >"$upgrade_state/hook/devices.json"
+chmod 0600 "$upgrade_state/hook"/*
+printf '%s\n' "$fingerprint" | OSHIOKI_CONFIG_DIR="$upgrade_state/hook" \
+  "$CUR_BIN/oshioki" pin-record "$upgrade_state/device.json"
+: >"$upgrade_state/agent.log"
+RUST_LOG=info "$CUR_BIN/oshioki-agent" run --state "$upgrade_state/agent" --auto approve \
+  >"$upgrade_state/agent.log" 2>&1 &
+AGENT_PID=$!
+wait_for_line "$upgrade_state/agent.log" 'agent socket listening'
+status=0
+OSHIOKI_CONFIG_DIR="$upgrade_state/hook" run_with_timeout 15 "$CUR_BIN/oshioki" test || status=$?
+stop_agent
+if [ "$status" -ne 0 ]; then
+  echo "upgrade path failed with status $status" >&2
+  cat "$upgrade_state/agent.log" >&2 || true
+  exit "$status"
+fi
+echo "upgrade path: previous identity still approved ($fingerprint)"
+
+echo "mixed: current hook / previous agent"
+mixed_status=0
+run_socket_pair "$CUR_BIN/oshioki" "$PREV_BIN/oshioki-agent" current-hook-prev-agent || mixed_status=$?
+if [ "$mixed_status" -eq 124 ]; then
+  echo "mixed current-hook/prev-agent hung" >&2
+  exit 1
+fi
+# Either a successful additive mix or a fail-closed diagnostic is acceptable.
+# A hang (timeout 124) is not. A silent allow is `test` exiting 0 without an
+# agent, which run_socket_pair cannot produce because the agent is started.
+if [ "$mixed_status" -ne 0 ]; then
+  echo "mixed current-hook/prev-agent failed closed (status $mixed_status)"
+fi
+
+echo "mixed: previous hook / current agent"
+mixed_status=0
+run_socket_pair "$PREV_BIN/oshioki" "$CUR_BIN/oshioki-agent" prev-hook-current-agent || mixed_status=$?
+if [ "$mixed_status" -eq 124 ]; then
+  echo "mixed prev-hook/current-agent hung" >&2
+  exit 1
+fi
+if [ "$mixed_status" -ne 0 ]; then
+  echo "mixed prev-hook/current-agent failed closed (status $mixed_status)"
+fi
+
+echo "identity restore through a test store"
+cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --locked -p oshioki-agent --lib \
+  tests::restoring_agent_json_prev_recovers_the_legacy_identity -- --exact
+
+echo "sqlite snapshot refresh"
+cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --locked -p oshioki-server --bin oshioki-server \
+  db::tests::a_second_upgrade_refreshes_the_restore_snapshot -- --exact
+
+echo "sqlite snapshot integrity"
+cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --locked -p oshioki-server --bin oshioki-server \
+  db::tests::a_restore_snapshot_with_corrupt_data_pages_is_rejected -- --exact
+
+free_port() {
+  python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+wait_for_http() {
+  local url="$1" attempt=0
+  while [ "$attempt" -lt 80 ]; do
+    if curl --fail --silent "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  echo "timed out waiting for $url" >&2
+  return 1
+}
+
+stop_server() {
+  [ -n "${SERVER_PID:-}" ] || return 0
+  kill "$SERVER_PID" >/dev/null 2>&1 || true
+  wait "$SERVER_PID" >/dev/null 2>&1 || true
+  SERVER_PID=""
+}
+
+start_server() {
+  local bin="$1" log="$2"
+  : >"$log"
+  NATS_URL="$NATS_URL" NATS_USER=oshioki NATS_PASS=test-only \
+    OSHIOKI_ALLOW_PLAINTEXT_NATS=1 \
+    OSHIOKI_STATE_PATH="$SERVER_DB" \
+    OSHIOKI_LISTEN="127.0.0.1:${SERVER_PORT}" \
+    OSHIOKI_ORIGIN=https://sudo.test \
+    OSHIOKI_RP_ID=sudo.test \
+    RUST_LOG=info "$bin" >"$log" 2>&1 &
+  SERVER_PID=$!
+  if ! wait_for_http "http://127.0.0.1:${SERVER_PORT}/healthz"; then
+    echo "server failed to become healthy" >&2
+    cat "$log" >&2 || true
+    return 1
+  fi
+}
+
+start_nats_agent() {
+  local bin="$1" log="$2"
+  : >"$log"
+  NATS_URL="$NATS_URL" NATS_USER=oshioki NATS_PASS=test-only \
+    OSHIOKI_ALLOW_PLAINTEXT_NATS=1 \
+    RUST_LOG=info "$bin" run --state "$AGENT_STATE" --auto approve >"$log" 2>&1 &
+  AGENT_PID=$!
+  wait_for_line "$log" 'NATS connected; watching for requests'
+}
+
+SERVER_TOKEN="compat-server-token-0123456789ab"
+
+seed_server_enrollment() {
+  python3 - "$SERVER_DB" "$REPO_ROOT/tests/compat/goldens/devices-v1.json" "$SERVER_TOKEN" <<'PY'
+import base64, hashlib, json, sqlite3, sys
+db, devices_path, token = sys.argv[1], sys.argv[2], sys.argv[3]
+def b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+devices = json.loads(open(devices_path, encoding="utf-8").read())
+device = devices["devices"][0]
+token_hash = hashlib.sha256(token.encode()).digest()
+device["api_token_hash"] = b64url_encode(token_hash)
+if "kind" not in device:
+    device["kind"] = "webauthn"
+conn = sqlite3.connect(db, timeout=10)
+conn.execute(
+    """INSERT OR REPLACE INTO devices(
+         fingerprint, credential_id, api_token_hash, public_record_json, active, updated_at)
+       VALUES (?, ?, ?, ?, 1, unixepoch())""",
+    (device["fingerprint"], device["credential_id"], token_hash, json.dumps(device)),
+)
+conn.commit()
+print(device["fingerprint"])
+PY
+}
+
+insert_server_request() {
+  python3 - "$SERVER_DB" "$1" "$2" <<'PY'
+import hashlib, json, sqlite3, sys, time
+db, request_id, fingerprint = sys.argv[1], sys.argv[2], sys.argv[3]
+now = int(time.time())
+envelope = {
+    "version": 1,
+    "request_id": request_id,
+    "host": "host.example",
+    "user": "eric",
+    "issued_at": now - 1,
+    "expires_at": now + 600,
+    "sealed": [{
+        "device_fingerprint": fingerprint,
+        "ephemeral_pub": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+        "nonce": "CQkJCQkJCQkJCQkJ",
+        "ciphertext": "CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo",
+    }],
+}
+raw = json.dumps(envelope, separators=(",", ":")).encode()
+body = json.dumps(envelope["sealed"][0]).encode()
+conn = sqlite3.connect(db, timeout=10)
+conn.execute("DELETE FROM sealed_bodies WHERE request_id=?", (request_id,))
+conn.execute("DELETE FROM requests WHERE id=?", (request_id,))
+conn.execute(
+    """INSERT INTO requests(
+         id, envelope_hash, envelope_json, host, user, issued_at, expires_at, state, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', unixepoch())""",
+    (
+        request_id,
+        hashlib.sha256(raw).digest(),
+        raw,
+        envelope["host"],
+        envelope["user"],
+        envelope["issued_at"],
+        envelope["expires_at"],
+    ),
+)
+conn.execute(
+    "INSERT INTO sealed_bodies(request_id, fingerprint, body_json) VALUES (?, ?, ?)",
+    (request_id, fingerprint, body),
+)
+conn.commit()
+PY
+}
+
+assert_server_enrollment() {
+  local request_id="$1" label="$2"
+  insert_server_request "$request_id" "$SERVER_FP"
+  local url="http://127.0.0.1:${SERVER_PORT}/api/v1/requests/${request_id}"
+  if ! curl --fail --silent -H "Authorization: Bearer ${SERVER_TOKEN}" "$url" | grep -F "$SERVER_FP" >/dev/null; then
+    echo "server enrollment missing for $label: GET $url with the enrolled token failed" >&2
+    return 1
+  fi
+  local wrong
+  wrong="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer wrong-token-012345678901234567890" "$url")"
+  if [ "$wrong" != "401" ]; then
+    echo "server enrollment for $label accepted a wrong token (HTTP $wrong)" >&2
+    return 1
+  fi
+  curl --fail --silent -X POST \
+    -H "Authorization: Bearer ${SERVER_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"action\":\"deny\",\"version\":1,\"request_id\":\"${request_id}\",\"device_fingerprint\":\"${SERVER_FP}\"}" \
+    "${url}/deny" >/dev/null
+  curl --fail --silent "${url}/verdict" | grep -F '"action":"deny"' >/dev/null
+  echo "server request/verdict API authenticated $label ($request_id)"
+}
+
+wait_for_pending_request() {
+  python3 - "$SERVER_DB" "$1" <<'PY'
+import sqlite3, sys, time
+path, cutoff = sys.argv[1], int(sys.argv[2])
+for _ in range(80):
+    try:
+        conn = sqlite3.connect(path)
+        row = conn.execute(
+            "SELECT id FROM requests WHERE state='pending' AND created_at>=? LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+        conn.close()
+        if row:
+            print(row[0])
+            raise SystemExit(0)
+    except sqlite3.Error:
+        pass
+    time.sleep(0.1)
+raise SystemExit("no pending request appeared in the server database")
+PY
+}
+
+echo "server upgrade with enrolled state and an in-flight request"
+NATS_PORT="$(free_port)"
+SERVER_PORT="$(free_port)"
+while [ "$SERVER_PORT" = "$NATS_PORT" ]; do
+  SERVER_PORT="$(free_port)"
+done
+NATS_URL="nats://127.0.0.1:${NATS_PORT}"
+SERVER_DIR="$WORK/server"
+SERVER_DB="$SERVER_DIR/state.sqlite3"
+AGENT_STATE="$WORK/server-agent"
+HOOK_DIR="$WORK/server-hook"
+install -d -m 0700 "$SERVER_DIR" "$AGENT_STATE" "$HOOK_DIR"
+"$PREV_BIN/oshioki-agent" init --signer software --state "$AGENT_STATE"
+"$PREV_BIN/oshioki-agent" device-record --label server-upgrade --state "$AGENT_STATE" \
+  >"$WORK/server-device.json"
+fingerprint="$("$PREV_BIN/oshioki-agent" show --state "$AGENT_STATE" | head -n1)"
+printf '{"version":1,"origin":"https://sudo.test","rp_id":"sudo.test","server_base_url":"https://sudo.test"}\n' \
+  >"$HOOK_DIR/hook.json"
+printf 'NATS_URL=%s\nNATS_USER=oshioki\nNATS_PASS=test-only\nOSHIOKI_ALLOW_PLAINTEXT_NATS=1\n' \
+  "$NATS_URL" >"$HOOK_DIR/config.env"
+printf '{"version":1,"devices":[]}\n' >"$HOOK_DIR/devices.json"
+chmod 0600 "$HOOK_DIR"/*
+printf '%s\n' "$fingerprint" | OSHIOKI_CONFIG_DIR="$HOOK_DIR" \
+  "$PREV_BIN/oshioki" pin-record "$WORK/server-device.json"
+
+if command -v nats-server >/dev/null 2>&1; then
+  mkdir -p "$SERVER_DIR/nats"
+  nats-server -js -sd "$SERVER_DIR/nats" -p "$NATS_PORT" \
+    --user oshioki --pass test-only >"$SERVER_DIR/nats.log" 2>&1 &
+  NATS_PID=$!
+else
+  command -v docker >/dev/null 2>&1 || {
+    echo "test-compat-upgrade: need nats-server or docker for the server path" >&2
+    exit 2
+  }
+  NATS_CONTAINER="$(docker run -d --rm -p "127.0.0.1:${NATS_PORT}:4222" \
+    nats:2.11-alpine --jetstream --user oshioki --pass test-only)"
+fi
+for _ in $(seq 1 50); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$NATS_PORT") 2>/dev/null; then
+    exec 3>&-
+    break
+  fi
+  sleep 0.1
+done
+OSHIOKI_TEST_NATS_LANE=1 NATS_URL="$NATS_URL" NATS_USER=oshioki NATS_PASS=test-only \
+  cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --locked \
+    -p oshioki-transport --test nats_lane_upgrade -- --test-threads=1
+
+start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-1.log"
+stop_server
+SERVER_FP="$(seed_server_enrollment)"
+start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-1.log"
+assert_server_enrollment "compat-prev-1" "previous server"
+start_nats_agent "$PREV_BIN/oshioki-agent" "$SERVER_DIR/agent-prev-1.log"
+approve_status=0
+OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 20 "$PREV_BIN/oshioki" test || approve_status=$?
+stop_agent
+if [ "$approve_status" -ne 0 ]; then
+  echo "previous server stack failed to approve (status $approve_status)" >&2
+  cat "$SERVER_DIR/prev-1.log" >&2 || true
+  cat "$SERVER_DIR/agent-prev-1.log" >&2 || true
+  exit "$approve_status"
+fi
+echo "previous server stack approved with enrolled credential ($fingerprint)"
+
+echo "in-flight request across server upgrade"
+cutoff="$(date +%s)"
+OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 45 "$PREV_BIN/oshioki" test &
+HOOK_PID=$!
+inflight_id="$(wait_for_pending_request "$cutoff")"
+kill "$HOOK_PID" >/dev/null 2>&1 || true
+wait "$HOOK_PID" >/dev/null 2>&1 || true
+HOOK_PID=""
+stop_server
+start_server "$CUR_BIN/oshioki-server" "$SERVER_DIR/current.log"
+python3 - "$SERVER_DB" "$inflight_id" <<'PY'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+row = conn.execute(
+    "SELECT id, state FROM requests WHERE id=?",
+    (sys.argv[2],),
+).fetchone()
+assert row is not None and row[1] == "pending", row
+print(f"in-flight {row[0]} still pending after current server open")
+PY
+assert_server_enrollment "compat-current-1" "current server"
+start_nats_agent "$CUR_BIN/oshioki-agent" "$SERVER_DIR/agent-current.log"
+approve_status=0
+OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 20 "$CUR_BIN/oshioki" test || approve_status=$?
+stop_agent
+if [ "$approve_status" -ne 0 ]; then
+  echo "current server stack failed to approve with enrolled credential (status $approve_status)" >&2
+  cat "$SERVER_DIR/current.log" >&2 || true
+  cat "$SERVER_DIR/agent-current.log" >&2 || true
+  exit "$approve_status"
+fi
+echo "current server stack approved with the same enrolled credential"
+
+stop_server
+snapshot="$(python3 - "$SERVER_DB" <<'PY'
+import glob, os, sys
+path = sys.argv[1]
+directory, name = os.path.split(path)
+stem, ext = os.path.splitext(name)
+matches = sorted(
+    glob.glob(os.path.join(directory, stem + ".pre-v*" + ext))
+)
+print(matches[-1] if matches else "")
+PY
+)"
+if [ -n "$snapshot" ]; then
+  echo "restoring $snapshot"
+  cp "$snapshot" "$SERVER_DB"
+  rm -f "$SERVER_DB-wal" "$SERVER_DB-shm"
+fi
+start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-3.log"
+assert_server_enrollment "compat-prev-restore" "previous server after restore"
+start_nats_agent "$PREV_BIN/oshioki-agent" "$SERVER_DIR/agent-prev-3.log"
+approve_status=0
+OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 20 "$PREV_BIN/oshioki" test || approve_status=$?
+stop_agent
+stop_server
+if [ "$approve_status" -ne 0 ]; then
+  echo "previous server stack failed to approve after restore (status $approve_status)" >&2
+  cat "$SERVER_DIR/prev-3.log" >&2 || true
+  cat "$SERVER_DIR/agent-prev-3.log" >&2 || true
+  exit "$approve_status"
+fi
+echo "previous server stack approved after rollback ($fingerprint)"
+
+TEST_OK=1
+echo "compat upgrade: ok (previous $PREV_TAG)"
