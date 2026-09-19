@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# N-1 → N upgrade and mixed hook/agent socket matrix against the previous
+# tagged release. Builds both sides from source so the Linux agent (not in
+# the Debian package) is included.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+cd "$REPO_ROOT"
+
+head_commit="$(git rev-parse HEAD)"
+PREV_TAG=""
+while read -r tag; do
+  [ -n "$tag" ] || continue
+  if [ "$(git rev-parse "${tag}^{commit}")" != "$head_commit" ]; then
+    PREV_TAG="$tag"
+    break
+  fi
+done < <(git tag --sort=-v:refname)
+
+if [ -z "$PREV_TAG" ]; then
+  echo "test-compat-upgrade: no previous tag to test against" >&2
+  exit 2
+fi
+
+echo "previous release: $PREV_TAG"
+
+TEMP_ROOT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+WORK="$(mktemp -d "$TEMP_ROOT/oshioki-compat-upgrade.XXXXXX")"
+PREV_SRC="$WORK/prev-src"
+PREV_BIN="$WORK/prev"
+CUR_BIN="$WORK/current"
+TEST_OK=0
+
+cleanup() {
+  set +e
+  [ -z "${AGENT_PID:-}" ] || kill "$AGENT_PID" >/dev/null 2>&1 || true
+  [ -z "${AGENT_PID:-}" ] || wait "$AGENT_PID" >/dev/null 2>&1 || true
+  if [ -d "$PREV_SRC" ]; then
+    git -C "$REPO_ROOT" worktree remove --force "$PREV_SRC" >/dev/null 2>&1 || true
+  fi
+  if [ "$TEST_OK" -eq 1 ]; then
+    rm -rf -- "$WORK"
+  else
+    printf 'retained failed compat-upgrade state: %s\n' "$WORK" >&2
+  fi
+}
+trap cleanup EXIT
+
+git fetch --tags --force >/dev/null 2>&1 || true
+git worktree add --detach "$PREV_SRC" "$PREV_TAG"
+
+build_side() {
+  local src="$1" dest="$2"
+  mkdir -p "$dest"
+  cargo build --manifest-path "$src/Cargo.toml" --locked --release \
+    -p oshioki-hook -p oshioki-server
+  cargo build --manifest-path "$src/Cargo.toml" --locked --release \
+    -p oshioki-agent --features unattended --target-dir "$src/target/unattended"
+  install -m 0755 "$src/target/release/oshioki" "$dest/oshioki"
+  install -m 0755 "$src/target/release/oshioki-server" "$dest/oshioki-server"
+  install -m 0755 "$src/target/unattended/release/oshioki-agent" "$dest/oshioki-agent"
+}
+
+echo "building $PREV_TAG"
+build_side "$PREV_SRC" "$PREV_BIN"
+echo "building current"
+build_side "$REPO_ROOT" "$CUR_BIN"
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+    return $?
+  fi
+  "$@" &
+  local pid=$!
+  local elapsed=0
+  while [ "$elapsed" -lt "$seconds" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"
+      return $?
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 124
+}
+
+wait_for_line() {
+  local file="$1" pattern="$2" attempt=0
+  while [ "$attempt" -lt 100 ]; do
+    if grep -Eq -- "$pattern" "$file" 2>/dev/null; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  echo "timed out waiting for /$pattern/ in $file" >&2
+  cat "$file" >&2 || true
+  return 1
+}
+
+stop_agent() {
+  [ -n "${AGENT_PID:-}" ] || return 0
+  kill "$AGENT_PID" >/dev/null 2>&1 || true
+  wait "$AGENT_PID" >/dev/null 2>&1 || true
+  AGENT_PID=""
+}
+
+# Socket-only: init a software identity, pin it, auto-approve a synthetic request.
+run_socket_pair() {
+  local hook_bin="$1" agent_bin="$2" label="$3"
+  local state="$WORK/$label"
+  rm -rf "$state"
+  local agent_state="$state/agent"
+  local hook_dir="$state/hook"
+  install -d -m 0700 "$agent_state" "$hook_dir"
+  "$agent_bin" init --signer software --state "$agent_state"
+  "$agent_bin" device-record --label "compat-$label" --state "$agent_state" \
+    >"$state/device.json"
+  fingerprint="$("$agent_bin" show --state "$agent_state" | head -n1)"
+  printf '{"version":1,"origin":"https://sudo.test","rp_id":"sudo.test","server_base_url":"https://sudo.test"}\n' \
+    >"$hook_dir/hook.json"
+  printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$agent_state/agent.sock" >"$hook_dir/config.env"
+  printf '{"version":1,"devices":[]}\n' >"$hook_dir/devices.json"
+  chmod 0600 "$hook_dir"/*
+  printf '%s\n' "$fingerprint" | OSHIOKI_CONFIG_DIR="$hook_dir" "$hook_bin" pin-record "$state/device.json"
+  : >"$state/agent.log"
+  RUST_LOG=info "$agent_bin" run --state "$agent_state" --auto approve >"$state/agent.log" 2>&1 &
+  AGENT_PID=$!
+  wait_for_line "$state/agent.log" 'agent socket listening'
+  local status=0
+  OSHIOKI_CONFIG_DIR="$hook_dir" run_with_timeout 15 "$hook_bin" test || status=$?
+  stop_agent
+  if [ "$status" -ne 0 ]; then
+    echo "socket pair $label failed with status $status" >&2
+    cat "$state/agent.log" >&2 || true
+    return "$status"
+  fi
+  echo "socket pair $label: approved ($fingerprint)"
+}
+
+echo "same-version current hook/agent"
+run_socket_pair "$CUR_BIN/oshioki" "$CUR_BIN/oshioki-agent" current-current
+
+echo "upgrade: previous identity, current agent/hook"
+# Previous agent writes the identity; current agent must load it and approve.
+upgrade_state="$WORK/upgrade"
+rm -rf "$upgrade_state"
+install -d -m 0700 "$upgrade_state/agent" "$upgrade_state/hook"
+"$PREV_BIN/oshioki-agent" init --signer software --state "$upgrade_state/agent"
+"$PREV_BIN/oshioki-agent" device-record --label upgrade --state "$upgrade_state/agent" \
+  >"$upgrade_state/device.json"
+fingerprint="$("$PREV_BIN/oshioki-agent" show --state "$upgrade_state/agent" | head -n1)"
+printf '{"version":1,"origin":"https://sudo.test","rp_id":"sudo.test","server_base_url":"https://sudo.test"}\n' \
+  >"$upgrade_state/hook/hook.json"
+printf 'OSHIOKI_AGENT_SOCKET=%s\n' "$upgrade_state/agent/agent.sock" >"$upgrade_state/hook/config.env"
+printf '{"version":1,"devices":[]}\n' >"$upgrade_state/hook/devices.json"
+chmod 0600 "$upgrade_state/hook"/*
+printf '%s\n' "$fingerprint" | OSHIOKI_CONFIG_DIR="$upgrade_state/hook" \
+  "$CUR_BIN/oshioki" pin-record "$upgrade_state/device.json"
+: >"$upgrade_state/agent.log"
+RUST_LOG=info "$CUR_BIN/oshioki-agent" run --state "$upgrade_state/agent" --auto approve \
+  >"$upgrade_state/agent.log" 2>&1 &
+AGENT_PID=$!
+wait_for_line "$upgrade_state/agent.log" 'agent socket listening'
+status=0
+OSHIOKI_CONFIG_DIR="$upgrade_state/hook" run_with_timeout 15 "$CUR_BIN/oshioki" test || status=$?
+stop_agent
+if [ "$status" -ne 0 ]; then
+  echo "upgrade path failed with status $status" >&2
+  cat "$upgrade_state/agent.log" >&2 || true
+  exit "$status"
+fi
+echo "upgrade path: previous identity still approved ($fingerprint)"
+
+echo "mixed: current hook / previous agent"
+mixed_status=0
+run_socket_pair "$CUR_BIN/oshioki" "$PREV_BIN/oshioki-agent" current-hook-prev-agent || mixed_status=$?
+if [ "$mixed_status" -eq 124 ]; then
+  echo "mixed current-hook/prev-agent hung" >&2
+  exit 1
+fi
+# Either a successful additive mix or a fail-closed diagnostic is acceptable.
+# A hang (timeout 124) is not. A silent allow is `test` exiting 0 without an
+# agent, which run_socket_pair cannot produce because the agent is started.
+if [ "$mixed_status" -ne 0 ]; then
+  echo "mixed current-hook/prev-agent failed closed (status $mixed_status)"
+fi
+
+echo "mixed: previous hook / current agent"
+mixed_status=0
+run_socket_pair "$PREV_BIN/oshioki" "$CUR_BIN/oshioki-agent" prev-hook-current-agent || mixed_status=$?
+if [ "$mixed_status" -eq 124 ]; then
+  echo "mixed prev-hook/current-agent hung" >&2
+  exit 1
+fi
+if [ "$mixed_status" -ne 0 ]; then
+  echo "mixed prev-hook/current-agent failed closed (status $mixed_status)"
+fi
+
+TEST_OK=1
+echo "compat upgrade: ok (previous $PREV_TAG)"

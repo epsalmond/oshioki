@@ -1,0 +1,16 @@
+{
+  "expires_at": 1090,
+  "host": "host.example",
+  "issued_at": 1000,
+  "request_id": "auth-1",
+  "sealed": [
+    {
+      "ciphertext": "CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo",
+      "device_fingerprint": "fVtK99-gAtnR6gm_opbLPg",
+      "ephemeral_pub": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+      "nonce": "CQkJCQkJCQkJCQkJ"
+    }
+  ],
+  "type": "sudo_authentication",
+  "version": 2
+}

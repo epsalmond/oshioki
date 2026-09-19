@@ -11,7 +11,13 @@
 pub mod secret_store;
 pub mod touchid;
 
-use std::{fmt, fs, io::Write as _, os::unix::fs::OpenOptionsExt as _, path::Path, time::Duration};
+use std::{
+    fmt, fs,
+    io::Write as _,
+    os::unix::fs::OpenOptionsExt as _,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result, bail};
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
@@ -193,10 +199,9 @@ impl Identity {
     /// macOS passes the login keychain; tests pass a memory store so no test
     /// run touches a real keychain.
     pub fn load_with(path: &Path, store: &dyn secret_store::SecretStore) -> Result<Self> {
-        let file: IdentityFileV1 = serde_json::from_slice(
-            &fs::read(path).with_context(|| format!("read {}", path.display()))?,
-        )
-        .context("decode identity file")?;
+        let original = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let file: IdentityFileV1 =
+            serde_json::from_slice(&original).context("decode identity file")?;
         if file.version != VERSION_V1 {
             bail!("unsupported identity file version");
         }
@@ -213,9 +218,11 @@ impl Identity {
                 path.display()
             ),
             (Some(secret), None) => {
-                // Legacy file: the secret moves into the store before the
-                // file is rewritten without it, so a crash in between leaves
-                // the old file intact and the migration simply retries.
+                // Legacy file: persist the original bytes, then move the
+                // secret into the store before the file is rewritten without
+                // it. A crash after the store write leaves the old live file
+                // intact and `agent.json.prev` already in place.
+                persist_identity_prev(path, &original)?;
                 let bytes = exact_32(&secret)?;
                 let reference = new_secret_ref();
                 store
@@ -229,6 +236,23 @@ impl Identity {
                     api_token_hash: api_token_hash.clone(),
                 };
                 write_identity_file(path, &stripped, false)?;
+                let stored = store
+                    .get(&reference)
+                    .with_context(|| format!("verify the box secret for {}", path.display()))?
+                    .with_context(|| {
+                        format!(
+                            "the secret store holds nothing for {} after migration; \
+                             restore {} if it exists, or re-pair with --force",
+                            path.display(),
+                            identity_prev_path(path).display()
+                        )
+                    })?;
+                if stored != bytes {
+                    bail!(
+                        "the secret store returned a different box secret for {}",
+                        path.display()
+                    );
+                }
                 (bytes, Some(reference))
             }
             (None, Some(reference)) => {
@@ -237,8 +261,10 @@ impl Identity {
                     .with_context(|| format!("read the box secret for {}", path.display()))?
                     .with_context(|| {
                         format!(
-                            "the secret store holds nothing for {}; re-pair with --force",
-                            path.display()
+                            "the secret store holds nothing for {}; restore {} if it exists, \
+                             or re-pair with --force",
+                            path.display(),
+                            identity_prev_path(path).display()
                         )
                     })?;
                 (bytes, Some(reference))
@@ -730,6 +756,55 @@ fn new_secret_ref() -> String {
     let mut bytes = [0_u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     encode_base64url(&bytes)
+}
+
+/// Sibling of the live identity: `agent.json` → `agent.json.prev`.
+fn identity_prev_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("agent.json"),
+        std::ffi::OsStr::to_os_string,
+    );
+    name.push(".prev");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// Writes the original identity bytes to `agent.json.prev` before a rewrite.
+/// Leaves an existing `.prev` untouched so a retry cannot clobber the
+/// last-known-good file.
+fn persist_identity_prev(path: &Path, original: &[u8]) -> Result<()> {
+    let prev = identity_prev_path(path);
+    if prev.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = prev.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let staging = {
+        let mut name = prev.file_name().map_or_else(
+            || std::ffi::OsString::from("agent.json.prev"),
+            std::ffi::OsStr::to_os_string,
+        );
+        name.push(".tmp");
+        prev.with_file_name(name)
+    };
+    {
+        let mut handle = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staging)
+            .with_context(|| format!("stage {}", staging.display()))?;
+        handle.write_all(original)?;
+        handle
+            .sync_all()
+            .with_context(|| format!("flush {}", staging.display()))?;
+    }
+    fs::rename(&staging, &prev).with_context(|| format!("replace {}", prev.display()))?;
+    Ok(())
 }
 
 /// Writes the identity file with mode 0600. `create_new` refuses to replace
@@ -1234,6 +1309,20 @@ mod tests {
         let after = Identity::load_with(&path, &store).unwrap();
         assert_eq!(before.fingerprint(), after.fingerprint());
         assert_eq!(after.secret_ref(), Some(reference));
+        let prev = dir.join("agent.json.prev");
+        assert_eq!(
+            fs::metadata(&prev).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let prev_file: serde_json::Value =
+            serde_json::from_slice(&fs::read(&prev).unwrap()).unwrap();
+        assert_eq!(prev_file["box_secret"], secret);
+        assert!(prev_file.get("box_secret_ref").is_none());
+        #[cfg(not(target_os = "macos"))]
+        {
+            let restored = Identity::load_embedded(&prev).unwrap();
+            assert_eq!(restored.fingerprint(), before.fingerprint());
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1295,7 +1384,9 @@ mod tests {
         let Err(error) = Identity::load_with(&path, &store) else {
             panic!("a missing store entry loaded");
         };
-        assert!(error.to_string().contains("--force"), "{error:#}");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("--force"), "{detail}");
+        assert!(detail.contains("agent.json.prev"), "{detail}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

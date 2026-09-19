@@ -1,0 +1,9 @@
+{
+  "api_token_hash": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM",
+  "box_secret": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+  "signing": {
+    "key": "ERERERERERERERERERERERERERERERERERERERERERE",
+    "kind": "software"
+  },
+  "version": 1
+}

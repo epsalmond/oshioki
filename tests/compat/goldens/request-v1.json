@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "apt"
+  ],
+  "command": "/usr/bin/apt",
+  "cwd": "/home/eric",
+  "expires_at": 1090,
+  "host": "host.example",
+  "issued_at": 1000,
+  "nonce": "AQEBAQEBAQEBAQEBAQEBAQ",
+  "pid_chain": [],
+  "request_id": "req-1",
+  "runas_uid": 0,
+  "tty": null,
+  "uid": 1000,
+  "user": "eric",
+  "version": 1
+}
