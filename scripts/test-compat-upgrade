@@ -468,23 +468,23 @@ echo "in-flight request across server upgrade"
 cutoff="$(date +%s)"
 OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 45 "$PREV_BIN/oshioki" test &
 HOOK_PID=$!
-wait_for_pending_request "$cutoff"
+inflight_id="$(wait_for_pending_request "$cutoff")"
 kill "$HOOK_PID" >/dev/null 2>&1 || true
 wait "$HOOK_PID" >/dev/null 2>&1 || true
 HOOK_PID=""
 stop_server
 start_server "$CUR_BIN/oshioki-server" "$SERVER_DIR/current.log"
-assert_server_enrollment "compat-current-1" "current server"
-python3 - "$SERVER_DB" "$cutoff" <<'PY'
+python3 - "$SERVER_DB" "$inflight_id" <<'PY'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
 row = conn.execute(
-    "SELECT id, state FROM requests WHERE created_at>=? ORDER BY created_at DESC LIMIT 1",
-    (int(sys.argv[2]),),
+    "SELECT id, state FROM requests WHERE id=?",
+    (sys.argv[2],),
 ).fetchone()
 assert row is not None and row[1] == "pending", row
 print(f"in-flight {row[0]} still pending after current server open")
 PY
+assert_server_enrollment "compat-current-1" "current server"
 start_nats_agent "$CUR_BIN/oshioki-agent" "$SERVER_DIR/agent-current.log"
 approve_status=0
 OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 20 "$CUR_BIN/oshioki" test || approve_status=$?
