@@ -17,6 +17,9 @@ current adapter is intentionally Google-first-party gcloud only.
 
 ## Local Mac mode
 
+Local prerequisites are gcloud on `PATH`, a logged-in graphical macOS session,
+an available Touch ID sensor, and Secure Enclave support.
+
 Build the binary and the native agent from this checkout, or use release
 artifacts built from the same reviewed source:
 
@@ -63,8 +66,8 @@ The helper loads only the Secure Enclave signing blob. It does not read the
 agent's unrelated box secret or its Keychain entry. It then shows one Oshioki
 Touch ID prompt. If gcloud can reuse or refresh valid credentials, no browser
 opens. If Google requires a new login, gcloud opens the default browser and
-handles its own loopback callback directly. Approval denial, expiry, and
-interruption start no gcloud process or leave one running.
+handles its own loopback callback directly. A denied or expired approval starts
+no gcloud process; an interruption after launch terminates and reaps it.
 
 The local mode does not require NATS, SSH, a server, a VM, a launchd service,
 or a public listener. The local browser callback is owned by gcloud, so the
@@ -90,6 +93,12 @@ only the required `-W localhost:<callback-port>` forwarding. The SSH
 destination is local Mac configuration and is never accepted from a received
 message.
 
+Use separate NATS users. Restrict the requester user to publish
+`oshioki.browser.v1.<lane>` and subscribe to
+`oshioki.browser.v1.<lane>.reply.*`. Restrict the approver user to subscribe
+to `oshioki.browser.v1.<lane>` and publish
+`oshioki.browser.v1.<lane>.reply.*`. No other subjects are needed.
+
 Generate one relay-only key on each requester/approver host and exchange only
 the public keys over a trusted channel:
 
@@ -103,7 +112,7 @@ Use mode-600 JSON configurations. Requester example:
 
 ```json
 {
-  "nats_url": "tls://relay-user:REDACTED@nats.example:4222",
+  "nats_url": "tls://requester-user:REDACTED@nats.example:4222",
   "lane": "REPLACE_WITH_SHARED_LANE_UUID",
   "private_key": "/path/to/requester/signing.key",
   "peer_public_key": "APPROVER_RELAY_PUBLIC_KEY",
@@ -116,7 +125,7 @@ Approver example:
 
 ```json
 {
-  "nats_url": "tls://relay-user:REDACTED@nats.example:4222",
+  "nats_url": "tls://approver-user:REDACTED@nats.example:4222",
   "lane": "REPLACE_WITH_SHARED_LANE_UUID",
   "private_key": "/path/to/approver/signing.key",
   "peer_public_key": "REQUESTER_RELAY_PUBLIC_KEY",
@@ -126,10 +135,15 @@ Approver example:
 }
 ```
 
-Start the approver and request one ceremony:
+In an approver terminal, start the foreground receiver:
 
 ```sh
 $RELAY serve --config /path/to/approver.json
+```
+
+In a separate requester terminal, request one ceremony:
+
+```sh
 $RELAY login --config /path/to/requester.json
 ```
 
