@@ -597,3 +597,83 @@ async fn process_group_anchor_cleans_descendant_after_leader_exit() {
     assert!(after >= before);
     assert_eq!(fs::metadata(&marker).unwrap().len(), after);
 }
+
+#[tokio::test]
+async fn local_mode_approval_and_gcloud_cleanup_are_deterministic() {
+    for (name, command) in [
+        ("headless", "exit 0"),
+        ("browser", "exit 0"),
+        ("timeout", "sleep 30"),
+    ] {
+        let directory = PathBuf::from(format!(
+            "/tmp/oshioki-relay-local-{name}-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let _cleanup = TempDir(directory.clone());
+        let marker = directory.join("started");
+        let executable = directory.join("gcloud");
+        let browser_callback = "python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(1); p=s.getsockname()[1]; c=socket.create_connection((\"127.0.0.1\",p)); q,_=s.accept(); q.sendall(b\"GET /callback HTTP/1.1\\r\\n\\r\\n\"); q.close(); c.close(); s.close()'";
+        let login_body = if name == "browser" {
+            browser_callback
+        } else {
+            command
+        };
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$2\" = print-access-token ]; then printf token; exit 0; fi\ntouch '{}'\n{}\n",
+                marker.display(), login_body
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        if name == "timeout" {
+            let error = run_local_gcloud_with_timeout(
+                "selected@example.com",
+                &executable,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("timed out"));
+        } else {
+            run_local_after_approval("selected@example.com", &executable, Ok(()), None)
+                .await
+                .unwrap();
+            assert!(marker.exists());
+        }
+    }
+
+    let directory = PathBuf::from(format!(
+        "/tmp/oshioki-relay-local-denied-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let _cleanup = TempDir(directory.clone());
+    let marker = directory.join("started");
+    let executable = directory.join("gcloud");
+    fs::write(
+        &executable,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        run_local_after_approval(
+            "selected@example.com",
+            &executable,
+            Err(anyhow::anyhow!("denied")),
+            None,
+        )
+        .await
+        .is_err()
+    );
+    assert!(!marker.exists());
+
+    let error = run_local_gcloud_with_timeout("selected@example.com", &executable, Duration::ZERO)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("expired before gcloud start"));
+    assert!(!marker.exists());
+}

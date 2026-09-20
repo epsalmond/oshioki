@@ -47,6 +47,11 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Run the account-bound ceremony on this Mac without NATS or SSH.
+    LocalLogin {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Receive ceremonies and open the default browser (macOS only).
     Serve {
         #[arg(long)]
@@ -75,6 +80,20 @@ struct Config {
     approval_identity: Option<PathBuf>,
     /// Trusted local configuration, never copied from the message.
     ssh_destination: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalConfig {
+    google_account: String,
+    approval_identity: PathBuf,
+    approval_public_key: String,
+    #[serde(default = "default_local_label")]
+    local_label: String,
+}
+
+fn default_local_label() -> String {
+    "this Mac".into()
 }
 
 fn validate_account(account: &str) -> Result<()> {
@@ -454,6 +473,60 @@ async fn login(config: Config) -> Result<()> {
     stopped.context("Mac cleanup confirmation timed out")?
 }
 
+#[cfg(target_os = "macos")]
+async fn local_login(config: LocalConfig) -> Result<()> {
+    validate_account(&config.google_account)?;
+    ensure!(
+        !config.local_label.is_empty(),
+        "local_label cannot be empty"
+    );
+    let approval_public_key =
+        VerifyingKey::from_sec1_bytes(&decode_base64url(&config.approval_public_key)?)?;
+    let signer = load_approval_signer(Some(&config.approval_identity))
+        .await?
+        .context("local approval identity was not loaded")?;
+    let deadline = Instant::now() + Duration::from_secs(MAX_LIFETIME);
+    let attempt = Message {
+        version: 1,
+        attempt: uuid::Uuid::new_v4().to_string(),
+        expires: now() + MAX_LIFETIME,
+        action: Action::Probe,
+    };
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let signature = tokio::select! {
+        result = timeout_at(deadline, browser_authorize(
+            &signer,
+            &attempt,
+            "local",
+            &nonce,
+            &config.google_account,
+            &config.local_label,
+        )) => result.context("local Oshioki approval timed out")??,
+        result = interrupted() => return result,
+    }
+    .context("local Oshioki approval was denied or expired")?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    run_local_after_approval(
+        &config.google_account,
+        Path::new("gcloud"),
+        verify_browser_approval(
+            &attempt,
+            "local",
+            &nonce,
+            &config.google_account,
+            &approval_public_key,
+            &encode_base64url(&signature),
+        ),
+        Some(remaining),
+    )
+    .await
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn local_login(_config: LocalConfig) -> Result<()> {
+    bail!("local browser ceremony requires macOS")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginAttempt {
     Headless,
@@ -502,9 +575,13 @@ async fn login_attempt(
 }
 
 async fn validate_headless_account(account: &str) -> Result<()> {
+    validate_headless_account_with(account, Path::new("gcloud")).await
+}
+
+async fn validate_headless_account_with(account: &str, executable: &Path) -> Result<()> {
     let output = timeout(
         Duration::from_secs(15),
-        Command::new("gcloud")
+        Command::new(executable)
             .args([
                 "auth",
                 "print-access-token",
@@ -525,6 +602,70 @@ async fn validate_headless_account(account: &str) -> Result<()> {
         "configured Google credentials could not produce an access token"
     );
     Ok(())
+}
+
+async fn run_local_after_approval(
+    account: &str,
+    executable: &Path,
+    approval: Result<()>,
+    limit: Option<Duration>,
+) -> Result<()> {
+    approval?;
+    match limit {
+        Some(limit) => run_local_gcloud_with_timeout(account, executable, limit).await,
+        None => run_local_gcloud(account, executable).await,
+    }
+}
+
+async fn run_local_gcloud(account: &str, executable: &Path) -> Result<()> {
+    run_local_gcloud_until(
+        account,
+        executable,
+        Instant::now() + Duration::from_secs(MAX_LIFETIME),
+    )
+    .await
+}
+
+async fn run_local_gcloud_with_timeout(
+    account: &str,
+    executable: &Path,
+    limit: Duration,
+) -> Result<()> {
+    run_local_gcloud_until(account, executable, Instant::now() + limit).await
+}
+
+async fn run_local_gcloud_until(account: &str, executable: &Path, deadline: Instant) -> Result<()> {
+    ensure!(
+        Instant::now() < deadline,
+        "local ceremony expired before gcloud start"
+    );
+    let mut command = Command::new(executable);
+    command
+        .args(["auth", "login", account, "--launch-browser"])
+        .env("CLOUDSDK_CORE_DISABLE_PROMPTS", "true")
+        .env("CLOUDSDK_AUTH_DISABLE_CODE_VERIFIER", "false")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = ProcessGroup::spawn(command)?;
+    let outcome = timeout_at(deadline, async {
+        tokio::select! {
+            status = child.child.wait() => {
+                ensure!(status?.success(), "Google sign-in failed or was denied");
+                anyhow::Ok(())
+            }
+            result = interrupted() => result,
+        }
+    })
+    .await
+    .context("local Google sign-in timed out");
+    child.terminate().await;
+    outcome??;
+    tokio::select! {
+        result = timeout_at(deadline, validate_headless_account_with(account, executable)) => {
+            result.context("local credential check timed out")?
+        }
+        result = interrupted() => result,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -989,6 +1130,9 @@ async fn run() -> Result<()> {
         }
         Commands::Capture { url } => timeout(Duration::from_secs(30), capture(&url)).await?,
         Commands::Login { config } => login(serde_json::from_slice(&private_read(&config)?)?).await,
+        Commands::LocalLogin { config } => {
+            local_login(serde_json::from_slice(&private_read(&config)?)?).await
+        }
         Commands::Serve { config } => serve(serde_json::from_slice(&private_read(&config)?)?).await,
     }
 }
