@@ -1,0 +1,28 @@
+{
+  "devices": [
+    {
+      "active": true,
+      "api_token_hash": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+      "box_public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+      "credential_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+      "credential_public_key": "pQECAyYgASFYIFUPRxAD89-Xw99QaseX9nIfsaH7e49vg9IkSYplyI4kIlggE2CT1wEuUJpzcVy9CwCjzA_0tcAbP_oZarH7MnA2uOY",
+      "fingerprint": "fVtK99-gAtnR6gm_opbLPg",
+      "label": "phone",
+      "sign_count": 0,
+      "version": 1
+    },
+    {
+      "active": true,
+      "api_token_hash": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+      "box_public_key": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+      "credential_id": "BgYGBgYGBgYGBgYGBgYGBg",
+      "credential_public_key": "pQECAyYgASFYIAeBDql0zqV3PmO4l_N-O-mgnnpf6blxpE0QZawqOpMRIlggY35HpPmUZKD9zkSojsfXA6kYPB0GVS2eLWt2BpSBxXc",
+      "fingerprint": "rujRgFFjczo1k_pMbefJ4w",
+      "kind": "webauthn",
+      "label": "laptop",
+      "sign_count": 0,
+      "version": 1
+    }
+  ],
+  "version": 1
+}

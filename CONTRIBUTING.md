@@ -49,8 +49,10 @@ use `scripts/dev-acceptance`; see the [runbook](RUNBOOK.md).
   documented in the root `Cargo.toml`. Unsafe calls live in the macOS
   `enclave` crate and the sudo plugin's documented FFI/PAM boundary.
 - Protocol changes require a new version and a compatibility decision: see
-  [docs/architecture.md](docs/architecture.md). The v1 cryptographic domain
-  strings (`oshioki/...`) and existing test vectors must not change.
+  [docs/compatibility.md](docs/compatibility.md). Additive fields stay on the
+  current numeric version and need a golden in `tests/compat/goldens/` plus a
+  matrix row, not only a unit test. The v1 cryptographic domain strings
+  (`oshioki/...`) and existing test vectors must not change.
 - Add or update tests with behavior changes; update this file and the
   affected `docs/` page when the workflow changes.
 - Security-sensitive change? Read [SECURITY.md](SECURITY.md) first and

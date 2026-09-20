@@ -11,8 +11,11 @@ Production must provide:
 - NATS 2.10 or newer. The durable `oshioki-server-v1` consumer filters on
   two subject trees at once, which older servers do not support.
 - An `OSHIOKI` JetStream stream carrying both `oshioki.request.>` and
-  `oshioki.auth.>`. An existing stream created for `oshioki.request.>` alone
-  must be updated; see "Authentication lane upgrade" in `RUNBOOK.md`.
+  `oshioki.auth.>`. The server widens an existing stream created for
+  `oshioki.request.>` alone and recreates the durable consumer when it
+  starts. A missing stream is still a misconfiguration. Recovery if that
+  repair fails is in `RUNBOOK.md`; the contract is in
+  [compatibility.md](compatibility.md).
 - The durable `oshioki-server-v1` consumer permissions.
 - Publish and subscribe permissions for `oshioki.verdict.*` and
   `oshioki.enrollment.*`.
@@ -51,4 +54,4 @@ per sudo, no password), laptop activation, and rollback.
 Neither the runtime nor the Mac installer changes the v1 request or decision
 wire format. `AliveV1` is a versioned liveness message on its own subject and
 socket response frame. A protocol change requires a compatibility decision in
-this repository.
+[compatibility.md](compatibility.md).

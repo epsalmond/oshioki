@@ -93,8 +93,21 @@ jobs:
           name: mac
           path: oshioki-macos-arm64-*.tar.gz
 
+  compat:
+    needs: gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup show active-toolchain
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
+      - run: cargo test --workspace --locked
+      - run: scripts/test-nats-lane-upgrade
+      - run: scripts/test-compat-upgrade
+
   release:
-    needs: [gate, build-deb, build-mac]
+    needs: [gate, build-deb, build-mac, compat]
     if: needs.gate.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     steps:

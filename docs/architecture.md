@@ -103,7 +103,9 @@ The delivery control message has no rolling negotiation. Browser-capable
 deployments must update the server, its browser bundle, and the hook together;
 native socket deployments must update the hook and agent together. An older
 server or peer leaves the corresponding receipt unavailable and the hook
-reports the required upgrade while failing closed.
+reports the required upgrade while failing closed. The supported mixed-version
+matrix and the restore path for a failed upgrade are in
+[compatibility.md](compatibility.md).
 
 This describes the approval-plugin lane, which is what `--prelaunch` installs
 and what every deployment used before the contextual PAM lane
@@ -172,12 +174,16 @@ device once the server is healthy.
 ## Persistence
 
 SQLite uses WAL, foreign keys, a five-second busy timeout, and embedded schema
-versions. Version 0 installs the existing V1 tables, version 1 adds the V2
-push subscription and push outbox tables in one transaction, and version 2
-opens directly; newer versions refuse startup. The V2 worker stores one
-device-owned subscription per browser endpoint and claims recipient rows with
-short leases before bounded Web Push attempts. Revocation and subscription
-deletion disable subscriptions and abandon pending rows transactionally.
+versions. Version 0 installs the V1 tables, version 1 adds the authentication
+and push tables, version 2 opens those, and version 3 adds the nullable outbox
+`expires_at` column a delivery receipt is worth delivering until. Newer
+versions refuse startup. A version-bumping open writes a verified restore
+snapshot (`<stem>.pre-v<from>.sqlite3`) before it migrates; see
+[compatibility.md](compatibility.md). Additive schema changes must not bump
+`user_version`. The push worker stores one device-owned subscription per
+browser endpoint and claims recipient rows with short leases before bounded
+Web Push attempts. Revocation and subscription deletion disable subscriptions
+and abandon pending rows transactionally.
 Cleanup expires pending enrollment state, removes old resolved work, and
 eventually removes abandoned push rows and disabled subscriptions. The VAPID
 P-256 key persists beside the state database (or at `OSHIOKI_VAPID_KEY_PATH`)

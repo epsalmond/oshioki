@@ -1,0 +1,27 @@
+{
+  "expires_at": 1090,
+  "issued_at": 1000,
+  "nonce": "BwcHBwcHBwcHBwcHBwcHBw",
+  "request_id": "auth-1",
+  "submitted": {
+    "invocation": {
+      "argv": [
+        "true"
+      ],
+      "command": "/usr/bin/true",
+      "cwd": "/home/eric",
+      "status": "available"
+    }
+  },
+  "trusted": {
+    "host": "host.example",
+    "invoking_uid": 1000,
+    "invoking_user": "eric",
+    "pam_uid": 1000,
+    "pam_user": "eric",
+    "service": "sudo",
+    "tty": "/dev/pts/0"
+  },
+  "type": "sudo_authentication_request",
+  "version": 2
+}

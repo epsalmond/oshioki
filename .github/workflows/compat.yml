@@ -1,0 +1,44 @@
+name: compat
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  goldens:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup show active-toolchain
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: npm --prefix server/web ci
+      - run: npm --prefix server/web test
+
+  upgrade:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup show active-toolchain
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
+      - name: NATS lane repair
+        run: scripts/test-nats-lane-upgrade
+      - name: Mixed-version upgrade
+        run: scripts/test-compat-upgrade

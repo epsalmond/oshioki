@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Starts a throwaway NATS with a command-only OSHIOKI stream and checks that
+# the current server transport widens it to the authentication lane.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+
+free_port() {
+  python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+NATS_PID=""
+NATS_CONTAINER=""
+TEMP_ROOT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+STATE_ROOT="$(mktemp -d "$TEMP_ROOT/oshioki-nats-lane.XXXXXX")"
+TEST_OK=0
+
+cleanup() {
+  set +e
+  [ -z "$NATS_PID" ] || kill "$NATS_PID" >/dev/null 2>&1 || true
+  [ -z "$NATS_PID" ] || wait "$NATS_PID" >/dev/null 2>&1 || true
+  [ -z "$NATS_CONTAINER" ] || docker rm -f "$NATS_CONTAINER" >/dev/null 2>&1 || true
+  if [ "$TEST_OK" -eq 1 ]; then
+    rm -rf -- "$STATE_ROOT"
+  else
+    printf 'retained failed nats-lane state: %s\n' "$STATE_ROOT" >&2
+  fi
+}
+trap cleanup EXIT
+
+NATS_PORT="${OSHIOKI_TEST_NATS_PORT:-$(free_port)}"
+NATS_URL="nats://127.0.0.1:${NATS_PORT}"
+
+if command -v nats-server >/dev/null 2>&1; then
+  mkdir -p "$STATE_ROOT/nats"
+  nats-server -js -sd "$STATE_ROOT/nats" -p "$NATS_PORT" \
+    --user oshioki --pass test-only >"$STATE_ROOT/nats.log" 2>&1 &
+  NATS_PID=$!
+else
+  command -v docker >/dev/null 2>&1 || {
+    echo "test-nats-lane-upgrade: need nats-server or docker" >&2
+    exit 2
+  }
+  NATS_CONTAINER="$(docker run -d --rm -p "127.0.0.1:${NATS_PORT}:4222" \
+    nats:2.11-alpine --jetstream --user oshioki --pass test-only)"
+fi
+
+for _ in $(seq 1 50); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/$NATS_PORT") 2>/dev/null; then
+    exec 3>&-
+    break
+  fi
+  sleep 0.1
+done
+
+OSHIOKI_TEST_NATS_LANE=1 NATS_URL="$NATS_URL" NATS_USER=oshioki NATS_PASS=test-only \
+  cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --locked \
+    -p oshioki-transport --test nats_lane_upgrade -- --nocapture --test-threads=1
+
+TEST_OK=1

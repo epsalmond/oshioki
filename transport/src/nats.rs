@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use async_nats::jetstream::{
     self, AckKind,
-    consumer::{AckPolicy, pull},
+    consumer::{self, AckPolicy, pull},
+    stream,
 };
 use futures::StreamExt as _;
 use oshioki_protocol::{
@@ -18,7 +19,7 @@ use oshioki_protocol::{
     EnrollmentSubmissionV1, allow_plaintext_nats, auth_v1::AuthDecisionV1, check_nats_url,
     nats_url_is_tls,
 };
-use tracing::warn;
+use tracing::info;
 
 use crate::{
     Ack, AckFuture, BoxFuture, HookProgress, HookTransport, HookTransportFailure, InboundMessage,
@@ -71,9 +72,196 @@ pub const REQUEST_CONSUMER: &str = "oshioki-server-v1";
 /// tree so the two lanes stay distinguishable on the wire.
 ///
 /// Multiple filters need NATS 2.10 or newer, and the stream itself must carry
-/// both subject trees. `RUNBOOK.md` owns the upgrade step for a deployment
-/// that predates this.
+/// both subject trees. The server widens an existing stream and recreates the
+/// durable when it starts; `RUNBOOK.md` is the recovery path if that repair
+/// fails.
 pub const REQUEST_CONSUMER_FILTERS: [&str; 2] = ["oshioki.request.>", "oshioki.auth.>"];
+
+const CONSUMER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// True when `existing` already captures every message `required` would.
+/// `oshioki.>` covers `oshioki.request.>` and `oshioki.auth.>`; a lone
+/// `oshioki.request.>` does not cover the authentication lane.
+pub(crate) fn subject_covers(existing: &str, required: &str) -> bool {
+    token_covers(&split_subject(existing), &split_subject(required))
+}
+
+fn split_subject(subject: &str) -> Vec<&str> {
+    if subject.is_empty() {
+        Vec::new()
+    } else {
+        subject.split('.').collect()
+    }
+}
+
+fn token_covers(existing: &[&str], required: &[&str]) -> bool {
+    let Some((have, rest_have)) = existing.split_first() else {
+        return required.is_empty();
+    };
+    let Some((need, rest_need)) = required.split_first() else {
+        return false;
+    };
+    if *have == ">" {
+        return true;
+    }
+    if *have == "*" {
+        return *need != ">" && token_covers(rest_have, rest_need);
+    }
+    if *need == "*" || *need == ">" {
+        return false;
+    }
+    have == need && token_covers(rest_have, rest_need)
+}
+
+/// True when `existing` already includes every required subject, including
+/// by a broader NATS wildcard.
+pub(crate) fn subjects_cover(existing: &[String], required: &[&str]) -> bool {
+    required
+        .iter()
+        .all(|need| existing.iter().any(|have| subject_covers(have, need)))
+}
+
+/// Existing subjects first, then any required subject that no existing
+/// pattern already covers. Does not add a narrower subject that would
+/// overlap a covering wildcard (`oshioki.>` plus `oshioki.request.>`).
+pub(crate) fn merge_subjects(existing: &[String], required: &[&str]) -> Vec<String> {
+    let mut subjects = existing.to_vec();
+    for need in required {
+        if !subjects.iter().any(|have| subject_covers(have, need)) {
+            subjects.push((*need).to_owned());
+        }
+    }
+    subjects
+}
+
+/// Durable filters as a list: `filter_subjects` wins when set, otherwise the
+/// legacy single `filter_subject`.
+pub(crate) fn consumer_filter_list(
+    filter_subject: &str,
+    filter_subjects: &[String],
+) -> Vec<String> {
+    if !filter_subjects.is_empty() {
+        filter_subjects.to_vec()
+    } else if !filter_subject.is_empty() {
+        vec![filter_subject.to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+pub(crate) fn filters_match(active: &[String], required: &[&str]) -> bool {
+    let mut left: Vec<&str> = active.iter().map(String::as_str).collect();
+    let mut right = required.to_vec();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
+}
+
+fn pull_consumer_config() -> pull::Config {
+    pull::Config {
+        durable_name: Some(REQUEST_CONSUMER.into()),
+        filter_subjects: REQUEST_CONSUMER_FILTERS
+            .iter()
+            .map(|subject| (*subject).to_owned())
+            .collect(),
+        ack_policy: AckPolicy::Explicit,
+        ..Default::default()
+    }
+}
+
+async fn ensure_request_stream(jetstream: &jetstream::Context) -> Result<stream::Stream> {
+    let stream = jetstream
+        .get_stream(REQUEST_STREAM)
+        .await
+        .context("open request stream")?;
+    let current = stream.cached_info().config.clone();
+    if subjects_cover(&current.subjects, &REQUEST_CONSUMER_FILTERS) {
+        return Ok(stream);
+    }
+    let mut updated = current.clone();
+    updated.subjects = merge_subjects(&current.subjects, &REQUEST_CONSUMER_FILTERS);
+    info!(
+        stream = REQUEST_STREAM,
+        from = %current.subjects.join(","),
+        to = %updated.subjects.join(","),
+        "widening OSHIOKI stream subjects for the authentication lane"
+    );
+    jetstream
+        .update_stream(updated)
+        .await
+        .context("widen OSHIOKI stream subjects for the authentication lane")?;
+    let stream = jetstream
+        .get_stream(REQUEST_STREAM)
+        .await
+        .context("re-open request stream after subject update")?;
+    if !subjects_cover(
+        &stream.cached_info().config.subjects,
+        &REQUEST_CONSUMER_FILTERS,
+    ) {
+        bail!("OSHIOKI stream subjects still missing the authentication lane after update");
+    }
+    Ok(stream)
+}
+
+async fn drain_consumer(stream: &stream::Stream, name: &str) -> Result<(u64, usize)> {
+    let deadline = tokio::time::Instant::now() + CONSUMER_DRAIN_TIMEOUT;
+    loop {
+        let info = stream
+            .consumer_info(name)
+            .await
+            .context("read durable consumer pending counts")?;
+        if info.num_pending == 0 && info.num_ack_pending == 0 {
+            return Ok((0, 0));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok((info.num_pending, info.num_ack_pending));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn ensure_request_consumer(
+    stream: &stream::Stream,
+) -> Result<consumer::Consumer<pull::Config>> {
+    let consumer = stream
+        .get_or_create_consumer(REQUEST_CONSUMER, pull_consumer_config())
+        .await
+        .context("open durable request consumer")?;
+    let configured = &consumer.cached_info().config;
+    let active = consumer_filter_list(&configured.filter_subject, &configured.filter_subjects);
+    if filters_match(&active, &REQUEST_CONSUMER_FILTERS) {
+        return Ok(consumer);
+    }
+    let (pending, ack_pending) = drain_consumer(stream, REQUEST_CONSUMER).await?;
+    info!(
+        consumer = REQUEST_CONSUMER,
+        stream = REQUEST_STREAM,
+        active_filters = %active.join(","),
+        expected_filters = %REQUEST_CONSUMER_FILTERS.join(","),
+        num_pending = pending,
+        num_ack_pending = ack_pending,
+        "recreating durable consumer so the authentication lane is delivered"
+    );
+    drop(consumer);
+    stream
+        .delete_consumer(REQUEST_CONSUMER)
+        .await
+        .context("delete durable request consumer with stale filters")?;
+    let consumer = stream
+        .create_consumer(pull_consumer_config())
+        .await
+        .context("recreate durable request consumer")?;
+    let configured = &consumer.cached_info().config;
+    let active = consumer_filter_list(&configured.filter_subject, &configured.filter_subjects);
+    if !filters_match(&active, &REQUEST_CONSUMER_FILTERS) {
+        bail!(
+            "durable consumer {REQUEST_CONSUMER} filters are {} after recreate; expected {}",
+            active.join(","),
+            REQUEST_CONSUMER_FILTERS.join(",")
+        );
+    }
+    Ok(consumer)
+}
 pub struct NatsTransport {
     client: async_nats::Client,
 }
@@ -652,49 +840,9 @@ impl HookTransport for NatsTransport {
 impl ServerTransport for NatsTransport {
     fn requests(&self) -> BoxFuture<'_, RequestStream> {
         Box::pin(async move {
-            let stream = jetstream::new(self.client.clone())
-                .get_stream(REQUEST_STREAM)
-                .await
-                .context("open request stream")?;
-            let consumer = stream
-                .get_or_create_consumer(
-                    REQUEST_CONSUMER,
-                    pull::Config {
-                        durable_name: Some(REQUEST_CONSUMER.into()),
-                        filter_subjects: REQUEST_CONSUMER_FILTERS
-                            .iter()
-                            .map(|subject| (*subject).to_owned())
-                            .collect(),
-                        ack_policy: AckPolicy::Explicit,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .context("open durable request consumer")?;
-            // `get_or_create_consumer` returns an existing durable as it is
-            // and never rewrites its configuration, so a consumer created
-            // before the authentication lane existed keeps filtering only
-            // `oshioki.request.>`. Everything on `oshioki.auth.>` would then
-            // be dropped silently, and a sudo would simply hang until it fell
-            // back to a password. Say so loudly instead.
-            let configured = &consumer.cached_info().config;
-            if configured.filter_subjects != REQUEST_CONSUMER_FILTERS {
-                let active = if configured.filter_subjects.is_empty() {
-                    configured.filter_subject.clone()
-                } else {
-                    configured.filter_subjects.join(",")
-                };
-                warn!(
-                    consumer = REQUEST_CONSUMER,
-                    stream = REQUEST_STREAM,
-                    active_filters = %active,
-                    expected_filters = %REQUEST_CONSUMER_FILTERS.join(","),
-                    "durable consumer filters do not match this build; contextual sudo \
-                     authentication will not be delivered. See the \"Authentication lane \
-                     upgrade\" step in RUNBOOK.md to update the stream subjects and recreate \
-                     the consumer."
-                );
-            }
+            let jetstream = jetstream::new(self.client.clone());
+            let stream = ensure_request_stream(&jetstream).await?;
+            let consumer = ensure_request_consumer(&stream).await?;
             let messages = consumer.messages().await?;
             Ok(Box::pin(messages.map(|result| {
                 result
@@ -788,5 +936,40 @@ mod tests {
     fn garbage_bytes_are_not_treated_as_an_unrecognized_kind() {
         assert!(!is_unrecognized_control_kind(b"not json"));
         assert!(!is_unrecognized_control_kind(b""));
+    }
+
+    #[test]
+    fn stream_subjects_are_merged_without_dropping_existing() {
+        let existing = vec!["oshioki.request.>".into(), "oshioki.other.>".into()];
+        assert!(!subjects_cover(&existing, &REQUEST_CONSUMER_FILTERS));
+        assert_eq!(
+            merge_subjects(&existing, &REQUEST_CONSUMER_FILTERS),
+            vec!["oshioki.request.>", "oshioki.other.>", "oshioki.auth.>",]
+        );
+        let already = merge_subjects(&existing, &REQUEST_CONSUMER_FILTERS);
+        assert!(subjects_cover(&already, &REQUEST_CONSUMER_FILTERS));
+        assert_eq!(merge_subjects(&already, &REQUEST_CONSUMER_FILTERS), already);
+    }
+
+    #[test]
+    fn a_covering_wildcard_does_not_need_narrower_subjects() {
+        let existing = vec!["oshioki.>".into()];
+        assert!(subjects_cover(&existing, &REQUEST_CONSUMER_FILTERS));
+        assert_eq!(
+            merge_subjects(&existing, &REQUEST_CONSUMER_FILTERS),
+            existing
+        );
+        assert!(subject_covers(">", "oshioki.request.>"));
+        assert!(!subject_covers("oshioki.request.>", "oshioki.auth.>"));
+        assert!(!subject_covers("oshioki.*", "oshioki.request.>"));
+    }
+
+    #[test]
+    fn a_legacy_single_filter_does_not_match_the_authentication_lane() {
+        let active = consumer_filter_list("oshioki.request.>", &[]);
+        assert_eq!(active, vec!["oshioki.request.>"]);
+        assert!(!filters_match(&active, &REQUEST_CONSUMER_FILTERS));
+        let both = consumer_filter_list("", &["oshioki.auth.>".into(), "oshioki.request.>".into()]);
+        assert!(filters_match(&both, &REQUEST_CONSUMER_FILTERS));
     }
 }
