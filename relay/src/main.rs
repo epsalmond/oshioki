@@ -16,9 +16,11 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
-use oshioki_browser_relay::{Action, MAX_LIFETIME, Message, google_callback_port, sign, verify};
+use oshioki_browser_relay::{
+    Action, MAX_LIFETIME, Message, approval_challenge, google_callback_port, sign, verify,
+};
 use oshioki_protocol::{decode_base64url, encode_base64url};
-use p256::ecdsa::{SigningKey, VerifyingKey};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Verifier as _};
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -60,8 +62,50 @@ struct Config {
     lane: String,
     private_key: PathBuf,
     peer_public_key: String,
+    /// Account selected for the headless credential reuse/refresh path.
+    #[serde(default)]
+    google_account: Option<String>,
+    /// Mac Oshioki credential public key, pinned on the NAS.
+    #[serde(default)]
+    approval_public_key: Option<String>,
+    /// Mac agent identity file used to show the Oshioki Touch ID prompt.
+    #[serde(default)]
+    approval_identity: Option<PathBuf>,
     /// Trusted local configuration, never copied from the message.
     ssh_destination: Option<String>,
+}
+
+fn validate_account(account: &str) -> Result<()> {
+    ensure!(
+        !account.is_empty()
+            && account.len() <= 320
+            && account.is_ascii()
+            && !account.bytes().any(|byte| byte.is_ascii_control()),
+        "invalid configured Google account"
+    );
+    Ok(())
+}
+
+fn verify_browser_approval(
+    message: &Message,
+    lane: &str,
+    nonce: &str,
+    account: &str,
+    public_key: &VerifyingKey,
+    signature: &str,
+) -> Result<()> {
+    let signature = Signature::from_der(&decode_base64url(signature)?)?;
+    public_key.verify(
+        &oshioki_protocol::browser_relay_signature_payload(&approval_challenge(
+            lane,
+            &message.attempt,
+            message.expires,
+            nonce,
+            account,
+        )),
+        &signature,
+    )?;
+    Ok(())
 }
 
 struct Peer {
@@ -76,6 +120,51 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+async fn authorize_account(
+    peer: &Peer,
+    sub: &mut async_nats::Subscriber,
+    attempt: &Message,
+    nonce: &str,
+    account: &str,
+    config: &Config,
+) -> Result<()> {
+    validate_account(account)?;
+    let approval_public_key = config
+        .approval_public_key
+        .as_deref()
+        .context("approval_public_key is required with google_account")?;
+    let approval_public_key =
+        VerifyingKey::from_sec1_bytes(&decode_base64url(approval_public_key)?)?;
+    peer.send(
+        &peer.subject,
+        attempt,
+        Action::Authorize {
+            nonce: nonce.to_owned(),
+            account: account.to_owned(),
+        },
+    )
+    .await?;
+    let authorized = timeout(Duration::from_secs(30), peer.receive(sub, attempt)).await??;
+    let Action::Authorized {
+        nonce: authorized_nonce,
+        signature,
+    } = authorized.action
+    else {
+        bail!("Mac relay did not authorize the configured Google account")
+    };
+    ensure!(nonce == authorized_nonce, "stale Mac authorization");
+    verify_browser_approval(
+        attempt,
+        &config.lane,
+        nonce,
+        account,
+        &approval_public_key,
+        &signature,
+    )
+    .context("verify Mac Oshioki approval")?;
+    Ok(())
 }
 
 fn nats_options(url: &str) -> Result<async_nats::ConnectOptions> {
@@ -261,6 +350,7 @@ async fn capture(url: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn login(config: Config) -> Result<()> {
     let peer = timeout(Duration::from_secs(10), connect(&config)).await??;
     let attempt = Message {
@@ -277,6 +367,27 @@ async fn login(config: Config) -> Result<()> {
     let Action::Offer { nonce } = offer.action else {
         bail!("Mac relay unavailable")
     };
+    let account = config.google_account.as_deref();
+    ensure!(
+        account.is_some() == config.approval_public_key.is_some(),
+        "google_account and approval_public_key must be configured together"
+    );
+    if let Some(account) = account {
+        if let Err(error) =
+            authorize_account(&peer, &mut sub, &attempt, &nonce, account, &config).await
+        {
+            let _ = timeout(Duration::from_secs(2), async {
+                peer.send(&peer.subject, &attempt, Action::Stop).await?;
+                ensure!(
+                    peer.receive(&mut sub, &attempt).await?.action == Action::Closed,
+                    "Mac relay did not confirm authorization cleanup"
+                );
+                anyhow::Ok(())
+            })
+            .await;
+            return Err(error);
+        }
+    }
     let dir = SocketDir(PathBuf::from(format!(
         "/tmp/oshioki-browser-{}",
         attempt.attempt
@@ -292,8 +403,14 @@ async fn login(config: Config) -> Result<()> {
         "unsupported executable path for Python BROWSER"
     );
     let mut command = Command::new("gcloud");
+    command.args(["auth", "login"]);
+    if let Some(account) = account {
+        command.arg(account);
+    } else {
+        command.arg("--force");
+    }
     command
-        .args(["auth", "login", "--force", "--launch-browser"])
+        .arg("--launch-browser")
         .env("BROWSER", format!("'{executable}' capture %s"))
         .env("CLOUDSDK_CORE_DISABLE_PROMPTS", "true")
         .env("CLOUDSDK_AUTH_DISABLE_CODE_VERIFIER", "false")
@@ -306,13 +423,20 @@ async fn login(config: Config) -> Result<()> {
     let mut child = ProcessGroup::spawn(command)?;
     let deadline = Instant::now() + Duration::from_secs(attempt.expires.saturating_sub(now()));
     let outcome = tokio::select! {
-        result = timeout_at(deadline, login_attempt(&peer, &attempt, nonce, &mut sub, &listener, &mut child.child)) => result.context("Google browser ceremony expired").and_then(std::convert::identity),
-        result = interrupted() => result,
+        result = timeout_at(deadline, login_attempt(&peer, &attempt, nonce, &mut sub, &listener, &mut child.child, account.is_some())) => result.context("Google browser ceremony expired").and_then(std::convert::identity),
+        result = interrupted() => result.map(|()| LoginAttempt::Browser),
     };
     // Do this before waiting for NATS cleanup. A failed or interrupted login
     // must not leave gcloud able to finish OAuth in the background. The same
     // cleanup removes the process-group anchor after a successful login.
     child.terminate().await;
+    let mut outcome = outcome;
+    if matches!(&outcome, Ok(LoginAttempt::Headless))
+        && let Some(account) = account
+        && let Err(error) = validate_headless_account(account).await
+    {
+        outcome = Err(error);
+    }
     // Stop contains no Google callback, authorization code, or token. It is
     // sent on success AND failure. A lost stop still expires on the Mac.
     let stopped = timeout(Duration::from_secs(2), async {
@@ -328,6 +452,12 @@ async fn login(config: Config) -> Result<()> {
     stopped.context("Mac cleanup confirmation timed out")?
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginAttempt {
+    Headless,
+    Browser,
+}
+
 async fn login_attempt(
     peer: &Peer,
     attempt: &Message,
@@ -335,10 +465,16 @@ async fn login_attempt(
     sub: &mut async_nats::Subscriber,
     listener: &UnixListener,
     child: &mut Child,
-) -> Result<()> {
+    allow_headless: bool,
+) -> Result<LoginAttempt> {
     let (mut socket, _) = tokio::select! {
         accepted = listener.accept() => accepted?,
-        status = child.wait() => { let _ = status?; bail!("gcloud exited without a browser ceremony"); },
+        status = child.wait() => {
+            let status = status?;
+            ensure!(status.success(), "Google sign-in failed or was denied");
+            ensure!(allow_headless, "gcloud exited without a browser ceremony");
+            return Ok(LoginAttempt::Headless);
+        },
     };
     let mut bytes = Vec::new();
     (&mut socket).take(8193).read_to_end(&mut bytes).await?;
@@ -360,6 +496,32 @@ async fn login_attempt(
         status = child.wait() => ensure!(status?.success(), "Google sign-in failed or was denied"),
         _ = peer.receive(sub, attempt) => bail!("Mac browser relay ended before gcloud completed"),
     }
+    Ok(LoginAttempt::Browser)
+}
+
+async fn validate_headless_account(account: &str) -> Result<()> {
+    let output = timeout(
+        Duration::from_secs(15),
+        Command::new("gcloud")
+            .args([
+                "auth",
+                "print-access-token",
+                "--account",
+                account,
+                "--quiet",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("headless Google credential check timed out")??;
+    ensure!(
+        output.status.success() && !output.stdout.is_empty(),
+        "configured Google credentials could not produce an access token"
+    );
     Ok(())
 }
 
@@ -379,6 +541,10 @@ async fn serve(config: Config) -> Result<()> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"@._-".contains(&b)),
         "invalid configured SSH destination"
+    );
+    ensure!(
+        config.google_account.is_some() == config.approval_identity.is_some(),
+        "google_account and approval_identity must be configured together on Mac"
     );
     let peer = connect(&config).await?;
     let mut sub = peer.client.subscribe(peer.subject.clone()).await?;
@@ -405,13 +571,8 @@ async fn serve(config: Config) -> Result<()> {
         let reply = format!("{}.reply.{}", peer.subject, attempt.attempt);
         let deadline = Instant::now() + Duration::from_secs(attempt.expires.saturating_sub(now()));
         let result = tokio::select! {
-            result = timeout_at(deadline, serve_attempt(&peer, &attempt, &reply, &mut sub, destination, &programs)) => result.context("ceremony expired").and_then(std::convert::identity),
+            result = timeout_at(deadline, serve_attempt(&peer, &attempt, &reply, &mut sub, &config.lane, config.google_account.as_deref(), destination, &programs, config.approval_identity.as_deref())) => result.context("ceremony expired").and_then(std::convert::identity),
             result = interrupted() => return result,
-        };
-        let action = if result.is_ok() {
-            Action::Closed
-        } else {
-            Action::Failed
         };
         // Diagnostics deliberately exclude URLs, NATS frames, and callback bytes.
         eprintln!(
@@ -422,13 +583,124 @@ async fn serve(config: Config) -> Result<()> {
                 "failed or expired"
             }
         );
-        let _ = timeout(Duration::from_secs(2), peer.send(&reply, &attempt, action)).await;
+        if result.is_ok() {
+            let _ = timeout(
+                Duration::from_secs(2),
+                peer.send(&reply, &attempt, Action::Closed),
+            )
+            .await;
+        } else {
+            let _ = timeout(Duration::from_secs(2), async {
+                peer.send(&reply, &attempt, Action::Failed).await?;
+                ensure!(
+                    peer.receive(&mut sub, &attempt).await?.action == Action::Stop,
+                    "expected Stop after failed ceremony"
+                );
+                peer.send(&reply, &attempt, Action::Closed).await
+            })
+            .await;
+        }
     }
 }
 
 struct Programs {
     browser: PathBuf,
     ssh: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+mod native_approval {
+    use std::sync::Arc;
+
+    use anyhow::{Context as _, Result, ensure};
+    use oshioki_agent::{
+        Identity, SignerKind,
+        touchid::{AttemptError, Outcome, PromptCancel, ScreenLock, TouchIdPrompt},
+    };
+    use oshioki_browser_relay::{Message, approval_challenge};
+    use oshioki_enclave::SignError;
+    use std::path::Path;
+
+    struct Screen;
+
+    impl ScreenLock for Screen {
+        fn is_locked(&self) -> bool {
+            oshioki_enclave::screen_is_locked()
+        }
+    }
+
+    struct Canceller(Arc<Identity>);
+
+    impl PromptCancel for Canceller {
+        fn begin(&self) -> u64 {
+            self.0.begin_prompt()
+        }
+
+        fn cancel(&self, attempt: u64) {
+            self.0.cancel_prompt(attempt);
+        }
+    }
+
+    pub async fn authorize(
+        identity_path: &Path,
+        attempt: &Message,
+        lane: &str,
+        nonce: &str,
+        account: &str,
+        destination: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let identity = Arc::new(Identity::load(identity_path)?);
+        ensure!(
+            identity.signer_kind() == SignerKind::Enclave,
+            "browser relay approval requires the Secure Enclave identity"
+        );
+        let prompt =
+            TouchIdPrompt::new(Box::new(Screen), Arc::new(Canceller(Arc::clone(&identity))));
+        let challenge = approval_challenge(lane, &attempt.attempt, attempt.expires, nonce, account);
+        let reason = format!("authorize gcloud for {account} via {destination}");
+        let sign = move || {
+            identity
+                .sign_browser_relay(&challenge, &reason)
+                .map_err(classify)
+        };
+        let expires = i64::try_from(attempt.expires).context("ceremony expiry is too large")?;
+        match prompt.ask(&attempt.attempt, expires, sign).await? {
+            Outcome::Approved(signature) => Ok(Some(signature)),
+            Outcome::Denied | Outcome::Expired => Ok(None),
+        }
+    }
+
+    fn classify(error: anyhow::Error) -> AttemptError {
+        if matches!(error.downcast_ref::<SignError>(), Some(SignError::Canceled)) {
+            AttemptError::Canceled
+        } else {
+            AttemptError::Failed(error)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn browser_authorize(
+    identity_path: &Path,
+    attempt: &Message,
+    lane: &str,
+    nonce: &str,
+    account: &str,
+    destination: &str,
+) -> Result<Option<Vec<u8>>> {
+    native_approval::authorize(identity_path, attempt, lane, nonce, account, destination).await
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn browser_authorize(
+    _identity_path: &Path,
+    _attempt: &Message,
+    _lane: &str,
+    _nonce: &str,
+    _account: &str,
+    _destination: &str,
+) -> Result<Option<Vec<u8>>> {
+    bail!("browser relay approval requires macOS")
 }
 
 impl Default for Programs {
@@ -440,13 +712,17 @@ impl Default for Programs {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn serve_attempt(
     peer: &Peer,
     attempt: &Message,
     reply: &str,
     sub: &mut async_nats::Subscriber,
+    lane: &str,
+    expected_account: Option<&str>,
     destination: &str,
     programs: &Programs,
+    approval_identity: Option<&Path>,
 ) -> Result<()> {
     // A fresh receiver nonce prevents a captured Start from working after
     // restart, even when its signed wall-clock expiry has not passed.
@@ -459,15 +735,69 @@ async fn serve_attempt(
         },
     )
     .await?;
-    let start = timeout(Duration::from_secs(15), peer.receive(sub, attempt)).await??;
-    let Action::Start {
-        nonce: offered,
-        url,
-    } = start.action
-    else {
-        bail!("ceremony cancelled before start")
+    let first = timeout(Duration::from_secs(30), peer.receive(sub, attempt)).await??;
+    let url = match first.action {
+        Action::Authorize {
+            nonce: offered,
+            account,
+        } => {
+            ensure!(nonce == offered, "stale receiver nonce");
+            validate_account(&account)?;
+            ensure!(
+                expected_account == Some(account.as_str()),
+                "Google account does not match Mac configuration"
+            );
+            let Some(identity) = approval_identity else {
+                bail!("Mac Oshioki approval identity is not configured")
+            };
+            let authorization = tokio::select! {
+                result = timeout(
+                    Duration::from_secs(30),
+                    browser_authorize(identity, attempt, lane, &offered, &account, destination),
+                ) => result.context("Oshioki authorization timed out")??,
+                message = peer.receive(sub, attempt) => {
+                    ensure!(message?.action == Action::Stop, "unexpected ceremony control message");
+                    return Ok(())
+                }
+            };
+            let Some(signature) = authorization else {
+                bail!("Oshioki approval was denied or expired")
+            };
+            peer.send(
+                reply,
+                attempt,
+                Action::Authorized {
+                    nonce: offered,
+                    signature: encode_base64url(&signature),
+                },
+            )
+            .await?;
+            let next = timeout(Duration::from_secs(30), peer.receive(sub, attempt)).await??;
+            match next.action {
+                Action::Start {
+                    nonce: offered,
+                    url,
+                } => {
+                    ensure!(nonce == offered, "stale receiver nonce");
+                    url
+                }
+                Action::Stop => return Ok(()),
+                _ => bail!("ceremony cancelled before browser start"),
+            }
+        }
+        Action::Start {
+            nonce: offered,
+            url,
+        } => {
+            ensure!(
+                approval_identity.is_none(),
+                "configured Mac approval requires an Authorize action"
+            );
+            ensure!(nonce == offered, "stale receiver nonce");
+            url
+        }
+        _ => bail!("ceremony cancelled before start"),
     };
-    ensure!(nonce == offered, "stale receiver nonce");
     let port = google_callback_port(&url)?;
     // These listeners live in this process, not in an orphanable ssh -L.
     // Binding both families prevents localhost from reaching a different

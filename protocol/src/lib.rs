@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+use sha2::{Digest as _, Sha256};
+
 pub mod auth_v1;
 pub mod enrollment_v1;
 pub mod error;
@@ -48,3 +50,36 @@ pub use v1::{
     is_approval_env, seal_v1, unseal_v1, verify_deny_v1,
 };
 pub use webauthn_v1::{AssertionOutcomeV1, verify_approval_v1};
+
+const BROWSER_RELAY_CHALLENGE_DOMAIN: &[u8] = b"oshioki/browser-ceremony-approval/v1\0";
+const BROWSER_RELAY_SIGNATURE_DOMAIN: &[u8] = b"oshioki/agent/browser-ceremony-approval/v1\0";
+
+/// Build the account-bound challenge for one browser ceremony approval.
+/// Every routing and freshness field is included so a signature cannot move
+/// between lanes, attempts, receiver nonces, or Google accounts.
+pub fn browser_relay_challenge(
+    lane: &str,
+    attempt: &str,
+    expires: u64,
+    nonce: &str,
+    account: &str,
+) -> Vec<u8> {
+    let mut hash = Sha256::new();
+    hash.update(BROWSER_RELAY_CHALLENGE_DOMAIN);
+    for field in [
+        lane.as_bytes(),
+        attempt.as_bytes(),
+        nonce.as_bytes(),
+        account.as_bytes(),
+    ] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    hash.update(expires.to_be_bytes());
+    hash.finalize().to_vec()
+}
+
+/// Add the agent-only domain before an enclave signs a relay challenge.
+pub fn browser_relay_signature_payload(challenge: &[u8]) -> Vec<u8> {
+    [BROWSER_RELAY_SIGNATURE_DOMAIN, challenge].concat()
+}

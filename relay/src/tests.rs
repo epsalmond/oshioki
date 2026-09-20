@@ -160,6 +160,9 @@ async fn authenticated_nats_url_uses_url_credentials() {
         peer_public_key: encode_base64url(
             peer_key.verifying_key().to_encoded_point(false).as_bytes(),
         ),
+        google_account: None,
+        approval_public_key: None,
+        approval_identity: None,
         ssh_destination: None,
     };
     let peer = timeout(Duration::from_secs(5), connect(&config))
@@ -169,6 +172,32 @@ async fn authenticated_nats_url_uses_url_credentials() {
     peer.client.flush().await.unwrap();
     drop(peer);
     server.kill().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires nats-server; run scripts/test-browser-relay"]
+async fn legacy_successful_gcloud_without_browser_is_rejected() {
+    let mut h = Harness::new().await;
+    let socket_path = PathBuf::from(format!(
+        "/tmp/oshioki-relay-login-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+    let error = login_attempt(
+        &h.mac,
+        &h.attempt,
+        "fresh-nonce".into(),
+        &mut h.replies,
+        &listener,
+        &mut child,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("without a browser ceremony"));
+    drop(listener);
+    let _ = fs::remove_file(socket_path);
 }
 
 fn oauth_url(port: u16) -> String {
@@ -217,8 +246,11 @@ async fn callback_bytes_stay_off_nats_and_stop_closes_both_listeners() {
         &h.attempt,
         &h.reply,
         &mut h.requests,
+        "test-lane",
+        None,
         "pinned-nas",
         &programs,
+        None,
     );
     let client = async {
         start(&h.host, &mut h.replies, &h.attempt, oauth_url(port), false).await;
@@ -294,8 +326,11 @@ async fn malformed_and_replayed_start_never_open_listeners() {
             &h.attempt,
             &h.reply,
             &mut h.requests,
+            "test-lane",
+            None,
             "pinned-nas",
             &programs,
+            None,
         );
         let client = start(&h.host, &mut h.replies, &h.attempt, url, stale);
         let (result, ()) = timeout(Duration::from_secs(5), async {
@@ -325,8 +360,11 @@ async fn expiry_cancels_active_forward_and_releases_port() {
             &h.attempt,
             &h.reply,
             &mut h.requests,
+            "test-lane",
+            None,
             "pinned-nas",
             &programs,
+            None,
         ),
     );
     let client = async {
@@ -382,8 +420,11 @@ async fn ipv6_collision_does_not_leave_ipv4_listener() {
         &h.attempt,
         &h.reply,
         &mut h.requests,
+        "test-lane",
+        None,
         "pinned-nas",
         &programs,
+        None,
     );
     let client = start(&h.host, &mut h.replies, &h.attempt, oauth_url(port), false);
     let (result, ()) = timeout(Duration::from_secs(5), async {
@@ -393,11 +434,17 @@ async fn ipv6_collision_does_not_leave_ipv4_listener() {
     .unwrap();
     assert!(result.is_err());
     drop(occupied);
-    assert!(
-        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .await
-            .is_ok()
-    );
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(listener) = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                drop(listener);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the failed dual-stack bind left the IPv4 port occupied");
 }
 
 #[tokio::test]

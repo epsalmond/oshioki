@@ -82,6 +82,34 @@ pub struct PromptPermit<'a> {
     _sheet: MutexGuard<'a, ()>,
 }
 
+struct PromptAttempt {
+    canceller: Arc<dyn PromptCancel>,
+    attempt: u64,
+    active: bool,
+}
+
+impl PromptAttempt {
+    fn new(canceller: Arc<dyn PromptCancel>, attempt: u64) -> Self {
+        Self {
+            canceller,
+            attempt,
+            active: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PromptAttempt {
+    fn drop(&mut self) {
+        if self.active {
+            self.canceller.cancel(self.attempt);
+        }
+    }
+}
+
 impl TouchIdPrompt {
     pub fn new(screen: Box<dyn ScreenLock>, canceller: Arc<dyn PromptCancel>) -> Self {
         Self {
@@ -177,6 +205,7 @@ impl TouchIdPrompt {
         // arrives from here: invalidating the context tears the sheet down.
         let expired = Arc::new(AtomicBool::new(false));
         let attempt = self.canceller.begin();
+        let mut prompt_attempt = PromptAttempt::new(Arc::clone(&self.canceller), attempt);
         let deadline = tokio::spawn({
             let expired = Arc::clone(&expired);
             let canceller = Arc::clone(&self.canceller);
@@ -188,6 +217,7 @@ impl TouchIdPrompt {
         });
         let signed = tokio::task::spawn_blocking(sign).await;
         deadline.abort();
+        prompt_attempt.finish();
 
         let signed = signed.context("the Touch ID prompt thread panicked")?;
         // An answer that arrives after the deadline is not a verdict: the hook
@@ -293,6 +323,40 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, Outcome::Approved(vec![1, 2, 3]));
         assert_eq!(canceller.cancels.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_active_prompt_cancels_its_sheet() {
+        let screen = Arc::new(Screen::default());
+        let canceller = Arc::new(Canceller::default());
+        let prompt = Arc::new(prompt(&screen, &canceller));
+        let task = tokio::spawn({
+            let prompt = Arc::clone(&prompt);
+            async move {
+                let _ = prompt
+                    .ask("req-drop", now() + 30, || {
+                        std::thread::sleep(Duration::from_secs(5));
+                        Ok(vec![1, 2, 3])
+                    })
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while canceller.attempt() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while canceller.cancels.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(canceller.cancelled());
     }
 
     /// A dismissed sheet is a denial, and the hook should hear it at once.

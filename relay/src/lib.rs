@@ -21,6 +21,8 @@ const DOMAIN: &[u8] = b"oshioki/browser-ceremony/v1\0";
 pub enum Action {
     Probe,
     Offer { nonce: String },
+    Authorize { nonce: String, account: String },
+    Authorized { nonce: String, signature: String },
     Start { nonce: String, url: String },
     Ready,
     Stop,
@@ -72,6 +74,19 @@ pub fn verify(bytes: &[u8], key: &VerifyingKey, now: u64) -> Result<Message> {
         "invalid ceremony expiry"
     );
     Ok(message)
+}
+
+/// Challenge signed by the Mac's enrolled Oshioki Secure Enclave identity.
+/// Relay keys authenticate transport; this separate signature proves that a
+/// person approved this account-bound ceremony on the Mac.
+pub fn approval_challenge(
+    lane: &str,
+    attempt: &str,
+    expires: u64,
+    nonce: &str,
+    account: &str,
+) -> Vec<u8> {
+    oshioki_protocol::browser_relay_challenge(lane, attempt, expires, nonce, account)
 }
 
 /// Accept only the first-party gcloud authorization-code flow. Unknown and
@@ -219,5 +234,23 @@ mod tests {
         );
         changed.expires = 401;
         assert!(verify(&sign(&changed, &key).unwrap(), key.verifying_key(), 100).is_err());
+    }
+
+    #[test]
+    fn browser_approval_binds_lane_attempt_expiry_nonce_and_account() {
+        let baseline = approval_challenge("lane-a", "attempt-a", 200, "nonce-a", "a@example.com");
+        for changed in [
+            approval_challenge("lane-b", "attempt-a", 200, "nonce-a", "a@example.com"),
+            approval_challenge("lane-a", "attempt-b", 200, "nonce-a", "a@example.com"),
+            approval_challenge("lane-a", "attempt-a", 201, "nonce-a", "a@example.com"),
+            approval_challenge("lane-a", "attempt-a", 200, "nonce-b", "a@example.com"),
+            approval_challenge("lane-a", "attempt-a", 200, "nonce-a", "b@example.com"),
+        ] {
+            assert_ne!(baseline, changed);
+        }
+        assert_ne!(
+            oshioki_protocol::browser_relay_signature_payload(&baseline),
+            baseline
+        );
     }
 }

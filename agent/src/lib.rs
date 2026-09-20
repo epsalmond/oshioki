@@ -410,6 +410,19 @@ impl Identity {
         self.signer.cancel_prompt(attempt);
     }
 
+    /// Signs a relay-specific, already domain-separated challenge. This is
+    /// distinct from command approval and contextual sudo authentication.
+    /// Only the Secure Enclave identity may answer it.
+    pub fn sign_browser_relay(&self, challenge: &[u8], reason: &str) -> Result<Vec<u8>> {
+        if self.device_kind() != DeviceKindV1::SecureEnclave {
+            bail!("a software identity cannot approve a browser relay ceremony");
+        }
+        self.signer.sign_der(
+            &oshioki_protocol::browser_relay_signature_payload(challenge),
+            reason,
+        )
+    }
+
     pub fn public_key_sec1(&self) -> Vec<u8> {
         self.signer.public_key_sec1()
     }

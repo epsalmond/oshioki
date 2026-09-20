@@ -14,11 +14,13 @@ async-nats.workspace = true
 clap.workspace = true
 futures.workspace = true
 oshioki-protocol = { path = "../protocol" }
+oshioki-agent = { path = "../agent" }
 p256.workspace = true
 percent-encoding = "2"
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 url = "2"
@@ -26,3 +28,6 @@ nix = { workspace = true, features = ["signal"] }
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+oshioki-enclave = { path = "../enclave" }

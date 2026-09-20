@@ -2,8 +2,10 @@
 
 Issue [#85](https://github.com/epsalmond/oshioki/issues/85): run the browser
 part of a NAS `gcloud auth login` on the Mac that holds the Google passkey.
-Google performs its own authentication. There is no additional Oshioki
-approval prompt and no copied authorization code.
+Google performs its own authentication. When account-bound mode is configured,
+one Oshioki Touch ID prompt authorizes establishing or renewing that account's
+gcloud access; routine gcloud commands remain headless and use gcloud's stored
+credentials.
 
 This is an opt-in companion binary, `oshioki-browser-relay`, separate from
 the sudo agent, PAM, browser enrollment, and phone push. It is not enabled
@@ -55,14 +57,25 @@ each host. Use absolute paths; `~` is not expanded in JSON. NAS example:
   "nats_url": "tls://relay-user:REPLACE_WITH_PASSWORD@nats.example:4222",
   "lane": "a188ae7d-1be4-4a2c-9843-3a843c77a427",
   "private_key": "/home/eric/.config/oshioki-browser/signing.key",
-  "peer_public_key": "REPLACE_WITH_MAC_PUBLIC_KEY"
+  "peer_public_key": "REPLACE_WITH_MAC_PUBLIC_KEY",
+  "google_account": "you@example.com",
+  "approval_public_key": "REPLACE_WITH_MAC_OSHIOKI_PUBLIC_KEY"
 }
 ```
 
 On the Mac use its local key path, pin the NAS public key, and add
-`"ssh_destination": "nas-tailnet"`. That destination comes only from this
-local configuration, never from a received request. Set both configurations
-to mode 600. No changes to `/etc/oshioki` or its permissions are needed.
+`"ssh_destination": "nas-tailnet"` plus
+`"approval_identity": "/Users/you/.config/oshioki/agent.json"`. The Mac
+identity must be a Secure Enclave identity; its public key is the value pinned
+as `approval_public_key` on the NAS. The destination and identity path come
+only from local configuration, never from a received request. Set both
+configurations to mode 600. No changes to `/etc/oshioki` or its permissions
+are needed.
+
+`google_account`, `approval_public_key`, and `approval_identity` opt into the
+headless account-bound flow. The NAS and Mac must be upgraded together for
+that flow; incomplete account approval fields fail closed. Existing configs
+without those fields retain the original browser-only behavior for migration.
 
 The NAS NATS identity publishes to `oshioki.browser.v1.<lane>` and subscribes
 to `oshioki.browser.v1.<lane>.reply.*`. The Mac has the inverse permissions.
@@ -98,13 +111,15 @@ gcloud() {
 }
 ```
 
-The binary starts `gcloud auth login --force --launch-browser` itself; it
-captures the URL through Python's `BROWSER` launcher, not terminal scraping.
-It supplies a display marker because gcloud's Linux browser check otherwise
-selects its headless flow even with a custom launcher. No display server is
-used. Automatic detection/retry of arbitrary failed gcloud commands and
-non-Google OAuth providers are not implemented. Invoke login when gcloud
-reports reauthentication is required.
+In account-bound mode the binary starts `gcloud auth login <ACCOUNT>
+--launch-browser` without `--force`. Gcloud activates valid stored credentials
+without opening a browser; the relay then runs a bounded access-token check
+with its output discarded. If gcloud needs a new login or reauthentication,
+the URL is captured through Python's `BROWSER` launcher and the Mac opens the
+browser. Gcloud itself validates the resulting account. No token or callback
+code enters NATS. The legacy config path retains `--force` for compatibility.
+Automatic detection/retry of arbitrary failed gcloud commands and non-Google
+OAuth providers are not implemented.
 
 ## Lifetime and trust boundaries
 
@@ -112,22 +127,28 @@ reports reauthentication is required.
 2. The Mac verifies the pinned key, version, ID and expiry, then returns a
    signed fresh nonce. Duplicate IDs are retained for their validity window;
    admission is bounded. A restarted receiver generates a different nonce.
-3. The NAS starts gcloud. Its private local launcher socket captures the URL
+3. In account-bound mode the NAS sends the configured account. The Mac shows
+   one Touch ID prompt whose reason names the locally configured NAS alias and
+   account. Its Secure Enclave signature is domain-separated from sudo and
+   Google WebAuthn and is bound to the lane, attempt, expiry, receiver nonce,
+   and account. The NAS verifies the pinned Mac Oshioki public key before
+   starting gcloud.
+4. The NAS starts gcloud. Its private local launcher socket captures the URL
    and sends a signed start bound to the nonce and the same attempt/expiry.
-4. The Mac permits only Google authorization-code endpoints, the gcloud
+5. The Mac permits only Google authorization-code endpoints, the gcloud
    client ID, S256 PKCE, a state value, and a canonical
    `http://localhost:<unprivileged-port>/` redirect. Duplicate/unknown query
    fields, tokens, authorization codes and reauthentication proof tokens
    are rejected. The callback port is derived from the signed URL rather
    than duplicated in a second potentially conflicting field.
-5. The Mac exclusively binds both `127.0.0.1` and `::1` at that port, then
+6. The Mac exclusively binds both `127.0.0.1` and `::1` at that port, then
    opens its default browser. Each accepted callback TCP connection uses
    `ssh -W localhost:<port>` to the locally pinned NAS destination. At most
    eight connections exist within the single active request.
-6. Google redirects the browser through SSH to gcloud. Google codes/tokens
+7. Google redirects the browser through SSH to gcloud. Google codes/tokens
    never enter a NATS message. Callback bytes are not parsed or logged by
    the relay; gcloud validates OAuth state and exchanges the code itself.
-7. Gcloud's exit, failure, SIGINT or SIGTERM causes a signed stop. Success
+8. Gcloud's exit, failure, SIGINT or SIGTERM causes a signed stop. Success
    additionally requires the Mac's signed cleanup acknowledgement. The
    browser session is bounded by a fixed maximum of 300 seconds from the initial probe; it is never renewed. Expiry,
    receiver cancellation and errors drop both listeners and their SSH
@@ -164,8 +185,10 @@ tests are explicitly ignored there and run by the dedicated script.
 
 Before calling #85 accepted, verify on NAS + Mac:
 
-- The literal wrapped `gcloud auth login` succeeds with the intended Google
-  passkey and no pasted code or extra Oshioki approval.
+- A configured account with valid gcloud credentials completes without a
+  browser and the bounded access-token check succeeds.
+- A new or reauthenticated login shows one Oshioki Touch ID prompt before
+  the Google browser flow, then succeeds with the intended passkey.
 - Google's denial and a request timeout return nonzero and leave neither
   callback address listening.
 - Inspect the private test lane's decoded signed message bodies to confirm
