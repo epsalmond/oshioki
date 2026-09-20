@@ -73,6 +73,10 @@ only from local configuration, never from a received request. Set both
 configurations to mode 600. No changes to `/etc/oshioki` or its permissions
 are needed.
 
+The relay reads only the Secure Enclave signing blob from `approval_identity`;
+it does not load the agent's unrelated box secret or its Keychain entry. The
+Keychain-backed box identity remains available to the normal Oshioki agent.
+
 `google_account`, `approval_public_key`, and `approval_identity` opt into the
 headless account-bound flow. The NAS and Mac must be upgraded together for
 that flow; incomplete account approval fields fail closed. Existing configs

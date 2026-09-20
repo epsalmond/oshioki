@@ -10,12 +10,14 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
+use oshioki_agent::BrowserRelaySigner;
 use oshioki_browser_relay::{
     Action, MAX_LIFETIME, Message, approval_challenge, google_callback_port, sign, verify,
 };
@@ -525,6 +527,28 @@ async fn validate_headless_account(account: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+async fn load_approval_signer(path: Option<&Path>) -> Result<Option<Arc<BrowserRelaySigner>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = path.to_owned();
+    let signer = timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || BrowserRelaySigner::load(&path)),
+    )
+    .await
+    .context("load Mac approval identity timed out")??
+    .context("load Mac approval identity")?;
+    Ok(Some(Arc::new(signer)))
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn load_approval_signer(path: Option<&Path>) -> Result<Option<Arc<BrowserRelaySigner>>> {
+    ensure!(path.is_none(), "browser relay approval requires macOS");
+    Ok(None)
+}
+
 async fn serve(config: Config) -> Result<()> {
     ensure!(
         cfg!(target_os = "macos"),
@@ -546,6 +570,7 @@ async fn serve(config: Config) -> Result<()> {
         config.google_account.is_some() == config.approval_identity.is_some(),
         "google_account and approval_identity must be configured together on Mac"
     );
+    let approval_signer = load_approval_signer(config.approval_identity.as_deref()).await?;
     let peer = connect(&config).await?;
     let mut sub = peer.client.subscribe(peer.subject.clone()).await?;
     peer.client.flush().await?;
@@ -571,7 +596,7 @@ async fn serve(config: Config) -> Result<()> {
         let reply = format!("{}.reply.{}", peer.subject, attempt.attempt);
         let deadline = Instant::now() + Duration::from_secs(attempt.expires.saturating_sub(now()));
         let result = tokio::select! {
-            result = timeout_at(deadline, serve_attempt(&peer, &attempt, &reply, &mut sub, &config.lane, config.google_account.as_deref(), destination, &programs, config.approval_identity.as_deref())) => result.context("ceremony expired").and_then(std::convert::identity),
+            result = timeout_at(deadline, serve_attempt(&peer, &attempt, &reply, &mut sub, &config.lane, config.google_account.as_deref(), destination, &programs, approval_signer.as_ref())) => result.context("ceremony expired").and_then(std::convert::identity),
             result = interrupted() => return result,
         };
         // Diagnostics deliberately exclude URLs, NATS frames, and callback bytes.
@@ -612,14 +637,13 @@ struct Programs {
 mod native_approval {
     use std::sync::Arc;
 
-    use anyhow::{Context as _, Result, ensure};
+    use anyhow::{Context as _, Result};
     use oshioki_agent::{
-        Identity, SignerKind,
+        BrowserRelaySigner,
         touchid::{AttemptError, Outcome, PromptCancel, ScreenLock, TouchIdPrompt},
     };
     use oshioki_browser_relay::{Message, approval_challenge};
     use oshioki_enclave::SignError;
-    use std::path::Path;
 
     struct Screen;
 
@@ -629,7 +653,7 @@ mod native_approval {
         }
     }
 
-    struct Canceller(Arc<Identity>);
+    struct Canceller(Arc<BrowserRelaySigner>);
 
     impl PromptCancel for Canceller {
         fn begin(&self) -> u64 {
@@ -642,24 +666,19 @@ mod native_approval {
     }
 
     pub async fn authorize(
-        identity_path: &Path,
+        signer: &Arc<BrowserRelaySigner>,
         attempt: &Message,
         lane: &str,
         nonce: &str,
         account: &str,
         destination: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let identity = Arc::new(Identity::load(identity_path)?);
-        ensure!(
-            identity.signer_kind() == SignerKind::Enclave,
-            "browser relay approval requires the Secure Enclave identity"
-        );
-        let prompt =
-            TouchIdPrompt::new(Box::new(Screen), Arc::new(Canceller(Arc::clone(&identity))));
+        let prompt = TouchIdPrompt::new(Box::new(Screen), Arc::new(Canceller(Arc::clone(signer))));
         let challenge = approval_challenge(lane, &attempt.attempt, attempt.expires, nonce, account);
         let reason = format!("authorize gcloud for {account} via {destination}");
+        let signer = Arc::clone(signer);
         let sign = move || {
-            identity
+            signer
                 .sign_browser_relay(&challenge, &reason)
                 .map_err(classify)
         };
@@ -681,19 +700,19 @@ mod native_approval {
 
 #[cfg(target_os = "macos")]
 async fn browser_authorize(
-    identity_path: &Path,
+    signer: &Arc<BrowserRelaySigner>,
     attempt: &Message,
     lane: &str,
     nonce: &str,
     account: &str,
     destination: &str,
 ) -> Result<Option<Vec<u8>>> {
-    native_approval::authorize(identity_path, attempt, lane, nonce, account, destination).await
+    native_approval::authorize(signer, attempt, lane, nonce, account, destination).await
 }
 
 #[cfg(not(target_os = "macos"))]
 async fn browser_authorize(
-    _identity_path: &Path,
+    _signer: &Arc<BrowserRelaySigner>,
     _attempt: &Message,
     _lane: &str,
     _nonce: &str,
@@ -722,7 +741,7 @@ async fn serve_attempt(
     expected_account: Option<&str>,
     destination: &str,
     programs: &Programs,
-    approval_identity: Option<&Path>,
+    approval_signer: Option<&Arc<BrowserRelaySigner>>,
 ) -> Result<()> {
     // A fresh receiver nonce prevents a captured Start from working after
     // restart, even when its signed wall-clock expiry has not passed.
@@ -747,13 +766,13 @@ async fn serve_attempt(
                 expected_account == Some(account.as_str()),
                 "Google account does not match Mac configuration"
             );
-            let Some(identity) = approval_identity else {
+            let Some(signer) = approval_signer else {
                 bail!("Mac Oshioki approval identity is not configured")
             };
             let authorization = tokio::select! {
                 result = timeout(
                     Duration::from_secs(30),
-                    browser_authorize(identity, attempt, lane, &offered, &account, destination),
+                    browser_authorize(signer, attempt, lane, &offered, &account, destination),
                 ) => result.context("Oshioki authorization timed out")??,
                 message = peer.receive(sub, attempt) => {
                     ensure!(message?.action == Action::Stop, "unexpected ceremony control message");
@@ -790,7 +809,7 @@ async fn serve_attempt(
             url,
         } => {
             ensure!(
-                approval_identity.is_none(),
+                approval_signer.is_none(),
                 "configured Mac approval requires an Authorize action"
             );
             ensure!(nonce == offered, "stale receiver nonce");
