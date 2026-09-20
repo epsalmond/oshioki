@@ -78,6 +78,35 @@ fn now() -> u64 {
         .as_secs()
 }
 
+fn nats_options(url: &str) -> Result<async_nats::ConnectOptions> {
+    let parsed = url::Url::parse(url).context("parse NATS URL")?;
+    let mut options =
+        async_nats::ConnectOptions::new().require_tls(oshioki_protocol::nats_url_is_tls(url));
+    if parsed.username().is_empty() {
+        ensure!(
+            parsed.password().is_none(),
+            "NATS URL password requires a username"
+        );
+    } else {
+        let username = percent_encoding::percent_decode_str(parsed.username())
+            .decode_utf8()
+            .context("decode NATS username")?
+            .into_owned();
+        let password = parsed
+            .password()
+            .map(|password| {
+                percent_encoding::percent_decode_str(password)
+                    .decode_utf8()
+                    .context("decode NATS password")
+                    .map(std::borrow::Cow::into_owned)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        options = options.user_and_password(username, password);
+    }
+    Ok(options)
+}
+
 fn private_read(path: &Path) -> Result<Vec<u8>> {
     let metadata = std::fs::symlink_metadata(path)?;
     ensure!(
@@ -96,8 +125,8 @@ async fn connect(config: &Config) -> Result<Peer> {
     let secret = private_read(&config.private_key)?;
     let signing = SigningKey::from_slice(&decode_base64url(std::str::from_utf8(&secret)?.trim())?)?;
     let verifying = VerifyingKey::from_sec1_bytes(&decode_base64url(&config.peer_public_key)?)?;
-    let client = async_nats::ConnectOptions::new()
-        .require_tls(oshioki_protocol::nats_url_is_tls(&config.nats_url))
+    let client = nats_options(&config.nats_url)
+        .context("configure relay NATS authentication")?
         .connect(&config.nats_url)
         .await
         .context("connect to relay NATS")?;

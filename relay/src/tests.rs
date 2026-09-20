@@ -102,6 +102,75 @@ impl Harness {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires nats-server; run scripts/test-browser-relay"]
+async fn authenticated_nats_url_uses_url_credentials() {
+    const USER: &str = "relay-test-user";
+    const PASSWORD: &str = "relay-test/password";
+    let address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = address.local_addr().unwrap().port();
+    drop(address);
+    let mut server = Command::new("nats-server")
+        .args([
+            "-a",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "--user",
+            USER,
+            "--pass",
+            PASSWORD,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("install nats-server to run relay integration tests");
+    let nats_url = format!("nats://{USER}:relay-test%2Fpassword@127.0.0.1:{port}");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if async_nats::ConnectOptions::with_user_and_password(
+                USER.to_owned(),
+                PASSWORD.to_owned(),
+            )
+            .connect(&nats_url)
+            .await
+            .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("authenticated nats-server did not start");
+
+    let directory = PathBuf::from(format!("/tmp/oshioki-relay-auth-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&directory).unwrap();
+    let _cleanup = TempDir(directory.clone());
+    let key = SigningKey::random(&mut rand::rngs::OsRng);
+    let key_path = directory.join("key");
+    fs::write(&key_path, encode_base64url(&key.to_bytes())).unwrap();
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let peer_key = SigningKey::random(&mut rand::rngs::OsRng);
+    let config = Config {
+        nats_url,
+        lane: uuid::Uuid::new_v4().to_string(),
+        private_key: key_path,
+        peer_public_key: encode_base64url(
+            peer_key.verifying_key().to_encoded_point(false).as_bytes(),
+        ),
+        ssh_destination: None,
+    };
+    let peer = timeout(Duration::from_secs(5), connect(&config))
+        .await
+        .expect("authenticated relay connection timed out")
+        .expect("URL credentials were not accepted by NATS");
+    peer.client.flush().await.unwrap();
+    drop(peer);
+    server.kill().await.unwrap();
+}
+
 fn oauth_url(port: u16) -> String {
     format!(
         "https://accounts.google.com/o/oauth2/auth?client_id=32555940559.apps.googleusercontent.com&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A{port}%2F&scope=openid&state=example&code_challenge_method=S256&code_challenge={}",

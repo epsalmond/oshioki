@@ -1524,6 +1524,7 @@ dependencies = [
  "nix",
  "oshioki-protocol",
  "p256",
+ "percent-encoding",
  "rand 0.8.8",
  "serde",
  "serde_json",
