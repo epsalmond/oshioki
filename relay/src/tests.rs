@@ -613,9 +613,19 @@ async fn local_mode_approval_and_gcloud_cleanup_are_deterministic() {
         let _cleanup = TempDir(directory.clone());
         let marker = directory.join("started");
         let executable = directory.join("gcloud");
-        let browser_callback = "python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); s.listen(1); p=s.getsockname()[1]; c=socket.create_connection((\"127.0.0.1\",p)); q,_=s.accept(); q.sendall(b\"GET /callback HTTP/1.1\\r\\n\\r\\n\"); q.close(); c.close(); s.close()'";
+        let browser_spy = directory.join("browser-spy");
+        fs::write(
+            &browser_spy,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\npython3 -c 'import socket,sys,urllib.parse; u=urllib.parse.urlparse(sys.argv[1]); c=socket.create_connection((u.hostname,u.port)); c.sendall(b\"GET /callback HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n\"); c.close()' \"$1\"\n",
+                directory.join("browser-url").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&browser_spy, fs::Permissions::from_mode(0o700)).unwrap();
+        let browser_launcher = "python3 - \"$BROWSER\" <<'PY'\nimport socket, subprocess, sys\ns = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1)\nurl = f'http://127.0.0.1:{s.getsockname()[1]}/callback'\nsubprocess.run([sys.argv[1], url], check=True)\nq, _ = s.accept(); q.recv(4096); q.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\n\\r\\n'); q.close(); s.close()\nPY";
         let login_body = if name == "browser" {
-            browser_callback
+            browser_launcher
         } else {
             command
         };
@@ -638,10 +648,26 @@ async fn local_mode_approval_and_gcloud_cleanup_are_deterministic() {
             .unwrap_err();
             assert!(error.to_string().contains("timed out"));
         } else {
-            run_local_after_approval("selected@example.com", &executable, Ok(()), None)
+            if name == "browser" {
+                run_local_gcloud_with_timeout_and_browser(
+                    "selected@example.com",
+                    &executable,
+                    Duration::from_secs(2),
+                    &browser_spy,
+                )
                 .await
                 .unwrap();
+            } else {
+                run_local_after_approval("selected@example.com", &executable, Ok(()), None)
+                    .await
+                    .unwrap();
+            }
             assert!(marker.exists());
+            if name == "browser" {
+                let url = fs::read_to_string(directory.join("browser-url")).unwrap();
+                assert!(url.starts_with("http://127.0.0.1:"));
+                assert!(url.ends_with("/callback"));
+            }
         }
     }
 

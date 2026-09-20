@@ -22,6 +22,7 @@ artifacts built from the same reviewed source:
 
 ```sh
 cargo build --locked --release -p oshioki-agent -p oshioki-browser-relay
+AGENT=./target/release/oshioki-agent
 ```
 
 Create a separate Secure Enclave identity for this helper. Keeping it separate
@@ -31,9 +32,9 @@ retaining the same native Touch ID experience:
 ```sh
 mkdir -p ~/.config/oshioki/browser-relay
 chmod 700 ~/.config/oshioki/browser-relay
-oshioki-agent init --signer enclave \
+$AGENT init --signer enclave \
   --state ~/.config/oshioki/browser-relay
-oshioki-agent device-record --state ~/.config/oshioki/browser-relay \
+$AGENT device-record --state ~/.config/oshioki/browser-relay \
   --label browser-relay
 ```
 
@@ -44,7 +45,7 @@ account, paths, and public key:
 ```json
 {
   "google_account": "you@example.com",
-  "approval_identity": "/Users/you/.config/oshioki/browser-relay/identity.json",
+  "approval_identity": "/Users/you/.config/oshioki/browser-relay/agent.json",
   "approval_public_key": "REPLACE_WITH_THE_IDENTITY_PUBLIC_KEY",
   "local_label": "this Mac"
 }
@@ -54,7 +55,7 @@ Run the local helper as the user who owns the gcloud profile:
 
 ```sh
 chmod 600 ~/.config/oshioki/browser-relay/local.json
-oshioki-browser-relay local-login \
+./target/release/oshioki-browser-relay local-login \
   --config ~/.config/oshioki/browser-relay/local.json
 ```
 
@@ -72,10 +73,65 @@ helper does not bind that port or inspect callback bytes.
 ## Optional remote requester
 
 When the requester and approving Mac differ, use the remote `login` and `serve`
-commands. This mode requires a private NATS account and lane reachable by both
-peers, two relay-only software signing keys, and noninteractive SSH from the
-Mac to the requester. The SSH destination is local Mac configuration and is
-never accepted from a received message.
+commands. Build once, then use explicit binary paths:
+
+```sh
+cargo build --locked --release -p oshioki-agent -p oshioki-browser-relay
+RELAY=./target/release/oshioki-browser-relay
+```
+
+The mode requires a private NATS account and lane reachable by both peers, two
+relay-only software signing keys, and noninteractive SSH from the Mac to the
+requester. Remote NATS uses `tls://` with server verification and credentials
+kept outside command history; only loopback `nats://127.0.0.1` is allowed for a
+disposable local broker. Do not expose NATS publicly. Pin the SSH host key in
+`known_hosts`, use `BatchMode=yes`, `StrictHostKeyChecking=yes`, and permit
+only the required `-W localhost:<callback-port>` forwarding. The SSH
+destination is local Mac configuration and is never accepted from a received
+message.
+
+Generate one relay-only key on each requester/approver host and exchange only
+the public keys over a trusted channel:
+
+```sh
+mkdir -p ~/.config/oshioki/browser-relay
+chmod 700 ~/.config/oshioki/browser-relay
+$RELAY keygen ~/.config/oshioki/browser-relay/signing.key
+```
+
+Use mode-600 JSON configurations. Requester example:
+
+```json
+{
+  "nats_url": "tls://relay-user:REDACTED@nats.example:4222",
+  "lane": "REPLACE_WITH_SHARED_LANE_UUID",
+  "private_key": "/path/to/requester/signing.key",
+  "peer_public_key": "APPROVER_RELAY_PUBLIC_KEY",
+  "google_account": "you@example.com",
+  "approval_public_key": "APPROVER_OSHIOKI_PUBLIC_KEY"
+}
+```
+
+Approver example:
+
+```json
+{
+  "nats_url": "tls://relay-user:REDACTED@nats.example:4222",
+  "lane": "REPLACE_WITH_SHARED_LANE_UUID",
+  "private_key": "/path/to/approver/signing.key",
+  "peer_public_key": "REQUESTER_RELAY_PUBLIC_KEY",
+  "google_account": "you@example.com",
+  "approval_identity": "/path/to/browser-relay/agent.json",
+  "ssh_destination": "requester-ssh-alias"
+}
+```
+
+Start the approver and request one ceremony:
+
+```sh
+$RELAY serve --config /path/to/approver.json
+$RELAY login --config /path/to/requester.json
+```
 
 Remote setup keeps the same account-bound Oshioki approval fields:
 
@@ -92,6 +148,24 @@ callback through short-lived SSH `-W` connections. Callback codes and tokens
 never enter NATS. Remote configurations with incomplete account-approval
 fields fail closed. Legacy configurations without account approval fields keep
 the original browser-only behavior for migration.
+
+## Reusable approval pattern
+
+The ceremony pattern is reusable even though this adapter is Google-specific:
+
+1. Bind a signed request to a trusted local target, explicit intent, lane,
+   fresh nonce, and short expiry.
+2. Show the local approver exactly what will be invoked and require one native
+   Touch ID decision before starting the helper.
+3. Verify the domain-separated approval signature and every binding field
+   before invoking the provider helper.
+4. Keep provider credentials, authorization codes, and tokens off the approval
+   transport and out of diagnostics.
+5. Cancel on denial, expiry, interruption, or peer loss; terminate and reap
+   every helper process and remove temporary listeners.
+
+The approval authorizes this helper invocation. It does not become a general
+credential broker or enforce every later provider token refresh.
 
 ## Trust and cleanup
 

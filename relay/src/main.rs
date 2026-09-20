@@ -622,6 +622,7 @@ async fn run_local_gcloud(account: &str, executable: &Path) -> Result<()> {
         account,
         executable,
         Instant::now() + Duration::from_secs(MAX_LIFETIME),
+        None,
     )
     .await
 }
@@ -631,10 +632,25 @@ async fn run_local_gcloud_with_timeout(
     executable: &Path,
     limit: Duration,
 ) -> Result<()> {
-    run_local_gcloud_until(account, executable, Instant::now() + limit).await
+    run_local_gcloud_until(account, executable, Instant::now() + limit, None).await
 }
 
-async fn run_local_gcloud_until(account: &str, executable: &Path, deadline: Instant) -> Result<()> {
+#[cfg(test)]
+async fn run_local_gcloud_with_timeout_and_browser(
+    account: &str,
+    executable: &Path,
+    limit: Duration,
+    browser: &Path,
+) -> Result<()> {
+    run_local_gcloud_until(account, executable, Instant::now() + limit, Some(browser)).await
+}
+
+async fn run_local_gcloud_until(
+    account: &str,
+    executable: &Path,
+    deadline: Instant,
+    browser: Option<&Path>,
+) -> Result<()> {
     ensure!(
         Instant::now() < deadline,
         "local ceremony expired before gcloud start"
@@ -646,6 +662,9 @@ async fn run_local_gcloud_until(account: &str, executable: &Path, deadline: Inst
         .env("CLOUDSDK_AUTH_DISABLE_CODE_VERIFIER", "false")
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    if let Some(browser) = browser {
+        command.env("BROWSER", browser);
+    }
     let mut child = ProcessGroup::spawn(command)?;
     let outcome = timeout_at(deadline, async {
         tokio::select! {
