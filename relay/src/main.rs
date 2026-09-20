@@ -84,6 +84,7 @@ struct Config {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct LocalConfig {
     google_account: String,
     approval_identity: PathBuf,
@@ -523,6 +524,7 @@ async fn local_login(config: LocalConfig) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unused_async)]
 async fn local_login(_config: LocalConfig) -> Result<()> {
     bail!("local browser ceremony requires macOS")
 }
@@ -604,6 +606,7 @@ async fn validate_headless_account_with(account: &str, executable: &Path) -> Res
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 async fn run_local_after_approval(
     account: &str,
     executable: &Path,
@@ -617,6 +620,7 @@ async fn run_local_after_approval(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 async fn run_local_gcloud(account: &str, executable: &Path) -> Result<()> {
     run_local_gcloud_until(
         account,
@@ -627,6 +631,7 @@ async fn run_local_gcloud(account: &str, executable: &Path) -> Result<()> {
     .await
 }
 
+#[cfg(any(target_os = "macos", test))]
 async fn run_local_gcloud_with_timeout(
     account: &str,
     executable: &Path,
@@ -645,6 +650,7 @@ async fn run_local_gcloud_with_timeout_and_browser(
     run_local_gcloud_until(account, executable, Instant::now() + limit, Some(browser)).await
 }
 
+#[cfg(any(target_os = "macos", test))]
 async fn run_local_gcloud_until(
     account: &str,
     executable: &Path,
@@ -704,6 +710,7 @@ async fn load_approval_signer(path: Option<&Path>) -> Result<Option<Arc<BrowserR
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unused_async)]
 async fn load_approval_signer(path: Option<&Path>) -> Result<Option<Arc<BrowserRelaySigner>>> {
     ensure!(path.is_none(), "browser relay approval requires macOS");
     Ok(None)
@@ -871,6 +878,7 @@ async fn browser_authorize(
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unused_async)]
 async fn browser_authorize(
     _signer: &Arc<BrowserRelaySigner>,
     _attempt: &Message,
