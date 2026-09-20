@@ -63,8 +63,9 @@ each host. Use absolute paths; `~` is not expanded in JSON. NAS example:
 }
 ```
 
-On the Mac use its local key path, pin the NAS public key, and add
-`"ssh_destination": "nas-tailnet"` plus
+On the Mac use its local key path, pin the NAS public key, and add the same
+`"google_account": "you@example.com"` plus
+`"ssh_destination": "nas-tailnet"` and
 `"approval_identity": "/Users/you/.config/oshioki/agent.json"`. The Mac
 identity must be a Secure Enclave identity; its public key is the value pinned
 as `approval_public_key` on the NAS. The destination and identity path come
