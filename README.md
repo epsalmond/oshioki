@@ -127,6 +127,11 @@ hostname-matched certificate. The plaintext opt-out is for local testing only.
 See [production requirements](docs/requirements.md),
 [configuration](docs/configuration.md), and the [runbook](RUNBOOK.md).
 
+For the separate opt-in Google `gcloud auth login` ceremony helper, see
+[browser ceremony relay](docs/browser-ceremony-relay.md). Its local Mac mode
+needs no server; an optional remote-requester mode uses a scoped NATS lane and
+relay-only signing keys. It does not participate in sudo approval.
+
 ## Command reference
 
 Run host commands as root because they read or update `/etc/oshioki`.

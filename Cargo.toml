@@ -9,6 +9,7 @@ members = [
     "agent",
     "enclave",
     "pam",
+    "relay",
 ]
 
 # All version numbers and shared features live here. Member crates reference
@@ -16,7 +17,7 @@ members = [
 # dependency in one edit.
 
 [workspace.package]
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 rust-version = "1.85.0"
 repository = "https://github.com/epsalmond/oshioki"

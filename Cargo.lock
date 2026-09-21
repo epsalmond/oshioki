@@ -1491,7 +1491,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "oshioki-agent"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1514,8 +1514,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "oshioki-browser-relay"
+version = "0.1.15"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "clap",
+ "futures",
+ "nix",
+ "oshioki-agent",
+ "oshioki-enclave",
+ "oshioki-protocol",
+ "p256",
+ "percent-encoding",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "oshioki-enclave"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "core-foundation",
@@ -1529,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "oshioki-hook"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "base64",
@@ -1556,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "oshioki-pam"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "serde",
@@ -1565,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "oshioki-plugin"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "nix",
@@ -1576,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "oshioki-protocol"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -1593,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "oshioki-server"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "axum",
@@ -1622,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "oshioki-transport"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-nats",

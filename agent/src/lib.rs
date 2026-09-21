@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -106,6 +106,44 @@ pub enum SignerKind {
     Software,
     /// A P-256 key in the Mac's Secure Enclave, behind Touch ID.
     Enclave,
+}
+
+/// Secure Enclave signing backend for browser-relay approvals. It loads only
+/// the signing blob from an identity file; the agent box secret and its
+/// Keychain entry are intentionally not touched.
+pub struct BrowserRelaySigner(Box<dyn Signer + Send + Sync>);
+
+impl BrowserRelaySigner {
+    pub fn load(path: &Path) -> Result<Self> {
+        let file: IdentityFileV1 = serde_json::from_slice(
+            &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .context("decode identity file")?;
+        ensure!(
+            file.version == VERSION_V1,
+            "unsupported identity file version"
+        );
+        ensure!(
+            matches!(file.signing, SigningFileV1::Enclave { .. }),
+            "browser relay approval requires a Secure Enclave identity"
+        );
+        Ok(Self(signer_from_file(&file.signing)?))
+    }
+
+    pub fn begin_prompt(&self) -> u64 {
+        self.0.begin_prompt()
+    }
+
+    pub fn cancel_prompt(&self, attempt: u64) {
+        self.0.cancel_prompt(attempt);
+    }
+
+    pub fn sign_browser_relay(&self, challenge: &[u8], reason: &str) -> Result<Vec<u8>> {
+        self.0.sign_der(
+            &oshioki_protocol::browser_relay_signature_payload(challenge),
+            reason,
+        )
+    }
 }
 
 impl fmt::Display for SignerKind {
@@ -434,6 +472,19 @@ impl Identity {
     /// Dismisses that attempt's prompt. See [`Signer::cancel_prompt`].
     pub fn cancel_prompt(&self, attempt: u64) {
         self.signer.cancel_prompt(attempt);
+    }
+
+    /// Signs a relay-specific, already domain-separated challenge. This is
+    /// distinct from command approval and contextual sudo authentication.
+    /// Only the Secure Enclave identity may answer it.
+    pub fn sign_browser_relay(&self, challenge: &[u8], reason: &str) -> Result<Vec<u8>> {
+        if self.device_kind() != DeviceKindV1::SecureEnclave {
+            bail!("a software identity cannot approve a browser relay ceremony");
+        }
+        self.signer.sign_der(
+            &oshioki_protocol::browser_relay_signature_payload(challenge),
+            reason,
+        )
     }
 
     pub fn public_key_sec1(&self) -> Vec<u8> {
@@ -886,6 +937,29 @@ mod tests {
 
     fn identity() -> Identity {
         Identity::from_material([0x11; 32], [0x22; 32], [0x33; 32]).unwrap()
+    }
+
+    #[test]
+    fn browser_relay_loader_rejects_software_before_box_store_access() {
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/oshioki-browser-relay-loader-{}",
+            std::process::id()
+        ));
+        let file = IdentityFileV1 {
+            version: VERSION_V1,
+            signing: SigningFileV1::Software {
+                key: encode_base64url(&[0x11; 32]),
+            },
+            box_secret: None,
+            box_secret_ref: Some("keychain-entry-that-must-not-be-read".into()),
+            api_token_hash: encode_base64url(&[0x33; 32]),
+        };
+        fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let Err(error) = BrowserRelaySigner::load(&path) else {
+            panic!("software identity was accepted")
+        };
+        assert!(error.to_string().contains("Secure Enclave"));
+        let _ = fs::remove_file(path);
     }
 
     fn request() -> RequestV1 {
