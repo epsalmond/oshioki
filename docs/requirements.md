@@ -1,57 +1,65 @@
-# Production requirements
+# Run an approval server
 
-What production needs that this repository does not provide: runtime,
-packaging, and rollout. For how the pieces fit together, see
-[architecture.md](architecture.md).
+Local Mac sudo and local Google login need no server.
+For a phone on your tailnet, [phone setup](phone-enrollment.md) provisions the
+server and broker. This page is for operating a shared deployment.
 
 ## Runtime
 
-Production must provide:
+Provide:
 
-- NATS 2.10 or newer. The durable `oshioki-server-v1` consumer filters on
-  two subject trees at once, which older servers do not support.
-- An `OSHIOKI` JetStream stream carrying both `oshioki.request.>` and
-  `oshioki.auth.>`. The server widens an existing stream created for
-  `oshioki.request.>` alone and recreates the durable consumer when it
-  starts. A missing stream is still a misconfiguration. Recovery if that
-  repair fails is in `RUNBOOK.md`; the contract is in
-  [compatibility.md](compatibility.md).
-- The durable `oshioki-server-v1` consumer permissions.
-- Publish and subscribe permissions for `oshioki.verdict.*` and
-  `oshioki.enrollment.*`.
-- Publish and subscribe permissions for `oshioki.ack.*`. Native agents and
-  the authenticated browser acknowledgement endpoint publish liveness
-  messages before a human decision.
-- Publish and subscribe permissions for `oshioki.delivery.*`. The server
-  publishes a durable delivery receipt for a request routed to a pinned
-  WebAuthn recipient, and the hook subscribes to report that the request
-  reached the browser while it waits for a decision.
-- Publish and subscribe permissions for `oshioki.device.>` (revocations and
-  their confirmations). These apply to the `nats` transport; other transports
-  document their own.
-- A writable SQLite path set by `OSHIOKI_STATE_PATH`.
-- `OSHIOKI_ORIGIN=https://sudo.example.com` and
+- NATS 2.10 or newer with JetStream, reachable by hooks, server, and native agents.
+- An existing `OSHIOKI` stream covering `oshioki.request.>` and `oshioki.auth.>`.
+  The server repairs an older stream's subjects, but does not create a missing one.
+- One active Oshioki server per SQLite database, with a persistent writable
+  `OSHIOKI_STATE_PATH` and persistent VAPID key for Web Push.
+- A trusted HTTPS origin reachable from enrolled browsers and hooks.
+  Set `OSHIOKI_ORIGIN=https://sudo.example.com` and
   `OSHIOKI_RP_ID=sudo.example.com`.
-- A selected server package or image, plus ntfy, DNS, TLS, alerts,
-  and rollback.
+- Service supervision, backups, health monitoring, and a previous release for restore.
 
-The runtime must not log or notify with request plaintext. An ntfy message may
-contain host, user, request ID, and `/r/<id>` URL only.
+The Debian package includes `oshioki-server.service`, running as user
+`oshioki` with `/etc/oshioki/server.env`. Start it after provisioning its
+environment and broker. A fresh package install enables the unit but does not
+start it. An example environment ships under
+`/usr/share/doc/oshioki/examples/server.env.example`.
 
-A device is kind `webauthn` (a browser), `software` (a native software key),
-or `secure-enclave` (the native agent's hardware-backed key). Software native
-devices never qualify for passwordless sudo. The native agent is a NATS
-consumer only; it never calls the server over HTTP. The NATS permissions above must
-cover it the same as any other consumer.
+Homebrew includes the server binary. Manage it through phone setup or your
+own service supervisor. The repository also has a Compose development stack;
+its credentials and plaintext networking are for tests.
 
-## The Mac installer (future — nothing ships yet)
+## Network and roles
 
-A future Mac installer will install the packaged Darwin client. It will own
-the read-only watcher credential, LaunchAgent, the `sudoers.d` passwordless
-drop-in (coupled to the plugin block, never `pam_tid`: one Touch ID approval
-per sudo, no password), laptop activation, and rollback.
+Use TLS for NATS outside loopback, with a certificate trusted by the client
+and matching its hostname. Give the hook, agent, and server separate users.
+The plaintext override is for development only.
 
-Neither the runtime nor the Mac installer changes the v1 request or decision
-wire format. `AliveV1` is a versioned liveness message on its own subject and
-socket response frame. A protocol change requires a compatibility decision in
-[compatibility.md](compatibility.md).
+Configure permissions for the traffic each role handles:
+
+| Subjects/resources | Use |
+| --- | --- |
+| `oshioki.request.>`, `oshioki.auth.>` | Encrypted requests from hooks; native agent subscriptions and server consumption |
+| `oshioki.verdict.*` | Decisions sent back to hooks |
+| `oshioki.ack.*` | Device liveness acknowledgements |
+| `oshioki.delivery.*` | Server delivery receipts for browser recipients |
+| `oshioki.enrollment.*` | Pairing submissions and activation |
+| `oshioki.device.>` | Device revocation and confirmation |
+| JetStream stream and durable `oshioki-server-v1` | Server consumption and startup repair |
+
+This is a traffic inventory, not a ready-to-paste NATS permission file.
+Include the JetStream API and reply permissions required by the server's role.
+Native agents receive requests over NATS; they do not need browser HTTP APIs.
+
+Web Push is built in; ntfy is optional. Neither notifications nor infrastructure
+logs may contain decrypted command/environment data. Web Push carries only
+request identifiers; ntfy may also carry host, user, and the request URL.
+
+## Verify and maintain
+
+Check `/healthz`, enroll a device, then complete an approval from each host.
+For phones, verify actual notification receipt and approval; health metadata
+does not prove delivery.
+
+Use [configuration](configuration.md) for runtime variables,
+[update and restore](update.md) for rollout, and
+[the runbook](../RUNBOOK.md#authentication-subject-upgrade) for stale NATS filters.

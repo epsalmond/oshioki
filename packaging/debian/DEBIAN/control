@@ -10,3 +10,5 @@ Description: Touch ID or WebAuthn approval for sudo requests
  The hook encrypts the request for each enrolled device; the server
  stores routing data and ciphertext. Devices approve from a browser
  via WebAuthn or from the native agent via Secure Enclave.
+ Also includes oshioki-browser-relay for requesting gcloud login approval
+ from a Mac. Google Cloud CLI is installed separately.

@@ -1,219 +1,144 @@
-# Oshioki architecture
+# Architecture
 
-The server stores routing data and opaque ciphertext. It cannot produce an
-approval accepted by the hook.
+Oshioki's server routes encrypted requests and stores ciphertext. The host
+verifies the device's signature before accepting approval; the server cannot
+manufacture that signature.
 
-For what production must provide, see [requirements.md](requirements.md).
-For configuration reference, see [configuration.md](configuration.md).
+For operating instructions, start with [the README](../README.md).
+[Configuration](configuration.md) and [server requirements](requirements.md)
+describe deployment settings.
 
-## Request path
+## Three distinct operations
 
-The hook serializes `RequestV1` once. It computes the WebAuthn challenge from
-those bytes and seals the same bytes for each active device. The server writes
-the exact envelope and one sealed body per device before acknowledging the
-JetStream message.
+| Operation | What approval authorizes | Components |
+| --- | --- | --- |
+| Command approval | Exact sudo command and effective environment | Sudo approval plugin, hook, native agent or browser |
+| Contextual authentication | Sudo authentication with advisory invocation context | PAM module, hook, hardware-backed native agent or browser |
+| Google browser ceremony | Establishing or renewing the configured Google account through the helper | Browser relay, Mac Secure Enclave; optional NATS and SSH |
 
-Identical redelivery is idempotent. Reuse of a request ID with different bytes
-is terminated and recorded. Malformed and expired messages are terminated.
+These use distinct signed purposes. A ceremony approval is not a sudo approval,
+and neither substitutes for Google's own authentication.
 
-The browser token identifies one device. The request API returns only that
-device's sealed body. Plaintext commands never enter SQLite, logs,
-notifications, or metrics.
+## Command approval
 
-The request also carries the complete effective execution environment in its
-original order, including duplicate names. Approvals sign those bytes
-alongside the command, so a different environment is a different approval;
-the environment travels only inside the sealed bodies. The finite list of
-well-known behavior-changing names is display emphasis only and never filters
-authentication coverage. Values that cannot be represented by the private
-line-framed plugin payload (invalid UTF-8, line delimiters, or an environment
-entry without `=`) cause the request to be denied. A NUL is the C-string
-terminator in sudo's `run_envp` ABI and therefore cannot be an environment
-byte; bytes after it are not part of the effective entry.
+The hook serializes `RequestV1` once, derives its challenge from those bytes,
+and seals the same bytes to each active pinned device. It includes the complete
+effective environment in original order, including duplicate names.
+Unrepresentable private-protocol input is rejected.
 
-The plugin adds an environment-complete marker and count to its private
-payload. The hook requires and checks both, preventing a new hook from
-silently accepting the partial environment emitted by an older plugin. This
-does not change the v1 JSON schema: `RequestV1.env` already defaults to empty
-and is omitted when empty, so old requests and signatures remain readable.
+The plugin's private payload carries an environment-complete marker and count.
+The hook checks both, so an older plugin cannot silently omit environment data.
+Display emphasis and truncated prompt summaries do not limit signature coverage.
 
-The hook and the server route through `oshioki-transport`. The hook holds a
-`HookTransport`; the server holds a `ServerTransport`. `OSHIOKI_TRANSPORT=nats`
-is the default and the only configured transport backend. Native agents also
-serve local hook requests over a Unix socket beside this transport seam.
+Locally the hook can send the envelope over the agent's Unix socket. Remotely
+it publishes through NATS/JetStream. The server commits the envelope and each
+recipient's sealed body to SQLite before acknowledging delivery. Repeated
+identical request IDs are idempotent; different bytes under the same ID are
+rejected.
 
-When `OSHIOKI_AGENT_SOCKET` is configured, the hook tries that socket before
-NATS. If it is unavailable, or closes or stays silent before its `AliveV1`
-acknowledgement, the hook can fall back to NATS when `NATS_URL` is set. A
-malformed protocol reply, a socket decision, or any failure after a valid
-acknowledgement is final and never falls back. Without `NATS_URL` in the hook
-configuration, that hook uses the socket only. An agent with no `NATS_URL` in
-its own runtime environment answers socket requests only. Browser approval
-uses the server and NATS path. The wire format uses the existing NATS subjects
-and v1 JSON payloads.
+A browser bearer token selects one recipient's encrypted body. Decryption
+happens on the device. Plaintext commands and environments do not enter server
+storage, notifications, or logs.
 
-## Device kinds
+## Decisions and liveness
 
-A device record carries a `kind`: `webauthn`, `software`, or
-`secure-enclave`. `software` identifies a native signer whose P-256 key is
-readable by the account running it; it is never eligible for passwordless
-sudo. `secure-enclave` is reserved for the macOS Secure Enclave backend.
+The hook verifies WebAuthn request ID, fingerprint, credential ID, origin,
+RP ID, challenge, flags, public key, and signature against retained request
+bytes. Native approvals sign the corresponding challenge with P-256.
 
-A `secure-enclave` record holds a 65-byte SEC1 uncompressed P-256 point as
-`credential_public_key`. `credential_id` is the SHA-256 hash of that point
-(32 bytes). `sign_count` is always 0. `api_token_hash` is still 32 random
-bytes, but the server does not use them for a native device; they exist only
-to keep the server's UNIQUE column honest. The fingerprint formula is
-unchanged for both native kinds.
+The first valid decision wins; a signed denial ends command approval.
+An invalid approval fails closed. The hook's command-approval deadline is
+90 seconds. Server decisions and outbox records commit together; the outbox
+retries publication after restart.
 
-## Decisions
+Liveness is separate from approval:
 
-Approve and deny are terminal decisions. SQLite commits the first accepted
-action and an outbox record in one transaction. Later actions receive `410`.
-The outbox retries after restart until NATS publication and flush succeed.
+| Message | What it proves |
+| --- | --- |
+| `AliveV1` | The native agent received a request, or the browser authenticated, decrypted, and checked it. |
+| `DeliveryV1` | The server durably routed a request to an active browser recipient. It does not prove the browser opened it. |
+| Signed decision | An enrolled device made the bound decision. |
 
-The hook accepts a WebAuthn approval only when its request ID, fingerprint,
-credential ID, origin, RP ID, challenge, flags, COSE key, P-256 point, and
-signature match. It validates the retained raw request bytes.
+Native attempts require an acknowledgement within three seconds. A browser
+delivery receipt permits waiting for the browser within the overall deadline.
+See [transport rules](transports.md) for fallback behavior.
 
-An `approve_native` decision carries a DER ECDSA P-256 signature, with SHA-256
-as the message hash, over the same 32-byte challenge WebAuthn signs. It
-carries no authenticator data, client data, origin, or RP ID: the native
-agent signs the challenge directly.
+On Linux, the command plugin also races an interactive password attempt through
+the system sudo PAM service. An explicit denial or invalid approval defeats that
+fallback. `sudo -n` never opens this plugin password prompt. Darwin has no
+plugin password branch.
 
-The hook applies the same signature rules to all device kinds. The first decision it receives
-wins. An explicit deny ends the request immediately. An invalid approval
-fails closed. The hook gives up after 90 seconds. A decision must name a
-device whose kind and fingerprint both match a pinned record.
+## Contextual PAM
 
-Each approval path reports liveness before it waits for a human decision. A
-native socket agent sends an `AliveV1` frame first. A native NATS agent sends
-the same message on `oshioki.ack.<request-id>`. For a request that includes an
-active pinned WebAuthn recipient, the server records a `DeliveryV1` outbox row
-in the request ingestion transaction after joining the sealed body to the
-active device record, then publishes it on `oshioki.delivery.<request-id>`.
-That receipt proves durable relay routing and lets the hook wait for the
-browser beyond the native three-second liveness bound. The browser posts
-`AliveV1` only after it authenticates, decrypts, and checks the sealed request;
-the server relays that browser message only after the authenticated post, so
-request ingestion cannot impersonate a live browser. The acknowledgement and
-delivery receipt carry no authorization.
+The opt-in PAM installation removes the Oshioki approval plugin and its
+passwordless sudoers rule. A service-specific PAM entry invokes the hook's
+`authenticate` command; sudo retains its own policy, timestamps, and password
+path.
 
-The delivery control message has no rolling negotiation. Browser-capable
-deployments must update the server, its browser bundle, and the hook together;
-native socket deployments must update the hook and agent together. An older
-server or peer leaves the corresponding receipt unavailable and the hook
-reports the required upgrade while failing closed. The supported mixed-version
-matrix and the restore path for a failed upgrade are in
-[compatibility.md](compatibility.md).
+Authentication requests use `oshioki.auth.<host>` and browser route `/a/<id>`,
+separate from command requests and `/r/<id>`. Their trusted principal/service
+context is distinct from the advisory invocation. Software native identities
+cannot authenticate sudo.
 
-This describes the approval-plugin lane, which is what `--prelaunch` installs
-and what every deployment used before the contextual PAM lane
-(`install-oshioki-hook --contextual-pam`, opt-in) existed. On the PAM lane
-sudo has no Oshioki plugin and no `NOPASSWD` rule at all: one `auth` entry in
-the sudo PAM stack asks the device, and sudo's own password prompt is the
-fallback. See RUNBOOK.md and pam/README.md.
+There is no signed Deny action on this operation. Unavailability and cancellation
+allow password fallback; malformed assertions remain failures. The installed
+Linux and macOS PAM controls differ for hard failures.
+The [PAM contract](../pam/README.md) defines exact results, cancellation,
+and process cleanup.
 
-The sudo plugin starts the hook and, for an interactive Linux invocation, a
-separate PAM password attempt at the same time. On this lane the installer
-normally adds a `NOPASSWD` sudoers entry, so this is the plugin's fallback
-path rather than a second sudo policy prompt. PAM authenticates the invoking user through the
-system `sudo` service and runs account management before it can approve.
-`sudo -n` skips the password child and never reads `/dev/tty`. An explicit
-denial or invalid hook result wins over a password. A transport failure or an
-unanswered request leaves password authentication available. Both children
-are canceled and reaped when one wins, and the plugin restores terminal echo
-and pending input. The race is bounded by the same 90-second deadline.
+## Enrollment and identity
 
-## Enrollment
+The host owns an enrollment secret; the server stores its hash. Enrollment
+binds registration and proof of key possession with an HMAC transcript.
+For a browser, the hook verifies origin, RP ID, user presence and verification,
+and the ES256 key before atomically pinning the record.
 
-The hook owns the enrollment secret. The server stores its SHA-256 hash and
-relays the HMAC-bound browser transcript. The hook verifies registration,
-the immediate proof assertion, origin, RP ID, UP, UV, and the ES256 key before
-atomically replacing its local registry.
+Native pairing publishes its signed proof through NATS. Native agents do not
+use the HTTP submission endpoint. After pinning, the host confirms server
+activation by reading the matching public device record over HTTPS, for up to
+15 seconds. A timeout leaves the local pin intact but server activation uncertain.
 
-Attestation and COSE CBOR are decoded with `ciborium` in bounded strict mode:
-attestation objects are capped at 128 KiB, COSE keys at 4 KiB, nesting at 16
-levels, and total CBOR items at 256. Each input must contain exactly one value;
-duplicate map keys are rejected before the existing ES256 key, coordinate, and
-`none` attestation-format checks run.
+| Device kind | Signing key | Use |
+| --- | --- | --- |
+| `webauthn` | Browser authenticator | Browser approval and authentication |
+| `secure-enclave` | Mac Secure Enclave P-256 | Touch ID approval and authentication |
+| `software` | P-256 secret in the agent file | Native command approval with normal sudo password retained |
 
-A native enrollment submission carries `credential_public_key`,
-`box_public_key`, `api_token_hash`, `label`, `proof_signature`, and
-`transcript_hmac`. The proof is a DER ECDSA P-256 signature over an HMAC of
-the domain `oshioki/enroll/native-proof/v1\0` and, in order, the credential ID
-(derived from the public key), the public key, the box key, the API token
-hash, and the label. The transcript HMAC covers the enrollment ID, the
-outer kind tag (`secure-enclave` or `software`), and every submission field
-including the proof signature, in that same order. The native agent publishes
-its submission straight to `oshioki.enrollment.submission.<id>` and waits on
-`oshioki.enrollment.activation.<id>`. Neither native variant calls the
-server's HTTP submission route, which accepts the `webauthn` kind only.
+The X25519 decryption key is software material even on a Mac. macOS stores it in
+the login keychain; other platforms keep it in private identity state. One
+identity can pair with multiple hosts. See [native identities](native-agent.md).
 
-The X25519 box key is always a software key, even on a secure-enclave device:
-the enclave only holds P-256. On macOS it will live in the Keychain (issue
-#9). Today the software agent keeps it in the same 0600 identity file as the
-signing key.
+## Persistence and notifications
 
-Activation is idempotent. A resumed hook updates the reply subject and causes
-an already stored submission to be relayed again. The server exposes a device
-only after activation and acknowledges nothing on NATS. `enroll` confirms the
-activation by reading the device back from `GET /api/v1/devices/<fingerprint>`
-over HTTPS, polling for up to fifteen seconds until the served record matches
-the one it just enrolled, so a server that cannot store the record fails the
-enrollment instead of dropping it. The read-back, not a message, is the
-confirmation: every consumer can publish on the device subjects, so a NATS
-acknowledgement could come from the device being enrolled rather than from the
-server.
+SQLite uses WAL, foreign keys, a busy timeout, and versioned migrations. One
+active server owns each database. Unsupported schema versions prevent startup;
+breaking migrations first write a verified restore snapshot.
+[Compatibility](compatibility.md) specifies migration and rollback rules.
 
-A confirmation that times out is not a rejection. The device is pinned on the
-host and can approve sudo there; what is unknown is the server's copy. `enroll`
-says so and names the recovery, which is a fresh `sudo oshioki enroll` for that
-device once the server is healthy.
+Web Push stores device-owned subscriptions and uses leased outbox work with
+bounded delivery attempts. Revocation disables subscriptions and abandons
+pending work. Preserve the private VAPID key across restarts and updates.
 
-## Persistence
+Push payloads contain only version, operation type, and request ID. The service
+worker opens a same-origin request route; approval still requires local
+decryption and WebAuthn. Delivery validates public destination addresses,
+disables redirects, and bounds timeouts. Duplicate notifications can coalesce.
 
-SQLite uses WAL, foreign keys, a five-second busy timeout, and embedded schema
-versions. Version 0 installs the V1 tables, version 1 adds the authentication
-and push tables, version 2 opens those, and version 3 adds the nullable outbox
-`expires_at` column a delivery receipt is worth delivering until. Newer
-versions refuse startup. A version-bumping open writes a verified restore
-snapshot (`<stem>.pre-v<from>.sqlite3`) before it migrates; see
-[compatibility.md](compatibility.md). Additive schema changes must not bump
-`user_version`. The push worker stores one device-owned subscription per
-browser endpoint and claims recipient rows with short leases before bounded
-Web Push attempts. Revocation and subscription deletion disable subscriptions
-and abandon pending rows transactionally.
-Cleanup expires pending enrollment state, removes old resolved work, and
-eventually removes abandoned push rows and disabled subscriptions. The VAPID
-P-256 key persists beside the state database (or at `OSHIOKI_VAPID_KEY_PATH`)
-with owner-only permissions. The expected runtime is one active server with
-one persistent database file.
+Browser responses use no-store caching, no-referrer, MIME sniffing protection,
+and a CSP restricting scripts, styles, and API calls to local resources.
+`/healthz` checks schema, request consumption, outbox progress, and push readiness.
 
-Push payloads contain only a version, lane (`request` or `auth`), and request
-identifier. The service worker maps those fields to exact same-origin routes;
-it never receives a command, environment, enrollment secret, or bearer token.
-The server validates subscription destinations, resolves public DNS immediately
-before delivery, pins the checked address through the HTTPS client, disables
-redirects, and bounds connection and response time. Provider acceptance is
-at-least-once; the browser notification tag coalesces duplicate taps.
+## Browser ceremony relay
 
-`GET /healthz` checks the schema, durable request consumer progress, and
-outbox progress. Every browser response uses `Cache-Control: no-store`,
-`Referrer-Policy: no-referrer`, MIME sniffing protection, and a CSP that allows
-only local scripts, styles, and API calls. Optional distribution artifacts use
-immutable cache headers.
+Local mode asks the Secure Enclave to approve the configured Google account,
+then invokes gcloud and lets it own the browser and callback.
 
-## Local verification
+Remote mode signs peer messages with separate relay keys. Account approval
+binds the lane, attempt, expiry, receiver nonce, and account. The requester
+verifies the Mac's approval before starting gcloud. When a browser is needed,
+the Mac validates the Google authorization URL and forwards the callback over
+short-lived SSH connections. Codes and tokens never enter NATS.
 
-Compose runs NATS, the server, and an ephemeral E2E runner. Playwright uses a
-virtual internal CTAP2 authenticator for registration and assertions. The same
-runner installs the Linux plugin and invokes real sudo without touching the
-host's sudo configuration.
-
-The browser bundle vendors libsodium.js 0.7.15. Its WebAssembly payload is
-embedded in the reviewed browser file. `server/web/vendor/SHA256SUMS` records
-the source files included in the browser application.
-
-Package publication remains deferred. There is no server container yet.
-When there is one, it will not include Darwin packages.
+The [ceremony guide](browser-ceremony-relay.md) documents configuration and the
+current Google-only scope. [Contributing](../CONTRIBUTING.md) describes automated
+and supervised verification.

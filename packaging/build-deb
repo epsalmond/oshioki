@@ -4,9 +4,10 @@
 #   packaging/build-deb STAGE_DIR VERSION OUTPUT_DEB
 #
 # STAGE_DIR holds the release artifacts built for the target architecture:
-# oshioki, liboshioki_plugin.so, liboshioki_pam.so, oshioki-server, and a
+# oshioki, liboshioki_plugin.so, liboshioki_pam.so, oshioki-server,
+# oshioki-browser-relay, and a
 # SHA256SUMS whose entries are named exactly oshioki, liboshioki_plugin.so
-# and liboshioki_pam.so (what scripts/install-oshioki-hook verifies).
+# liboshioki_pam.so, and oshioki-browser-relay.
 # VERSION is the Debian version,
 # e.g. 0.1.0 for tag v0.1.0. DEB_ARCH overrides the target architecture
 # (default amd64) for local validation; the staged binaries must match it.
@@ -22,10 +23,10 @@ case "$OUTPUT_DEB" in /*) ;; *) OUTPUT_DEB="$(pwd -P)/$OUTPUT_DEB" ;; esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 ARCH="${DEB_ARCH:-amd64}"
 
-for artifact in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-server SHA256SUMS; do
+for artifact in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-server oshioki-browser-relay SHA256SUMS; do
   [ -f "$STAGE_DIR/$artifact" ] || { echo "build-deb: missing $STAGE_DIR/$artifact" >&2; exit 1; }
 done
-for name in oshioki liboshioki_plugin.so liboshioki_pam.so; do
+for name in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-browser-relay; do
   awk -v name="$name" '$2 == name {found=1} END {exit !found}' "$STAGE_DIR/SHA256SUMS" \
     || { echo "build-deb: SHA256SUMS has no entry for $name" >&2; exit 1; }
 done
@@ -38,7 +39,7 @@ case "$ARCH" in
   *) echo "build-deb: unsupported DEB_ARCH $ARCH" >&2; exit 1 ;;
 esac
 command -v file >/dev/null || { echo "build-deb: need the file command" >&2; exit 1; }
-for artifact in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-server; do
+for artifact in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-server oshioki-browser-relay; do
   file -b "$STAGE_DIR/$artifact" | grep -Eq "$arch_probe" \
     || { echo "build-deb: $artifact does not match DEB_ARCH=$ARCH" >&2; exit 1; }
 done
@@ -50,7 +51,8 @@ TREE="$WORK/oshioki_$VERSION"
 cp -r "$ROOT/packaging/debian" "$TREE"
 sed -i "s/@VERSION@/$VERSION/g; s/^Architecture: .*/Architecture: $ARCH/" "$TREE/DEBIAN/control"
 
-install -d "$TREE/usr/share/oshioki" "$TREE/usr/sbin"
+install -d "$TREE/usr/share/oshioki" "$TREE/usr/sbin" "$TREE/usr/bin"
+install -m 0755 "$STAGE_DIR/oshioki-browser-relay" "$TREE/usr/bin/oshioki-browser-relay"
 install -m 0755 "$STAGE_DIR/oshioki" "$TREE/usr/share/oshioki/"
 install -m 0644 "$STAGE_DIR/liboshioki_plugin.so" "$STAGE_DIR/liboshioki_pam.so" \
   "$STAGE_DIR/SHA256SUMS" "$TREE/usr/share/oshioki/"
@@ -80,7 +82,8 @@ printf 'Source: oshioki\nMaintainer: Oshioki contributors\n\nPackage: oshioki\nA
 shlib_log="$WORK/shlib-errors.log"
 shlib_depends="$(
   cd "$WORK/scan" && dpkg-shlibdeps -O "$TREE/usr/sbin/oshioki-server" "$TREE/usr/share/oshioki/oshioki" \
-    "$TREE/usr/share/oshioki/liboshioki_pam.so" 2>"$shlib_log" | sed 's/^shlibs:Depends=//'
+    "$TREE/usr/share/oshioki/liboshioki_pam.so" "$TREE/usr/bin/oshioki-browser-relay" \
+    2>"$shlib_log" | sed 's/^shlibs:Depends=//'
 )" || { cat "$shlib_log" >&2; echo "build-deb: dpkg-shlibdeps failed" >&2; exit 1; }
 [ -n "$shlib_depends" ] || { cat "$shlib_log" >&2; echo "build-deb: dpkg-shlibdeps produced no Depends" >&2; exit 1; }
 # The PAM module links libpam; if the scan above did not name it (a dpkg-dev

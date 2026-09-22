@@ -4,6 +4,7 @@ An upgrade succeeds only when an already-enrolled user can still
 authenticate, and a failed upgrade has a tested restore path that gives that
 ability back to the previous release. Starting the new binary is not success.
 
+For operator steps, see [update and restore](update.md).
 This page is the release contract. Protocol, persistence, and CI changes
 must keep it true. The v1 cryptographic domain strings (`oshioki/...`) and
 existing test vectors do not change.
@@ -119,11 +120,11 @@ On server start, after opening the existing `OSHIOKI` stream:
 A missing stream is still a misconfigured deployment; the server does not
 create one.
 
-## Release gates
+## Release checks
 
 CI must fail the release if a compatibility case would silently discard
 auth state, require re-enrollment, or turn a recoverable upgrade into a
-permanent outage. The gates are:
+permanent outage. The required checks are:
 
 1. Previous-release goldens load on the candidate.
 2. Old-reader/new-writer and new-reader/old-writer pass wherever this
@@ -137,5 +138,5 @@ permanent outage. The gates are:
    they do not hang or silently allow.
 
 Darwin Keychain / Secure Enclave is not in GitHub Actions; software-identity
-Linux is the automated gate. Restore a Keychain-migrated identity with
+Linux provides the automated coverage. Restore a Keychain-migrated identity with
 `agent.json.prev` the same way.

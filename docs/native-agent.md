@@ -1,102 +1,76 @@
-# Native agent
+# Native identities and pairing
 
-A native device signs approvals directly with a P-256 key instead of using a
-browser and WebAuthn. Enroll one from the host:
+For a complete setup, start with [local sudo](local-sudo.md) or
+[remote sudo](remote-sudo.md). This page covers identity management.
 
-```bash
-sudo oshioki enroll
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `oshioki-agent init` | Create an identity if none exists. |
+| `oshioki-agent pair '<enrollment-url>' --label <label>` | Pair with a host waiting in `sudo oshioki enroll`. |
+| `oshioki-agent run` | Listen on the local socket and, when configured, NATS. |
+| `oshioki-agent show` | Show the fingerprint and signing backend. |
+| `oshioki-agent device-record --label <label>` | Export the public device record for offline pinning. |
+
+The default state directory is `~/.config/oshioki`; override it with
+`--state` or `OSHIOKI_AGENT_STATE`. Its `agent.json` is private (0600).
+
+## Identity lifetime
+
+One identity can pair with many hosts. Ordinary `init` and `pair` preserve it.
+`--force` replaces it, changes its fingerprint, and requires every paired host
+to enroll or pin the new record and revoke the old one.
+
+macOS defaults to a Secure Enclave signing key; other platforms use a software
+P-256 key. `--signer software` explicitly selects the software backend on a
+Mac. Software identities cannot replace sudo password authentication or approve
+browser relay ceremonies.
+
+On macOS the X25519 decryption secret lives in the login keychain; elsewhere
+it is in the identity file. Legacy Mac files migrate without changing their
+fingerprint and retain `agent.json.prev` for [restore](update.md#restore).
+
+## Pair without a server
+
+On the approval device:
+
+```sh
+oshioki-agent init
+oshioki-agent device-record --label my-device > /tmp/oshioki-device.json
 ```
 
-`enroll` prints an enrollment URL and, below it, the `oshioki-agent` command
-that consumes it. On the device:
+Copy that public record to the host, then confirm its fingerprint there:
 
-```bash
-oshioki-agent pair '<enrollment-url>' --label <label>
+```sh
+sudo oshioki pin-record /tmp/oshioki-device.json
+sudo oshioki status
+```
+
+The record contains public material only. Offline pinning removes the server
+dependency from pairing; it does not create a network transport between two
+machines. Same-host approval can use the Unix socket. Remote approval still
+needs NATS. Later server pairing preserves this fingerprint.
+
+## Run the agent
+
+Mac hardware approvals need a graphical login session but no terminal.
+Use [Mac autostart](mac-approvals.md#start-at-login) for persistent operation.
+
+A software agent needs a terminal for every decision. Linux setup writes
+`~/.config/oshioki/agent.env` and prints:
+
+```sh
+set -a
+. ~/.config/oshioki/agent.env
+set +a
 oshioki-agent run
 ```
 
-`pair` creates a 0600 identity file (`agent.json`, under
-`$OSHIOKI_AGENT_STATE` or `~/.config/oshioki` by default) on first use, then
-submits the enrollment and waits for the host to activate it. On a Mac the
-signing key is created in the Secure Enclave; everywhere else it is a P-256
-key in that file. `pair --signer software` forces the software key on a Mac
-too, which is what the tests use. Software enrollments are recorded as
-`software`, never as `secure-enclave`; a host therefore keeps normal sudo
-password authentication for them. On a Mac the file holds only a keychain
-reference for the X25519 box secret, which lives in the login keychain;
-anywhere else the file carries the secret itself. Pre-move files migrate on
-first load, keeping the fingerprint, and leave `agent.json.prev` beside the
-rewritten file so an older agent can be restored; see
-[compatibility.md](compatibility.md).
+Keep that terminal open. No Linux user service is installed because it would
+have no terminal to answer. Release builds have no automatic approval option;
+`run --auto` exists only with the test-only `unattended` build feature.
 
-One identity serves every host this device pairs with, so pairing again
-reuses it. A `--signer` that disagrees with the identity already there is an
-error. `pair --force` replaces the
-identity: the device gets a new fingerprint, every host it had paired with
-needs a new enrollment, and their old records should be revoked. `show` prints the fingerprint and which of
-the two backends this device has.
-
-A host the server never sees pairs offline: `device-record --label <label>`
-prints this device's public record (no NATS, no server), and `sudo oshioki
-pin-record <path>` pins it on the host with the same typed-fingerprint
-confirmation as server pairing. The pinned device approves local sudo over
-the socket exactly like an enrolled one, and the agent still answers NATS
-requests whenever the network is up — one agent does both. Pairing with the
-server later keeps the fingerprint, so nothing pinned needs redoing.
-
-The software signer is suitable for Linux and test use, but its key is
-readable by the account running the agent. The installer never writes the
-passwordless sudoers rule for a software-only device; keep the normal sudo
-password prompt as the independent authorization action.
-
-`run` watches for sudo requests and prompts. A release build has no way
-to skip the prompt: `run --auto approve` and `run --auto deny`, which decide
-every request without asking, exist only when the agent is built with
-`--features unattended`, as the Compose E2E does.
-The terminal prompt and the browser page render the same request: the host, the
-invoking user with their uid, the target account the command would run as
-(`root (uid 0)` for sudo's default, otherwise the bare uid), the command, its
-arguments, the working directory, the caller process chain, and every signed
-environment entry. Environment values are escaped for the terminal/browser;
-none are summarized or cut. An argument
-that is empty or holds anything but plainly printable characters is shown in
-shell single quotes, so one argument holding a space never reads as two.
-A running agent sends an `AliveV1` acknowledgement as soon as it receives a
-request, before it opens the terminal prompt. The hook reports the waiting
-state only after that acknowledgement. A missing acknowledgement fails a
-native-only transport attempt within three seconds. When the hook has a
-pinned WebAuthn recipient as well, it may first report the server's durable
-`DeliveryV1` receipt and wait for that browser to open and post `AliveV1`; the
-browser's bearer token remains bound to the pending sealed request.
-A prompt nobody answers before the request expires publishes no verdict at
-all, and the hook fails closed on its own deadline. The terminal prompt needs
-a terminal: with stdin closed nothing could answer, so `run` stops rather than
-leaving every request to time out. A Mac with an enclave key reads no stdin
-and does not check this.
-
-That is why there is no Linux autostart. A service manager gives the agent no
-terminal, so `oshioki-laptop-setup` installs no unit there; it writes
-`~/.config/oshioki/agent.env` and leaves the agent to a terminal you keep
-open:
-
-```bash
-set -a; . ~/.config/oshioki/agent.env; set +a; oshioki-agent run
-```
-
-macOS is different: the LaunchAgent opens the complete request in its native
-review window before it runs the Touch ID sheet, so it needs no terminal. A
-missing GUI session or canceled review fails closed.
-
-`enroll` pins the device locally and then confirms the server stored it by
-reading `GET /api/v1/devices/<fingerprint>` back over HTTPS for up to fifteen
-seconds. If that confirmation times out, the device is still pinned and can
-approve sudo on the host; only the server's copy is unknown. The error says
-so, and the fix is another `sudo oshioki enroll` for that device once the server
-is reachable.
-
-The agent needs the same `NATS_URL` as the hook, plus `NATS_USER` and
-`NATS_PASS` together where the server wants credentials; setting only one of
-the pair is an error.
-
-For the enrollment wire format, see [architecture.md](architecture.md).
-For Mac Touch ID behavior, see [mac-approvals.md](mac-approvals.md).
+NATS credentials are environment settings, separate from identity state.
+Use the device role, with both `NATS_USER` and `NATS_PASS` set together.
+See [configuration](configuration.md).
