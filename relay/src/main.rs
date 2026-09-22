@@ -1125,7 +1125,15 @@ async fn serve_attempt(
                 connections.push(forward(stream, destination.to_owned(), port, programs.ssh.clone()));
             },
             result = connections.next(), if !connections.is_empty() => {
-                result.context("missing forward result")??;
+                match result.context("missing forward result")? {
+                    Ok(()) => {}
+                    Err(_error) => {
+                        // Google can open an unused callback connection and close it after
+                        // the active connection has been identified. Individual SSH routes
+                        // are not a login verdict: the gcloud child and signed Stop
+                        // lifecycle still decide whether login succeeds or fails.
+                    }
+                }
             },
         }
     }
