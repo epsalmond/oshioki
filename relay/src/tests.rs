@@ -116,11 +116,9 @@ impl Harness {
 
     fn programs(&self) -> Programs {
         let browser = self.directory.join("browser");
-        std::fs::write(&browser, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+        install_test_executable(&browser, "#!/bin/sh\nexit 0\n");
         let ssh = self.directory.join("ssh");
-        std::fs::write(&ssh, "#!/bin/sh\nexec /bin/cat\n").unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        install_test_executable(&ssh, "#!/bin/sh\nexec /bin/cat\n");
         Programs { browser, ssh }
     }
 }
@@ -236,6 +234,23 @@ fn available_port() -> u16 {
     socket.local_addr().unwrap().port()
 }
 
+fn install_test_executable(path: &Path, contents: impl AsRef<[u8]>) {
+    let staging = path.with_file_name(format!(
+        ".{}-{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    {
+        let mut file = fs::File::create(&staging).unwrap();
+        file.write_all(contents.as_ref()).unwrap();
+        file.sync_all().unwrap();
+    }
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+    // Publish the complete, closed fixture atomically so Command cannot resolve
+    // its final pathname while that pathname is still being prepared.
+    fs::rename(staging, path).unwrap();
+}
+
 #[allow(clippy::too_many_lines)]
 async fn startup_transport_fault_is_bounded(stage: StartupStage) {
     let _port_guard = PORT_TEST_LOCK.lock().await;
@@ -284,12 +299,10 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
     };
     let launch_marker = directory.join("gcloud-started");
     let gcloud = directory.join("gcloud");
-    fs::write(
+    install_test_executable(
         &gcloud,
         format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", launch_marker.display()),
-    )
-    .unwrap();
-    fs::set_permissions(&gcloud, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let triggered = Arc::new(AtomicBool::new(false));
     let triggered_by_hook = Arc::clone(&triggered);
     let server_for_hook = Arc::clone(&server);
@@ -640,8 +653,7 @@ async fn ssh_exit_does_not_wait_for_browser_write_half() {
     let ssh = directory.join("ssh");
     // Close stdout before exiting so the forwarder observes an orderly SSH
     // EOF, not a scheduler-dependent pipe error racing the failed status.
-    fs::write(&ssh, "#!/bin/sh\nexec 1>&-\nexit 1\n").unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    install_test_executable(&ssh, "#!/bin/sh\nexec 1>&-\nexit 1\n");
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -671,12 +683,10 @@ async fn ssh_response_is_drained_before_success() {
     fs::create_dir(&directory).unwrap();
     let _cleanup = TempDir(directory.clone());
     let ssh = directory.join("ssh");
-    fs::write(
+    install_test_executable(
         &ssh,
         "#!/bin/sh\n/bin/dd if=/dev/zero bs=1024 count=256 2>/dev/null\nexit 0\n",
-    )
-    .unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    );
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -798,30 +808,27 @@ async fn local_mode_approval_and_gcloud_cleanup_are_deterministic() {
         let marker = directory.join("started");
         let executable = directory.join("gcloud");
         let browser_spy = directory.join("browser-spy");
-        fs::write(
+        install_test_executable(
             &browser_spy,
             format!(
                 "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\npython3 -c 'import socket,sys,urllib.parse; u=urllib.parse.urlparse(sys.argv[1]); c=socket.create_connection((u.hostname,u.port)); c.sendall(b\"GET /callback HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n\"); c.close()' \"$1\"\n",
                 directory.join("browser-url").display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&browser_spy, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let browser_launcher = "python3 - \"$BROWSER\" <<'PY'\nimport socket, subprocess, sys\ns = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1)\nurl = f'http://127.0.0.1:{s.getsockname()[1]}/callback'\nsubprocess.run([sys.argv[1], url], check=True)\nq, _ = s.accept(); q.recv(4096); q.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\n\\r\\n'); q.close(); s.close()\nPY";
         let login_body = if name == "browser" {
             browser_launcher
         } else {
             command
         };
-        fs::write(
+        install_test_executable(
             &executable,
             format!(
                 "#!/bin/sh\nif [ \"$2\" = print-access-token ]; then printf token; exit 0; fi\ntouch '{}'\n{}\n",
-                marker.display(), login_body
+                marker.display(),
+                login_body
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         if name == "timeout" {
             let error = run_local_gcloud_with_timeout(
                 "selected@example.com",
@@ -863,12 +870,10 @@ async fn local_mode_approval_and_gcloud_cleanup_are_deterministic() {
     let _cleanup = TempDir(directory.clone());
     let marker = directory.join("started");
     let executable = directory.join("gcloud");
-    fs::write(
+    install_test_executable(
         &executable,
         format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
-    )
-    .unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     assert!(
         run_local_after_approval(
             "selected@example.com",
