@@ -143,18 +143,23 @@ enum StartupStage {
     BeforeProbeFlush,
 }
 
+#[cfg(test)]
+type StartupFault = Arc<dyn Fn(StartupStage, &Message) + Send + Sync>;
+
 #[derive(Default)]
 struct StartupHooks {
     #[cfg(test)]
-    fault: Option<Arc<dyn Fn(StartupStage) + Send + Sync>>,
+    fault: Option<StartupFault>,
+    #[cfg(test)]
+    gcloud: Option<PathBuf>,
 }
 
 impl StartupHooks {
-    fn at(&self, stage: StartupStage) {
-        let _ = stage;
+    fn at(&self, stage: StartupStage, attempt: &Message) {
+        let _ = (self, stage, attempt);
         #[cfg(test)]
         if let Some(fault) = &self.fault {
-            fault(stage);
+            fault(stage, attempt);
         }
     }
 }
@@ -430,9 +435,10 @@ async fn login_with_lifetime(
     // async-nats may otherwise keep a flush pending while its connection task
     // retries forever. Dropping the peer on every setup error closes that task
     // before any browser, callback listener, or process group is created.
-    let peer = match timeout_at(deadline, connect(&config)).await {
+    let connect_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
+    let peer = match timeout_at(connect_deadline, connect(&config)).await {
         Ok(result) => result?,
-        Err(_) => bail!("NATS setup exceeded ceremony deadline"),
+        Err(_) => bail!("NATS connection exceeded setup deadline"),
     };
     let (mut sub, offer) =
         match timeout_at(deadline, startup(&peer, &attempt, deadline, &startup_hooks)).await {
@@ -494,7 +500,14 @@ async fn login_with_lifetime(
         !executable.contains([':', '\'', '\n']),
         "unsupported executable path for Python BROWSER"
     );
-    let mut command = Command::new("gcloud");
+    #[cfg(test)]
+    let gcloud = startup_hooks
+        .gcloud
+        .as_deref()
+        .unwrap_or_else(|| Path::new("gcloud"));
+    #[cfg(not(test))]
+    let gcloud = Path::new("gcloud");
+    let mut command = Command::new(gcloud);
     command.args(["auth", "login"]);
     if let Some(account) = account {
         command.arg(account);
@@ -551,7 +564,7 @@ async fn startup(
 ) -> Result<(async_nats::Subscriber, Message)> {
     let reply = format!("{}.reply.{}", peer.subject, attempt.attempt);
     let mut sub = peer.client.subscribe(reply).await?;
-    hooks.at(StartupStage::BeforeSubscriptionFlush);
+    hooks.at(StartupStage::BeforeSubscriptionFlush, attempt);
     peer.client.flush().await?;
 
     let mut probe = attempt.clone();
@@ -559,7 +572,7 @@ async fn startup(
     peer.client
         .publish(peer.subject.clone(), sign(&probe, &peer.signing)?.into())
         .await?;
-    hooks.at(StartupStage::BeforeProbeFlush);
+    hooks.at(StartupStage::BeforeProbeFlush, attempt);
     peer.client.flush().await?;
 
     let offer = timeout_at(deadline, peer.receive(&mut sub, attempt))

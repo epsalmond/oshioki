@@ -244,6 +244,7 @@ fn browser_directories() -> BTreeSet<PathBuf> {
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 async fn startup_transport_fault_is_bounded(stage: StartupStage) {
     let directory = PathBuf::from(format!(
         "/tmp/oshioki-relay-startup-{}",
@@ -274,12 +275,13 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
 
     let signing = SigningKey::random(&mut rand::rngs::OsRng);
     let peer = SigningKey::random(&mut rand::rngs::OsRng);
+    let lane = uuid::Uuid::new_v4().to_string();
     let key_path = directory.join("key");
     fs::write(&key_path, encode_base64url(&signing.to_bytes())).unwrap();
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
     let config = Config {
         nats_url: format!("nats://127.0.0.1:{port}"),
-        lane: uuid::Uuid::new_v4().to_string(),
+        lane: lane.clone(),
         private_key: key_path,
         peer_public_key: encode_base64url(peer.verifying_key().to_encoded_point(false).as_bytes()),
         google_account: None,
@@ -287,26 +289,39 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
         approval_identity: None,
         ssh_destination: None,
     };
+    let launch_marker = directory.join("gcloud-started");
+    let gcloud = directory.join("gcloud");
+    fs::write(
+        &gcloud,
+        format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", launch_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&gcloud, fs::Permissions::from_mode(0o700)).unwrap();
     let triggered = Arc::new(AtomicBool::new(false));
     let triggered_by_hook = Arc::clone(&triggered);
     let server_for_hook = Arc::clone(&server);
+    let attempt_capture = Arc::new(Mutex::new(None));
+    let attempt_for_hook = Arc::clone(&attempt_capture);
     let hooks = StartupHooks {
-        fault: Some(Arc::new(move |actual| {
+        fault: Some(Arc::new(move |actual, attempt| {
             if actual != stage {
                 return;
             }
             triggered_by_hook.store(true, Ordering::SeqCst);
+            *attempt_for_hook.lock().unwrap() = Some(attempt.clone());
             if let Some(mut server) = server_for_hook.lock().unwrap().take() {
                 let _ = server.kill();
                 let _ = server.wait();
             }
         })),
+        gcloud: Some(gcloud),
     };
     let before = browser_directories();
     let started = Instant::now();
+    let lifetime = Duration::from_secs(2);
     let result = timeout(
         Duration::from_secs(5),
-        login_with_lifetime(config, Duration::from_secs(2), hooks),
+        login_with_lifetime(config, lifetime, hooks),
     )
     .await
     .expect("NATS startup fault was not bounded")
@@ -316,19 +331,47 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
         "fault hook was not reached"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < lifetime + Duration::from_secs(1),
         "startup exceeded its two-second lifetime: {result:#}"
     );
 
     // The timeout happens before the relay creates its private browser socket
     // or process group. Restarting NATS must not resume the cancelled attempt.
+    let attempt = attempt_capture
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("fault hook did not capture the attempt");
     let mut restarted = StdCommand::new("nats-server")
         .args(["-a", "127.0.0.1", "-p", &port.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("restart nats-server for cancellation check");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    timeout(Duration::from_secs(3), async {
+        let client = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(client) = async_nats::connect(format!("nats://127.0.0.1:{port}")).await {
+                    break client;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restarted NATS did not accept a responder");
+        let reply = format!("oshioki.browser.v1.{lane}.reply.{}", attempt.attempt);
+        let mut offer = attempt;
+        offer.action = Action::Offer {
+            nonce: "late-offer".into(),
+        };
+        client
+            .publish(reply, sign(&offer, &peer).unwrap().into())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+    })
+    .await
+    .expect("NATS responder path was not bounded");
     let _ = restarted.kill();
     let _ = restarted.wait();
     let after = browser_directories();
@@ -336,6 +379,7 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
         before, after,
         "failed startup left a browser socket directory"
     );
+    assert!(!launch_marker.exists(), "cancelled startup launched gcloud");
     let _ = server.lock().unwrap().take();
 }
 
