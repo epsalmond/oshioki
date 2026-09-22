@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Browser relay NATS startup now shares the signed ceremony deadline across
   connection, subscription, flushing, and Probe publication, so reconnects
   cannot leave a failed login waiting indefinitely. (#114)
+- Browser relay callback failures from unused or aborted extra connections no
+  longer cancel an active Google login; gcloud's result and the signed cleanup
+  lifecycle remain authoritative. (#113)
 
 - The agent no longer drops a NATS retry for a request it is already holding
   on the local socket. The hook falls back to NATS when the socket

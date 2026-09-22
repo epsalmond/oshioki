@@ -476,16 +476,28 @@ async fn callback_bytes_stay_off_nats_and_stop_closes_both_listeners() {
     .await
     .unwrap();
     result.unwrap();
-    assert!(
-        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .await
-            .is_ok()
-    );
-    assert!(
-        TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port))
-            .await
-            .is_ok()
-    );
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(listener) = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                drop(listener);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("callback left the IPv4 listener occupied");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(listener) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await {
+                drop(listener);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("callback left the IPv6 listener occupied");
     let mut count = 0;
     while let Ok(Some(frame)) = timeout(Duration::from_millis(20), h.traffic.next()).await {
         let key = if frame.subject.as_str().contains(".reply.") {
@@ -499,6 +511,206 @@ async fn callback_bytes_stay_off_nats_and_stop_closes_both_listeners() {
         count += 1;
     }
     assert_eq!(count, 4); // Offer, Start, Ready, Stop; never the callback.
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+#[ignore = "requires nats-server; run scripts/test-browser-relay"]
+async fn failed_extra_callback_does_not_abort_active_login() {
+    let mut h = Harness::new().await;
+    let _port_guard = PORT_TEST_LOCK.lock().await;
+    let programs = h.programs();
+    let first_forward = h.directory.join("first-forward");
+    let extra_forward = h.directory.join("extra-forward");
+    install_test_executable(
+        &programs.ssh,
+        format!(
+            "#!/bin/sh\nif mkdir '{}' 2>/dev/null; then\n  while [ \"$#\" -gt 0 ]; do shift; done\n  exec /bin/cat\nelse\n  touch '{}'\n  while [ \"$#\" -gt 0 ]; do shift; done\n  cat >/dev/null\n  exit 1\nfi\n",
+            first_forward.display(),
+            extra_forward.display()
+        ),
+    );
+
+    let port = available_port();
+    let server = async {
+        let result = serve_attempt(
+            &h.mac,
+            &h.attempt,
+            &h.reply,
+            &mut h.requests,
+            "test-lane",
+            None,
+            "pinned-nas",
+            &programs,
+            None,
+        )
+        .await;
+        if result.is_ok() {
+            h.mac
+                .send(&h.reply, &h.attempt, Action::Closed)
+                .await
+                .unwrap();
+        }
+        result
+    };
+    let client = async {
+        start(&h.host, &mut h.replies, &h.attempt, oauth_url(port), false).await;
+        assert!(
+            h.host
+                .receive(&mut h.replies, &h.attempt)
+                .await
+                .unwrap()
+                .action
+                == Action::Ready
+        );
+
+        // Keep the valid callback active while the late, unused callback fails.
+        let mut active = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        active.write_all(b"valid-callback").await.unwrap();
+        let mut echoed = vec![0; b"valid-callback".len()];
+        active.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"valid-callback");
+
+        let mut extra = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !extra_forward.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("extra callback forward did not start");
+        // The browser abandons the unused callback while the valid route remains active.
+        extra.shutdown().await.unwrap();
+        let mut discarded = Vec::new();
+        timeout(Duration::from_secs(1), extra.read_to_end(&mut discarded))
+            .await
+            .expect("failed extra callback did not close")
+            .unwrap();
+
+        active.shutdown().await.unwrap();
+        let mut remainder = Vec::new();
+        active.read_to_end(&mut remainder).await.unwrap();
+        h.host
+            .send(&h.host.subject, &h.attempt, Action::Stop)
+            .await
+            .unwrap();
+        assert!(
+            h.host
+                .receive(&mut h.replies, &h.attempt)
+                .await
+                .unwrap()
+                .action
+                == Action::Closed
+        );
+    };
+    let (result, ()) = timeout(Duration::from_secs(5), async {
+        tokio::join!(server, client)
+    })
+    .await
+    .unwrap();
+    result.expect("a failed extra callback must not cancel the active login");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(listener) = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                drop(listener);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("active callback left the IPv4 listener occupied");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(listener) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await {
+                drop(listener);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("active callback left the IPv6 listener occupied");
+}
+
+#[tokio::test]
+#[ignore = "requires nats-server; run scripts/test-browser-relay"]
+async fn all_failed_callback_forwards_wait_for_signed_stop() {
+    let mut h = Harness::new().await;
+    let _port_guard = PORT_TEST_LOCK.lock().await;
+    let programs = h.programs();
+    install_test_executable(&programs.ssh, "#!/bin/sh\nexit 1\n");
+
+    let port = available_port();
+    let server = serve_attempt(
+        &h.mac,
+        &h.attempt,
+        &h.reply,
+        &mut h.requests,
+        "test-lane",
+        None,
+        "pinned-nas",
+        &programs,
+        None,
+    );
+    let client = async {
+        start(&h.host, &mut h.replies, &h.attempt, oauth_url(port), false).await;
+        assert!(
+            h.host
+                .receive(&mut h.replies, &h.attempt)
+                .await
+                .unwrap()
+                .action
+                == Action::Ready
+        );
+        let mut callback = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        callback.shutdown().await.unwrap();
+        let mut discarded = Vec::new();
+        timeout(Duration::from_secs(1), callback.read_to_end(&mut discarded))
+            .await
+            .expect("failed callback did not close")
+            .unwrap();
+        // A failed SSH route is not an authentication verdict. The host's
+        // gcloud result drives the signed cleanup exchange.
+        h.host
+            .send(&h.host.subject, &h.attempt, Action::Stop)
+            .await
+            .unwrap();
+    };
+    let (result, ()) = timeout(Duration::from_secs(5), async {
+        tokio::join!(server, client)
+    })
+    .await
+    .unwrap();
+    result.expect("signed Stop must close the failed callback ceremony");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(listener) = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                drop(listener);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed callback left the IPv4 listener occupied");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(listener) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await {
+                drop(listener);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed callback left the IPv6 listener occupied");
 }
 
 #[tokio::test]
