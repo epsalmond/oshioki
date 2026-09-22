@@ -1,12 +1,34 @@
 use super::*;
 
-use std::fs;
+use std::{
+    fs,
+    process::Command as StdCommand,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+// Tests that deliberately release and reclaim the same callback or broker
+// port must not race another test doing the same thing in this process.
+static PORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct TempDir(PathBuf);
 
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct ChildGuard(Arc<Mutex<Option<std::process::Child>>>);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -30,6 +52,7 @@ impl Drop for Harness {
 
 impl Harness {
     async fn new() -> Self {
+        let _port_guard = PORT_TEST_LOCK.lock().await;
         let address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = address.local_addr().unwrap().port();
         drop(address);
@@ -93,11 +116,9 @@ impl Harness {
 
     fn programs(&self) -> Programs {
         let browser = self.directory.join("browser");
-        std::fs::write(&browser, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+        install_test_executable(&browser, "#!/bin/sh\nexit 0\n");
         let ssh = self.directory.join("ssh");
-        std::fs::write(&ssh, "#!/bin/sh\nexec /bin/cat\n").unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        install_test_executable(&ssh, "#!/bin/sh\nexec /bin/cat\n");
         Programs { browser, ssh }
     }
 }
@@ -107,6 +128,7 @@ impl Harness {
 async fn authenticated_nats_url_uses_url_credentials() {
     const USER: &str = "relay-test-user";
     const PASSWORD: &str = "relay-test/password";
+    let _port_guard = PORT_TEST_LOCK.lock().await;
     let address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = address.local_addr().unwrap().port();
     drop(address);
@@ -212,6 +234,175 @@ fn available_port() -> u16 {
     socket.local_addr().unwrap().port()
 }
 
+fn install_test_executable(path: &Path, contents: impl AsRef<[u8]>) {
+    let staging = path.with_file_name(format!(
+        ".{}-{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    {
+        let mut file = fs::File::create(&staging).unwrap();
+        file.write_all(contents.as_ref()).unwrap();
+        file.sync_all().unwrap();
+    }
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+    // Publish the complete, closed fixture atomically so Command cannot resolve
+    // its final pathname while that pathname is still being prepared.
+    fs::rename(staging, path).unwrap();
+}
+
+#[allow(clippy::too_many_lines)]
+async fn startup_transport_fault_is_bounded(stage: StartupStage) {
+    let _port_guard = PORT_TEST_LOCK.lock().await;
+    let directory = PathBuf::from(format!(
+        "/tmp/oshioki-relay-startup-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let _cleanup = TempDir(directory.clone());
+
+    let port = available_port();
+    let server = StdCommand::new("nats-server")
+        .args(["-a", "127.0.0.1", "-p", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("install nats-server to run relay startup tests");
+    let server = Arc::new(Mutex::new(Some(server)));
+    let _server_guard = ChildGuard(Arc::clone(&server));
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("nats-server did not start");
+
+    let signing = SigningKey::random(&mut rand::rngs::OsRng);
+    let peer = SigningKey::random(&mut rand::rngs::OsRng);
+    let lane = uuid::Uuid::new_v4().to_string();
+    let key_path = directory.join("key");
+    fs::write(&key_path, encode_base64url(&signing.to_bytes())).unwrap();
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let config = Config {
+        nats_url: format!("nats://127.0.0.1:{port}"),
+        lane: lane.clone(),
+        private_key: key_path,
+        peer_public_key: encode_base64url(peer.verifying_key().to_encoded_point(false).as_bytes()),
+        google_account: None,
+        approval_public_key: None,
+        approval_identity: None,
+        ssh_destination: None,
+    };
+    let launch_marker = directory.join("gcloud-started");
+    let gcloud = directory.join("gcloud");
+    install_test_executable(
+        &gcloud,
+        format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", launch_marker.display()),
+    );
+    let triggered = Arc::new(AtomicBool::new(false));
+    let triggered_by_hook = Arc::clone(&triggered);
+    let server_for_hook = Arc::clone(&server);
+    let attempt_capture = Arc::new(Mutex::new(None));
+    let attempt_for_hook = Arc::clone(&attempt_capture);
+    let hooks = StartupHooks {
+        fault: Some(Arc::new(move |actual, attempt| {
+            if actual != stage {
+                return;
+            }
+            triggered_by_hook.store(true, Ordering::SeqCst);
+            *attempt_for_hook.lock().unwrap() = Some(attempt.clone());
+            if let Some(mut server) = server_for_hook.lock().unwrap().take() {
+                let _ = server.kill();
+                let _ = server.wait();
+            }
+        })),
+        gcloud: Some(gcloud),
+    };
+    let started = Instant::now();
+    let lifetime = Duration::from_secs(2);
+    let result = timeout(
+        Duration::from_secs(5),
+        login_with_lifetime(config, lifetime, hooks),
+    )
+    .await
+    .expect("NATS startup fault was not bounded")
+    .expect_err("NATS startup fault unexpectedly succeeded");
+    assert!(
+        triggered.load(Ordering::SeqCst),
+        "fault hook was not reached"
+    );
+    assert!(
+        started.elapsed() < lifetime + Duration::from_secs(1),
+        "startup exceeded its two-second lifetime: {result:#}"
+    );
+
+    // The timeout happens before the relay creates its private browser socket
+    // or process group. Restarting NATS must not resume the cancelled attempt.
+    let attempt = attempt_capture
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("fault hook did not capture the attempt");
+    let browser_directory = PathBuf::from(format!("/tmp/oshioki-browser-{}", attempt.attempt));
+    let mut restarted = StdCommand::new("nats-server")
+        .args(["-a", "127.0.0.1", "-p", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("restart nats-server for cancellation check");
+    timeout(Duration::from_secs(3), async {
+        let client = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(client) = async_nats::connect(format!("nats://127.0.0.1:{port}")).await {
+                    break client;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restarted NATS did not accept a responder");
+        let reply = format!("oshioki.browser.v1.{lane}.reply.{}", attempt.attempt);
+        let mut offer = attempt;
+        offer.action = Action::Offer {
+            nonce: "late-offer".into(),
+        };
+        client
+            .publish(reply, sign(&offer, &peer).unwrap().into())
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+    })
+    .await
+    .expect("NATS responder path was not bounded");
+    // Give a wrongly retained startup future an opportunity to consume the
+    // late Offer and create its socket or launcher before checking cancellation.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    assert!(
+        !browser_directory.exists(),
+        "failed startup left a browser socket directory"
+    );
+    assert!(!launch_marker.exists(), "cancelled startup launched gcloud");
+    let _ = server.lock().unwrap().take();
+}
+
+#[tokio::test]
+#[ignore = "requires nats-server; run scripts/test-browser-relay"]
+async fn subscription_flush_disconnect_is_bounded_before_browser_launch() {
+    startup_transport_fault_is_bounded(StartupStage::BeforeSubscriptionFlush).await;
+}
+
+#[tokio::test]
+#[ignore = "requires nats-server; run scripts/test-browser-relay"]
+async fn probe_flush_disconnect_is_bounded_before_browser_launch() {
+    startup_transport_fault_is_bounded(StartupStage::BeforeProbeFlush).await;
+}
+
 async fn start(
     host: &Peer,
     replies: &mut async_nats::Subscriber,
@@ -239,6 +430,7 @@ async fn start(
 #[ignore = "requires nats-server; run scripts/test-browser-relay"]
 async fn callback_bytes_stay_off_nats_and_stop_closes_both_listeners() {
     let mut h = Harness::new().await;
+    let _port_guard = PORT_TEST_LOCK.lock().await;
     let programs = h.programs();
     let port = available_port();
     let server = serve_attempt(
@@ -314,6 +506,7 @@ async fn callback_bytes_stay_off_nats_and_stop_closes_both_listeners() {
 async fn malformed_and_replayed_start_never_open_listeners() {
     for stale in [false, true] {
         let mut h = Harness::new().await;
+        let _port_guard = PORT_TEST_LOCK.lock().await;
         let programs = h.programs();
         let port = available_port();
         let url = if stale {
@@ -351,6 +544,7 @@ async fn malformed_and_replayed_start_never_open_listeners() {
 #[ignore = "requires nats-server; run scripts/test-browser-relay"]
 async fn expiry_cancels_active_forward_and_releases_port() {
     let mut h = Harness::new().await;
+    let _port_guard = PORT_TEST_LOCK.lock().await;
     let programs = h.programs();
     let port = available_port();
     let server = timeout(
@@ -410,6 +604,7 @@ async fn expiry_cancels_active_forward_and_releases_port() {
 #[ignore = "requires nats-server; run scripts/test-browser-relay"]
 async fn ipv6_collision_does_not_leave_ipv4_listener() {
     let mut h = Harness::new().await;
+    let _port_guard = PORT_TEST_LOCK.lock().await;
     let programs = h.programs();
     let occupied = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
         .await
@@ -456,8 +651,9 @@ async fn ssh_exit_does_not_wait_for_browser_write_half() {
     fs::create_dir(&directory).unwrap();
     let _cleanup = TempDir(directory.clone());
     let ssh = directory.join("ssh");
-    fs::write(&ssh, "#!/bin/sh\nexit 1\n").unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    // Close stdout before exiting so the forwarder observes an orderly SSH
+    // EOF, not a scheduler-dependent pipe error racing the failed status.
+    install_test_executable(&ssh, "#!/bin/sh\nexec 1>&-\nexit 1\n");
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -487,12 +683,10 @@ async fn ssh_response_is_drained_before_success() {
     fs::create_dir(&directory).unwrap();
     let _cleanup = TempDir(directory.clone());
     let ssh = directory.join("ssh");
-    fs::write(
+    install_test_executable(
         &ssh,
         "#!/bin/sh\n/bin/dd if=/dev/zero bs=1024 count=256 2>/dev/null\nexit 0\n",
-    )
-    .unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    );
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -614,30 +808,27 @@ async fn local_mode_approval_and_gcloud_cleanup_are_deterministic() {
         let marker = directory.join("started");
         let executable = directory.join("gcloud");
         let browser_spy = directory.join("browser-spy");
-        fs::write(
+        install_test_executable(
             &browser_spy,
             format!(
                 "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\npython3 -c 'import socket,sys,urllib.parse; u=urllib.parse.urlparse(sys.argv[1]); c=socket.create_connection((u.hostname,u.port)); c.sendall(b\"GET /callback HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n\"); c.close()' \"$1\"\n",
                 directory.join("browser-url").display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&browser_spy, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let browser_launcher = "python3 - \"$BROWSER\" <<'PY'\nimport socket, subprocess, sys\ns = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(1)\nurl = f'http://127.0.0.1:{s.getsockname()[1]}/callback'\nsubprocess.run([sys.argv[1], url], check=True)\nq, _ = s.accept(); q.recv(4096); q.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\n\\r\\n'); q.close(); s.close()\nPY";
         let login_body = if name == "browser" {
             browser_launcher
         } else {
             command
         };
-        fs::write(
+        install_test_executable(
             &executable,
             format!(
                 "#!/bin/sh\nif [ \"$2\" = print-access-token ]; then printf token; exit 0; fi\ntouch '{}'\n{}\n",
-                marker.display(), login_body
+                marker.display(),
+                login_body
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         if name == "timeout" {
             let error = run_local_gcloud_with_timeout(
                 "selected@example.com",
@@ -679,12 +870,10 @@ async fn local_mode_approval_and_gcloud_cleanup_are_deterministic() {
     let _cleanup = TempDir(directory.clone());
     let marker = directory.join("started");
     let executable = directory.join("gcloud");
-    fs::write(
+    install_test_executable(
         &executable,
         format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
-    )
-    .unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     assert!(
         run_local_after_approval(
             "selected@example.com",

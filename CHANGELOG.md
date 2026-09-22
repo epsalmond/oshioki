@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Browser relay NATS startup now shares the signed ceremony deadline across
+  connection, subscription, flushing, and Probe publication, so reconnects
+  cannot leave a failed login waiting indefinitely. (#114)
+
 - The agent no longer drops a NATS retry for a request it is already holding
   on the local socket. The hook falls back to NATS when the socket
   acknowledgement arrives too late, republishing the same request id, and the
