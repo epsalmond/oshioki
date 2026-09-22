@@ -1,12 +1,31 @@
 use super::*;
 
-use std::fs;
+use std::{
+    collections::BTreeSet,
+    fs,
+    process::Command as StdCommand,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 struct TempDir(PathBuf);
 
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct ChildGuard(Arc<Mutex<Option<std::process::Child>>>);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -210,6 +229,126 @@ fn oauth_url(port: u16) -> String {
 fn available_port() -> u16 {
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     socket.local_addr().unwrap().port()
+}
+
+fn browser_directories() -> BTreeSet<PathBuf> {
+    fs::read_dir("/tmp")
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with("oshioki-browser-"))
+        })
+        .collect()
+}
+
+async fn startup_transport_fault_is_bounded(stage: StartupStage) {
+    let directory = PathBuf::from(format!(
+        "/tmp/oshioki-relay-startup-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let _cleanup = TempDir(directory.clone());
+
+    let port = available_port();
+    let server = StdCommand::new("nats-server")
+        .args(["-a", "127.0.0.1", "-p", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("install nats-server to run relay startup tests");
+    let server = Arc::new(Mutex::new(Some(server)));
+    let _server_guard = ChildGuard(Arc::clone(&server));
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("nats-server did not start");
+
+    let signing = SigningKey::random(&mut rand::rngs::OsRng);
+    let peer = SigningKey::random(&mut rand::rngs::OsRng);
+    let key_path = directory.join("key");
+    fs::write(&key_path, encode_base64url(&signing.to_bytes())).unwrap();
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let config = Config {
+        nats_url: format!("nats://127.0.0.1:{port}"),
+        lane: uuid::Uuid::new_v4().to_string(),
+        private_key: key_path,
+        peer_public_key: encode_base64url(peer.verifying_key().to_encoded_point(false).as_bytes()),
+        google_account: None,
+        approval_public_key: None,
+        approval_identity: None,
+        ssh_destination: None,
+    };
+    let triggered = Arc::new(AtomicBool::new(false));
+    let triggered_by_hook = Arc::clone(&triggered);
+    let server_for_hook = Arc::clone(&server);
+    let hooks = StartupHooks {
+        fault: Some(Arc::new(move |actual| {
+            if actual != stage {
+                return;
+            }
+            triggered_by_hook.store(true, Ordering::SeqCst);
+            if let Some(mut server) = server_for_hook.lock().unwrap().take() {
+                let _ = server.kill();
+                let _ = server.wait();
+            }
+        })),
+    };
+    let before = browser_directories();
+    let started = Instant::now();
+    let result = timeout(
+        Duration::from_secs(5),
+        login_with_lifetime(config, Duration::from_secs(2), hooks),
+    )
+    .await
+    .expect("NATS startup fault was not bounded")
+    .expect_err("NATS startup fault unexpectedly succeeded");
+    assert!(
+        triggered.load(Ordering::SeqCst),
+        "fault hook was not reached"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "startup exceeded its two-second lifetime: {result:#}"
+    );
+
+    // The timeout happens before the relay creates its private browser socket
+    // or process group. Restarting NATS must not resume the cancelled attempt.
+    let mut restarted = StdCommand::new("nats-server")
+        .args(["-a", "127.0.0.1", "-p", &port.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("restart nats-server for cancellation check");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    let after = browser_directories();
+    assert_eq!(
+        before, after,
+        "failed startup left a browser socket directory"
+    );
+    let _ = server.lock().unwrap().take();
+}
+
+#[tokio::test]
+#[ignore = "requires nats-server; run scripts/test-browser-relay"]
+async fn subscription_flush_disconnect_is_bounded_before_browser_launch() {
+    startup_transport_fault_is_bounded(StartupStage::BeforeSubscriptionFlush).await;
+}
+
+#[tokio::test]
+#[ignore = "requires nats-server; run scripts/test-browser-relay"]
+async fn probe_flush_disconnect_is_bounded_before_browser_launch() {
+    startup_transport_fault_is_bounded(StartupStage::BeforeProbeFlush).await;
 }
 
 async fn start(

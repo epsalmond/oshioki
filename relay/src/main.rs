@@ -137,6 +137,28 @@ struct Peer {
     subject: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupStage {
+    BeforeSubscriptionFlush,
+    BeforeProbeFlush,
+}
+
+#[derive(Default)]
+struct StartupHooks {
+    #[cfg(test)]
+    fault: Option<Arc<dyn Fn(StartupStage) + Send + Sync>>,
+}
+
+impl StartupHooks {
+    fn at(&self, stage: StartupStage) {
+        let _ = stage;
+        #[cfg(test)]
+        if let Some(fault) = &self.fault {
+            fault(stage);
+        }
+    }
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -374,18 +396,56 @@ async fn capture(url: &str) -> Result<()> {
 
 #[allow(clippy::too_many_lines)]
 async fn login(config: Config) -> Result<()> {
-    let peer = timeout(Duration::from_secs(10), connect(&config)).await??;
+    login_with_lifetime(
+        config,
+        Duration::from_secs(MAX_LIFETIME),
+        StartupHooks::default(),
+    )
+    .await
+}
+
+fn ceremony_deadline(lifetime: Duration) -> Result<(Instant, u64)> {
+    ensure!(!lifetime.is_zero(), "ceremony lifetime must be nonzero");
+    Ok((
+        Instant::now() + lifetime,
+        now().saturating_add(lifetime.as_secs().max(1)),
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn login_with_lifetime(
+    config: Config,
+    lifetime: Duration,
+    startup_hooks: StartupHooks,
+) -> Result<()> {
+    let (deadline, expires) = ceremony_deadline(lifetime)?;
     let attempt = Message {
         version: 1,
         attempt: uuid::Uuid::new_v4().to_string(),
-        expires: now() + MAX_LIFETIME,
+        expires,
         action: Action::Probe,
     };
-    let reply = format!("{}.reply.{}", peer.subject, attempt.attempt);
-    let mut sub = peer.client.subscribe(reply).await?;
-    peer.client.flush().await?;
-    peer.send(&peer.subject, &attempt, Action::Probe).await?;
-    let offer = timeout(Duration::from_secs(10), peer.receive(&mut sub, &attempt)).await??;
+
+    // This deadline starts before connecting. Once a NATS client has connected,
+    // async-nats may otherwise keep a flush pending while its connection task
+    // retries forever. Dropping the peer on every setup error closes that task
+    // before any browser, callback listener, or process group is created.
+    let peer = match timeout_at(deadline, connect(&config)).await {
+        Ok(result) => result?,
+        Err(_) => bail!("NATS setup exceeded ceremony deadline"),
+    };
+    let (mut sub, offer) =
+        match timeout_at(deadline, startup(&peer, &attempt, deadline, &startup_hooks)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                drop(peer);
+                return Err(error);
+            }
+            Err(_) => {
+                drop(peer);
+                return Err(anyhow::anyhow!("NATS setup exceeded ceremony deadline"));
+            }
+        };
     let Action::Offer { nonce } = offer.action else {
         bail!("Mac relay unavailable")
     };
@@ -395,9 +455,15 @@ async fn login(config: Config) -> Result<()> {
         "google_account and approval_public_key must be configured together"
     );
     if let Some(account) = account {
-        if let Err(error) =
-            authorize_account(&peer, &mut sub, &attempt, &nonce, account, &config).await
-        {
+        let authorization = timeout_at(
+            deadline,
+            authorize_account(&peer, &mut sub, &attempt, &nonce, account, &config),
+        )
+        .await;
+        if let Err(error) = match authorization {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("NATS ceremony deadline expired")),
+        } {
             let _ = timeout(Duration::from_secs(2), async {
                 peer.send(&peer.subject, &attempt, Action::Stop).await?;
                 ensure!(
@@ -410,6 +476,10 @@ async fn login(config: Config) -> Result<()> {
             return Err(error);
         }
     }
+    ensure!(
+        Instant::now() < deadline,
+        "browser ceremony expired before launcher setup"
+    );
     let dir = SocketDir(PathBuf::from(format!(
         "/tmp/oshioki-browser-{}",
         attempt.attempt
@@ -443,7 +513,6 @@ async fn login(config: Config) -> Result<()> {
         .stdin(Stdio::null())
         .kill_on_drop(true);
     let mut child = ProcessGroup::spawn(command)?;
-    let deadline = Instant::now() + Duration::from_secs(attempt.expires.saturating_sub(now()));
     let outcome = tokio::select! {
         result = timeout_at(deadline, login_attempt(&peer, &attempt, nonce, &mut sub, &listener, &mut child.child, account.is_some())) => result.context("Google browser ceremony expired").and_then(std::convert::identity),
         result = interrupted() => result.map(|()| LoginAttempt::Browser),
@@ -472,6 +541,31 @@ async fn login(config: Config) -> Result<()> {
     .await;
     outcome?;
     stopped.context("Mac cleanup confirmation timed out")?
+}
+
+async fn startup(
+    peer: &Peer,
+    attempt: &Message,
+    deadline: Instant,
+    hooks: &StartupHooks,
+) -> Result<(async_nats::Subscriber, Message)> {
+    let reply = format!("{}.reply.{}", peer.subject, attempt.attempt);
+    let mut sub = peer.client.subscribe(reply).await?;
+    hooks.at(StartupStage::BeforeSubscriptionFlush);
+    peer.client.flush().await?;
+
+    let mut probe = attempt.clone();
+    probe.action = Action::Probe;
+    peer.client
+        .publish(peer.subject.clone(), sign(&probe, &peer.signing)?.into())
+        .await?;
+    hooks.at(StartupStage::BeforeProbeFlush);
+    peer.client.flush().await?;
+
+    let offer = timeout_at(deadline, peer.receive(&mut sub, attempt))
+        .await
+        .context("Mac relay offer timed out")??;
+    Ok((sub, offer))
 }
 
 #[cfg(target_os = "macos")]
