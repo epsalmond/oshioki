@@ -1,7 +1,6 @@
 use super::*;
 
 use std::{
-    collections::BTreeSet,
     fs,
     process::Command as StdCommand,
     sync::{
@@ -9,6 +8,10 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+
+// Tests that deliberately release and reclaim the same callback or broker
+// port must not race another test doing the same thing in this process.
+static PORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct TempDir(PathBuf);
 
@@ -49,6 +52,7 @@ impl Drop for Harness {
 
 impl Harness {
     async fn new() -> Self {
+        let _port_guard = PORT_TEST_LOCK.lock().await;
         let address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = address.local_addr().unwrap().port();
         drop(address);
@@ -126,6 +130,7 @@ impl Harness {
 async fn authenticated_nats_url_uses_url_credentials() {
     const USER: &str = "relay-test-user";
     const PASSWORD: &str = "relay-test/password";
+    let _port_guard = PORT_TEST_LOCK.lock().await;
     let address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = address.local_addr().unwrap().port();
     drop(address);
@@ -231,21 +236,9 @@ fn available_port() -> u16 {
     socket.local_addr().unwrap().port()
 }
 
-fn browser_directories() -> BTreeSet<PathBuf> {
-    fs::read_dir("/tmp")
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|name| name.starts_with("oshioki-browser-"))
-        })
-        .collect()
-}
-
 #[allow(clippy::too_many_lines)]
 async fn startup_transport_fault_is_bounded(stage: StartupStage) {
+    let _port_guard = PORT_TEST_LOCK.lock().await;
     let directory = PathBuf::from(format!(
         "/tmp/oshioki-relay-startup-{}",
         uuid::Uuid::new_v4()
@@ -316,7 +309,6 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
         })),
         gcloud: Some(gcloud),
     };
-    let before = browser_directories();
     let started = Instant::now();
     let lifetime = Duration::from_secs(2);
     let result = timeout(
@@ -342,6 +334,7 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
         .unwrap()
         .clone()
         .expect("fault hook did not capture the attempt");
+    let browser_directory = PathBuf::from(format!("/tmp/oshioki-browser-{}", attempt.attempt));
     let mut restarted = StdCommand::new("nats-server")
         .args(["-a", "127.0.0.1", "-p", &port.to_string()])
         .stdout(Stdio::null())
@@ -372,11 +365,13 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
     })
     .await
     .expect("NATS responder path was not bounded");
+    // Give a wrongly retained startup future an opportunity to consume the
+    // late Offer and create its socket or launcher before checking cancellation.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = restarted.kill();
     let _ = restarted.wait();
-    let after = browser_directories();
-    assert_eq!(
-        before, after,
+    assert!(
+        !browser_directory.exists(),
         "failed startup left a browser socket directory"
     );
     assert!(!launch_marker.exists(), "cancelled startup launched gcloud");
@@ -422,6 +417,7 @@ async fn start(
 #[ignore = "requires nats-server; run scripts/test-browser-relay"]
 async fn callback_bytes_stay_off_nats_and_stop_closes_both_listeners() {
     let mut h = Harness::new().await;
+    let _port_guard = PORT_TEST_LOCK.lock().await;
     let programs = h.programs();
     let port = available_port();
     let server = serve_attempt(
@@ -497,6 +493,7 @@ async fn callback_bytes_stay_off_nats_and_stop_closes_both_listeners() {
 async fn malformed_and_replayed_start_never_open_listeners() {
     for stale in [false, true] {
         let mut h = Harness::new().await;
+        let _port_guard = PORT_TEST_LOCK.lock().await;
         let programs = h.programs();
         let port = available_port();
         let url = if stale {
@@ -534,6 +531,7 @@ async fn malformed_and_replayed_start_never_open_listeners() {
 #[ignore = "requires nats-server; run scripts/test-browser-relay"]
 async fn expiry_cancels_active_forward_and_releases_port() {
     let mut h = Harness::new().await;
+    let _port_guard = PORT_TEST_LOCK.lock().await;
     let programs = h.programs();
     let port = available_port();
     let server = timeout(
@@ -593,6 +591,7 @@ async fn expiry_cancels_active_forward_and_releases_port() {
 #[ignore = "requires nats-server; run scripts/test-browser-relay"]
 async fn ipv6_collision_does_not_leave_ipv4_listener() {
     let mut h = Harness::new().await;
+    let _port_guard = PORT_TEST_LOCK.lock().await;
     let programs = h.programs();
     let occupied = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
         .await
@@ -639,7 +638,9 @@ async fn ssh_exit_does_not_wait_for_browser_write_half() {
     fs::create_dir(&directory).unwrap();
     let _cleanup = TempDir(directory.clone());
     let ssh = directory.join("ssh");
-    fs::write(&ssh, "#!/bin/sh\nexit 1\n").unwrap();
+    // Close stdout before exiting so the forwarder observes an orderly SSH
+    // EOF, not a scheduler-dependent pipe error racing the failed status.
+    fs::write(&ssh, "#!/bin/sh\nexec 1>&-\nexit 1\n").unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
