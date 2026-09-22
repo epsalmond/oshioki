@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Package `oshioki-browser-relay` in the Mac release and Debian package so
+  Google login approval no longer requires a source build. Release checks
+  exercise the extracted binary and run the local/remote relay test suite.
+
 - A release compatibility contract so `N-1 → N` upgrades keep enrolled
   devices, identity files, pending requests, and a tested restore path.
   Additive wire fields stay backward-readable; a breaking SQLite change

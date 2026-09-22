@@ -1,66 +1,99 @@
-# Contributing to Oshioki
+# Develop Oshioki
 
-## Prerequisites
+Use Rust through rustup (the checkout pins its toolchain), Node.js/npm for
+browser tests, and Python 3 for setup tests. Linux needs `libpam0g-dev`.
+Docker with Compose is required for the full end-to-end suite; `nats-server`
+is required for the browser relay suite.
 
-- Rust via rustup (pinned toolchain in `rust-toolchain.toml`; `cargo` picks it
-  up automatically).
-- Docker (rootful or rootless) for the Compose-based tests and dev server.
-- Node.js for the browser UI tests (`server/web`, Playwright + libsodium).
-- Tailscale only for the Safari/Mac acceptance loops.
+## Everyday loop
 
-Phone setup has a hermetic Python test suite:
-`scripts/test-oshioki-phone-setup`. It substitutes the service and privilege
-boundaries, so it does not change the host's Tailscale, services, or sudo
-configuration. A real phone enrollment still needs a reachable HTTPS server
-and a browser WebAuthn ceremony.
+```sh
+scripts/dev build
+scripts/dev test --quick
+```
 
-## Development loop
+`build` builds the workspace and runs browser unit tests. `--quick` runs
+Rust tests, Clippy, browser vectors, and installer/setup checks on the host.
+Linux-only checks report a skip elsewhere. On macOS, use `TMPDIR=/tmp` if
+Unix-socket tests exceed the platform's socket path limit.
 
-All entry points go through `scripts/dev`:
+Choose additional checks for the behavior changed:
 
-```bash
-scripts/dev build          # workspace build + browser unit tests
-scripts/dev test --quick   # Rust suite, browser vectors, installer checks (host only)
-scripts/dev test --browser # browser protocol against local NATS + SQLite
-scripts/dev test           # full E2E: disposable Compose project + real sudo plugin path
-scripts/test-browser-relay # opt-in Google ceremony tests (local fakes + nats-server)
-scripts/dev up [--state-dir PATH]  # retained dev server on http://127.0.0.1:8443
+| Command | Exercises |
+| --- | --- |
+| `scripts/dev test --browser` | Browser protocol against local NATS and SQLite |
+| `scripts/dev test` | Quick checks plus disposable Compose and real Linux sudo integration |
+| `scripts/test-browser-relay` | Google ceremony orchestration, authenticated NATS, and subprocess cleanup with fake provider/device boundaries |
+| `scripts/test-pam-acceptance` | PAM integration in a disposable container |
+| `scripts/test-oshioki-phone-setup` | Phone setup with service and privilege boundaries replaced |
+
+The automated sudo tests run in containers; they do not install a plugin on
+your host. Failed full-suite runs retain their state path and Compose logs.
+
+## Keep a development server running
+
+```sh
+scripts/dev up --state-dir /path/to/dev-state
 scripts/dev status
 scripts/dev down
 ```
 
-`--quick` runs on the host. The full `test` creates a disposable Compose
-project and also invokes the real Linux sudo plugin path; non-Linux hosts skip
-the acceptance lifecycle test, which relies on Linux process identity. Failed
-runs retain their state path and scrubbed Compose logs.
+The server is at `http://127.0.0.1:8443`. An explicit state directory survives
+`down`; without one, setup creates temporary state and removes it on shutdown.
+The wrapper handles rootful/rootless Docker UID mapping. Direct Compose users
+must set `OSHIOKI_UID` themselves (host UID for rootful Docker, 0 for rootless).
 
-Without `--state-dir`, `up` creates disposable state and `down` removes it.
-Direct Compose callers (not going through `scripts/dev`) must set
-`OSHIOKI_UID` to the host UID for rootful Docker or `0` for rootless Docker;
-`scripts/dev` derives this automatically.
+## Before a PR
 
-Supervised acceptance sessions (Linux Tailscale host, Safari, Mac approver)
-use `scripts/dev-acceptance`; see the [runbook](RUNBOOK.md).
+Run `cargo fmt --check` and `scripts/dev test --quick`, plus the relevant checks
+above. Update the affected journey or reference when behavior changes.
 
-## Expectations
+Public protocol and persistence changes follow the
+[compatibility contract](docs/compatibility.md): additive wire fields need a
+golden and a matrix entry; incompatible semantics need a version and restore
+plan. Keep existing v1 cryptographic domains and test vectors unchanged.
 
-- `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and
-  `scripts/dev test --quick` pass before opening a PR.
-- The workspace denies warnings and `unsafe_code`, with the only exceptions
-  documented in the root `Cargo.toml`. Unsafe calls live in the macOS
-  `enclave` crate and the sudo plugin's documented FFI/PAM boundary.
-- Protocol changes require a new version and a compatibility decision: see
-  [docs/compatibility.md](docs/compatibility.md). Additive fields stay on the
-  current numeric version and need a golden in `tests/compat/goldens/` plus a
-  matrix row, not only a unit test. The v1 cryptographic domain strings
-  (`oshioki/...`) and existing test vectors must not change.
-- Add or update tests with behavior changes; update this file and the
-  affected `docs/` page when the workflow changes.
-- Security-sensitive change? Read [SECURITY.md](SECURITY.md) first and
-  report vulnerabilities privately, never in a public issue or PR.
+Unsafe code is limited to the existing enclave, sudo plugin, and PAM boundaries.
+Read [SECURITY.md](SECURITY.md) before reporting a vulnerability.
 
-The optional Google browser ceremony helper is documented in
-[docs/browser-ceremony-relay.md](docs/browser-ceremony-relay.md). Its dedicated
-script runs local fakes plus ignored broker and subprocess tests; those tests
-simulate the Google and Mac boundaries and do not replace real Google or Touch
-ID acceptance.
+## Package verification
+
+`scripts/build-darwin-artifact OUTPUT_DIR` builds the Mac release, including
+the browser relay and agent app bundle. It checks architecture, signing,
+framework linkage, and checksums. `CARGO_TARGET_DIR` selects an isolated build
+directory. `packaging/build-deb` assembles Linux release binaries and checks
+their architecture and runtime dependencies.
+
+The release workflow extracts each package and runs:
+
+```sh
+scripts/test-browser-relay-package /path/to/oshioki-browser-relay /path/to/SHA256SUMS
+```
+
+This checks the shipped helper's hash, commands, and private key creation
+without contacting Google or asking for Touch ID. The separate Homebrew tap
+must install the helper and test it again after a bottle is poured.
+
+## Supervised acceptance
+
+Automated provider/device substitutes do not prove physical Touch ID, Google
+policy, or phone notification delivery. Use a test host with a retained root
+shell for these sessions.
+
+For a Linux Tailscale host and Mac approver:
+
+```sh
+# On the host:
+scripts/dev-acceptance mac
+# Follow its printed pairing command on the Mac, then on the host:
+scripts/dev-acceptance test
+scripts/dev-acceptance down
+```
+
+Each test sends one synthetic request. Check approval, cancellation, and expiry
+separately. If you installed a real host plugin during the session,
+[disable it](RUNBOOK.md#restore-ordinary-sudo) before stopping its services.
+
+Use the [phone](docs/phone-enrollment.md) and
+[Google login](docs/browser-ceremony-relay.md) guides for those acceptance
+journeys. Record the build, what the person observed, and any untested path.

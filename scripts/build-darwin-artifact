@@ -7,14 +7,16 @@ case "$OUTPUT" in /*) ;; *) OUTPUT="$(pwd -P)/$OUTPUT" ;; esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 REVISION="$(git -C "$ROOT" rev-parse HEAD)"
 TARGET="aarch64-apple-darwin"
+BUILD_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
+case "$BUILD_ROOT" in /*) ;; *) BUILD_ROOT="$ROOT/$BUILD_ROOT" ;; esac
 
 cd "$ROOT"
 # The agent links Security.framework and LocalAuthentication through
 # oshioki-enclave, so it builds here and nowhere else.
-cargo build --locked --release --target "$TARGET" -p oshioki-hook -p oshioki-plugin -p oshioki-agent -p oshioki-server -p oshioki-pam
+cargo build --locked --release --target "$TARGET" -p oshioki-hook -p oshioki-plugin -p oshioki-agent -p oshioki-server -p oshioki-pam -p oshioki-browser-relay
 mkdir -p "$OUTPUT"
-install -m 0755 "target/$TARGET/release/oshioki" "$OUTPUT/oshioki"
-install -m 0755 "target/$TARGET/release/liboshioki_plugin.dylib" "$OUTPUT/oshioki.dylib"
+install -m 0755 "$BUILD_ROOT/$TARGET/release/oshioki" "$OUTPUT/oshioki"
+install -m 0755 "$BUILD_ROOT/$TARGET/release/liboshioki_plugin.dylib" "$OUTPUT/oshioki.dylib"
 # Homebrew rewrites LC_ID_DYLIB and re-signs any dylib in a keg whose id is
 # not already the keg's opt path, which invalidates the checksum taken here
 # (issue #87). Both dylibs are linked with that exact id by plugin/build.rs
@@ -33,10 +35,13 @@ codesign --force --sign - "$OUTPUT/oshioki.dylib"
 # The PAM module keeps its own name here: install-oshioki-hook looks the
 # artifact up in SHA256SUMS under exactly liboshioki_pam.dylib before it will
 # install it, and the macOS auth line names the same file.
-install -m 0644 "target/$TARGET/release/liboshioki_pam.dylib" "$OUTPUT/liboshioki_pam.dylib"
+install -m 0644 "$BUILD_ROOT/$TARGET/release/liboshioki_pam.dylib" "$OUTPUT/liboshioki_pam.dylib"
 codesign --force --sign - "$OUTPUT/liboshioki_pam.dylib"
-install -m 0755 "target/$TARGET/release/oshioki-agent" "$OUTPUT/oshioki-agent"
-install -m 0755 "target/$TARGET/release/oshioki-server" "$OUTPUT/oshioki-server"
+install -m 0755 "$BUILD_ROOT/$TARGET/release/oshioki-agent" "$OUTPUT/oshioki-agent"
+install -m 0755 "$BUILD_ROOT/$TARGET/release/oshioki-server" "$OUTPUT/oshioki-server"
+install -m 0755 "$BUILD_ROOT/$TARGET/release/oshioki-browser-relay" "$OUTPUT/oshioki-browser-relay"
+codesign --force --sign - "$OUTPUT/oshioki-browser-relay"
+codesign --verify --strict "$OUTPUT/oshioki-browser-relay"
 # The Touch ID sheet takes its name and icon from the calling process's app
 # bundle, so the agent a brew install runs has to live inside Oshioki.app.
 # The bundle is staged here, next to the flat binary, and both ship: a keg
@@ -81,6 +86,7 @@ hash_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '
 hook_hash="$(hash_of "$OUTPUT/oshioki")"
 plugin_hash="$(hash_of "$OUTPUT/oshioki.dylib")"
 pam_hash="$(hash_of "$OUTPUT/liboshioki_pam.dylib")"
+relay_hash="$(hash_of "$OUTPUT/oshioki-browser-relay")"
 agent_hash="$(hash_of "$OUTPUT/oshioki-agent")"
 installer_hash="$(hash_of "$OUTPUT/install-oshioki-hook")"
 setup_hash="$(hash_of "$OUTPUT/oshioki-laptop-setup")"
@@ -88,7 +94,7 @@ server_hash="$(hash_of "$OUTPUT/oshioki-server")"
 phone_setup_hash="$(hash_of "$OUTPUT/oshioki-phone-setup")"
 toolchain="$(rustc --version --verbose | tr '\n' ';')"
 cat > "$OUTPUT/manifest.json" <<EOF
-{"schema_version":1,"target":"$TARGET","revision":"$REVISION","toolchain":"$toolchain","files":[{"name":"oshioki","mode":"$(mode_of "$OUTPUT/oshioki")","sha256":"$hook_hash","media_type":"application/vnd.oshioki.hook.v1"},{"name":"oshioki.dylib","mode":"$(mode_of "$OUTPUT/oshioki.dylib")","sha256":"$plugin_hash","media_type":"application/vnd.oshioki.plugin.v1"},{"name":"liboshioki_pam.dylib","mode":"$(mode_of "$OUTPUT/liboshioki_pam.dylib")","sha256":"$pam_hash","media_type":"application/vnd.oshioki.pam.v1"},{"name":"oshioki-agent","mode":"$(mode_of "$OUTPUT/oshioki-agent")","sha256":"$agent_hash","media_type":"application/vnd.oshioki.agent.v1"},{"name":"install-oshioki-hook","mode":"$(mode_of "$OUTPUT/install-oshioki-hook")","sha256":"$installer_hash","media_type":"application/vnd.oshioki.installer.v1"},{"name":"oshioki-laptop-setup","mode":"$(mode_of "$OUTPUT/oshioki-laptop-setup")","sha256":"$setup_hash","media_type":"application/vnd.oshioki.setup.v1"},{"name":"oshioki-server","mode":"$(mode_of "$OUTPUT/oshioki-server")","sha256":"$server_hash","media_type":"application/vnd.oshioki.server.v1"},{"name":"oshioki-phone-setup","mode":"$(mode_of "$OUTPUT/oshioki-phone-setup")","sha256":"$phone_setup_hash","media_type":"application/vnd.oshioki.phone-setup.v1"}]}
+{"schema_version":1,"target":"$TARGET","revision":"$REVISION","toolchain":"$toolchain","files":[{"name":"oshioki","mode":"$(mode_of "$OUTPUT/oshioki")","sha256":"$hook_hash","media_type":"application/vnd.oshioki.hook.v1"},{"name":"oshioki.dylib","mode":"$(mode_of "$OUTPUT/oshioki.dylib")","sha256":"$plugin_hash","media_type":"application/vnd.oshioki.plugin.v1"},{"name":"liboshioki_pam.dylib","mode":"$(mode_of "$OUTPUT/liboshioki_pam.dylib")","sha256":"$pam_hash","media_type":"application/vnd.oshioki.pam.v1"},{"name":"oshioki-browser-relay","mode":"$(mode_of "$OUTPUT/oshioki-browser-relay")","sha256":"$relay_hash","media_type":"application/vnd.oshioki.browser-relay.v1"},{"name":"oshioki-agent","mode":"$(mode_of "$OUTPUT/oshioki-agent")","sha256":"$agent_hash","media_type":"application/vnd.oshioki.agent.v1"},{"name":"install-oshioki-hook","mode":"$(mode_of "$OUTPUT/install-oshioki-hook")","sha256":"$installer_hash","media_type":"application/vnd.oshioki.installer.v1"},{"name":"oshioki-laptop-setup","mode":"$(mode_of "$OUTPUT/oshioki-laptop-setup")","sha256":"$setup_hash","media_type":"application/vnd.oshioki.setup.v1"},{"name":"oshioki-server","mode":"$(mode_of "$OUTPUT/oshioki-server")","sha256":"$server_hash","media_type":"application/vnd.oshioki.server.v1"},{"name":"oshioki-phone-setup","mode":"$(mode_of "$OUTPUT/oshioki-phone-setup")","sha256":"$phone_setup_hash","media_type":"application/vnd.oshioki.phone-setup.v1"}]}
 EOF
 # manifest.json stays a flat-file manifest: it is hashed into SHA256SUMS
 # itself and the installer reads it by name, so the bundle entry goes only
@@ -97,9 +103,9 @@ EOF
 app_bin_rel="Oshioki.app/Contents/MacOS/oshioki-agent"
 (
   cd "$OUTPUT"
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json "$app_bin_rel" > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json "$app_bin_rel" > SHA256SUMS; fi
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server oshioki-browser-relay install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json "$app_bin_rel" > SHA256SUMS; else shasum -a 256 oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server oshioki-browser-relay install-oshioki-hook oshioki-laptop-setup oshioki-phone-setup manifest.json "$app_bin_rel" > SHA256SUMS; fi
 )
-for artifact in oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server \
+for artifact in oshioki oshioki.dylib liboshioki_pam.dylib oshioki-agent oshioki-server oshioki-browser-relay \
   "Oshioki.app/Contents/MacOS/oshioki-agent"; do
   file "$OUTPUT/$artifact" | grep -q 'arm64'
 done
@@ -115,3 +121,4 @@ nm -gU "$OUTPUT/liboshioki_pam.dylib" | grep -Eq '(_)?pam_sm_authenticate$'
 # The agent is useless without the enclave; a build that dropped the framework
 # would still run and only fail at the first signature.
 otool -L "$OUTPUT/oshioki-agent" | grep -q 'LocalAuthentication'
+otool -L "$OUTPUT/oshioki-browser-relay" | grep -q 'LocalAuthentication'

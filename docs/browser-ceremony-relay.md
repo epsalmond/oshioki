@@ -1,201 +1,192 @@
-# Oshioki-secured Google browser ceremonies
+# Approve a browser login
 
-`oshioki-browser-relay` is an opt-in helper for a Google `gcloud auth login`
-ceremony. The first-class mode runs entirely on one Mac: Oshioki shows one
-Touch ID approval, then gcloud owns its normal browser and localhost callback.
-An optional remote-requester mode adds signed NATS messages and short-lived SSH
-forwarding when the requester and approving Mac are different machines.
+Oshioki can require one Touch ID approval before establishing or renewing
+Google CLI access. It supports a login on the same Mac or a login on a remote
+host approved from that Mac.
 
-The Oshioki approval authorizes this helper invocation to establish or renew
-the configured Google account. It does not intercept ordinary gcloud commands
-or take ownership of credentials already stored by gcloud. Routine commands
-may refresh those credentials directly under gcloud's normal policy.
+| Journey | Command |
+| --- | --- |
+| Google login on this Mac | `oshioki-browser-relay local-login --config …` |
+| Google login on a server or VM | `oshioki-browser-relay login --config …` on the host, with `serve` on the Mac |
+| `vercel login` or another provider | Not implemented; there is no generic browser adapter. |
 
-Google remains the authentication authority. The helper neither supplies a
-Google password or passkey nor replaces Google's WebAuthn challenge. The
-current adapter is intentionally Google-first-party gcloud only.
+Use the helper explicitly. Running bare `gcloud auth login` does not invoke
+Oshioki. After approval, gcloud owns the credentials and routine commands can
+refresh them normally. Google may still require account selection, consent,
+a password, or a passkey; Touch ID does not replace Google's authentication.
 
-## Local Mac mode
+## Install
 
-Local prerequisites are gcloud on `PATH`, a logged-in graphical macOS session,
-an available Touch ID sensor, and Secure Enclave support.
+[Install Oshioki](install.md) and install Google Cloud CLI separately on the
+machine that will run gcloud. The relay is included in the next release after
+0.1.15, in both Homebrew's Mac package and the Debian package. The Mac package
+also includes the agent used to create the approval identity.
 
-Build the binary and the native agent from this checkout, or use release
-artifacts built from the same reviewed source:
+For an earlier release or a source checkout:
 
 ```sh
 cargo build --locked --release -p oshioki-agent -p oshioki-browser-relay
-AGENT=./target/release/oshioki-agent
+export PATH="$PWD/target/release:$PATH"
 ```
 
-Create a separate Secure Enclave identity for this helper. Keeping it separate
-from the normal agent identity avoids unrelated agent box-secret access while
-retaining the same native Touch ID experience:
+Confirm that the required commands are available:
+
+```sh
+oshioki-browser-relay --help
+gcloud --version
+```
+
+Local approval requires macOS, Touch ID, Secure Enclave, and a graphical login
+session. Sudo installation, a server, NATS, and SSH are unnecessary for a
+local login.
+
+## Local login
+
+### Create the approval identity once
+
+Run as the user who owns the gcloud profile:
 
 ```sh
 mkdir -p ~/.config/oshioki/browser-relay
 chmod 700 ~/.config/oshioki/browser-relay
-$AGENT init --signer enclave \
-  --state ~/.config/oshioki/browser-relay
-$AGENT device-record --state ~/.config/oshioki/browser-relay \
-  --label browser-relay
+oshioki-agent init --signer enclave --state ~/.config/oshioki/browser-relay
+oshioki-agent device-record --state ~/.config/oshioki/browser-relay --label browser-relay
 ```
 
-Use the `credential_public_key` from that public device record as
-`approval_public_key`. Create a mode-600 local configuration, replacing the
-account, paths, and public key:
+Use a separate identity from the sudo agent. Copy its public
+`credential_public_key` into `approval_public_key` below.
+
+Create `~/.config/oshioki/browser-relay/local.json` with mode 0600 and this
+content, substituting your account, absolute identity path, and public key:
 
 ```json
 {
   "google_account": "you@example.com",
   "approval_identity": "/Users/you/.config/oshioki/browser-relay/agent.json",
-  "approval_public_key": "REPLACE_WITH_THE_IDENTITY_PUBLIC_KEY",
+  "approval_public_key": "IDENTITY_CREDENTIAL_PUBLIC_KEY",
   "local_label": "this Mac"
 }
 ```
 
-Run the local helper as the user who owns the gcloud profile:
+JSON paths must be absolute; `~` is not expanded inside the file.
+
+### Request a login
 
 ```sh
 chmod 600 ~/.config/oshioki/browser-relay/local.json
-./target/release/oshioki-browser-relay local-login \
-  --config ~/.config/oshioki/browser-relay/local.json
+oshioki-browser-relay local-login --config ~/.config/oshioki/browser-relay/local.json
 ```
 
-The helper loads only the Secure Enclave signing blob. It does not read the
-agent's unrelated box secret or its Keychain entry. It then shows one Oshioki
-Touch ID prompt. If gcloud can reuse or refresh valid credentials, no browser
-opens. If Google requires a new login, gcloud opens the default browser and
-handles its own loopback callback directly. A denied or expired approval starts
-no gcloud process; an interruption after launch terminates and reaps it.
+Approve the named account with Touch ID. If stored credentials are usable,
+gcloud can finish without opening a browser. Otherwise, complete Google's
+browser flow; gcloud handles its own localhost callback. The helper checks
+credential usability without printing the token.
 
-The local mode does not require NATS, SSH, a server, a VM, a launchd service,
-or a public listener. The local browser callback is owned by gcloud, so the
-helper does not bind that port or inspect callback bytes.
+Success is the helper exiting zero. Denying or letting approval expire starts
+no gcloud process. Interrupting an active attempt stops its helper processes.
 
-## Optional remote requester
+## Remote login
 
-When the requester and approving Mac differ, use the remote `login` and `serve`
-commands. Build once, then use explicit binary paths:
+Here the **requester** runs gcloud and stores its credentials; the **Mac**
+shows Touch ID and, when needed, opens the browser.
 
-```sh
-cargo build --locked --release -p oshioki-agent -p oshioki-browser-relay
-RELAY=./target/release/oshioki-browser-relay
-```
+### Prepare the connection
 
-The mode requires a private NATS account and lane reachable by both peers, two
-relay-only software signing keys, and noninteractive SSH from the Mac to the
-requester. Remote NATS uses `tls://` with server verification and credentials
-kept outside command history; only loopback `nats://127.0.0.1` is allowed for a
-disposable local broker. Do not expose NATS publicly. Pin the SSH host key in
-`known_hosts`, use `BatchMode=yes`, `StrictHostKeyChecking=yes`, and permit
-only the required `-W localhost:<callback-port>` forwarding. The SSH
-destination is local Mac configuration and is never accepted from a received
-message.
+Install the relay on both machines and create the Mac approval identity above.
+You also need:
 
-Use separate NATS users. Restrict the requester user to publish
-`oshioki.browser.v1.<lane>` and subscribe to
-`oshioki.browser.v1.<lane>.reply.*`. Restrict the approver user to subscribe
-to `oshioki.browser.v1.<lane>` and publish
-`oshioki.browser.v1.<lane>.reply.*`. No other subjects are needed.
+- A private TLS NATS broker reachable by both machines, with separate users.
+  This relay uses core NATS; it needs no Oshioki server or JetStream stream.
+- A shared canonical UUID for `lane` (lowercase).
+- Noninteractive SSH from the Mac to the requester, with a pinned host key
+  and permission for `-W localhost:<callback-port>` forwarding.
+  The relay uses `BatchMode=yes` and `StrictHostKeyChecking=yes`.
 
-Generate one relay-only key on each requester/approver host and exchange only
-the public keys over a trusted channel:
+Give each NATS user only these subjects:
+
+| Role | Publish | Subscribe |
+| --- | --- | --- |
+| Requester | `oshioki.browser.v1.<lane>` | `oshioki.browser.v1.<lane>.reply.*` |
+| Mac | `oshioki.browser.v1.<lane>.reply.*` | `oshioki.browser.v1.<lane>` |
+
+On **each** machine, create its relay signing key:
 
 ```sh
 mkdir -p ~/.config/oshioki/browser-relay
 chmod 700 ~/.config/oshioki/browser-relay
-$RELAY keygen ~/.config/oshioki/browser-relay/signing.key
+oshioki-browser-relay keygen ~/.config/oshioki/browser-relay/signing.key
 ```
 
-Use mode-600 JSON configurations. Requester example:
+Exchange the printed public keys over a trusted channel. These authenticate
+the relay peers; they are separate from the Mac's Touch ID approval key.
+
+### Configure each machine
+
+Save each JSON file with mode 0600. Requester
+(`~/.config/oshioki/browser-relay/requester.json`):
 
 ```json
 {
-  "nats_url": "tls://requester-user:REDACTED@nats.example:4222",
-  "lane": "REPLACE_WITH_SHARED_LANE_UUID",
-  "private_key": "/path/to/requester/signing.key",
-  "peer_public_key": "APPROVER_RELAY_PUBLIC_KEY",
+  "nats_url": "tls://requester-user:PASSWORD@nats.example.com:4222",
+  "lane": "REPLACE_WITH_SHARED_LOWERCASE_UUID",
+  "private_key": "/home/you/.config/oshioki/browser-relay/signing.key",
+  "peer_public_key": "MAC_RELAY_PUBLIC_KEY",
   "google_account": "you@example.com",
-  "approval_public_key": "APPROVER_OSHIOKI_PUBLIC_KEY"
+  "approval_public_key": "MAC_IDENTITY_CREDENTIAL_PUBLIC_KEY"
 }
 ```
 
-Approver example:
+Mac (`~/.config/oshioki/browser-relay/approver.json`):
 
 ```json
 {
-  "nats_url": "tls://approver-user:REDACTED@nats.example:4222",
-  "lane": "REPLACE_WITH_SHARED_LANE_UUID",
-  "private_key": "/path/to/approver/signing.key",
+  "nats_url": "tls://approver-user:PASSWORD@nats.example.com:4222",
+  "lane": "REPLACE_WITH_SHARED_LOWERCASE_UUID",
+  "private_key": "/Users/you/.config/oshioki/browser-relay/signing.key",
   "peer_public_key": "REQUESTER_RELAY_PUBLIC_KEY",
   "google_account": "you@example.com",
-  "approval_identity": "/path/to/browser-relay/agent.json",
+  "approval_identity": "/Users/you/.config/oshioki/browser-relay/agent.json",
   "ssh_destination": "requester-ssh-alias"
 }
 ```
 
-In an approver terminal, start the foreground receiver:
+Percent-encode special characters in URL credentials. Keep passwords in these
+private files, not command arguments. Both configurations must name the same
+Google account. Keep the account approval fields: legacy configurations that
+omit all of them use a browser-only relay without the account approval step.
+
+### Run
+
+On the Mac, leave this foreground receiver running:
 
 ```sh
-$RELAY serve --config /path/to/approver.json
+oshioki-browser-relay serve --config ~/.config/oshioki/browser-relay/approver.json
 ```
 
-In a separate requester terminal, request one ceremony:
+On the requester:
 
 ```sh
-$RELAY login --config /path/to/requester.json
+oshioki-browser-relay login --config ~/.config/oshioki/browser-relay/requester.json
 ```
 
-Remote setup keeps the same account-bound Oshioki approval fields:
+Approve on the Mac. When Google requires a browser, the relay forwards the
+localhost callback over short-lived SSH connections; credentials remain on
+the requester. Callback codes and tokens do not cross NATS.
 
-- the requester pins the Mac identity public key as `approval_public_key`;
-- the Mac pins its local `google_account` and `approval_identity`;
-- the requester sends a signed account-bound authorization request;
-- the Mac signs a challenge bound to lane, attempt, expiry, receiver nonce,
-  and account after Touch ID;
-- only then does the requester run gcloud without `--force`.
+## Update or troubleshoot
 
-The browser fallback is the remote adapter's only extra behavior: it validates
-Google's authorization URL, opens the Mac browser, and forwards the loopback
-callback through short-lived SSH `-W` connections. Callback codes and tokens
-never enter NATS. Remote configurations with incomplete account-approval
-fields fail closed. Legacy configurations without account approval fields keep
-the original browser-only behavior for migration.
+Upgrade both peers together and restart `serve`. Preserve the configuration
+and keys; a routine package update needs no new identity or enrollment.
 
-## Reusable approval pattern
+| Symptom | Check |
+| --- | --- |
+| Command not found | Package must include the relay; older releases need the source build. |
+| Private-file error | Config and signing key must be regular private files, normally mode 0600. |
+| No Touch ID | Use the graphical Mac session and a Secure Enclave identity; software keys cannot approve. |
+| Remote receiver never becomes ready | NATS TLS/authentication, subject permissions, matching lane and peer keys. |
+| Approval succeeds but browser login fails | SSH access to the requester and Google's browser flow. |
+| Identity key invalid after changing Touch ID fingerprints | Create a replacement ceremony identity and update its public key in the local/requester config. |
 
-The ceremony pattern is reusable even though this adapter is Google-specific:
-
-1. Bind a signed request to a trusted local target, explicit intent, lane,
-   fresh nonce, and short expiry.
-2. Show the local approver exactly what will be invoked and require one native
-   Touch ID decision before starting the helper.
-3. Verify the domain-separated approval signature and every binding field
-   before invoking the provider helper.
-4. Keep provider credentials, authorization codes, and tokens off the approval
-   transport and out of diagnostics.
-5. Cancel on denial, expiry, interruption, or peer loss; terminate and reap
-   every helper process and remove temporary listeners.
-
-The approval authorizes this helper invocation. It does not become a general
-credential broker or enforce every later provider token refresh.
-
-## Trust and cleanup
-
-Relay software keys authenticate the two relay peers; they cannot approve sudo
-or sign Google's WebAuthn challenges. The separate Oshioki Secure Enclave key
-signs only the domain-separated browser-ceremony approval challenge.
-
-Every attempt has a short expiry, a fresh receiver nonce, and bounded IDs.
-Success, denial, expiry, interruption, failed gcloud commands, and lost peers
-clean up process groups and temporary listeners. The remote adapter requires
-the requester and Mac to be upgraded together for account-bound mode.
-
-## Verification scope
-
-Automated tests cover URL validation, signed-frame binding, authenticated NATS,
-headless account reuse, local gcloud orchestration, denial and timeout cleanup,
-remote browser fallback, and process teardown. A real Google account, browser,
-passkey, and Touch ID run is separate acceptance work; local fakes do not prove
-Google policy or physical biometric behavior.
+Automated tests use fake Google and Mac boundaries. They verify orchestration,
+signatures, broker authentication, callback forwarding, and cleanup; they do
+not replace a real Google/Touch ID acceptance run.

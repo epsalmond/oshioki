@@ -1,131 +1,113 @@
-# Enroll a phone
+# Approve sudo from a phone
 
-Run enrollment on the host whose sudo requests the phone will approve. Open
-the resulting URL in the phone's browser. The phone does not run the
-`oshioki` command.
+Run setup and enrollment on the host whose sudo the phone will approve.
+The phone opens a URL; it does not run the `oshioki` command.
 
-The hook needs a reachable HTTPS Oshioki server and a NATS connection to
-that server. Local Touch ID setup alone does not provide a browser server.
-`localhost` refers to the device opening the URL, so it cannot serve as the
-host's address on a phone.
+## 1. Make the server reachable
 
-## Tailscale setup
+[Install Oshioki](install.md). Choose one setup:
 
-Tailscale is the first choice when it is running on the host. Connect the
-phone to the same tailnet, then run these commands on the host:
+| Setup | Prerequisites |
+| --- | --- |
+| Tailscale (managed local server) | Python 3, `oshioki-server`, `nats-server`, Tailscale running on the host, and the phone on the same tailnet |
+| Existing HTTPS server | An Oshioki origin trusted and reachable by host and phone, plus this host's NATS credentials |
+
+For Tailscale, run as your normal user:
 
 ```sh
+# On macOS, if NATS is not installed:
+brew install nats-server
+oshioki-phone-setup --check
 oshioki-phone-setup
+```
+
+Setup starts a local server and JetStream broker on loopback and publishes
+HTTPS through Tailscale Serve. It refuses to replace an unrelated Serve
+configuration. On Linux it requires a systemd user service manager.
+
+For an existing server, put `NATS_URL`, `NATS_USER`, and `NATS_PASS` in a
+mode-600 file, then:
+
+```sh
+oshioki-phone-setup --server-url https://sudo.example.com --nats-config /path/to/hook-nats.env
+```
+
+That option configures the host without starting services. The server's
+`OSHIOKI_ORIGIN` must match the HTTPS URL and `OSHIOKI_RP_ID` its hostname.
+See [server requirements](requirements.md) if you operate that deployment.
+
+## 2. Enroll
+
+On the host:
+
+```sh
 sudo oshioki enroll
 ```
 
-Run the setup command as your normal user. It elevates only to update the
-installed host configuration. Prerequisites are Python 3, `oshioki-server`,
-`nats-server`, and a running Tailscale client. On macOS, install NATS with
-`brew install nats-server`; the Oshioki release includes the server and
-setup helper. From a source checkout, build the server and use the script:
+On a fresh Debian install, the hook may still be at
+`/usr/share/oshioki/oshioki`; use
+`sudo /usr/share/oshioki/oshioki enroll` until host activation installs it on PATH.
+
+Keep that command running. The printed URL expires after five minutes.
+
+On iPhone or iPad:
+
+1. Open the Oshioki HTTPS origin and add it to the Home Screen.
+2. Open the installed app, go to `/setup`, and paste the **complete** enrollment
+   URL, including its `#secret` fragment.
+3. Tap Continue and complete the passkey prompt.
+4. After activation, tap Enable notifications.
+
+Other supported browsers can open the enrollment URL directly. Enroll each
+browser profile separately. An enrollment completed in a Safari tab may not
+be available to the Home Screen app; use a fresh URL in the app if necessary.
+A denied notification permission does not undo enrollment, but prevents push
+delivery.
+
+## 3. Activate and verify
+
+On the host, confirm the device and send a test:
 
 ```sh
-cargo build --locked -p oshioki-server -p oshioki-hook
-scripts/oshioki-phone-setup
+sudo oshioki status
+sudo oshioki test
 ```
 
-Setup creates private persistent state for an owned local NATS broker with
-JetStream and an Oshioki server. Both listen on loopback. Tailscale Serve
-provides the HTTPS endpoint; the broker is not exposed to the phone. On
-macOS, LaunchAgents supervise the services; on Linux, systemd user services
-are required. Setup refuses an unrelated Tailscale Serve configuration.
+Use the full hook path above if it is not installed yet. Confirm that the phone
+receives a notification, opens the request, and completes approval.
 
-Use `oshioki-phone-setup --check` to inspect prerequisites without applying
-the setup. The default loopback ports are 14222 for NATS and 18443 for the
-server; `--nats-port` and `--server-port` select alternatives. State and logs
-live under `~/.local/share/oshioki/phone-server`.
+Then [activate sudo on the host](install.md#activate-a-manually-configured-sudo-host)
+and approve a real `sudo true`. Setup configures reachability; enrollment and
+activation are separate steps.
 
-The macOS service labels are `com.oshioki.phone-server.nats` and
-`com.oshioki.phone-server.server`. On Linux, inspect them with:
+## Keep it working
+
+The phone must reach the same HTTPS origin when a notification is tapped.
+With Tailscale Serve, that means an active tailnet connection. Keep the hostname
+stable: passkeys are scoped to the RP ID. Do not substitute `localhost`;
+on the phone it refers to the phone itself.
+
+Managed state and logs live under `~/.local/share/oshioki/phone-server`.
+The default ports are NATS 14222 and HTTP 18443, configurable with
+`--nats-port` and `--server-port`. Re-run setup after a package update.
+
+On macOS the service labels are `com.oshioki.phone-server.nats` and
+`com.oshioki.phone-server.server`. On Linux:
 
 ```sh
 systemctl --user status oshioki-phone-server-nats.service oshioki-phone-server.service
 ```
 
-These are user services: the hosting user's service manager must be running
-for the server to be available. An always-on server is preferable if other
-hosts need approval while the laptop is asleep.
+The hosting user's service manager must remain running. Use an always-on server
+if approvals must work while a laptop sleeps.
 
-The printed enrollment URL expires after five minutes. On an iPhone or iPad,
-add the Oshioki origin to the Home Screen before completing enrollment, then
-open the installed Oshioki app. In `/setup`, paste the complete enrollment URL
-including its `#secret` fragment. The app validates the origin and enrollment
-path locally and does not upload or persist that fragment. Leave `enroll`
-running while you tap Continue and complete the browser's WebAuthn prompt.
-After activation, tap Enable notifications as a separate user action.
+| Problem | Next step |
+| --- | --- |
+| URL expired | Run enrollment again; its lifetime cannot be extended. |
+| Host preflight fails | Restore server health, HTTPS trust, and matching origin/RP ID first. |
+| Host succeeds but phone cannot connect | Check the phone's network and tailnet access. |
+| Enrolled but no notifications | Check permission and push registration in the installed app; `/healthz` alone does not prove delivery. |
+| Server confirmation timed out | The host may already have pinned the device. Inspect status and re-enroll once the server is healthy. |
 
-If enrollment was completed in a normal browser tab, reopen `/setup` in the
-installed Home Screen app and paste a fresh URL. Safari may give the installed
-app separate IndexedDB storage, and an enrollment URL cannot be extended after
-its five-minute lifetime; rerun `sudo oshioki enroll` when it has expired.
-Enrollment, passkey status, push permission, and server registration are
-reported separately. A denied or unsupported notification API does not prevent
-passkey enrollment, but no request-triggered notification can arrive until a
-browser subscription is registered.
-
-## An existing HTTPS server
-
-Users without Tailscale can run an Oshioki server behind their own HTTPS
-reverse proxy or use an existing deployment. The certificate must be
-trusted by both the host and the phone, and the hostname must resolve and
-be reachable from both. See [server configuration](configuration.md) and
-[production requirements](requirements.md) for the server and NATS setup.
-
-Configure the server with matching values:
-
-```text
-OSHIOKI_ORIGIN=https://sudo.example.com
-OSHIOKI_RP_ID=sudo.example.com
-```
-
-Put the host role's NATS settings in a private file. Do not put credentials
-in command arguments:
-
-```text
-NATS_URL=tls://nats.example.com:4222
-NATS_USER=oshioki-hook
-NATS_PASS=<host-role-password>
-```
-
-Then run:
-
-```sh
-chmod 600 /path/to/hook-nats.env
-oshioki-phone-setup --server-url https://sudo.example.com --nats-config /path/to/hook-nats.env
-sudo oshioki enroll
-```
-
-This option does not start local services or configure Tailscale. Plaintext
-NATS is permitted only on loopback. An HTTPS reverse proxy can forward to
-the server's loopback HTTP listener; WebAuthn uses the public HTTPS origin.
-
-## Configuration and troubleshooting
-
-Setup checks the public server before updating `/etc/oshioki/hook.json`,
-`config.env`, and `install.env`. It preserves the local agent socket,
-device registry, and native identity. The server's reported origin and RP
-ID must agree with the host configuration. Keep the hostname stable:
-browser credentials are scoped to their WebAuthn RP ID. Changing it after
-enrollment requires planning for new browser credentials.
-
-`sudo oshioki enroll` checks the HTTPS endpoint before creating an
-enrollment. If it reports that the server is unavailable, fix server or
-network access first. A successful host check cannot prove the phone's
-network access; check that the phone is on the tailnet when using Serve.
-
-When a notification is tapped, the phone must still be able to reach the same
-configured HTTPS/Tailscale origin. A stored subscription or healthy `/healthz`
-response is not evidence that a real phone received a notification. Notification
-taps only open `/r/<id>` or `/a/<id>`; the existing local decryption and
-WebAuthn ceremony remains required.
-
-For deliberate local browser development, use
-`sudo oshioki enroll --allow-localhost`. This permits a loopback origin;
-it does not bypass certificate verification or make the URL accessible
-from another device.
+Local browser development can use `oshioki enroll --allow-localhost`; that
+does not make the URL reachable from a phone.

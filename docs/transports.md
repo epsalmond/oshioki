@@ -1,37 +1,55 @@
-# Transports
+# Transport contract
 
-`oshioki-transport` is the seam the hook and the server implement against. The wire format is unchanged: the subjects and v1 JSON payloads below are byte-identical to what shipped before the seam existed.
+NATS/JetStream is the only configured `oshioki-transport` backend.
+The native agent's local Unix socket is an additional hook-to-device path.
+Browser approvals need NATS and the server.
 
-## Guarantees
+## Delivery and decisions
 
-Every transport must provide the guarantees below.
+| Property | Implementation |
+| --- | --- |
+| Idempotent server commit | SQLite deduplicates by request ID; request commit precedes JetStream acknowledgement. Conflicting bytes are rejected. |
+| First decision wins | The server commits the first accepted action and outbox row together; later actions receive `410`. |
+| Durable publication | The server outbox retries after restart until NATS publication and flush succeed. |
+| Bounded waiting | The hook owns the approval deadline; unavailable transports report the underlying error. |
+| Liveness before a human decision | Native `AliveV1` acknowledgement, or browser `DeliveryV1` followed by browser `AliveV1`. Neither authorizes execution. |
 
-- Exactly-once request commit. The `nats` transport provides it with JetStream explicit ack and the commit-before-ack outbox: the server writes the envelope to SQLite and marks the row sent only after the message acknowledges.
-- First decision wins. The `nats` transport provides it with the durable consumer replay: redelivered requests dedup at `Store::ingest_request` on `request_id`.
-- A deny fails fast. The `nats` transport provides it with a direct verdict publish+flush: the denial is not routed through the request outbox.
-- A timeout fires at the deadline. The `nats` transport provides it with the hook-side deadline timer: the hook keeps the approval timer and fails the request on expiry regardless of what the transport does.
-- A request is acknowledged before the agent asks for a decision. A native-only socket or NATS request requires an `AliveV1` from the agent within three seconds. For a request with an active pinned WebAuthn recipient, the server adds a `DeliveryV1` row to the same durable transaction as the request after routing it to that recipient; the hook accepts that receipt on `oshioki.delivery.<request-id>` and reports that the request was delivered while it waits for the browser. The browser posts `AliveV1` on `oshioki.ack.<request-id>` only after authenticating, decrypting, and checking the request. The server never uses ingestion itself as evidence that a browser opened it.
-- An unavailable transport is reported with its underlying error and ends that attempt quickly. A connected transport that sends no acknowledgement is reported as a nonresponsive daemon. Neither message is an approval.
+Exactly-once commit refers to server state, not exactly-once network delivery.
+The hook waits live for a decision; its wait is not a durable outbox.
 
-The outbox wording matters because the hook's verdict wait is a live hold, not an outbox. The outbox row lives server-side, and the approval lane drains delivery receipts and verdicts, so `nats` provides exactly-once *server-side* commit. Request redelivery after a consumer restart is idempotent because `Store::ingest_request` dedups on `request_id`. A transport holding a live connection can depart from the outbox only when its reply ordering preserves first-decision-wins on the hook.
+## Socket fallback
 
-## Transports
+With `OSHIOKI_AGENT_SOCKET` configured, the hook tries the socket first.
 
-`OSHIOKI_TRANSPORT=nats` is the only configured transport backend. It selects
-NATS and JetStream for hook and server traffic. Native agents also serve local
-hook requests over a Unix socket, which sits beside this transport seam.
+| Socket outcome | Command approval behavior |
+| --- | --- |
+| Unavailable, closes, or silent before acknowledgement | Try NATS if configured, within the same deadline. |
+| Valid decision | Finish with that result. |
+| Malformed reply or failure after valid acknowledgement | Fail closed; no transport retry. |
 
-When `OSHIOKI_AGENT_SOCKET` is configured, the hook tries that socket first.
-If it is unavailable, or closes or stays silent before its `AliveV1`
-acknowledgement, the hook can fall back to NATS when `NATS_URL` is set. A
-malformed protocol reply, a socket decision, or any failure after a valid
-acknowledgement is final and never falls back. Without `NATS_URL` in the hook
-configuration, that hook uses the socket only. An agent with no `NATS_URL` in
-its own runtime environment answers socket requests only. Browser approval
-still uses the server and NATS path.
+Omitting `NATS_URL` makes the hook socket-only. Omitting both transports is
+a configuration error. An agent without NATS settings serves the local socket.
 
-The existing v1 request and decision JSON fields stay unchanged. Native enrollment records additionally distinguish software keys from Secure Enclave keys. `AliveV1` is a versioned control message with `type: "alive"`, `version: 1`, and the request ID. `DeliveryV1` has `type: "delivery"` with the same version and ID and is published only on the server delivery subject. Socket peers exchange `AliveV1` as the first response frame; NATS and the browser use the dedicated acknowledgement subject. The hook never treats either receipt as a signed decision. Native socket control requires a coordinated hook and agent upgrade: either old side can reject the new first frame, and the diagnostic names `oshioki-agent` so an operator can repair the pair. Browser-capable NATS approval additionally requires the upgraded server and browser bundle, because an older server does not publish `DeliveryV1`; deploy those components as one compatibility set rather than relying on rolling negotiation. Additive JSON remains backward-readable; the matrix and restore path are in [compatibility.md](compatibility.md).
+The authentication operation distinguishes an unanswered connection from a
+malformed assertion: a clean hangup can leave password fallback available,
+whereas truncated or invalid decision bytes are a hard failure.
+See [PAM results](../pam/README.md#results-and-cancellation).
 
-The server widens the `OSHIOKI` stream subjects and recreates the durable `oshioki-server-v1` consumer when a new authentication lane needs filters the running stream does not have. A missing stream is still a misconfigured deployment. See [compatibility.md](compatibility.md) and the recovery section in [RUNBOOK.md](../RUNBOOK.md).
+## Control messages and upgrades
 
-See [configuration.md](configuration.md) for `OSHIOKI_TRANSPORT`.
+`AliveV1` has `type: "alive"`, version 1, and a request ID. Socket agents send
+it as the first response frame; NATS agents publish it on
+`oshioki.ack.<request-id>`.
+
+`DeliveryV1` has `type: "delivery"`, version 1, and a request ID. The server
+commits it with the routed browser request and publishes it on
+`oshioki.delivery.<request-id>`. Only an authenticated browser post after
+decryption causes the server to relay browser liveness.
+
+These control protocols require coordinated updates: hook/agent for the socket,
+and server/browser bundle/hook for browser delivery. Additive public JSON remains
+backward-readable; see [compatibility](compatibility.md).
+
+Server startup repairs stale stream subjects and durable consumer filters. A
+missing stream is an operator configuration error.
+[The runbook](../RUNBOOK.md#authentication-subject-upgrade) covers repair.
