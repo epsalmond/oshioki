@@ -45,9 +45,10 @@ See [installation](docs/install.md) for source builds and host activation.
 | Build, change, or test Oshioki | [Contributing](CONTRIBUTING.md) |
 | Diagnose an approval or recover sudo | [Runbook](RUNBOOK.md) |
 
-The browser helper authorizes `gcloud auth login` through an explicit
-`oshioki-browser-relay` command. It does not intercept ordinary gcloud
-commands. Vercel login is not supported yet.
+An opt-in setup helper can route the exact `gcloud auth login` command through
+the browser relay; other gcloud commands and login forms with flags pass
+through unchanged. Vercel login is not supported yet. See the
+[Google Cloud CLI login guide](docs/browser-ceremony-relay.md).
 
 ## Reference
 

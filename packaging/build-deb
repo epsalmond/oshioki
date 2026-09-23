@@ -5,9 +5,8 @@
 #
 # STAGE_DIR holds the release artifacts built for the target architecture:
 # oshioki, liboshioki_plugin.so, liboshioki_pam.so, oshioki-server,
-# oshioki-browser-relay, and a
-# SHA256SUMS whose entries are named exactly oshioki, liboshioki_plugin.so
-# liboshioki_pam.so, and oshioki-browser-relay.
+# oshioki-browser-relay, oshioki-google-login-setup,
+# oshioki-browser-service, and a SHA256SUMS with one entry per staged file.
 # VERSION is the Debian version,
 # e.g. 0.1.0 for tag v0.1.0. DEB_ARCH overrides the target architecture
 # (default amd64) for local validation; the staged binaries must match it.
@@ -23,10 +22,10 @@ case "$OUTPUT_DEB" in /*) ;; *) OUTPUT_DEB="$(pwd -P)/$OUTPUT_DEB" ;; esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 ARCH="${DEB_ARCH:-amd64}"
 
-for artifact in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-server oshioki-browser-relay SHA256SUMS; do
+for artifact in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-server oshioki-browser-relay oshioki-google-login-setup oshioki-browser-service SHA256SUMS; do
   [ -f "$STAGE_DIR/$artifact" ] || { echo "build-deb: missing $STAGE_DIR/$artifact" >&2; exit 1; }
 done
-for name in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-browser-relay; do
+for name in oshioki liboshioki_plugin.so liboshioki_pam.so oshioki-browser-relay oshioki-google-login-setup oshioki-browser-service; do
   awk -v name="$name" '$2 == name {found=1} END {exit !found}' "$STAGE_DIR/SHA256SUMS" \
     || { echo "build-deb: SHA256SUMS has no entry for $name" >&2; exit 1; }
 done
@@ -53,6 +52,8 @@ sed -i "s/@VERSION@/$VERSION/g; s/^Architecture: .*/Architecture: $ARCH/" "$TREE
 
 install -d "$TREE/usr/share/oshioki" "$TREE/usr/sbin" "$TREE/usr/bin"
 install -m 0755 "$STAGE_DIR/oshioki-browser-relay" "$TREE/usr/bin/oshioki-browser-relay"
+install -m 0755 "$STAGE_DIR/oshioki-google-login-setup" "$TREE/usr/bin/oshioki-google-login-setup"
+install -m 0755 "$STAGE_DIR/oshioki-browser-service" "$TREE/usr/bin/oshioki-browser-service"
 install -m 0755 "$STAGE_DIR/oshioki" "$TREE/usr/share/oshioki/"
 install -m 0644 "$STAGE_DIR/liboshioki_plugin.so" "$STAGE_DIR/liboshioki_pam.so" \
   "$STAGE_DIR/SHA256SUMS" "$TREE/usr/share/oshioki/"
