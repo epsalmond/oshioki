@@ -4,11 +4,11 @@ Architecture: amd64
 Maintainer: Oshioki contributors
 Section: admin
 Priority: optional
-Depends: adduser, file, sudo, init-system-helpers, python3
+Depends: adduser, file, sudo, init-system-helpers, python3 (>= 3.9)
 Description: Touch ID or WebAuthn approval for sudo requests
  Oshioki asks an enrolled device to approve one exact sudo request.
  The hook encrypts the request for each enrolled device; the server
  stores routing data and ciphertext. Devices approve from a browser
  via WebAuthn or from the native agent via Secure Enclave.
- Also includes oshioki-browser-relay for requesting gcloud login approval
- from a Mac. Google Cloud CLI is installed separately.
+ Also includes oshioki-browser-relay and opt-in gcloud and browser-service
+ setup tools. Google Cloud CLI is installed separately.

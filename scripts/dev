@@ -47,6 +47,8 @@ local_checks() {
   "$REPO_ROOT/scripts/test-debian-package-scripts"
   "$REPO_ROOT/scripts/test-oshioki-laptop-setup"
   "$REPO_ROOT/scripts/test-oshioki-phone-setup"
+  python3 "$REPO_ROOT/scripts/test-google-login-setup"
+  python3 "$REPO_ROOT/scripts/test-browser-service"
 }
 
 read_session() {

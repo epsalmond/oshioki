@@ -28,13 +28,16 @@ sudo apt install ./oshioki_X.Y.Z_amd64.deb
 ```
 
 The package includes the sudo hook, plugin, PAM module, server, phone setup
-helper, and browser relay. It does not include the Linux native agent or
-laptop setup helper; use a source build for those.
+helper, browser relay, and the opt-in `oshioki-google-login-setup` and
+`oshioki-browser-service` commands. Python 3 is installed as a runtime
+dependency (3.9 or newer) for these commands. It does not include the Linux
+native agent or laptop setup helper; use a source build for those.
 
 A fresh install does not activate sudo approval without host configuration
 and a pinned device. Continue with [remote sudo](remote-sudo.md) or
 [phone approval](phone-enrollment.md). For Google login on this host, follow
-the [remote browser ceremony](browser-ceremony-relay.md#remote-login) instructions.
+the [Google Cloud CLI login](browser-ceremony-relay.md) instructions. Its
+wrapper and background services remain opt-in.
 
 Browser relay packaging is new in the next release after 0.1.15. Earlier
 packages require the source build below.

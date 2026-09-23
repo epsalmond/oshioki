@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Filesystem-only tests for oshioki-browser-service."""
+
+import contextlib
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import io
+import os
+import plistlib
+import shutil
+import subprocess
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+
+SCRIPT = Path(__file__).with_name("oshioki-browser-service")
+LOADER = SourceFileLoader("oshioki_browser_service", str(SCRIPT))
+SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
+service = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(service)
+
+
+class ServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=str(Path(tempfile.gettempdir()).resolve()))
+        self.root = Path(self.temp.name)
+        self.home = self.root / "home $% with space"
+        self.home.mkdir()
+        self.home.chmod(0o700)
+        self.config = self.home / 'private "$% config.json'
+        self.config.write_text('{"password":"secret-marker"}\n')
+        self.config.chmod(0o600)
+        self.relay = self.home / "bin dir" / "oshioki relay"
+        self.relay.parent.mkdir()
+        self.relay.write_text("binary\n")
+        self.relay.chmod(0o700)
+        self.env = mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def call(self, system, argv, runner=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        if runner is None:
+            runner = mock.Mock(side_effect=AssertionError("service command ran"))
+        with mock.patch.object(service.platform, "system", return_value=system), \
+                mock.patch.object(service.subprocess, "run", side_effect=runner), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = service.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def ok(stdout="", code=0, stderr=""):
+        return SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
+
+    def receiver_args(self, start=False):
+        args = ["install", "receiver", "--config", str(self.config),
+                "--relay", str(self.relay)]
+        return args + (["--start"] if start else [])
+
+    def broker_inputs(self, suffix=""):
+        config = self.home / f'nats "{suffix}$%.conf'
+        config.write_text("authorization { user: secret-marker }\n")
+        config.chmod(0o600)
+        binary = self.home / f'nats binary "{suffix}$%.bin'
+        binary.write_text("binary\n")
+        binary.chmod(0o700)
+        return config, binary
+
+    def test_receiver_is_file_only_private_and_uses_stable_paths(self):
+        code, out, _ = self.call("Darwin", self.receiver_args())
+        self.assertEqual(code, 0)
+        self.assertNotIn("secret-marker", out)
+        target = self.home / "Library/LaunchAgents/io.oshioki.browser-relay.receiver.plist"
+        data = plistlib.loads(target.read_bytes())
+        self.assertEqual(data["ProgramArguments"], [str(self.relay), "serve", "--config", str(self.config)])
+        self.assertEqual(data["EnvironmentVariables"]["PATH"], "/usr/bin:/bin")
+        self.assertTrue(data["RunAtLoad"] and data["KeepAlive"])
+        self.assertEqual(data["UMask"], 0o077)
+        self.assertTrue(target.stat().st_mode & stat.S_IRUSR)
+        self.assertEqual(target.stat().st_mode & 0o077, 0)
+        self.assertNotIn("secret-marker", target.read_text())
+        self.assertNotIn("secret-marker", out)
+        self.assertTrue(out.count("Activate with:") == 1)
+        manifest = self.home / ".config/oshioki/browser-relay/services/manifest.json"
+        self.assertEqual(manifest.stat().st_mode & 0o077, 0)
+
+    def test_tunnel_uses_loopback_batch_mode_and_rejects_option_destinations(self):
+        code, _, _ = self.call("Darwin", ["install", "tunnel", "--ssh-destination", "nas-ssh",
+                                           "--local-port", "4222", "--remote-port", "4222"])
+        self.assertEqual(code, 0)
+        target = self.home / "Library/LaunchAgents/io.oshioki.browser-relay.tunnel.plist"
+        args = plistlib.loads(target.read_bytes())["ProgramArguments"]
+        self.assertEqual(args[0:2], ["/usr/bin/ssh", "-N"])
+        self.assertIn("BatchMode=yes", args)
+        self.assertIn("StrictHostKeyChecking=yes", args)
+        self.assertIn("ExitOnForwardFailure=yes", args)
+        self.assertIn("ServerAliveCountMax=3", args)
+        self.assertIn("127.0.0.1:4222:127.0.0.1:4222", args)
+        self.assertEqual(args[-1], "nas-ssh")
+        code, _, err = self.call("Darwin", ["install", "tunnel", "--ssh-destination=-oProxyCommand=x",
+                                              "--local-port", "4222", "--remote-port", "4222"])
+        self.assertEqual(code, 1)
+        self.assertIn("without options", err)
+
+    def test_broker_escapes_systemd_arguments_and_omits_config_contents(self):
+        config, binary = self.broker_inputs()
+        code, out, _ = self.call("Linux", ["install", "broker", "--config", str(config),
+                                            "--nats-server", str(binary)])
+        self.assertEqual(code, 0)
+        unit = (self.home / ".config/systemd/user/oshioki-browser-relay-nats.service").read_text()
+        self.assertIn('UMask=0077', unit)
+        self.assertIn('ExecStart="/usr/bin/env"', unit)
+        escaped_binary = str(binary).replace("\\", "\\\\").replace('"', '\\"')
+        escaped_binary = escaped_binary.replace("$", "$$").replace("%", "%%")
+        self.assertIn(f'"{escaped_binary}" "--config"', unit)
+        self.assertIn("\\\"", unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertNotIn("secret-marker", unit + out)
+
+    def test_systemd_analyze_accepts_paths_with_space_dollar_percent_and_quote(self):
+        analyzer = shutil.which("systemd-analyze")
+        if analyzer is None:
+            self.skipTest("systemd-analyze is unavailable")
+        config, binary = self.broker_inputs("verify")
+        unit = self.root / "oshioki-browser-relay-nats.service"
+        unit.write_bytes(service.systemd_unit(binary, config))
+        result = subprocess.run([analyzer, "--user", "verify", str(unit)],
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rendered = unit.read_text()
+        self.assertTrue(rendered.startswith("[Unit]\n"))
+        self.assertIn('ExecStart="/usr/bin/env"', rendered)
+        self.assertIn("$$", rendered)
+        self.assertIn("%%", rendered)
+        self.assertIn('\\"verify', rendered)
+
+    def test_unmanaged_collision_and_modified_uninstall_preserve_files(self):
+        target = self.home / "Library/LaunchAgents/io.oshioki.browser-relay.receiver.plist"
+        target.parent.mkdir(parents=True)
+        (self.home / "Library").chmod(0o700)
+        target.parent.chmod(0o700)
+        target.write_text("foreign\n")
+        target.chmod(0o600)
+        code, _, err = self.call("Darwin", self.receiver_args())
+        self.assertEqual(code, 1)
+        self.assertIn("unmanaged", err)
+        self.assertEqual(target.read_text(), "foreign\n")
+        target.unlink()
+        self.assertEqual(self.call("Darwin", self.receiver_args())[0], 0)
+        target.write_text(target.read_text() + "changed\n")
+        code, _, err = self.call("Darwin", ["uninstall", "receiver"])
+        self.assertEqual(code, 1)
+        self.assertIn("modified", err)
+        self.assertTrue(target.exists())
+
+    def test_symlinked_definition_and_config_are_rejected(self):
+        target = self.home / "Library/LaunchAgents/io.oshioki.browser-relay.receiver.plist"
+        target.parent.mkdir(parents=True)
+        (self.home / "Library").chmod(0o700)
+        target.parent.chmod(0o700)
+        foreign = self.root / "foreign.plist"
+        foreign.write_text("foreign\n")
+        foreign.chmod(0o600)
+        target.symlink_to(foreign)
+        code, _, err = self.call("Darwin", self.receiver_args())
+        self.assertEqual(code, 1)
+        self.assertIn("symlink", err)
+        self.assertEqual(foreign.read_text(), "foreign\n")
+        target.unlink()
+        alias = self.home / "approver-link.json"
+        alias.symlink_to(self.config)
+        args = ["install", "receiver", "--config", str(alias), "--relay", str(self.relay)]
+        code, _, err = self.call("Darwin", args)
+        self.assertEqual(code, 1)
+        self.assertIn("must not be a symlink", err)
+
+    def test_uninstall_rejects_symlinked_service_parent(self):
+        self.assertEqual(self.call("Darwin", self.receiver_args())[0], 0)
+        original = self.home / "Library/LaunchAgents"
+        copied = self.root / "elsewhere"
+        copied.mkdir()
+        target = original / "io.oshioki.browser-relay.receiver.plist"
+        foreign = copied / target.name
+        shutil.copyfile(target, foreign)
+        original.rename(self.home / "Library/LaunchAgents.saved")
+        original.symlink_to(copied, target_is_directory=True)
+        code, _, err = self.call("Darwin", ["uninstall", "receiver"])
+        self.assertEqual(code, 1)
+        self.assertIn("symlink", err)
+        self.assertTrue(foreign.exists())
+
+    def test_start_failure_is_redacted_and_foreign_label_is_not_touched(self):
+        calls = []
+        def failed_start(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:2] == ["print"]:
+                return self.ok(code=113, stderr="Could not find service")
+            return self.ok(code=1, stderr="secret-marker")
+        code, out, err = self.call("Darwin", self.receiver_args(start=True), failed_start)
+        self.assertEqual(code, 1)
+        self.assertIn("activation failed", err)
+        self.assertNotIn("secret-marker", out + err)
+        self.assertTrue(any(call[1:2] == ["bootstrap"] for call in calls))
+        target = self.home / "Library/LaunchAgents/io.oshioki.browser-relay.receiver.plist"
+        self.assertTrue(target.exists())
+
+        def foreign(argv, **kwargs):
+            return self.ok(stdout="path = /foreign/agent.plist\n")
+        code, _, err = self.call("Darwin", self.receiver_args(start=True), foreign)
+        self.assertEqual(code, 1)
+        self.assertIn("different service", err)
+
+    def test_broker_start_reloads_enables_and_restarts_changed_unit(self):
+        old_config, old_binary = self.broker_inputs("old")
+        args = ["install", "broker", "--config", str(old_config), "--nats-server", str(old_binary)]
+        self.assertEqual(self.call("Linux", args)[0], 0)
+        target = self.home / ".config/systemd/user/oshioki-browser-relay-nats.service"
+        new_config, new_binary = self.broker_inputs("new")
+        calls = []
+        def systemd(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:2] == ["show"]:
+                return self.ok(stdout=str(target) + "\n")
+            return self.ok()
+        code, out, _ = self.call("Linux", ["install", "broker", "--config", str(new_config),
+                                            "--nats-server", str(new_binary), "--start"], systemd)
+        self.assertEqual(code, 0)
+        ops = [call[2] for call in calls if len(call) > 2]
+        self.assertLess(ops.index("daemon-reload"), ops.index("enable"))
+        self.assertLess(ops.index("enable"), ops.index("restart"))
+        self.assertIn("start requested", out)
+        self.assertIn("new$$%%.conf", target.read_text())
+
+    def test_broker_uninstall_stops_then_removes_then_reloads(self):
+        config, binary = self.broker_inputs()
+        args = ["install", "broker", "--config", str(config), "--nats-server", str(binary)]
+        self.assertEqual(self.call("Linux", args)[0], 0)
+        target = self.home / ".config/systemd/user/oshioki-browser-relay-nats.service"
+        observations = []
+        def systemd(argv, **kwargs):
+            if argv[2:3] == ["show"]:
+                return self.ok(stdout=str(target) + "\n")
+            if argv[2:3] == ["disable"]:
+                observations.append(("disable", target.exists()))
+            if argv[2:3] == ["daemon-reload"]:
+                observations.append(("reload", target.exists()))
+            return self.ok()
+        code, _, _ = self.call("Linux", ["uninstall", "broker"], systemd)
+        self.assertEqual(code, 0)
+        self.assertEqual(observations, [("disable", True), ("reload", False)])
+        self.assertFalse(target.exists())
+
+    def test_uninstall_tolerates_unloaded_services(self):
+        self.assertEqual(self.call("Darwin", self.receiver_args())[0], 0)
+        launchctl_calls = []
+        def launchctl(argv, **kwargs):
+            launchctl_calls.append(argv)
+            return self.ok(code=113, stderr="Could not find service")
+        code, _, _ = self.call("Darwin", ["uninstall", "receiver"], launchctl)
+        self.assertEqual(code, 0)
+        self.assertEqual([call[1] for call in launchctl_calls], ["print"])
+
+        config, binary = self.broker_inputs()
+        args = ["install", "broker", "--config", str(config), "--nats-server", str(binary)]
+        self.assertEqual(self.call("Linux", args)[0], 0)
+        systemd_calls = []
+        def systemd(argv, **kwargs):
+            systemd_calls.append(argv)
+            return self.ok(stdout="")
+        code, _, _ = self.call("Linux", ["uninstall", "broker"], systemd)
+        self.assertEqual(code, 0)
+        self.assertEqual([call[2] for call in systemd_calls], ["show"])
+
+    def test_commands_have_timeout_and_timeout_errors_are_safe(self):
+        def timeout(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], 20)
+            raise service.subprocess.TimeoutExpired(argv, 20, stderr="secret-marker")
+        with mock.patch.object(service.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(service.SetupError) as error:
+                service.run_command(["systemctl", "--user", "show"], "service lookup")
+        self.assertIn("timed out", str(error.exception))
+        self.assertNotIn("secret-marker", str(error.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

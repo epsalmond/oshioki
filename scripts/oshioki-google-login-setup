@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Install an opt-in gcloud wrapper for Oshioki browser-approved logins."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import stat
+import sys
+import tempfile
+
+
+STATE_NAME = ".oshioki-google-login-setup.json"
+WRAPPER_MARKER = "# oshioki-google-login-setup managed wrapper v1"
+BYPASS_ENV = "OSHIOKI_GCLOUD_WRAPPER_BYPASS"
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def absolute_path(value, label):
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        fail(f"{label} must be an absolute path")
+    return Path(os.path.abspath(path))
+
+
+def read_private_regular(path, label):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        fail(f"{label} must be a regular private file, not a symlink")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"{label} must be a regular private file")
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            fail(f"{label} must be owned by this user and have no group or other permissions")
+        chunks = []
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                return b"".join(chunks)
+            chunks.append(block)
+    finally:
+        os.close(fd)
+
+
+def validate_config(path, mode):
+    raw = read_private_regular(path, "config")
+    try:
+        config = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("config must contain valid JSON")
+    if not isinstance(config, dict):
+        fail("config must be a JSON object")
+    if not isinstance(config.get("google_account"), str) or not config["google_account"].strip():
+        fail("config must include google_account")
+    if not isinstance(config.get("approval_public_key"), str) or not config["approval_public_key"].strip():
+        fail("config must include approval_public_key for account approval")
+    if mode == "local":
+        identity = config.get("approval_identity")
+        if not isinstance(identity, str) or not Path(identity).is_absolute():
+            fail("local config must include an absolute approval_identity")
+
+
+def executable_path(value, label, search=False):
+    if search:
+        found = shutil.which(value)
+        if not found:
+            fail(f"could not find {label} on PATH")
+        value = found
+    path = absolute_path(value, label)
+    try:
+        info = path.stat()
+    except OSError:
+        fail(f"{label} must name an executable regular file")
+    if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
+        fail(f"{label} must name an executable regular file")
+    return path
+
+
+def ensure_destination_directory(path):
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o755)
+            except FileExistsError:
+                pass
+            info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            fail("bin-dir has a symlink parent")
+        if not stat.S_ISDIR(info.st_mode):
+            fail("bin-dir parent must be a directory")
+        if current != path and info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+            fail("bin-dir has a writable non-sticky parent")
+    info = path.stat()
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        fail("bin-dir must be owned by this user and not group or world writable")
+
+
+def managed_state(path, wrapper):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("managed state path is not a regular file")
+    raw = read_private_regular(path, "managed state")
+    try:
+        state = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("managed state is invalid")
+    required = {"version", "wrapper", "wrapper_sha256", "mode", "config", "gcloud", "relay"}
+    if not isinstance(state, dict) or set(state) != required or state.get("version") != 1:
+        fail("managed state is invalid")
+    if state["wrapper"] != str(wrapper) or not isinstance(state["wrapper_sha256"], str):
+        fail("managed state belongs to a different wrapper path")
+    return state
+
+
+def file_info(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail("gcloud path exists but is not a regular managed file")
+    return info
+
+
+def file_hash(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def reject_gcloud_recursion(gcloud, wrapper):
+    try:
+        if wrapper.exists() and os.path.samefile(gcloud, wrapper):
+            fail("gcloud path resolves to the managed wrapper")
+        resolved = gcloud.resolve(strict=True)
+    except OSError:
+        fail("gcloud executable cannot be resolved")
+    try:
+        if resolved == wrapper.resolve(strict=False):
+            fail("gcloud path resolves to the managed wrapper")
+        with resolved.open("rb") as executable:
+            marker = executable.read(4096).decode(errors="replace").splitlines()[:4]
+    except OSError:
+        fail("gcloud executable cannot be inspected")
+    if WRAPPER_MARKER in marker:
+        fail("gcloud path names an existing Oshioki wrapper")
+
+
+def wrapper_text(mode, config, gcloud, relay):
+    command = "local-login" if mode == "local" else "login"
+    return "\n".join((
+        "#!/bin/sh",
+        WRAPPER_MARKER,
+        "# Routes only the bare interactive login command.",
+        f'if [ "${{OSHIOKI_BROWSER_SOCKET+x}}" != x ] && [ "${{{BYPASS_ENV}+x}}" != x ] && [ "$#" -eq 2 ] && [ "$1" = auth ] && [ "$2" = login ]; then',
+        f"  {BYPASS_ENV}=1 exec {shlex.quote(str(relay))} {command} --config {shlex.quote(str(config))}",
+        "fi",
+        f"exec {shlex.quote(str(gcloud))} \"$@\"",
+        "",
+    ))
+
+
+def atomic_write(path, content, mode):
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def install(args):
+    config = absolute_path(args.config, "config")
+    validate_config(config, args.mode)
+    gcloud = executable_path(args.gcloud, "gcloud")
+    relay = executable_path(args.relay or "oshioki-browser-relay", "relay", search=args.relay is None)
+    bin_dir = absolute_path(args.bin_dir, "bin-dir")
+    ensure_destination_directory(bin_dir)
+    wrapper = bin_dir / "gcloud"
+    state_path = bin_dir / STATE_NAME
+    existing_wrapper = file_info(wrapper)
+    state = managed_state(state_path, wrapper)
+    if existing_wrapper and state is None:
+        fail("refusing to overwrite an unmanaged gcloud file")
+    if state is not None and existing_wrapper and file_hash(wrapper) != state["wrapper_sha256"]:
+        fail("managed gcloud wrapper was modified; refusing to replace it")
+    reject_gcloud_recursion(gcloud, wrapper)
+    reject_gcloud_recursion(relay, wrapper)
+
+    content = wrapper_text(args.mode, config, gcloud, relay).encode()
+    digest = hashlib.sha256(content).hexdigest()
+    new_state = {
+        "version": 1,
+        "wrapper": str(wrapper),
+        "wrapper_sha256": digest,
+        "mode": args.mode,
+        "config": str(config),
+        "gcloud": str(gcloud),
+        "relay": str(relay),
+    }
+    state_bytes = (json.dumps(new_state, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if state == new_state and existing_wrapper and file_hash(wrapper) == digest:
+        print(f"gcloud wrapper already installed in {bin_dir}")
+        return
+
+    old_content = wrapper.read_bytes() if existing_wrapper else None
+    old_mode = stat.S_IMODE(existing_wrapper.st_mode) if existing_wrapper else 0o755
+    try:
+        atomic_write(wrapper, content, 0o755)
+        atomic_write(state_path, state_bytes, 0o600)
+    except OSError:
+        if old_content is None:
+            try:
+                if file_info(wrapper) and file_hash(wrapper) == digest:
+                    wrapper.unlink()
+            except OSError:
+                pass
+        else:
+            atomic_write(wrapper, old_content, old_mode)
+        raise
+    print(f"installed gcloud wrapper in {bin_dir}; put this directory before real gcloud on PATH, then run hash -r")
+
+
+def uninstall(args):
+    bin_dir = absolute_path(args.bin_dir, "bin-dir")
+    if not bin_dir.exists():
+        print("no Oshioki gcloud wrapper installed")
+        return
+    ensure_destination_directory(bin_dir)
+    wrapper = bin_dir / "gcloud"
+    state_path = bin_dir / STATE_NAME
+    state = managed_state(state_path, wrapper)
+    if state is None:
+        print("no Oshioki gcloud wrapper installed")
+        return
+    info = file_info(wrapper)
+    if info and file_hash(wrapper) != state["wrapper_sha256"]:
+        fail("managed gcloud wrapper was modified; preserving it and its state")
+    if info:
+        wrapper.unlink()
+    state_path.unlink()
+    print(f"removed Oshioki gcloud wrapper from {bin_dir}")
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    commands = result.add_subparsers(dest="command", required=True)
+    setup = commands.add_parser("install", help="install the optional gcloud wrapper")
+    setup.add_argument("--mode", choices=("requester", "local"), required=True)
+    setup.add_argument("--config", required=True, help="absolute private relay config path")
+    setup.add_argument("--gcloud", required=True, help="absolute real gcloud executable path")
+    setup.add_argument("--relay", help="absolute oshioki-browser-relay executable path")
+    setup.add_argument("--bin-dir", default="~/.local/bin")
+    setup.set_defaults(run=install)
+    remove = commands.add_parser("uninstall", help="remove an unmodified owned wrapper")
+    remove.add_argument("--bin-dir", default="~/.local/bin")
+    remove.set_defaults(run=uninstall)
+    return result
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        args.run(args)
+    except (OSError, ValueError) as error:
+        print(f"oshioki-google-login-setup: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
