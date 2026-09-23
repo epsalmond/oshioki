@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Exercise the optional gcloud wrapper using only temporary fake binaries."""
+
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+SCRIPT = Path(__file__).with_name("oshioki-google-login-setup").resolve()
+BYPASS_ENV = "OSHIOKI_GCLOUD_WRAPPER_BYPASS"
+
+
+class GoogleLoginSetupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="oshioki-google-login-")
+        self.root = Path(self.temp.name).resolve()
+        self.real_log = self.root / "real.json"
+        self.relay_log = self.root / "relay.json"
+        self.real = self.make_executable(self.root / "real gcloud", self.real_source())
+        self.relay = self.make_executable(self.root / "relay binary", self.relay_source())
+        self.config = self.write_config("requester")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def make_executable(self, path, source):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"#!{sys.executable}\n" + source)
+        path.chmod(0o755)
+        return path
+
+    def real_source(self):
+        return '''import json, os, sys
+with open(os.environ["REAL_LOG"], "w") as stream:
+    json.dump({"args": sys.argv[1:], "bypass": os.getenv("OSHIOKI_GCLOUD_WRAPPER_BYPASS"),
+               "socket": os.getenv("OSHIOKI_BROWSER_SOCKET")}, stream)
+raise SystemExit(int(os.getenv("REAL_EXIT", "41")))
+'''
+
+    def relay_source(self):
+        return '''import json, os, sys
+with open(os.environ["RELAY_LOG"], "w") as stream:
+    json.dump({"args": sys.argv[1:], "bypass": os.getenv("OSHIOKI_GCLOUD_WRAPPER_BYPASS"),
+               "socket": os.getenv("OSHIOKI_BROWSER_SOCKET")}, stream)
+child = os.getenv("RELAY_CHILD")
+if child:
+    env = os.environ.copy()
+    if child == "requester":
+        env.pop("OSHIOKI_GCLOUD_WRAPPER_BYPASS", None)
+        env["OSHIOKI_BROWSER_SOCKET"] = "/tmp/fake-browser-socket"
+    else:
+        env.pop("OSHIOKI_BROWSER_SOCKET", None)
+    os.execve(env["TEST_WRAPPER"], ["gcloud", "auth", "login"], env)
+raise SystemExit(int(os.getenv("RELAY_EXIT", "37")))
+'''
+
+    def write_config(self, mode, content=None):
+        path = self.root / f"{mode} private config.json"
+        if content is None:
+            config = {"google_account": "fixture@example.test", "approval_public_key": "fixture-key"}
+            if mode == "local":
+                config["approval_identity"] = str(self.root / "identity.json")
+            content = json.dumps(config)
+        path.write_text(content)
+        path.chmod(0o600)
+        return path
+
+    def invoke(self, *arguments):
+        return subprocess.run([sys.executable, str(SCRIPT), *map(str, arguments)],
+                              text=True, capture_output=True, timeout=10)
+
+    def install(self, bin_dir, mode="requester", config=None, gcloud=None, relay=None):
+        args = ["install", "--mode", mode, "--config", config or self.config,
+                "--gcloud", gcloud or self.real, "--bin-dir", bin_dir]
+        args.extend(["--relay", str(relay or self.relay)])
+        result = self.invoke(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return Path(bin_dir) / "gcloud"
+
+    def run_wrapper(self, wrapper, arguments, **extra_env):
+        env = os.environ.copy()
+        env.update({"REAL_LOG": str(self.real_log), "RELAY_LOG": str(self.relay_log),
+                    "TEST_WRAPPER": str(wrapper), "REAL_EXIT": "41", "RELAY_EXIT": "37"})
+        env.pop("OSHIOKI_BROWSER_SOCKET", None)
+        env.pop(BYPASS_ENV, None)
+        env.update(extra_env)
+        return subprocess.run([str(wrapper), *arguments], env=env, capture_output=True,
+                              timeout=10)
+
+    def read_json(self, path):
+        return json.loads(path.read_text())
+
+    def test_requester_routes_only_exact_login_and_preserves_exit(self):
+        bin_dir = self.root / "requester-bin"
+        wrapper = self.install(bin_dir)
+        result = self.run_wrapper(wrapper, ["auth", "login"])
+        self.assertEqual(result.returncode, 37, result.stderr.decode())
+        self.assertEqual(self.read_json(self.relay_log)["args"],
+                         ["login", "--config", str(self.config)])
+        self.assertEqual(self.read_json(self.relay_log)["bypass"], "1")
+        self.assertFalse(self.real_log.exists())
+
+        self.relay_log.unlink()
+        result = self.run_wrapper(wrapper, ["auth", "login"],
+                                  OSHIOKI_BROWSER_SOCKET="/tmp/child-socket")
+        self.assertEqual(result.returncode, 41, result.stderr.decode())
+        self.assertEqual(self.read_json(self.real_log)["args"], ["auth", "login"])
+        self.assertFalse(self.relay_log.exists())
+
+        self.real_log.unlink()
+        result = self.run_wrapper(wrapper, ["auth", "login", "--no-launch-browser"])
+        self.assertEqual(result.returncode, 41, result.stderr.decode())
+        self.assertEqual(self.read_json(self.real_log)["args"],
+                         ["auth", "login", "--no-launch-browser"])
+        self.assertFalse(self.relay_log.exists())
+
+    def test_local_child_uses_invocation_bypass_without_socket_marker(self):
+        config = self.write_config("local")
+        wrapper = self.install(self.root / "local-bin", mode="local", config=config)
+        result = self.run_wrapper(wrapper, ["auth", "login"], RELAY_CHILD="local")
+        self.assertEqual(result.returncode, 41, result.stderr.decode())
+        self.assertEqual(self.read_json(self.relay_log)["args"],
+                         ["local-login", "--config", str(config)])
+        self.assertEqual(self.read_json(self.relay_log)["bypass"], "1")
+        self.assertIsNone(self.read_json(self.real_log)["socket"])
+        self.assertEqual(self.read_json(self.real_log)["bypass"], "1")
+        self.assertEqual(self.read_json(self.real_log)["args"], ["auth", "login"])
+
+    def test_requester_child_bypasses_using_socket_environment(self):
+        wrapper = self.install(self.root / "requester-child-bin")
+        result = self.run_wrapper(wrapper, ["auth", "login"], RELAY_CHILD="requester")
+        self.assertEqual(result.returncode, 41, result.stderr.decode())
+        self.assertEqual(self.read_json(self.relay_log)["args"][0], "login")
+        self.assertEqual(self.read_json(self.real_log)["socket"], "/tmp/fake-browser-socket")
+        self.assertTrue(self.real_log.exists())
+
+    def test_shell_quoting_and_stable_symlink_pins(self):
+        unusual = self.root / "space ' ; $ paths"
+        unusual.mkdir()
+        unusual.chmod(0o700)
+        target_real = self.make_executable(unusual / "gcloud target", self.real_source())
+        target_relay = self.make_executable(unusual / "relay target", self.relay_source())
+        stable_real = unusual / "stable gcloud"
+        stable_relay = unusual / "stable relay"
+        stable_real.symlink_to(target_real)
+        stable_relay.symlink_to(target_relay)
+        wrapper = self.install(unusual / "bin", gcloud=stable_real, relay=stable_relay)
+        contents = wrapper.read_text()
+        self.assertIn("exec " + shlex.quote(str(stable_real)) + ' "$@"', contents)
+        self.assertIn(shlex.quote(str(stable_relay)), contents)
+        result = self.run_wrapper(wrapper, ["auth", "login"])
+        self.assertEqual(result.returncode, 37, result.stderr.decode())
+        self.assertEqual(self.read_json(self.relay_log)["args"][0], "login")
+
+    def test_optional_relay_resolves_from_controlled_path(self):
+        relay_dir = self.root / "controlled relay path"
+        relay_dir.mkdir()
+        resolved_relay = self.make_executable(relay_dir / "oshioki-browser-relay", self.relay_source())
+        bin_dir = self.root / "path-resolved-bin"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "install", "--mode", "requester",
+             "--config", str(self.config), "--gcloud", str(self.real), "--bin-dir", str(bin_dir)],
+            env={"PATH": str(relay_dir)}, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wrapper = bin_dir / "gcloud"
+        self.assertIn(shlex.quote(str(resolved_relay)), wrapper.read_text())
+        routed = self.run_wrapper(wrapper, ["auth", "login"])
+        self.assertEqual(routed.returncode, 37, routed.stderr.decode())
+
+    def test_rejects_bad_config_without_echoing_contents(self):
+        secret = "PRIVATE_FIXTURE_VALUE"
+        config = self.write_config("bad", '{"broken":"' + secret)
+        result = self.invoke("install", "--mode", "requester", "--config", config,
+                             "--gcloud", self.real, "--relay", self.relay,
+                             "--bin-dir", self.root / "bad-bin")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(secret, result.stderr)
+
+        missing_fields = self.write_config("missing", json.dumps({"google_account": "fixture"}))
+        result = self.invoke("install", "--mode", "requester", "--config", missing_fields,
+                             "--gcloud", self.real, "--relay", self.relay,
+                             "--bin-dir", self.root / "missing-bin")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("approval_public_key", result.stderr)
+
+    def test_refuses_unmanaged_file_and_symlink_parent(self):
+        bin_dir = self.root / "unmanaged-bin"
+        bin_dir.mkdir()
+        wrapper = bin_dir / "gcloud"
+        wrapper.write_text("keep me\n")
+        result = self.invoke("install", "--mode", "requester", "--config", self.config,
+                             "--gcloud", self.real, "--relay", self.relay, "--bin-dir", bin_dir)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(wrapper.read_text(), "keep me\n")
+
+        real_parent = self.root / "real-parent"
+        real_parent.mkdir()
+        link_parent = self.root / "linked-parent"
+        link_parent.symlink_to(real_parent, target_is_directory=True)
+        result = self.invoke("install", "--mode", "requester", "--config", self.config,
+                             "--gcloud", self.real, "--relay", self.relay,
+                             "--bin-dir", link_parent / "bin")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((real_parent / "bin" / "gcloud").exists())
+
+    def test_refuses_group_writable_parent_with_secure_bin_dir(self):
+        parent = self.root / "group-writable-parent"
+        parent.mkdir()
+        bin_dir = parent / "secure-bin"
+        bin_dir.mkdir(mode=0o700)
+        bin_dir.chmod(0o700)
+        parent.chmod(0o770)
+        result = self.invoke("install", "--mode", "requester", "--config", self.config,
+                             "--gcloud", self.real, "--relay", self.relay, "--bin-dir", bin_dir)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("writable non-sticky parent", result.stderr)
+        self.assertFalse((bin_dir / "gcloud").exists())
+        self.assertFalse((bin_dir / ".oshioki-google-login-setup.json").exists())
+
+    def test_rejects_wrapper_recursion_through_direct_and_symlink_pins(self):
+        owned = self.install(self.root / "owned-bin")
+        alias = self.root / "gcloud alias"
+        alias.symlink_to(owned)
+        hardlink = self.root / "gcloud hardlink"
+        os.link(owned, hardlink)
+        for index, pin in enumerate((owned, alias, hardlink)):
+            bin_dir = self.root / f"blocked-{index}"
+            result = self.invoke("install", "--mode", "requester", "--config", self.config,
+                                 "--gcloud", pin, "--relay", self.relay, "--bin-dir", bin_dir)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((bin_dir / "gcloud").exists())
+            self.assertFalse((bin_dir / ".oshioki-google-login-setup.json").exists())
+
+    def test_repeat_uninstall_and_preserve_modified_artifacts(self):
+        bin_dir = self.root / "managed-bin"
+        wrapper = self.install(bin_dir)
+        original = wrapper.read_bytes()
+        self.assertEqual(self.install(bin_dir).read_bytes(), original)
+        state = bin_dir / ".oshioki-google-login-setup.json"
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+
+        removed = self.invoke("uninstall", "--bin-dir", bin_dir)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(wrapper.exists())
+        self.assertFalse(state.exists())
+
+        wrapper = self.install(bin_dir)
+        wrapper.write_text(wrapper.read_text() + "# changed\n")
+        refused = self.invoke("uninstall", "--bin-dir", bin_dir)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertTrue(wrapper.exists())
+        self.assertTrue(state.exists())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

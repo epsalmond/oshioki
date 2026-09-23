@@ -59,20 +59,23 @@ Read [SECURITY.md](SECURITY.md) before reporting a vulnerability.
 ## Package verification
 
 `scripts/build-darwin-artifact OUTPUT_DIR` builds the Mac release, including
-the browser relay and agent app bundle. It checks architecture, signing,
-framework linkage, and checksums. `CARGO_TARGET_DIR` selects an isolated build
-directory. `packaging/build-deb` assembles Linux release binaries and checks
-their architecture and runtime dependencies.
+the browser relay, setup tools, and agent app bundle. It checks architecture,
+signing, framework linkage, manifest entries, and checksums.
+`CARGO_TARGET_DIR` selects an isolated build directory. `packaging/build-deb`
+assembles Linux release binaries and setup tools and checks their architecture
+and runtime dependencies.
 
 The release workflow extracts each package and runs:
 
 ```sh
-scripts/test-browser-relay-package /path/to/oshioki-browser-relay /path/to/SHA256SUMS
+scripts/test-browser-relay-package /path/to/oshioki-browser-relay /path/to/SHA256SUMS --with-installers
 ```
 
-This checks the shipped helper's hash, commands, and private key creation
-without contacting Google or asking for Touch ID. The separate Homebrew tap
-must install the helper and test it again after a bottle is poured.
+This checks the shipped helper's hash, commands, private key creation, and
+the extracted gcloud/service setup tools' hashes and CLI help without
+contacting Google or asking for Touch ID. The separate Homebrew tap installs
+the setup tools when the release archive contains them; its formula test
+requires their manifest entries and checks their hashes and CLI help.
 
 ## Supervised acceptance
 

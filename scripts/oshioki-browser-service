@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Install private per-user background services for the browser relay."""
+
+import argparse
+import hashlib
+import json
+import os
+import plistlib
+import platform
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+LABELS = {
+    "receiver": "io.oshioki.browser-relay.receiver",
+    "tunnel": "io.oshioki.browser-relay.tunnel",
+    "broker": "oshioki-browser-relay-nats.service",
+}
+MANIFEST_REL = Path(".config/oshioki/browser-relay/services/manifest.json")
+
+
+class SetupError(Exception):
+    pass
+
+
+def checked_path(value, label, executable=False, private=False):
+    path = Path(value)
+    if not path.is_absolute() or any(ord(ch) < 32 or ord(ch) == 127 for ch in str(path)):
+        raise SetupError(f"{label} must be an absolute path without control characters")
+    path = Path(os.path.normpath(str(path)))
+    if private and path.is_symlink():
+        raise SetupError(f"{label} must not be a symlink")
+    try:
+        info = path.stat()
+    except OSError:
+        raise SetupError(f"{label} is unavailable") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise SetupError(f"{label} must be a regular file")
+    if executable and not os.access(path, os.X_OK):
+        raise SetupError(f"{label} must be executable")
+    if private and (info.st_uid != os.getuid() or info.st_mode & 0o077):
+        raise SetupError(f"{label} must be owned by this user and private")
+    return path
+
+
+def home_path():
+    raw = os.environ.get("HOME") or str(Path.home())
+    home = Path(raw)
+    if not home.is_absolute():
+        raise SetupError("HOME must be an absolute path")
+    return Path(os.path.normpath(str(home)))
+
+
+def ensure_tree(path, home, private_final=False):
+    path, home = Path(path), Path(home)
+    try:
+        path.relative_to(home)
+    except ValueError:
+        raise SetupError("service paths must stay under the current home directory") from None
+    current = Path(path.anchor)
+    protected = False
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            info = current.lstat()
+        except OSError:
+            raise SetupError("cannot inspect a service directory") from None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise SetupError("service directory contains a symlink or non-directory")
+        if current == home or current.is_relative_to(home):
+            if info.st_uid != os.getuid():
+                raise SetupError("service directory is not owned by this user")
+            if info.st_mode & 0o022 and not protected:
+                raise SetupError("service directory is writable by another user")
+            protected = protected or not (info.st_mode & 0o011)
+        if private_final and current == path and info.st_mode & 0o077:
+            raise SetupError("private service directory has group or other permissions")
+
+
+def inspect_regular(path, private=False):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise SetupError("cannot inspect a service file") from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SetupError("service file is a symlink or not a regular file")
+    if info.st_uid != os.getuid():
+        raise SetupError("service file is not owned by this user")
+    if private and info.st_mode & 0o077:
+        raise SetupError("private service file has group or other permissions")
+    return path.read_bytes()
+
+
+def manifest_path(home):
+    return home / MANIFEST_REL
+
+
+def read_manifest(home, create=False):
+    path = manifest_path(home)
+    if create:
+        ensure_tree(path.parent, home, private_final=True)
+    else:
+        # Check every existing parent, including HOME, without creating anything.
+        current = Path(path.anchor)
+        protected = False
+        for part in path.parts[1:-1]:
+            current /= part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                return {"version": 1, "services": {}}
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise SetupError("manifest parent contains a symlink or non-directory")
+            if current == home or current.is_relative_to(home):
+                if info.st_uid != os.getuid() or (info.st_mode & 0o022 and not protected):
+                    raise SetupError("manifest parent has unsafe ownership or permissions")
+                protected = protected or not (info.st_mode & 0o011)
+        if not path.parent.exists():
+            return {"version": 1, "services": {}}
+        info = path.parent.lstat()
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise SetupError("private service directory has unsafe ownership or permissions")
+    raw = inspect_regular(path, private=True)
+    if raw is None:
+        return {"version": 1, "services": {}}
+    try:
+        data = json.loads(raw)
+        if data.get("version") != 1 or not isinstance(data.get("services"), dict):
+            raise ValueError
+        for role, entry in data["services"].items():
+            if (role not in LABELS or not isinstance(entry, dict)
+                    or not isinstance(entry.get("path"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", entry.get("sha256", ""))):
+                raise ValueError
+    except (ValueError, TypeError, AttributeError):
+        raise SetupError("service ownership manifest is invalid") from None
+    return data
+
+
+def atomic_write(path, data, mode=0o600):
+    fd, temporary = tempfile.mkstemp(prefix=".oshioki-service-", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def save_manifest(home, data):
+    path = manifest_path(home)
+    inspect_regular(path, private=True)
+    payload = (json.dumps(data, sort_keys=True, indent=2) + "\n").encode()
+    atomic_write(path, payload)
+
+
+def check_owned_target(role, target, manifest):
+    target = Path(target)
+    current = inspect_regular(target, private=True)
+    entry = manifest["services"].get(role)
+    if entry is not None and entry["path"] != str(target):
+        raise SetupError("manifest records this service at a different path")
+    if current is None:
+        return None
+    if entry is None:
+        raise SetupError("refusing to overwrite an unmanaged service file")
+    if hashlib.sha256(current).hexdigest() != entry["sha256"]:
+        raise SetupError("refusing to overwrite a modified service file")
+    return current
+
+
+def install_definition(home, role, target, payload):
+    ensure_tree(target.parent, home)
+    manifest = read_manifest(home, create=True)
+    previous = check_owned_target(role, target, manifest)
+    old_entry = manifest["services"].get(role)
+    manifest["services"][role] = {
+        "path": str(target),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    try:
+        if previous != payload:
+            atomic_write(target, payload)
+        save_manifest(home, manifest)
+    except BaseException:
+        try:
+            if previous is None:
+                target.unlink(missing_ok=True)
+            else:
+                atomic_write(target, previous)
+            if old_entry is None:
+                manifest["services"].pop(role, None)
+            else:
+                manifest["services"][role] = old_entry
+        except OSError:
+            pass
+        raise
+
+
+def systemd_quote(value):
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("$", "$$").replace("%", "%%")
+    return f'"{escaped}"'
+
+
+def systemd_unit(nats_server, config):
+    # The first ExecStart word cannot use variable expansion. Keep the stable
+    # absolute binary path as an argument to env so $$ is decoded consistently.
+    args = ["/usr/bin/env", "--", str(nats_server), "--config", str(config)]
+    return (
+        "[Unit]\nDescription=Oshioki browser relay NATS broker\nAfter=network.target\n\n"
+        "[Service]\nType=simple\nUMask=0077\nRestart=on-failure\nRestartSec=2\n"
+        f"ExecStart={' '.join(systemd_quote(arg) for arg in args)}\n\n"
+        "[Install]\nWantedBy=default.target\n"
+    ).encode()
+
+
+def plist_bytes(label, arguments, log_dir):
+    document = {
+        "Label": label,
+        "ProgramArguments": arguments,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "UMask": 0o077,
+        "EnvironmentVariables": {"PATH": "/usr/bin:/bin"},
+        "StandardOutPath": str(log_dir / f"{label.rsplit('.', 1)[-1]}.out.log"),
+        "StandardErrorPath": str(log_dir / f"{label.rsplit('.', 1)[-1]}.err.log"),
+        "ThrottleInterval": 5,
+    }
+    return plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=True)
+
+
+def ensure_private_log(path, home):
+    ensure_tree(path.parent, home, private_final=True)
+    if path.is_symlink():
+        raise SetupError("log file is a symlink")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_nlink != 1):
+            raise SetupError("log file must be owned by this user and private")
+    except OSError:
+        raise SetupError("cannot create a private service log") from None
+    finally:
+        if "fd" in locals():
+            os.close(fd)
+
+
+def run_command(argv, description):
+    try:
+        result = subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, check=False, timeout=20)
+    except subprocess.TimeoutExpired:
+        raise SetupError(f"{description} timed out") from None
+    except OSError:
+        raise SetupError(f"{description} could not run") from None
+    return result
+
+
+def require_success(result, description):
+    if result.returncode:
+        raise SetupError(f"{description} failed (exit {result.returncode})")
+
+
+def launch_domain():
+    if os.getuid() == 0:
+        raise SetupError("run as the Mac user, not as root")
+    return f"gui/{os.getuid()}"
+
+
+def launch_loaded_path(label, target):
+    domain = launch_domain()
+    result = run_command(["/bin/launchctl", "print", f"{domain}/{label}"],
+                         "launchd service lookup")
+    if result.returncode:
+        message = (result.stdout or "") + (result.stderr or "")
+        if result.returncode == 113 or "Could not find service" in message:
+            return False
+        raise SetupError("launchd service state could not be verified")
+    for line in (result.stdout or "").splitlines():
+        match = re.match(r"\s*path\s*=\s*(.*?)\s*$", line)
+        if match:
+            loaded = match.group(1).strip('"')
+            if loaded == str(target):
+                return True
+            raise SetupError("a different service already uses this launchd label")
+    raise SetupError("launchd service ownership could not be verified")
+
+
+def systemd_loaded_path(unit):
+    result = run_command(["systemctl", "--user", "show", "--property=FragmentPath",
+                          "--value", unit], "systemd service lookup")
+    require_success(result, "systemd service lookup")
+    return (result.stdout or "").strip()
+
+
+def service_paths(role, home):
+    if role in ("receiver", "tunnel"):
+        directory = home / "Library/LaunchAgents"
+        target = directory / f"{LABELS[role]}.plist"
+    else:
+        directory = home / ".config/systemd/user"
+        target = directory / LABELS[role]
+    return directory, target
+
+
+def ensure_platform(role):
+    expected = "Linux" if role == "broker" else "Darwin"
+    if platform.system() != expected:
+        raise SetupError(f"{role} installation is supported on {expected} only")
+    if os.getuid() == 0:
+        raise SetupError("run as the service account, not as root")
+
+
+def build_receiver(args, home):
+    config = checked_path(args.config, "approver config", private=True)
+    relay = checked_path(args.relay, "relay binary", executable=True)
+    log_dir = home / "Library/Logs/Oshioki/browser-relay"
+    ensure_tree(log_dir, home, private_final=True)
+    label = LABELS["receiver"]
+    for suffix in ("out", "err"):
+        ensure_private_log(log_dir / f"receiver.{suffix}.log", home)
+    return plist_bytes(label, [str(relay), "serve", "--config", str(config)], log_dir)
+
+
+def build_tunnel(args, home):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", args.ssh_destination):
+        raise SetupError("SSH destination must be a host or configured alias without options")
+    local, remote = args.local_port, args.remote_port
+    if not 1 <= local <= 65535 or not 1 <= remote <= 65535:
+        raise SetupError("tunnel ports must be between 1 and 65535")
+    log_dir = home / "Library/Logs/Oshioki/browser-relay"
+    ensure_tree(log_dir, home, private_final=True)
+    for suffix in ("out", "err"):
+        ensure_private_log(log_dir / f"tunnel.{suffix}.log", home)
+    args_ = ["/usr/bin/ssh", "-N", "-o", "BatchMode=yes", "-o",
+             "StrictHostKeyChecking=yes", "-o", "ExitOnForwardFailure=yes", "-o",
+             "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3", "-L",
+             f"127.0.0.1:{local}:127.0.0.1:{remote}", args.ssh_destination]
+    return plist_bytes(LABELS["tunnel"], args_, log_dir)
+
+
+def build_broker(args):
+    config = checked_path(args.config, "private NATS config", private=True)
+    server = checked_path(args.nats_server, "nats-server binary", executable=True)
+    return systemd_unit(server, config)
+
+
+def activation_command(role, target):
+    if role == "broker":
+        unit = LABELS[role]
+        return (f"systemctl --user daemon-reload && systemctl --user enable {unit} "
+                f"&& systemctl --user restart {unit}")
+    return shlex.join(["launchctl", "bootstrap", launch_domain(), str(target)])
+
+
+def activate(role, target):
+    if role == "broker":
+        current = systemd_loaded_path(LABELS[role])
+        if current and current != str(target):
+            raise SetupError("a different service already uses this systemd unit name")
+        require_success(run_command(["systemctl", "--user", "daemon-reload"],
+                                    "systemd daemon reload"), "systemd daemon reload")
+        require_success(run_command(["systemctl", "--user", "enable", LABELS[role]],
+                                    "systemd enable"), "systemd enable")
+        require_success(run_command(["systemctl", "--user", "restart", LABELS[role]],
+                                    "systemd activation"), "systemd activation")
+        return
+    label = LABELS[role]
+    if launch_loaded_path(label, target):
+        require_success(run_command(["/bin/launchctl", "bootout",
+                                     f"{launch_domain()}/{label}"], "launchd restart"),
+                        "launchd restart")
+    require_success(run_command(["/bin/launchctl", "bootstrap", launch_domain(), str(target)],
+                                "launchd activation"), "launchd activation")
+
+
+def install(args, role):
+    ensure_platform(role)
+    home = home_path()
+    _, target = service_paths(role, home)
+    if role == "receiver":
+        payload = build_receiver(args, home)
+    elif role == "tunnel":
+        payload = build_tunnel(args, home)
+    else:
+        payload = build_broker(args)
+    # Check service ownership before writing; --start may only replace an
+    # already-loaded job when launchd/systemd identifies this exact file.
+    if args.start:
+        if role == "broker":
+            loaded = systemd_loaded_path(LABELS[role])
+            if loaded and loaded != str(target):
+                raise SetupError("a different service already uses this systemd unit name")
+        else:
+            launch_loaded_path(LABELS[role], target)
+    install_definition(home, role, target, payload)
+    command = activation_command(role, target)
+    print(f"Installed {role} service definition: {target}")
+    print(f"Activate with: {command}")
+    if args.start:
+        activate(role, target)
+        state = "enabled and start requested" if role == "broker" else "loaded"
+        print(f"Service {state}: {LABELS[role]}")
+
+
+def uninstall(role):
+    ensure_platform(role)
+    home = home_path()
+    _, target = service_paths(role, home)
+    manifest = read_manifest(home)
+    entry = manifest["services"].get(role)
+    if entry is None:
+        if inspect_regular(target, private=True) is not None:
+            raise SetupError("refusing to remove an unmanaged service file")
+        print(f"No managed {role} service is installed")
+        return
+    ensure_tree(target.parent, home)
+    if entry["path"] != str(target):
+        raise SetupError("manifest records this service at a different path")
+    current = inspect_regular(target, private=True)
+    if current is None or hashlib.sha256(current).hexdigest() != entry["sha256"]:
+        raise SetupError("refusing to remove a missing or modified service file")
+    if role == "broker":
+        loaded = systemd_loaded_path(LABELS[role])
+        if loaded and loaded != str(target):
+            raise SetupError("a different service already uses this systemd unit name")
+        if loaded:
+            require_success(run_command(["systemctl", "--user", "disable", "--now", LABELS[role]],
+                                        "systemd stop"), "systemd stop")
+    elif launch_loaded_path(LABELS[role], target):
+        require_success(run_command(["/bin/launchctl", "bootout",
+                                     f"{launch_domain()}/{LABELS[role]}"], "launchd stop"),
+                        "launchd stop")
+    target.unlink()
+    manifest["services"].pop(role)
+    if manifest["services"]:
+        save_manifest(home, manifest)
+    else:
+        manifest_file = manifest_path(home)
+        if inspect_regular(manifest_file, private=True) is not None:
+            manifest_file.unlink()
+    if role == "broker" and loaded:
+        require_success(run_command(["systemctl", "--user", "daemon-reload"],
+                                    "systemd daemon reload"), "systemd daemon reload")
+    print(f"Uninstalled {role} service")
+
+
+def parser_for_cli():
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_subparsers(dest="action", required=True)
+    install_parser = actions.add_parser("install", help="write a service definition")
+    roles = install_parser.add_subparsers(dest="role", required=True)
+    receiver = roles.add_parser("receiver", help="macOS launchd relay receiver")
+    receiver.add_argument("--config", required=True, help="absolute private approver JSON")
+    receiver.add_argument("--relay", required=True, help="absolute relay executable")
+    tunnel = roles.add_parser("tunnel", help="macOS launchd SSH tunnel")
+    tunnel.add_argument("--ssh-destination", required=True, help="configured SSH alias")
+    tunnel.add_argument("--local-port", required=True, type=int)
+    tunnel.add_argument("--remote-port", required=True, type=int)
+    broker = roles.add_parser("broker", help="Linux systemd user NATS broker")
+    broker.add_argument("--config", required=True, help="absolute private NATS config")
+    broker.add_argument("--nats-server", required=True, help="absolute nats-server executable")
+    for subparser in (receiver, tunnel, broker):
+        subparser.add_argument("--start", action="store_true",
+                               help="activate after writing the service definition")
+    remove = actions.add_parser("uninstall", help="stop and remove a managed definition")
+    remove.add_argument("role", choices=tuple(LABELS))
+    return parser
+
+
+def main(argv=None):
+    args = parser_for_cli().parse_args(argv)
+    try:
+        if args.action == "uninstall":
+            uninstall(args.role)
+        else:
+            install(args, args.role)
+    except SetupError as error:
+        print(f"oshioki-browser-service: {error}", file=sys.stderr)
+        return 1
+    except OSError:
+        print("oshioki-browser-service: filesystem operation failed", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

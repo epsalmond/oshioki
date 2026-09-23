@@ -1,39 +1,109 @@
-# Approve a browser login
+# Google Cloud CLI login
 
-Oshioki can require one Touch ID approval before establishing or renewing
-Google CLI access. It supports a login on the same Mac or a login on a remote
-host approved from that Mac.
+Oshioki can route the exact command `gcloud auth login` through the browser
+relay after you opt in with `oshioki-google-login-setup`. The wrapper leaves
+every other gcloud command alone, including `gcloud auth login` with extra
+flags. It supports a login on the same Mac or on a remote requester approved
+from the Mac.
+
+The relay reuses usable cached credentials and invokes Google's browser flow
+when Google requires sign-in or reauthentication. Complete any Google account
+checks in the browser; the routed flow returns the result to gcloud
+automatically. Gcloud credentials stay in the normal gcloud profile. In
+account-bound mode, Touch ID authorizes the configured account before gcloud
+proceeds.
 
 | Journey | Command |
 | --- | --- |
+| Google login through the opt-in wrapper | `gcloud auth login` |
 | Google login on this Mac | `oshioki-browser-relay local-login --config …` |
 | Google login on a server or VM | `oshioki-browser-relay login --config …` on the host, with `serve` on the Mac |
 | `vercel login` or another provider | Not implemented; there is no generic browser adapter. |
 
-Use the helper explicitly. Running bare `gcloud auth login` does not invoke
-Oshioki. After approval, gcloud owns the credentials and routine commands can
-refresh them normally. Google may still require account selection, consent,
-a password, or a passkey; Touch ID does not replace Google's authentication.
+Bare `gcloud auth login` invokes Oshioki only after you install its opt-in
+wrapper below. Before installation, the command behaves as Google Cloud CLI
+documents it. After sign-in, gcloud owns the credentials and routine commands
+can refresh them normally. Google may still require account selection,
+consent, a password, or a passkey; Touch ID does not replace Google's
+authentication.
 
 ## Install
 
 [Install Oshioki](install.md) and install Google Cloud CLI separately on the
-machine that will run gcloud. The relay is included in the next release after
-0.1.15, in both Homebrew's Mac package and the Debian package. The Mac package
-also includes the agent used to create the approval identity.
+machine that will run gcloud. The release carrying these changes includes the
+relay, the opt-in gcloud wrapper setup tool, and the background service setup
+tool in both Homebrew's Mac archive and the Debian package. These setup tools
+need Python 3.9 or newer; the packages declare that runtime dependency. Google
+Cloud CLI remains separate.
 
 For an earlier release or a source checkout:
 
 ```sh
 cargo build --locked --release -p oshioki-agent -p oshioki-browser-relay
-export PATH="$PWD/target/release:$PATH"
+export PATH="$PWD/scripts:$PWD/target/release:$PATH"
 ```
+
+The setup tools in `scripts/` require Python 3.9 or newer.
 
 Confirm that the required commands are available:
 
 ```sh
 oshioki-browser-relay --help
 gcloud --version
+```
+
+### Connect plain `gcloud auth login`
+
+Create the local or requester config described below before installing the
+wrapper. Resolve the real gcloud executable **before** installing it. The
+setup command pins that path so the wrapper can safely delegate other gcloud
+commands without calling itself:
+
+```sh
+real_gcloud="$(command -v gcloud)"
+oshioki-google-login-setup install \
+  --mode requester \
+  --config "$HOME/.config/oshioki/browser-relay/requester.json" \
+  --gcloud "$real_gcloud"
+```
+
+Use `--mode local` with `local.json` on the Mac that runs gcloud. Use
+`--mode requester` with `requester.json` on the remote host that stores the
+gcloud credentials. If the relay binary is not on `PATH`, pass its absolute
+path with `--relay`. The wrapper is installed in `~/.local/bin` by default;
+that directory must be owned by your user and not writable by group or
+others. Its parent directories must not be group- or world-writable unless
+they have the sticky bit. If the default path fails those checks, create a
+private bin directory and pass it explicitly. Put the selected bin directory
+before the real gcloud path on `PATH`, then refresh the shell's command lookup
+(`hash -r` in Bash or `rehash` in zsh). For a private alternative:
+
+```sh
+mkdir -p "$HOME/.oshioki/bin"
+chmod 700 "$HOME/.oshioki" "$HOME/.oshioki/bin"
+oshioki-google-login-setup install \
+  --mode requester \
+  --config "$HOME/.config/oshioki/browser-relay/requester.json" \
+  --gcloud "$real_gcloud" \
+  --bin-dir "$HOME/.oshioki/bin"
+export PATH="$HOME/.oshioki/bin:$PATH"
+hash -r
+gcloud auth login
+```
+
+Only the no-argument form above is routed through Oshioki. Other gcloud
+commands and login forms with flags go directly to the pinned gcloud
+executable. Remove the opt-in wrapper with:
+
+```sh
+oshioki-google-login-setup uninstall
+```
+
+If you installed to a custom `--bin-dir`, pass the same directory when
+uninstalling, for example:
+
+```sh
+oshioki-google-login-setup uninstall --bin-dir "$HOME/.oshioki/bin"
 ```
 
 Local approval requires macOS, Touch ID, Secure Enclave, and a graphical login
@@ -95,8 +165,10 @@ shows Touch ID and, when needed, opens the browser.
 Install the relay on both machines and create the Mac approval identity above.
 You also need:
 
-- A private TLS NATS broker reachable by both machines, with separate users.
-  This relay uses core NATS; it needs no Oshioki server or JetStream stream.
+- A private NATS broker reachable by both machines, with separate users. It
+  can use TLS directly or an authenticated loopback listener reached through
+  an SSH tunnel, as described below. This relay uses core NATS; it needs no
+  Oshioki server or JetStream stream.
 - A shared canonical UUID for `lane` (lowercase).
 - Noninteractive SSH from the Mac to the requester, with a pinned host key
   and permission for `-W localhost:<callback-port>` forwarding.
@@ -155,23 +227,104 @@ private files, not command arguments. Both configurations must name the same
 Google account. Keep the account approval fields: legacy configurations that
 omit all of them use a browser-only relay without the account approval step.
 
-### Run
+### Optional background services
 
-On the Mac, leave this foreground receiver running:
+`oshioki-browser-service` installs per-user services for an existing config;
+it does not create relay keys, identities, or NATS config. Without `--start`
+it only writes the service definition. On the Mac, install the receiver in
+your logged-in GUI session:
 
 ```sh
-oshioki-browser-relay serve --config ~/.config/oshioki/browser-relay/approver.json
+oshioki-browser-service install receiver \
+  --config "$HOME/.config/oshioki/browser-relay/approver.json" \
+  --relay "$(command -v oshioki-browser-relay)" \
+  --start
 ```
 
-On the requester:
+The LaunchAgent keeps the receiver running while you are logged in. For a
+direct TLS NATS broker, this is the only service required. Remove it with
+`oshioki-browser-service uninstall receiver`.
+
+### Optional loopback NATS over SSH
+
+For a broker on the requester host, keep NATS bound to loopback and let SSH
+carry its traffic to the Mac. The NATS ACL should match the table above; give
+the two users separate random passwords and substitute the same lane UUID in
+both subject lists:
+
+```conf
+host: 127.0.0.1
+port: 4222
+authorization {
+  users = [
+    { user: "requester", password: "RANDOM_REQUESTER_PASSWORD", permissions: {
+      publish: ["oshioki.browser.v1.LANE_UUID"],
+      subscribe: ["oshioki.browser.v1.LANE_UUID.reply.*"]
+    } },
+    { user: "approver", password: "RANDOM_APPROVER_PASSWORD", permissions: {
+      publish: ["oshioki.browser.v1.LANE_UUID.reply.*"],
+      subscribe: ["oshioki.browser.v1.LANE_UUID"]
+    } }
+  ]
+}
+```
+
+Replace the sample lane and passwords with your own values. Save the NATS
+configuration as `nats.conf` with mode 0600 and install `nats-server`
+separately on the requester. Choose an unused port if 4222 is occupied, and
+use that same port in the listener, both configs, and the tunnel endpoints.
+Set the requester and Mac `nats_url` values to their respective users at
+`nats://USER:PASSWORD@127.0.0.1:4222`, percent-encoding password characters
+as needed. Keep both JSON configs private. On the requester, install the
+broker service:
+
+```sh
+oshioki-browser-service install broker \
+  --config "$HOME/.config/oshioki/browser-relay/nats.conf" \
+  --nats-server "$(command -v nats-server)" \
+  --start
+```
+
+On the Mac, forward the same loopback port through a pinned SSH alias to the
+requester, then start the receiver:
+
+```sh
+oshioki-browser-service install tunnel \
+  --ssh-destination requester \
+  --local-port 4222 --remote-port 4222 --start
+oshioki-browser-service install receiver \
+  --config "$HOME/.config/oshioki/browser-relay/approver.json" \
+  --relay "$(command -v oshioki-browser-relay)" \
+  --start
+```
+
+The tunnel and receiver are LaunchAgents; the broker is a systemd user
+service. The SSH tunnel encrypts the loopback NATS traffic. Do not bind this
+broker to a network interface. Check Mac service state with
+`launchctl print gui/$(id -u)/io.oshioki.browser-relay.receiver` and
+`launchctl print gui/$(id -u)/io.oshioki.browser-relay.tunnel`; private logs
+are under `~/Library/Logs/Oshioki/browser-relay/`. Check the broker with
+`systemctl --user status oshioki-browser-relay-nats.service` and
+`journalctl --user -u oshioki-browser-relay-nats.service`. Remove roles on
+their host with `oshioki-browser-service uninstall ROLE`.
+
+### Run
+
+After installing the opt-in wrapper on the requester and starting the Mac
+receiver, run the unmodified command on the requester:
+
+```sh
+gcloud auth login
+```
+
+Approve on the Mac when prompted. If Google requires a browser, gcloud opens
+it and receives the localhost callback through a short-lived SSH connection;
+credentials remain on the requester. Callback codes and tokens do not cross
+NATS. The explicit command remains available for troubleshooting:
 
 ```sh
 oshioki-browser-relay login --config ~/.config/oshioki/browser-relay/requester.json
 ```
-
-Approve on the Mac. When Google requires a browser, the relay forwards the
-localhost callback over short-lived SSH connections; credentials remain on
-the requester. Callback codes and tokens do not cross NATS.
 
 ## Update or troubleshoot
 
@@ -183,7 +336,7 @@ and keys; a routine package update needs no new identity or enrollment.
 | Command not found | Package must include the relay; older releases need the source build. |
 | Private-file error | Config and signing key must be regular private files, normally mode 0600. |
 | No Touch ID | Use the graphical Mac session and a Secure Enclave identity; software keys cannot approve. |
-| Remote receiver never becomes ready | NATS TLS/authentication, subject permissions, matching lane and peer keys. |
+| Remote receiver never becomes ready | NATS authentication, subject permissions, matching lane and peer keys, and the TLS connection or SSH tunnel. |
 | Approval succeeds but browser login fails | SSH access to the requester and Google's browser flow. |
 | Identity key invalid after changing Touch ID fingerprints | Create a replacement ceremony identity and update its public key in the local/requester config. |
 
