@@ -7,6 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 cd "$REPO_ROOT"
+python3 "$SCRIPT_DIR/test-compat-rollback.py"
 
 head_commit="$(git rev-parse HEAD)"
 PREV_TAG=""
@@ -473,6 +474,13 @@ kill "$HOOK_PID" >/dev/null 2>&1 || true
 wait "$HOOK_PID" >/dev/null 2>&1 || true
 HOOK_PID=""
 stop_server
+previous_schema="$(python3 - "$SERVER_DB" <<'PY'
+import sqlite3, sys
+from contextlib import closing
+with closing(sqlite3.connect(sys.argv[1])) as db:
+    print(db.execute("PRAGMA user_version").fetchone()[0])
+PY
+)"
 start_server "$CUR_BIN/oshioki-server" "$SERVER_DIR/current.log"
 python3 - "$SERVER_DB" "$inflight_id" <<'PY'
 import sqlite3, sys
@@ -498,21 +506,13 @@ fi
 echo "current server stack approved with the same enrolled credential"
 
 stop_server
-snapshot="$(python3 - "$SERVER_DB" <<'PY'
-import glob, os, sys
-path = sys.argv[1]
-directory, name = os.path.split(path)
-stem, ext = os.path.splitext(name)
-matches = sorted(
-    glob.glob(os.path.join(directory, stem + ".pre-v*" + ext))
-)
-print(matches[-1] if matches else "")
-PY
-)"
+snapshot="$(python3 "$SCRIPT_DIR/compat-rollback-snapshot.py" "$SERVER_DB" "$previous_schema")"
 if [ -n "$snapshot" ]; then
   echo "restoring $snapshot"
   cp "$snapshot" "$SERVER_DB"
   rm -f "$SERVER_DB-wal" "$SERVER_DB-shm"
+else
+  echo "schema unchanged: rollback reuses the enrolled database"
 fi
 start_server "$PREV_BIN/oshioki-server" "$SERVER_DIR/prev-3.log"
 assert_server_enrollment "compat-prev-restore" "previous server after restore"
