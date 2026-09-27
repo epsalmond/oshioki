@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-26
+
+### Fixed
+
+- Homebrew upgrades refresh an already running Mac agent configured with the
+  formula's stable app-bundle path, preserving launchd configuration, identities,
+  enrollment, and credentials. The tap validates the new bundle and verifies
+  its replacement process; absent, stopped, disabled, and custom agents remain
+  unchanged. Retry any approval interrupted by the refresh. Privileged hook,
+  plugin, and PAM updates still use the existing setup command. (#120, #48)
+
 ## [0.3.0] - 2026-09-26
 
 ### Added

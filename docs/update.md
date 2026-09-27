@@ -22,6 +22,27 @@ brew upgrade epsalmond/oshioki/oshioki
 oshioki-laptop-setup --local
 ```
 
+Homebrew automatically refreshes an already running `com.oshioki.agent` in your
+GUI login session when its configured executable exactly matches the formula's
+stable `opt/oshioki/Oshioki.app/Contents/MacOS/oshioki-agent` path. It validates
+the new bundle's executable, identity, version, icon, and signature, then checks
+for a replacement process running that bundled executable within ten seconds.
+The existing launchd configuration, identities, enrollment, and credentials are
+preserved. Absent, stopped, disabled, and custom installations remain unchanged;
+a custom path produces instructions to re-run your original setup command.
+
+Read Homebrew's output. If a refresh fails or the upgrade runs outside your GUI
+login session, retry from a logged-in Terminal:
+
+```sh
+brew postinstall epsalmond/oshioki/oshioki
+```
+
+Retry any approval interrupted by the restart. Automated bundle validation does
+not verify the Touch ID sheet's visual appearance on a real Mac.
+
+Privileged hook, plugin, and PAM updates still require the setup step above;
+automating those components is tracked in [#48](https://github.com/epsalmond/oshioki/issues/48).
 Use the setup mode you originally chose: omit `--local` for server-backed
 laptop setup. An existing PAM installation stays on PAM. Ordinary re-runs
 preserve the agent's configured NATS credentials; `--reconfigure` replaces them.
