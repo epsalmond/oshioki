@@ -48,6 +48,25 @@ must set `OSHIOKI_UID` themselves (host UID for rootful Docker, 0 for rootless).
 Run `cargo fmt --check` and `scripts/dev test --quick`, plus the relevant checks
 above. Update the affected journey or reference when behavior changes.
 
+## Wait for an existing release run
+
+For a version tag that has already been pushed, select its Actions run by
+workflow and tag:
+
+```sh
+gh run list --repo epsalmond/oshioki --workflow release.yml --branch <tag> --event push --json databaseId,headBranch,headSha,status,conclusion
+```
+
+On a maintainer machine with the shared waiter installed, pass the selected run
+ID to `wait-for-status`:
+
+```sh
+wait-for-status --repo epsalmond/oshioki gh-run <run-id>
+```
+
+The waiter returns when that run completes and saves the full failure log with
+a short matching-line summary.
+
 Public protocol and persistence changes follow the
 [compatibility contract](docs/compatibility.md): additive wire fields need a
 golden and a matrix entry; incompatible semantics need a version and restore
