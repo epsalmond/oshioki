@@ -40,13 +40,14 @@ class RollbackTests(unittest.TestCase):
         self.assert_state(self.live)
 
     def test_schema_change_restores_exact_previous_version_not_sorted_snapshot(self):
-        self.database(self.live, 10)
-        expected = self.live.with_name("state.pre-v9.sqlite3")
-        self.database(expected, 9)
-        self.database(self.live.with_name("state.pre-v10.sqlite3"), 10, enrolled=False)
-        self.assertEqual(rollback.rollback_snapshot(self.live, 9), expected)
+        self.database(self.live, 11)
+        expected = self.live.with_name("state.pre-v10.sqlite3")
+        self.database(expected, 10)
+        # Lexicographic last selects pre-v9, although this upgrade began at 10.
+        self.database(self.live.with_name("state.pre-v9.sqlite3"), 9, enrolled=False)
+        self.assertEqual(rollback.rollback_snapshot(self.live, 10), expected)
         shutil.copyfile(expected, self.live)
-        self.assertEqual(rollback.schema_version(self.live), 9)
+        self.assertEqual(rollback.schema_version(self.live), 10)
         self.assert_state(self.live)
 
     def test_schema_change_requires_valid_matching_snapshot(self):
