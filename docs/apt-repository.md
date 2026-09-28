@@ -38,22 +38,38 @@ key.
 ## Install and update
 
 These commands are ready once the repository is active and the fingerprint
-above has been published. Download and inspect the scoped archive key, then
-compare its full fingerprint with the value above before installing it:
+above has been published. Replace `PENDING` in `expected_fingerprint` below
+with that full fingerprint. The command stops before installing the key while
+the value is pending, the keyring does not contain exactly one primary public
+key, or the fingerprint does not match:
 
 ```sh
-curl --fail --show-error --silent --location \
-  https://epsalmond.github.io/oshioki/oshioki-archive-keyring.gpg \
-  --output /tmp/oshioki-archive-keyring.gpg
-gpg --show-keys --with-fingerprint /tmp/oshioki-archive-keyring.gpg
-sudo install -d -m 0755 /etc/apt/keyrings
-sudo install -m 0644 /tmp/oshioki-archive-keyring.gpg \
-  /etc/apt/keyrings/oshioki-archive-keyring.gpg
-rm /tmp/oshioki-archive-keyring.gpg
+(
+  set -e
+  keyring_tmp="$(mktemp)"
+  trap 'rm -f "$keyring_tmp"' EXIT
+  expected_fingerprint='PENDING'
+  curl --fail --show-error --silent --location \
+    https://epsalmond.github.io/oshioki/oshioki-archive-keyring.gpg \
+    --output "$keyring_tmp"
+  gpg --show-keys --with-fingerprint "$keyring_tmp"
+  keyring_info="$(gpg --show-keys --with-colons "$keyring_tmp")"
+  public_key_count="$(printf '%s\n' "$keyring_info" \
+    | awk -F: '$1 == "pub" { count++ } END { print count + 0 }')"
+  actual_fingerprint="$(printf '%s\n' "$keyring_info" \
+    | awk -F: '$1 == "fpr" { print toupper($10); exit }')"
+  if [ "$public_key_count" != 1 ] || [ "$expected_fingerprint" = PENDING ] || [ "$actual_fingerprint" != "$expected_fingerprint" ]; then
+    echo 'Oshioki archive key must contain exactly one public key matching the published fingerprint.' >&2
+    exit 1
+  fi
+  sudo install -d -m 0755 /etc/apt/keyrings
+  sudo install -m 0644 "$keyring_tmp" \
+    /etc/apt/keyrings/oshioki-archive-keyring.gpg
+)
 ```
 
-Add the repository with `Signed-By` so this key authenticates only Oshioki's
-packages:
+Add the repository with `Signed-By` so this key is trusted only for the
+Oshioki repository:
 
 ```sh
 printf '%s\n' \

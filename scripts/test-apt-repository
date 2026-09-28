@@ -128,9 +128,18 @@ if GNUPGHOME="$TEST_ROOT/verify-gnupg" gpg --batch --verify "$TEST_ROOT/InReleas
 fi
 
 APT_ROOT="$TEST_ROOT/apt"
-mkdir -p "$APT_ROOT/etc/apt/keyrings" "$APT_ROOT/lists/partial" "$APT_ROOT/cache/archives/partial"
-cp "$REPOSITORY/oshioki-archive-keyring.gpg" "$APT_ROOT/etc/apt/keyrings/oshioki.gpg"
-cat >"$APT_ROOT/status" <<'EOF'
+prepare_apt_root() {
+  local apt_root="$1"
+  local repository="$2"
+  mkdir -p \
+    "$apt_root/etc/apt/apt.conf.d" \
+    "$apt_root/etc/apt/keyrings" \
+    "$apt_root/etc/apt/preferences.d" \
+    "$apt_root/etc/apt/trusted.gpg.d" \
+    "$apt_root/lists/partial" \
+    "$apt_root/cache/archives/partial"
+  cp "$REPOSITORY/oshioki-archive-keyring.gpg" "$apt_root/etc/apt/keyrings/oshioki.gpg"
+  cat >"$apt_root/status" <<'EOF'
 Package: oshioki
 Status: install ok installed
 Priority: optional
@@ -140,29 +149,79 @@ Version: 0.3.0
 Description: Installed synthetic Oshioki package
 
 EOF
-printf 'deb [arch=amd64 signed-by=%s] file:%s/ stable main\n' \
-  "$APT_ROOT/etc/apt/keyrings/oshioki.gpg" "$REPOSITORY" >"$APT_ROOT/sources.list"
+  printf 'deb [arch=amd64 signed-by=%s] file:%s/ stable main\n' \
+    "$apt_root/etc/apt/keyrings/oshioki.gpg" "$repository" >"$apt_root/sources.list"
+  cat >"$apt_root/apt.conf" <<EOF
+Dir::Etc "$apt_root/etc/apt";
+Dir::Etc::main "$apt_root/etc/apt/apt.conf";
+Dir::Etc::parts "$apt_root/etc/apt/apt.conf.d";
+Dir::Etc::sourcelist "$apt_root/sources.list";
+Dir::Etc::sourceparts "-";
+Dir::Etc::preferences "$apt_root/etc/apt/preferences";
+Dir::Etc::preferencesparts "$apt_root/etc/apt/preferences.d";
+Dir::Etc::trusted "$apt_root/etc/apt/trusted.gpg";
+Dir::Etc::trustedparts "$apt_root/etc/apt/trusted.gpg.d";
+EOF
+  : >"$apt_root/etc/apt/apt.conf"
+  : >"$apt_root/etc/apt/preferences"
+  : >"$apt_root/etc/apt/trusted.gpg"
+}
 
 apt_get() {
-  apt-get \
-    -o "Dir::Etc::sourcelist=$APT_ROOT/sources.list" \
+  local apt_root="$1"
+  shift
+  APT_CONFIG="$apt_root/apt.conf" apt-get \
+    -o "Dir::Etc=$apt_root/etc/apt" \
+    -o "Dir::Etc::sourcelist=$apt_root/sources.list" \
     -o 'Dir::Etc::sourceparts=-' \
-    -o "Dir::State::status=$APT_ROOT/status" \
-    -o "Dir::State::lists=$APT_ROOT/lists" \
-    -o "Dir::State::extended_states=$APT_ROOT/extended_states" \
-    -o "Dir::Cache=$APT_ROOT/cache" \
-    -o "Dir::Cache::pkgcache=$APT_ROOT/cache/pkgcache.bin" \
-    -o "Dir::Cache::srcpkgcache=$APT_ROOT/cache/srcpkgcache.bin" \
-    -o "Dir::Log::History=$APT_ROOT/history.log" \
-    -o "Dir::Log::Terminal=$APT_ROOT/term.log" \
+    -o "Dir::Etc::parts=$apt_root/etc/apt/apt.conf.d" \
+    -o "Dir::Etc::preferences=$apt_root/etc/apt/preferences" \
+    -o "Dir::Etc::preferencesparts=$apt_root/etc/apt/preferences.d" \
+    -o "Dir::Etc::trusted=$apt_root/etc/apt/trusted.gpg" \
+    -o "Dir::Etc::trustedparts=$apt_root/etc/apt/trusted.gpg.d" \
+    -o "Dir::State::status=$apt_root/status" \
+    -o "Dir::State::lists=$apt_root/lists" \
+    -o "Dir::State::extended_states=$apt_root/extended_states" \
+    -o "Dir::Cache=$apt_root/cache" \
+    -o "Dir::Cache::pkgcache=$apt_root/cache/pkgcache.bin" \
+    -o "Dir::Cache::srcpkgcache=$apt_root/cache/srcpkgcache.bin" \
+    -o "Dir::Cache::archives=$apt_root/cache/archives" \
+    -o "Dir::Log::History=$apt_root/history.log" \
+    -o "Dir::Log::Terminal=$apt_root/term.log" \
     -o 'APT::Get::List-Cleanup=0' \
     -o 'Debug::NoLocking=1' \
     "$@"
 }
 
-chmod 0755 "$TEST_ROOT" "$REPOSITORY" "$APT_ROOT" "$APT_ROOT/lists" "$APT_ROOT/cache"
-apt_get update -qq
-SIMULATION="$(apt_get --simulate install --only-upgrade oshioki 2>&1)"
+chmod 0755 "$TEST_ROOT" "$REPOSITORY"
+prepare_apt_root "$APT_ROOT" "$REPOSITORY"
+chmod 0755 "$APT_ROOT"
+
+TAMPERED_REPOSITORY="$TEST_ROOT/repository-tampered-signature"
+cp -a "$REPOSITORY" "$TAMPERED_REPOSITORY"
+for signed_file in InRelease Release; do
+  sed 's/Origin: Oshioki/Origin: Tampered/' \
+    "$TAMPERED_REPOSITORY/dists/stable/$signed_file" \
+    >"$TAMPERED_REPOSITORY/dists/stable/$signed_file.changed"
+  mv "$TAMPERED_REPOSITORY/dists/stable/$signed_file.changed" \
+    "$TAMPERED_REPOSITORY/dists/stable/$signed_file"
+done
+TAMPERED_APT_ROOT="$TEST_ROOT/apt-tampered-signature"
+prepare_apt_root "$TAMPERED_APT_ROOT" "$TAMPERED_REPOSITORY"
+chmod 0755 "$TAMPERED_APT_ROOT" "$TAMPERED_REPOSITORY"
+if apt_get "$TAMPERED_APT_ROOT" update >"$TEST_ROOT/tampered-update.log" 2>&1; then
+  echo 'test-apt-repository: apt accepted a repository with a modified Release signature' >&2
+  exit 1
+fi
+if ! grep -Eiq 'BADSIG|signature.*(invalid|couldn.t be verified)|couldn.t be verified|not signed|clearsigned file' \
+  "$TEST_ROOT/tampered-update.log"; then
+  cat "$TEST_ROOT/tampered-update.log" >&2
+  echo 'test-apt-repository: apt failed for a reason other than signature rejection' >&2
+  exit 1
+fi
+
+apt_get "$APT_ROOT" update -qq
+SIMULATION="$(apt_get "$APT_ROOT" --simulate install --only-upgrade oshioki 2>&1)"
 if ! grep -Eq 'Inst oshioki \[0\.3\.0\] \(0\.3\.1 ' <<<"$SIMULATION"; then
   printf '%s\n' "$SIMULATION" >&2
   echo 'test-apt-repository: apt did not select 0.3.1 over installed 0.3.0' >&2
@@ -170,9 +229,16 @@ if ! grep -Eq 'Inst oshioki \[0\.3\.0\] \(0\.3\.1 ' <<<"$SIMULATION"; then
 fi
 
 printf 'tamper\n' >>"$REPOSITORY/pool/main/o/oshioki/oshioki_0.3.1_amd64.deb"
-if apt_get --download-only --assume-yes install --only-upgrade oshioki >/dev/null 2>&1; then
+if apt_get "$APT_ROOT" --download-only --assume-yes install --only-upgrade oshioki \
+  >"$TEST_ROOT/tampered-download.log" 2>&1; then
   echo 'test-apt-repository: modified package unexpectedly passed apt hash verification' >&2
   exit 1
 fi
+if ! grep -Eiq 'Hash Sum mismatch|File has unexpected size|expected.*checksum|checksum.*does not match|hashes of expected file' \
+  "$TEST_ROOT/tampered-download.log"; then
+  cat "$TEST_ROOT/tampered-download.log" >&2
+  echo 'test-apt-repository: apt download failed for a reason other than package hash rejection' >&2
+  exit 1
+fi
 
-echo 'test-apt-repository: PASS (stable versions retained, signatures verified, apt selects upgrade, tampering rejected)'
+echo 'test-apt-repository: PASS (stable versions retained, signed index verified, apt selects upgrade, signature and package tampering rejected)'
