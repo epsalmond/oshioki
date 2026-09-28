@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add a signed amd64 apt repository assembled from stable GitHub release
+  packages, with isolated `Signed-By` installation instructions. Repository
+  publication remains pending GitHub Pages and signing-key configuration.
+
 ## [0.3.1] - 2026-09-26
 
 ### Fixed

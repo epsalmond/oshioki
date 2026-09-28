@@ -20,6 +20,9 @@ unlocked login keychain.
 
 ## Debian or Ubuntu
 
+The signed [apt repository](apt-repository.md) is not active yet. Until its
+signing fingerprint is published there, install from a GitHub release:
+
 Download the amd64 `.deb` from a
 [release](https://github.com/epsalmond/oshioki/releases), then:
 

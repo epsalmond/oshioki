@@ -52,16 +52,28 @@ Restart any running `oshioki-browser-relay serve` process after upgrading.
 
 ## Debian or Ubuntu
 
-Install the new release package:
+After configuring the signed [apt repository](apt-repository.md), explicitly
+check for and install an update with:
+
+```sh
+sudo apt update
+sudo apt upgrade
+```
+
+The apt repository is not active yet. Until its signing fingerprint is
+published, download the new release package and install it directly:
 
 ```sh
 sudo apt install ./oshioki_X.Y.Z_amd64.deb
 ```
 
 Package configuration refreshes the hook when `/etc/oshioki/install.env`
-exists and restarts an already running packaged server. An existing PAM
+exists and try-restarts an already running packaged server. An existing PAM
 installation stays on PAM even if its original opt-in setting was removed.
 Read the output: a deferred PAM migration is not an active PAM installation.
+These package actions preserve enrolled devices. A running
+`oshioki-browser-relay serve` process still needs a manual restart after the
+upgrade.
 
 Phone setup's user services are separate from the packaged system service.
 Re-run `oshioki-phone-setup` for an owned Tailscale setup to refresh them;
