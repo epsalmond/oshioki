@@ -24,12 +24,17 @@ brew install epsalmond/oshioki/oshioki
 oshioki-laptop-setup --local
 ```
 
-Debian or Ubuntu (amd64), from the
-[latest release](https://github.com/epsalmond/oshioki/releases):
+Debian or Ubuntu (amd64), configure the signed
+[apt repository](docs/apt-repository.md), then install:
 
 ```sh
-sudo apt install ./oshioki_X.Y.Z_amd64.deb
+sudo apt update
+sudo apt install oshioki
 ```
+
+For a one-time install without configuring the repository, download the amd64
+`.deb` from the [latest release](https://github.com/epsalmond/oshioki/releases)
+and run `sudo apt install ./oshioki_X.Y.Z_amd64.deb`.
 
 The Mac setup creates a Touch ID identity and starts the agent; no server is
 needed. On Linux, install the package, then choose an approval device below.

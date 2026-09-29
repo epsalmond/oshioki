@@ -151,3 +151,22 @@ systemctl restart oshioki-server
 Use the deployment's administrative NATS credentials. Deleting the durable
 can lose in-flight deliveries; perform it with requests paused. Verify both
 consumer filters after restart. See the [compatibility contract](docs/compatibility.md).
+
+## Maintain the apt repository
+
+Set the repository's Actions secret `APT_SIGNING_PRIVATE_KEY` to the
+ASCII-armored export of the repository signing subkey, with no usable primary
+private key. Set Actions variable `APT_SIGNING_KEY_FINGERPRINT` to the full
+primary fingerprint. Keep protected backups and renew the keys before expiry.
+
+The `github-pages` environment allows deployments from the default branch for
+bootstrap and from `v*` tags for releases. The release workflow indexes stable
+releases, verifies each `.deb` against its `SHA256SUMS`, checks package
+metadata, retains published versions, and excludes drafts and prereleases.
+
+To publish existing releases, run the `release` workflow from the default
+branch with `publish_apt_repository` enabled. This does not create a release;
+the deployment summary reports the signing fingerprint. For a signing-subkey
+rotation, update the Actions secret and republish the public keyring. Replacing
+the primary key requires publishing its new fingerprint and coordinating a
+client keyring rollover.
