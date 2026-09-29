@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-29
+
 ### Added
 
 - Add a signed amd64 apt repository assembled from stable GitHub release
