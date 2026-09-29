@@ -113,11 +113,10 @@ case "$1" in
     # because the packaged installer may already have been deleted.
     remove_verified_sudoers_dropin ||
       echo "oshioki: warning: could not remove an unverified sudoers drop-in; leaving it in place" >&2
-    # Server state is never load-bearing for authentication, so it always
-    # goes. The helper and its config only go when the module went with them:
-    # if sweep_pam_module kept the module, /etc/pam.d still execs that helper
-    # on every sudo, and removing it here would leave a referenced module
-    # with nothing to run.
+    # Purge deletes server state. Hook config and its helper only go when the
+    # PAM module can be removed too: if sweep_pam_module kept it, /etc/pam.d
+    # still execs that helper on every sudo, and removing it would leave a
+    # referenced module with nothing to run.
     if sweep_pam_module; then
       rm -rf /etc/oshioki
       rm -f /usr/local/sbin/oshioki /usr/local/libexec/sudo/oshioki.so

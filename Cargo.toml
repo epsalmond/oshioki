@@ -24,9 +24,8 @@ repository = "https://github.com/epsalmond/oshioki"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Deny warnings workspace-wide; keep the supply chain tight. The plugin crate
-# additionally forbids allocation across the FFI boundary in its own [lints].
-# Crates opt in with `[lints] workspace = true` in their own manifest.
+# Keep unsafe code denied by default. CI treats Clippy warnings as errors with
+# `-D warnings`. Crates opt in with `[lints] workspace = true` in their manifest.
 
 # Release profile. `lto` and `panic` can only be set at the workspace root;
 # `opt-level` and `codegen-units` may be scoped per-package. Set everything

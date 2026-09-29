@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Push endpoint checks apply the IPv4 public-address policy to IPv4-mapped
+  IPv6 addresses.
+- The phone setup guide now documents restarting the Linux server service
+  after a package update.
+
 ## [0.3.1] - 2026-09-26
 
 ### Fixed

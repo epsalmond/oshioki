@@ -89,7 +89,14 @@ on the phone it refers to the phone itself.
 
 Managed state and logs live under `~/.local/share/oshioki/phone-server`.
 The default ports are NATS 14222 and HTTP 18443, configurable with
-`--nats-port` and `--server-port`. Re-run setup after a package update.
+`--nats-port` and `--server-port`. Re-run setup after a package update. On
+Linux, setup may leave a running service on the previous binary when its unit
+is unchanged. Restart and verify the server unit:
+
+```sh
+systemctl --user restart oshioki-phone-server.service
+systemctl --user status oshioki-phone-server.service
+```
 
 On macOS the service labels are `com.oshioki.phone-server.nats` and
 `com.oshioki.phone-server.server`. On Linux:
