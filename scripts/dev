@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Design notes: ~/.claude/plans/oshioki-extraction.md
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

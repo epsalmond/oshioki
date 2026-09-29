@@ -69,7 +69,7 @@ case "$1" in
       systemctl daemon-reload
       if [ -n "${2:-}" ]; then
         systemctl try-restart oshioki-server.service || {
-          echo "oshioki: upgraded but failed to restart oshioki-server; the old binary is still running" >&2
+          echo "oshioki: upgraded but failed to restart oshioki-server; inspect systemctl status oshioki-server.service" >&2
           exit 1
         }
       fi

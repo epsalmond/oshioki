@@ -39,9 +39,6 @@ and a pinned device. Continue with [remote sudo](remote-sudo.md) or
 the [Google Cloud CLI login](browser-ceremony-relay.md) instructions. Its
 wrapper and background services remain opt-in.
 
-Browser relay packaging is new in the next release after 0.1.15. Earlier
-packages require the source build below.
-
 ## From source
 
 Install Rust through rustup; this checkout selects its pinned toolchain.

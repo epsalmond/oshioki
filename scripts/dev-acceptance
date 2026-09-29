@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Design notes: ~/.claude/plans/oshioki-safari-acceptance.md
 set -euo pipefail
 umask 077
 
