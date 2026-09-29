@@ -1,51 +1,15 @@
 # Debian and Ubuntu apt repository
 
-The signed repository is ready for its first publication at
-`https://epsalmond.github.io/oshioki`. GitHub Pages and the archive signing
-settings are configured; the initial deployment still needs the bootstrap run
-below. Until that run publishes the index, install the `.deb` directly from a
-[GitHub release](https://github.com/epsalmond/oshioki/releases).
+Configure apt to install and update Oshioki from
+`https://epsalmond.github.io/oshioki`.
 
 Published archive signing fingerprint: **AA93668ABF0040387C7EB51C1632F50E2226409D**.
 
-## Signing key and publication
-
-The repository's **Settings → Secrets and variables → Actions** contains the
-signing configuration:
-
-- Secret `APT_SIGNING_PRIVATE_KEY`: ASCII-armored signing-subkey export. It
-  contains the public primary key, a nonusable primary secret-key stub, and
-  the usable signing subkey; it has no usable primary private key.
-- Variable `APT_SIGNING_KEY_FINGERPRINT`: full primary fingerprint shown
-  above.
-
-The cert-only RSA4096 primary key and RSA3072 signing subkey are retained in
-`~/.local/share/oshioki/apt-signing` with mode 0700 on the directory and 0600
-on files. The primary private key stays on this machine; these permissions
-protect it, but the key is not physically offline. Actions receives only the
-secret-subkey export. Keep protected backups and renew or replace the
-two-year primary and signing subkey before they expire. For a signing-subkey
-rotation, update the Actions secret and republish the public keyring. If the
-primary key must be replaced, publish and verify its new fingerprint and
-coordinate a client keyring rollover before signing only with the replacement.
-
-Pages uses the GitHub Actions source. The `github-pages` environment permits
-deployments from `main` for bootstrap and `v*` tag releases. The release
-workflow publishes after a stable GitHub release succeeds. It reads all stable
-releases, checks each `.deb` against that release's `SHA256SUMS`, validates
-package metadata, and retains every published version in the package index.
-Drafts and prereleases are excluded.
-
-To bootstrap from existing stable releases, run the `release` workflow from
-the default branch with `publish_apt_repository` enabled. This deploys the
-already-published release assets and does not create another release. The
-deployment summary includes the active signing fingerprint.
-
 ## Install and update
 
-After the bootstrap deployment is available, download and inspect the scoped
-archive key. The command stops before installing it unless the keyring has
-exactly one primary public key with the published fingerprint:
+Download and inspect the scoped archive key. The command stops before
+installing it unless the keyring has exactly one primary public key with the
+published fingerprint:
 
 ```sh
 (
@@ -94,3 +58,40 @@ Oshioki does not enable unattended upgrades. Package updates refresh the
 configured hook when `/etc/oshioki/install.env` exists and try-restart an
 already running packaged server. They preserve enrolled devices. Restart any
 running `oshioki-browser-relay serve` process manually after an update.
+
+For a one-time installation without configuring apt, download the amd64
+`.deb` from a [GitHub release](https://github.com/epsalmond/oshioki/releases)
+and run `sudo apt install ./oshioki_X.Y.Z_amd64.deb`.
+
+## Repository administration
+
+The repository's **Settings → Secrets and variables → Actions** contains the
+signing configuration:
+
+- Secret `APT_SIGNING_PRIVATE_KEY`: ASCII-armored signing-subkey export. It
+  contains the public primary key, a nonusable primary secret-key stub, and
+  the usable signing subkey; it has no usable primary private key.
+- Variable `APT_SIGNING_KEY_FINGERPRINT`: full primary fingerprint shown
+  above.
+
+The cert-only RSA4096 primary key and RSA3072 signing subkey are retained in
+`~/.local/share/oshioki/apt-signing` with mode 0700 on the directory and 0600
+on files. The primary private key stays on this machine; these permissions
+protect it, but the key is not physically offline. Actions receives only the
+secret-subkey export. Keep protected backups and renew or replace the
+two-year primary and signing subkey before they expire. For a signing-subkey
+rotation, update the Actions secret and republish the public keyring. If the
+primary key must be replaced, publish and verify its new fingerprint and
+coordinate a client keyring rollover before signing only with the replacement.
+
+Pages uses the GitHub Actions source. The `github-pages` environment permits
+deployments from `main` for bootstrap and `v*` tag releases. The release
+workflow publishes after a stable GitHub release succeeds. It reads all stable
+releases, checks each `.deb` against that release's `SHA256SUMS`, validates
+package metadata, and retains every published version in the package index.
+Drafts and prereleases are excluded.
+
+To bootstrap from existing stable releases, run the `release` workflow from
+the default branch with `publish_apt_repository` enabled. This deploys the
+already-published release assets and does not create another release. The
+deployment summary includes the active signing fingerprint.

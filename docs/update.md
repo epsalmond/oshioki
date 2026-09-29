@@ -52,18 +52,16 @@ Restart any running `oshioki-browser-relay serve` process after upgrading.
 
 ## Debian or Ubuntu
 
-The signed [apt repository](apt-repository.md) is ready for its first
-bootstrap publication. Once its package index is available, explicitly check
-for and install an update with:
+With the signed [apt repository](apt-repository.md) configured, explicitly
+check for and install updates when you choose:
 
 ```sh
 sudo apt update
 sudo apt upgrade
 ```
 
-The apt repository's first bootstrap publication is still required. Until its
-package index is available, download the new release package and install it
-directly:
+For a one-time update on a machine installed directly from a release package,
+download the new `.deb` and install it directly:
 
 ```sh
 sudo apt install ./oshioki_X.Y.Z_amd64.deb

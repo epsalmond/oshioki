@@ -20,13 +20,16 @@ unlocked login keychain.
 
 ## Debian or Ubuntu
 
-The signed [apt repository](apt-repository.md) is ready for its first
-publication. After bootstrap, follow its `Signed-By` steps to install through
-apt. Until the bootstrap deploys the package index, install from a GitHub
-release:
+Configure the signed [apt repository](apt-repository.md), then install with
+apt:
 
-Download the amd64 `.deb` from a
-[release](https://github.com/epsalmond/oshioki/releases), then:
+```sh
+sudo apt update
+sudo apt install oshioki
+```
+
+For a one-time install without configuring the repository, download the amd64
+`.deb` from a [release](https://github.com/epsalmond/oshioki/releases), then:
 
 ```sh
 sudo apt install ./oshioki_X.Y.Z_amd64.deb
