@@ -20,8 +20,16 @@ unlocked login keychain.
 
 ## Debian or Ubuntu
 
-Download the amd64 `.deb` from a
-[release](https://github.com/epsalmond/oshioki/releases), then:
+Configure the signed [apt repository](apt-repository.md), then install with
+apt:
+
+```sh
+sudo apt update
+sudo apt install oshioki
+```
+
+For a one-time install without configuring the repository, download the amd64
+`.deb` from a [release](https://github.com/epsalmond/oshioki/releases), then:
 
 ```sh
 sudo apt install ./oshioki_X.Y.Z_amd64.deb

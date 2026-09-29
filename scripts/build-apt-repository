@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: build-apt-repository --output-dir DIR --signing-key FILE --fingerprint HEX
+       [--repo OWNER/REPO] [--releases-json FILE]
+
+Use --releases-json with an array of GitHub release API objects for offline
+fixtures. Without it, release metadata is read from GitHub with gh api.
+EOF
+}
+
+die() {
+  echo "build-apt-repository: $*" >&2
+  exit 1
+}
+
+REPOSITORY="${GITHUB_REPOSITORY:-epsalmond/oshioki}"
+OUTPUT_DIR=
+SIGNING_KEY=
+FINGERPRINT=
+RELEASES_JSON=
+
+while (($#)); do
+  case "$1" in
+    --repo)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      REPOSITORY="$2"
+      shift 2
+      ;;
+    --output-dir)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      OUTPUT_DIR="$2"
+      shift 2
+      ;;
+    --signing-key)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      SIGNING_KEY="$2"
+      shift 2
+      ;;
+    --fingerprint)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      FINGERPRINT="$2"
+      shift 2
+      ;;
+    --releases-json)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      RELEASES_JSON="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$OUTPUT_DIR" && -n "$SIGNING_KEY" && -n "$FINGERPRINT" ]] || { usage >&2; exit 2; }
+[[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "invalid repository name: $REPOSITORY"
+[[ "$FINGERPRINT" =~ ^[[:xdigit:]]{40,64}$ ]] || die 'fingerprint must be a full 40- or 64-character hexadecimal value'
+[[ -r "$SIGNING_KEY" ]] || die "signing key is not readable: $SIGNING_KEY"
+if [[ -n "$RELEASES_JSON" ]]; then
+  [[ -r "$RELEASES_JSON" ]] || die "release metadata is not readable: $RELEASES_JSON"
+fi
+
+for command_name in curl date dpkg-deb dpkg-scanpackages gpg gzip jq sha256sum; do
+  command -v "$command_name" >/dev/null 2>&1 || die "missing required command: $command_name"
+done
+if [[ -z "$RELEASES_JSON" ]]; then
+  command -v gh >/dev/null 2>&1 || die 'gh is required when --releases-json is not provided'
+fi
+
+[[ ! -L "$OUTPUT_DIR" ]] || die 'output directory must not be a symlink'
+OUTPUT_DIR="$(mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" && pwd)"
+if [[ -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  die "output directory must be empty: $OUTPUT_DIR"
+fi
+
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+GNUPGHOME="$WORK_DIR/gnupg"
+mkdir -m 0700 "$GNUPGHOME"
+
+if [[ -n "$RELEASES_JSON" ]]; then
+  jq -e 'type == "array"' "$RELEASES_JSON" >/dev/null || die 'release metadata must be a JSON array'
+  cp "$RELEASES_JSON" "$WORK_DIR/releases.json"
+else
+  gh api --paginate "repos/$REPOSITORY/releases?per_page=100" >"$WORK_DIR/release-pages.jsonl" \
+    || die "could not list releases for $REPOSITORY"
+  jq -s 'add' "$WORK_DIR/release-pages.jsonl" >"$WORK_DIR/releases.json" \
+    || die 'could not combine paginated release metadata'
+  jq -e 'type == "array"' "$WORK_DIR/releases.json" >/dev/null || die 'GitHub returned invalid release metadata'
+fi
+
+GNUPGHOME="$GNUPGHOME" gpg --batch --import "$SIGNING_KEY" >/dev/null 2>&1 \
+  || die 'could not import the apt signing key'
+GNUPGHOME="$GNUPGHOME" gpg --batch --with-colons --list-secret-keys "$FINGERPRINT" \
+  >"$WORK_DIR/signing-keys.txt" || die 'signing key does not contain the configured fingerprint'
+if ! awk -F: -v wanted="${FINGERPRINT^^}" '$1 == "fpr" && toupper($10) == wanted { found = 1 } END { exit !found }' \
+  "$WORK_DIR/signing-keys.txt"; then
+  die 'configured fingerprint is not present in the imported secret key'
+fi
+
+GNUPGHOME="$GNUPGHOME" gpg --batch --yes --output "$OUTPUT_DIR/oshioki-archive-keyring.gpg" \
+  --export "$FINGERPRINT" || die 'could not export the public apt key'
+[[ -s "$OUTPUT_DIR/oshioki-archive-keyring.gpg" ]] || die 'exported apt key is empty'
+printf '%s\n' "${FINGERPRINT^^}" >"$OUTPUT_DIR/KEY-FINGERPRINT"
+
+POOL="$OUTPUT_DIR/pool/main/o/oshioki"
+mkdir -p "$POOL"
+declare -A seen_versions=()
+package_count=0
+
+while IFS= read -r release; do
+  tag_name="$(jq -r '.tag_name // empty' <<<"$release")"
+  [[ "$tag_name" =~ ^v[0-9][A-Za-z0-9.+:~_-]*$ ]] || die "stable release has an invalid tag: $tag_name"
+  release_version="${tag_name#v}"
+  if [[ "$release_version" == *-* || "$release_version" == *~* ]]; then
+    continue
+  fi
+
+  deb_assets="$(jq -c '[.assets[]? | select(.name | test("^oshioki_[0-9][A-Za-z0-9.+:~_-]*_amd64[.]deb$"))]' <<<"$release")"
+  deb_count="$(jq 'length' <<<"$deb_assets")"
+  ((deb_count == 0)) && continue
+  ((deb_count == 1)) || die "$tag_name has $deb_count amd64 Oshioki packages; expected one"
+
+  deb_name="$(jq -r '.[0].name' <<<"$deb_assets")"
+  expected_name="oshioki_${release_version}_amd64.deb"
+  [[ "$deb_name" == "$expected_name" ]] || die "$tag_name contains unexpected package asset $deb_name"
+  deb_url="$(jq -r '.[0].browser_download_url // empty' <<<"$deb_assets")"
+  [[ -n "$deb_url" ]] || die "$tag_name package asset has no download URL"
+
+  checksum_assets="$(jq -c '[.assets[]? | select(.name == "SHA256SUMS")]' <<<"$release")"
+  checksum_count="$(jq 'length' <<<"$checksum_assets")"
+  ((checksum_count == 1)) || die "$tag_name must contain exactly one SHA256SUMS asset"
+  checksum_url="$(jq -r '.[0].browser_download_url // empty' <<<"$checksum_assets")"
+  [[ -n "$checksum_url" ]] || die "$tag_name SHA256SUMS asset has no download URL"
+
+  deb_file="$WORK_DIR/$deb_name"
+  checksum_file="$WORK_DIR/SHA256SUMS-$release_version"
+  curl --fail --show-error --silent --location --proto '=https,file' --proto-redir '=https,file' \
+    "$deb_url" --output "$deb_file" || die "could not download $tag_name package"
+  curl --fail --show-error --silent --location --proto '=https,file' --proto-redir '=https,file' \
+    "$checksum_url" --output "$checksum_file" || die "could not download $tag_name SHA256SUMS"
+
+  expected_hash="$(awk -v name="$deb_name" '$2 == name { count++; hash = $1 } END { if (count == 1) print hash; else exit 1 }' \
+    "$checksum_file")" || die "$tag_name SHA256SUMS must list $deb_name exactly once"
+  [[ "$expected_hash" =~ ^[[:xdigit:]]{64}$ ]] || die "$tag_name has an invalid SHA256 entry for $deb_name"
+  actual_hash="$(sha256sum "$deb_file" | awk '{ print $1 }')"
+  [[ "${actual_hash,,}" == "${expected_hash,,}" ]] || die "$tag_name package checksum does not match SHA256SUMS"
+
+  package_name="$(dpkg-deb --field "$deb_file" Package 2>/dev/null)" || die "$tag_name asset is not a valid Debian package"
+  package_version="$(dpkg-deb --field "$deb_file" Version 2>/dev/null)" || die "$tag_name package has no version"
+  package_architecture="$(dpkg-deb --field "$deb_file" Architecture 2>/dev/null)" || die "$tag_name package has no architecture"
+  [[ "$package_name" == oshioki ]] || die "$tag_name package is $package_name, expected oshioki"
+  [[ "$package_version" == "$release_version" ]] || die "$tag_name package version is $package_version"
+  [[ "$package_architecture" == amd64 ]] || die "$tag_name package architecture is $package_architecture"
+
+  package_key="$package_name:$package_version:$package_architecture"
+  [[ -z "${seen_versions[$package_key]:-}" ]] || die "duplicate package version in stable releases: $package_version"
+  seen_versions[$package_key]=1
+  cp "$deb_file" "$POOL/$deb_name"
+  package_count=$((package_count + 1))
+done < <(jq -c '.[] | select(.draft == false and .prerelease == false)' "$WORK_DIR/releases.json")
+
+((package_count > 0)) || die "no stable Oshioki amd64 packages found in $REPOSITORY releases"
+
+DIST="$OUTPUT_DIR/dists/stable"
+INDEX="$DIST/main/binary-amd64"
+mkdir -p "$INDEX"
+(cd "$OUTPUT_DIR" && dpkg-scanpackages --multiversion pool /dev/null >"$INDEX/Packages") \
+  || die 'could not generate Packages index'
+gzip --no-name --best --stdout "$INDEX/Packages" >"$INDEX/Packages.gz"
+
+cat >"$DIST/Release" <<EOF
+Origin: Oshioki
+Label: Oshioki
+Suite: stable
+Codename: stable
+Date: $(LC_ALL=C date -Ru)
+Architectures: amd64
+Components: main
+Description: Oshioki apt repository
+SHA256:
+EOF
+while IFS= read -r index_file; do
+  relative_path="${index_file#"$DIST/"}"
+  file_size="$(wc -c <"$index_file" | tr -d '[:space:]')"
+  file_hash="$(sha256sum "$index_file" | awk '{ print $1 }')"
+  printf ' %s %s %s\n' "$file_hash" "$file_size" "$relative_path" >>"$DIST/Release"
+done < <(find "$INDEX" -maxdepth 1 -type f -print | sort)
+
+GNUPGHOME="$GNUPGHOME" gpg --batch --yes --local-user "$FINGERPRINT" --digest-algo SHA256 \
+  --clearsign --output "$DIST/InRelease" "$DIST/Release" \
+  || die 'could not create InRelease signature'
+GNUPGHOME="$GNUPGHOME" gpg --batch --yes --local-user "$FINGERPRINT" --digest-algo SHA256 \
+  --detach-sign --output "$DIST/Release.gpg" "$DIST/Release" \
+  || die 'could not create Release.gpg signature'
+
+echo "build-apt-repository: indexed $package_count stable version(s); signing fingerprint ${FINGERPRINT^^}"

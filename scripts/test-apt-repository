@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_REPOSITORY="$ROOT/scripts/build-apt-repository"
+for command_name in apt-get curl dpkg-deb dpkg-scanpackages gpg jq python3 sha256sum; do
+  command -v "$command_name" >/dev/null 2>&1 || {
+    echo "test-apt-repository: missing required command: $command_name" >&2
+    exit 1
+  }
+done
+
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+mkdir -p "$TEST_ROOT/assets" "$TEST_ROOT/gnupg" "$TEST_ROOT/verify-gnupg"
+chmod 0700 "$TEST_ROOT/gnupg" "$TEST_ROOT/verify-gnupg"
+
+make_deb() {
+  local version="$1"
+  local package_root="$TEST_ROOT/package-$version"
+  mkdir -p "$package_root/DEBIAN" "$package_root/usr/share/oshioki"
+  cat >"$package_root/DEBIAN/control" <<EOF
+Package: oshioki
+Version: $version
+Architecture: amd64
+Maintainer: Oshioki apt test <apt-test@example.invalid>
+Description: Disposable package for apt repository integration test
+EOF
+  printf 'test package %s\n' "$version" >"$package_root/usr/share/oshioki/version"
+  dpkg-deb --build --root-owner-group "$package_root" "$TEST_ROOT/assets/oshioki_${version}_amd64.deb" >/dev/null
+  (
+    cd "$TEST_ROOT/assets"
+    sha256sum "oshioki_${version}_amd64.deb" >"SHA256SUMS-$version"
+  )
+}
+
+make_deb 0.3.0
+make_deb 0.3.1
+make_deb 0.4.0~rc1
+make_deb 0.3.2
+
+python3 - "$TEST_ROOT/assets" "$TEST_ROOT/releases.json" <<'PY'
+import json
+import pathlib
+import sys
+
+assets = pathlib.Path(sys.argv[1])
+releases_path = pathlib.Path(sys.argv[2])
+releases = []
+for version, prerelease, draft in (
+    ("0.3.0", False, False),
+    ("0.3.1", False, False),
+    ("0.4.0~rc1", True, False),
+    ("0.3.2", False, True),
+):
+    deb_name = f"oshioki_{version}_amd64.deb"
+    sums_name = f"SHA256SUMS-{version}"
+    releases.append(
+        {
+            "tag_name": f"v{version}",
+            "draft": draft,
+            "prerelease": prerelease,
+            "assets": [
+                {"name": deb_name, "browser_download_url": (assets / deb_name).as_uri()},
+                {"name": "SHA256SUMS", "browser_download_url": (assets / sums_name).as_uri()},
+            ],
+        }
+    )
+releases_path.write_text(json.dumps(releases), encoding="utf-8")
+PY
+
+GNUPGHOME="$TEST_ROOT/gnupg" gpg --batch --pinentry-mode loopback --passphrase '' \
+  --quick-generate-key 'Oshioki apt repository test <apt-test@example.invalid>' rsa3072 sign 1d >/dev/null 2>&1
+SIGNING_FINGERPRINT="$(GNUPGHOME="$TEST_ROOT/gnupg" gpg --batch --with-colons --list-secret-keys \
+  | awk -F: '$1 == "fpr" { print $10; exit }')"
+GNUPGHOME="$TEST_ROOT/gnupg" gpg --batch --armor --export-secret-keys "$SIGNING_FINGERPRINT" \
+  >"$TEST_ROOT/signing-key.asc"
+
+printf '%064d  %s\n' 0 "oshioki_0.3.1_amd64.deb" >"$TEST_ROOT/assets/SHA256SUMS-invalid"
+python3 - "$TEST_ROOT/releases.json" "$TEST_ROOT/releases-invalid-sums.json" \
+  "$TEST_ROOT/assets/SHA256SUMS-invalid" <<'PY'
+import json
+import pathlib
+import sys
+
+releases = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+invalid_sums = pathlib.Path(sys.argv[3]).as_uri()
+for release in releases:
+    if release["tag_name"] == "v0.3.1":
+        for asset in release["assets"]:
+            if asset["name"] == "SHA256SUMS":
+                asset["browser_download_url"] = invalid_sums
+pathlib.Path(sys.argv[2]).write_text(json.dumps(releases), encoding="utf-8")
+PY
+if "$BUILD_REPOSITORY" \
+  --releases-json "$TEST_ROOT/releases-invalid-sums.json" \
+  --output-dir "$TEST_ROOT/repository-invalid-sums" \
+  --signing-key "$TEST_ROOT/signing-key.asc" \
+  --fingerprint "$SIGNING_FINGERPRINT" >"$TEST_ROOT/invalid-sums.log" 2>&1; then
+  echo 'test-apt-repository: package with an invalid release checksum was accepted' >&2
+  exit 1
+fi
+grep -q 'package checksum does not match SHA256SUMS' "$TEST_ROOT/invalid-sums.log"
+
+"$BUILD_REPOSITORY" \
+  --releases-json "$TEST_ROOT/releases.json" \
+  --output-dir "$TEST_ROOT/repository" \
+  --signing-key "$TEST_ROOT/signing-key.asc" \
+  --fingerprint "$SIGNING_FINGERPRINT"
+
+REPOSITORY="$TEST_ROOT/repository"
+PACKAGES="$REPOSITORY/dists/stable/main/binary-amd64/Packages"
+grep -q '^Version: 0\.3\.0$' "$PACKAGES"
+grep -q '^Version: 0\.3\.1$' "$PACKAGES"
+if grep -q '^Version: 0\.4\.0~rc1$\|^Version: 0\.3\.2$' "$PACKAGES"; then
+  echo 'test-apt-repository: prerelease or draft package entered the repository' >&2
+  exit 1
+fi
+
+GNUPGHOME="$TEST_ROOT/verify-gnupg" gpg --batch --import "$REPOSITORY/oshioki-archive-keyring.gpg" >/dev/null 2>&1
+GNUPGHOME="$TEST_ROOT/verify-gnupg" gpg --batch --verify "$REPOSITORY/dists/stable/InRelease" >/dev/null 2>&1
+cp "$REPOSITORY/dists/stable/InRelease" "$TEST_ROOT/InRelease.tampered"
+sed 's/Origin: Oshioki/Origin: Tampered/' "$TEST_ROOT/InRelease.tampered" >"$TEST_ROOT/InRelease.changed"
+mv "$TEST_ROOT/InRelease.changed" "$TEST_ROOT/InRelease.tampered"
+if GNUPGHOME="$TEST_ROOT/verify-gnupg" gpg --batch --verify "$TEST_ROOT/InRelease.tampered" >/dev/null 2>&1; then
+  echo 'test-apt-repository: modified InRelease unexpectedly passed signature verification' >&2
+  exit 1
+fi
+
+APT_ROOT="$TEST_ROOT/apt"
+prepare_apt_root() {
+  local apt_root="$1"
+  local repository="$2"
+  mkdir -p \
+    "$apt_root/etc/apt/apt.conf.d" \
+    "$apt_root/etc/apt/keyrings" \
+    "$apt_root/etc/apt/preferences.d" \
+    "$apt_root/etc/apt/trusted.gpg.d" \
+    "$apt_root/lists/partial" \
+    "$apt_root/cache/archives/partial"
+  cp "$REPOSITORY/oshioki-archive-keyring.gpg" "$apt_root/etc/apt/keyrings/oshioki.gpg"
+  cat >"$apt_root/status" <<'EOF'
+Package: oshioki
+Status: install ok installed
+Priority: optional
+Section: admin
+Architecture: amd64
+Version: 0.3.0
+Description: Installed synthetic Oshioki package
+
+EOF
+  printf 'deb [arch=amd64 signed-by=%s] file:%s/ stable main\n' \
+    "$apt_root/etc/apt/keyrings/oshioki.gpg" "$repository" >"$apt_root/sources.list"
+  cat >"$apt_root/apt.conf" <<EOF
+Dir::Etc "$apt_root/etc/apt";
+Dir::Etc::main "$apt_root/etc/apt/apt.conf";
+Dir::Etc::parts "$apt_root/etc/apt/apt.conf.d";
+Dir::Etc::sourcelist "$apt_root/sources.list";
+Dir::Etc::sourceparts "-";
+Dir::Etc::preferences "$apt_root/etc/apt/preferences";
+Dir::Etc::preferencesparts "$apt_root/etc/apt/preferences.d";
+Dir::Etc::trusted "$apt_root/etc/apt/trusted.gpg";
+Dir::Etc::trustedparts "$apt_root/etc/apt/trusted.gpg.d";
+EOF
+  : >"$apt_root/etc/apt/apt.conf"
+  : >"$apt_root/etc/apt/preferences"
+  : >"$apt_root/etc/apt/trusted.gpg"
+}
+
+apt_get() {
+  local apt_root="$1"
+  shift
+  APT_CONFIG="$apt_root/apt.conf" apt-get \
+    -o "Dir::Etc=$apt_root/etc/apt" \
+    -o "Dir::Etc::sourcelist=$apt_root/sources.list" \
+    -o 'Dir::Etc::sourceparts=-' \
+    -o "Dir::Etc::parts=$apt_root/etc/apt/apt.conf.d" \
+    -o "Dir::Etc::preferences=$apt_root/etc/apt/preferences" \
+    -o "Dir::Etc::preferencesparts=$apt_root/etc/apt/preferences.d" \
+    -o "Dir::Etc::trusted=$apt_root/etc/apt/trusted.gpg" \
+    -o "Dir::Etc::trustedparts=$apt_root/etc/apt/trusted.gpg.d" \
+    -o "Dir::State::status=$apt_root/status" \
+    -o "Dir::State::lists=$apt_root/lists" \
+    -o "Dir::State::extended_states=$apt_root/extended_states" \
+    -o "Dir::Cache=$apt_root/cache" \
+    -o "Dir::Cache::pkgcache=$apt_root/cache/pkgcache.bin" \
+    -o "Dir::Cache::srcpkgcache=$apt_root/cache/srcpkgcache.bin" \
+    -o "Dir::Cache::archives=$apt_root/cache/archives" \
+    -o "Dir::Log::History=$apt_root/history.log" \
+    -o "Dir::Log::Terminal=$apt_root/term.log" \
+    -o 'APT::Get::List-Cleanup=0' \
+    -o 'Debug::NoLocking=1' \
+    "$@"
+}
+
+chmod 0755 "$TEST_ROOT" "$REPOSITORY"
+prepare_apt_root "$APT_ROOT" "$REPOSITORY"
+chmod 0755 "$APT_ROOT"
+
+TAMPERED_REPOSITORY="$TEST_ROOT/repository-tampered-signature"
+cp -a "$REPOSITORY" "$TAMPERED_REPOSITORY"
+for signed_file in InRelease Release; do
+  sed 's/Origin: Oshioki/Origin: Tampered/' \
+    "$TAMPERED_REPOSITORY/dists/stable/$signed_file" \
+    >"$TAMPERED_REPOSITORY/dists/stable/$signed_file.changed"
+  mv "$TAMPERED_REPOSITORY/dists/stable/$signed_file.changed" \
+    "$TAMPERED_REPOSITORY/dists/stable/$signed_file"
+done
+TAMPERED_APT_ROOT="$TEST_ROOT/apt-tampered-signature"
+prepare_apt_root "$TAMPERED_APT_ROOT" "$TAMPERED_REPOSITORY"
+chmod 0755 "$TAMPERED_APT_ROOT" "$TAMPERED_REPOSITORY"
+if apt_get "$TAMPERED_APT_ROOT" update >"$TEST_ROOT/tampered-update.log" 2>&1; then
+  echo 'test-apt-repository: apt accepted a repository with a modified Release signature' >&2
+  exit 1
+fi
+if ! grep -Eiq 'BADSIG|signature.*(invalid|couldn.t be verified)|couldn.t be verified|not signed|clearsigned file' \
+  "$TEST_ROOT/tampered-update.log"; then
+  cat "$TEST_ROOT/tampered-update.log" >&2
+  echo 'test-apt-repository: apt failed for a reason other than signature rejection' >&2
+  exit 1
+fi
+
+apt_get "$APT_ROOT" update -qq
+SIMULATION="$(apt_get "$APT_ROOT" --simulate install --only-upgrade oshioki 2>&1)"
+if ! grep -Eq 'Inst oshioki \[0\.3\.0\] \(0\.3\.1 ' <<<"$SIMULATION"; then
+  printf '%s\n' "$SIMULATION" >&2
+  echo 'test-apt-repository: apt did not select 0.3.1 over installed 0.3.0' >&2
+  exit 1
+fi
+
+printf 'tamper\n' >>"$REPOSITORY/pool/main/o/oshioki/oshioki_0.3.1_amd64.deb"
+if apt_get "$APT_ROOT" --download-only --assume-yes install --only-upgrade oshioki \
+  >"$TEST_ROOT/tampered-download.log" 2>&1; then
+  echo 'test-apt-repository: modified package unexpectedly passed apt hash verification' >&2
+  exit 1
+fi
+if ! grep -Eiq 'Hash Sum mismatch|File has unexpected size|expected.*checksum|checksum.*does not match|hashes of expected file' \
+  "$TEST_ROOT/tampered-download.log"; then
+  cat "$TEST_ROOT/tampered-download.log" >&2
+  echo 'test-apt-repository: apt download failed for a reason other than package hash rejection' >&2
+  exit 1
+fi
+
+echo 'test-apt-repository: PASS (stable versions retained, signed index verified, apt selects upgrade, signature and package tampering rejected)'
