@@ -12,8 +12,7 @@ publish = { workspace = true }
 [lib]
 crate-type = ["cdylib"]
 
-# The plugin runs inside sudo's process. Keep the binary lean and forbid
-# leaking allocation across the FFI boundary.
+# The plugin runs inside sudo's process. Keep the binary lean.
 
 [dependencies]
 libc = { workspace = true }
@@ -22,8 +21,7 @@ oshioki-protocol = { path = "../protocol" }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
-# Inherit workspace lints. The plugin's extra alloc/ffi denials live as
-# `#![deny(...)]` attributes in src/lib.rs, since a manifest cannot combine
-# `lints.workspace` with per-table overrides.
+# Inherit workspace lints. The source also sets Clippy rules that prefer
+# `core` and `alloc` imports where possible. They do not govern FFI ownership.
 [lints]
 workspace = true

@@ -939,6 +939,9 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
                 || octets[0] >= 224)
         }
         std::net::IpAddr::V6(ip) => {
+            if let Some(ipv4) = ip.to_ipv4_mapped() {
+                return is_public_ip(std::net::IpAddr::V4(ipv4));
+            }
             let segments = ip.segments();
             !(ip.is_unspecified()
                 || ip.is_loopback()
@@ -1700,6 +1703,27 @@ mod tests {
     use super::*;
     use sha2::Digest as _;
     use tower::util::ServiceExt as _;
+
+    #[test]
+    fn mapped_ipv4_addresses_follow_ipv4_public_address_policy() {
+        let cases = [
+            ("::ffff:127.0.0.1", false),
+            ("::ffff:10.0.0.1", false),
+            ("::ffff:172.16.0.1", false),
+            ("::ffff:192.168.1.1", false),
+            ("::ffff:8.8.8.8", true),
+            ("2606:4700:4700::1111", true),
+            ("::1", false),
+        ];
+
+        for (address, expected) in cases {
+            assert_eq!(
+                is_public_ip(address.parse().unwrap()),
+                expected,
+                "unexpected public-address classification for {address}"
+            );
+        }
+    }
 
     fn test_vapid() -> VapidConfig {
         let key = p256::SecretKey::from_slice(&[7; 32]).unwrap();

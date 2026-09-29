@@ -40,7 +40,10 @@ oshioki-agent init
 oshioki-agent device-record --label my-device > /tmp/oshioki-device.json
 ```
 
-Copy that public record to the host, then confirm its fingerprint there:
+Copy the public record to the host. On the approval device, read
+`oshioki-agent show` and send its fingerprint to the host over a trusted
+channel independent of the record file. Compare it with the fingerprint
+printed by `pin-record` before typing the full value to confirm:
 
 ```sh
 sudo oshioki pin-record /tmp/oshioki-device.json

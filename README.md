@@ -9,9 +9,11 @@ Adds Touch ID, WebAuthn, or native device approval to `sudo`.
 WebAuthn runs in a WebAuthn-compatible browser. Native approvals use
 `oshioki-agent`.
 
-Requests are encrypted and approvals are signed. A local Unix socket is
-available for native approvals. NATS with JetStream connects your servers, VMs,
-etc to your phone or laptop.
+The command and environment are sealed for recipient devices. The request
+envelope exposes the host, user, request ID, timestamps, and recipient
+fingerprints. Approvals are signed. A local Unix socket is available for
+native approvals. NATS with JetStream connects your servers, VMs, etc to your
+phone or laptop.
 
 ## Install
 

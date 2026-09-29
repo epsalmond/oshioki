@@ -137,6 +137,16 @@ permanent outage. The required checks are:
 6. Unsupported mixes fail closed with a diagnostic or unavailable-with-fallback;
    they do not hang or silently allow.
 
+The current integration test checks a narrower case: the current server
+preserves a pending row from the previous server's database, then approves a
+new request with the same enrolled credential. It does not complete that
+pre-upgrade request, so the in-flight completion requirement remains
+unverified.
+
+The mixed hook/agent checks accept a successful result or any nonzero result
+and reject a timeout. They do not verify that a failed mix printed an
+actionable diagnostic.
+
 Darwin Keychain / Secure Enclave is not in GitHub Actions; software-identity
 Linux provides the automated coverage. Restore a Keychain-migrated identity with
 `agent.json.prev` the same way.
