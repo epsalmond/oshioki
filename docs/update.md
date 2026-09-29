@@ -61,8 +61,12 @@ installation stays on PAM even if its original opt-in setting was removed.
 Read the output: a deferred PAM migration is not an active PAM installation.
 
 Phone setup's user services are separate from the packaged system service.
-Re-run `oshioki-phone-setup` for an owned Tailscale setup to refresh them;
-for external HTTPS, restart the server in its own deployment.
+Re-run `oshioki-phone-setup` for an owned Tailscale setup to refresh them. On
+Linux, then run `systemctl --user restart oshioki-phone-server.service` to load
+the updated binary; setup does not restart an already-running service when its
+unit is unchanged. See the [phone guide](phone-enrollment.md#keep-it-working)
+for the status check. For external HTTPS, restart the server in its own
+deployment.
 
 For source installs, rebuild the same components, regenerate the installer
 manifest, and repeat the [installation](install.md) using the existing state.

@@ -4,14 +4,14 @@
 //! library. The plugin forks `oshioki check` and maps
 //! its exit code to the sudo approval API contract.
 //!
-//! This module is the only unsafe code in the workspace. Every unsafe block
+//! This module contains the sudo plugin's unsafe FFI code. Every unsafe block
 //! carries a `// SAFETY:` comment explaining why it is sound.
 
-// The plugin runs inside sudo's process and crosses the FFI boundary, so it is
-// the one place unsafe is unavoidable. Everything unsafe lives here.
+// The sudo ABI uses unsafe function pointers and callbacks; its operations
+// stay in this plugin module.
 #![allow(unsafe_code)]
-// The sudo approval plugin ABI requires allocation to stay inside the FFI
-// boundary. A leak would corrupt sudo's heap.
+// Prefer core imports where possible and use alloc instead of std when only
+// allocation support is needed.
 #![deny(clippy::alloc_instead_of_core)]
 #![deny(clippy::std_instead_of_alloc)]
 

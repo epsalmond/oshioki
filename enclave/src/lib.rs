@@ -4,8 +4,9 @@
 //! only after Touch ID. The enclave never releases the private key, so signing
 //! happens inside the enclave and the Touch ID sheet is the approval itself.
 //!
-//! Every `unsafe` call in the workspace lives in this crate's [`mac`] module.
-//! On other targets the crate is empty, and nothing links Security.framework.
+//! The macOS implementation contains unsafe calls for Security.framework.
+//! The sudo plugin has separate unsafe operations for its C ABI. On other
+//! targets this crate is empty, and nothing links Security.framework.
 
 #[cfg(target_os = "macos")]
 mod mac;
