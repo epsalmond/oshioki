@@ -1,54 +1,58 @@
 # Debian and Ubuntu apt repository
 
-The signed repository is planned at
-`https://epsalmond.github.io/oshioki`, but it is not active yet. GitHub Pages
-and the archive signing key still need to be configured. Until the published
-fingerprint below is set, install the `.deb` directly from a
+The signed repository is ready for its first publication at
+`https://epsalmond.github.io/oshioki`. GitHub Pages and the archive signing
+settings are configured; the initial deployment still needs the bootstrap run
+below. Until that run publishes the index, install the `.deb` directly from a
 [GitHub release](https://github.com/epsalmond/oshioki/releases).
 
-Published archive signing fingerprint: **pending key configuration**.
+Published archive signing fingerprint: **AA93668ABF0040387C7EB51C1632F50E2226409D**.
 
-## Enable repository publishing
+## Signing key and publication
 
-Create a dedicated archive signing key and keep its primary key offline. The
-key supplied to Actions must let GPG sign without an interactive prompt. In
-the repository's **Settings → Secrets and variables → Actions**, configure:
+The repository's **Settings → Secrets and variables → Actions** contains the
+signing configuration:
 
-- Secret `APT_SIGNING_PRIVATE_KEY`: ASCII-armored private signing key.
-- Variable `APT_SIGNING_KEY_FINGERPRINT`: full primary fingerprint for that
-  key, written as 40 or 64 hexadecimal characters.
+- Secret `APT_SIGNING_PRIVATE_KEY`: ASCII-armored signing-subkey export. It
+  contains the public primary key, a nonusable primary secret-key stub, and
+  the usable signing subkey; it has no usable primary private key.
+- Variable `APT_SIGNING_KEY_FINGERPRINT`: full primary fingerprint shown
+  above.
 
-Then set **Settings → Pages → Build and deployment → Source** to **GitHub
-Actions**. The release workflow publishes the repository after it successfully
-publishes a stable GitHub release. The apt job reads all stable releases,
-checks each `.deb` against that release's `SHA256SUMS`, validates package
-metadata, and retains every published version in the package index. Drafts and
-prereleases are excluded.
+The cert-only RSA4096 primary key and RSA3072 signing subkey are retained in
+`~/.local/share/oshioki/apt-signing` with mode 0700 on the directory and 0600
+on files. The primary private key stays on this machine; these permissions
+protect it, but the key is not physically offline. Actions receives only the
+secret-subkey export. Keep protected backups and renew or replace the
+two-year primary and signing subkey before they expire. For a signing-subkey
+rotation, update the Actions secret and republish the public keyring. If the
+primary key must be replaced, publish and verify its new fingerprint and
+coordinate a client keyring rollover before signing only with the replacement.
 
-To bootstrap the repository from the stable releases that already exist, run
-the `release` workflow from the default branch with
-`publish_apt_repository` enabled. This builds the repository from the release
-assets already published; it does not create another release. The workflow
-skips publication when both signing settings are absent and fails on partial
-or invalid configuration. The deployment summary reports the active signing
-fingerprint. Before enabling client instructions, replace the pending
-fingerprint above with the full fingerprint verified against the configured
-key.
+Pages uses the GitHub Actions source. The `github-pages` environment permits
+deployments from `main` for bootstrap and `v*` tag releases. The release
+workflow publishes after a stable GitHub release succeeds. It reads all stable
+releases, checks each `.deb` against that release's `SHA256SUMS`, validates
+package metadata, and retains every published version in the package index.
+Drafts and prereleases are excluded.
+
+To bootstrap from existing stable releases, run the `release` workflow from
+the default branch with `publish_apt_repository` enabled. This deploys the
+already-published release assets and does not create another release. The
+deployment summary includes the active signing fingerprint.
 
 ## Install and update
 
-These commands are ready once the repository is active and the fingerprint
-above has been published. Replace `PENDING` in `expected_fingerprint` below
-with that full fingerprint. The command stops before installing the key while
-the value is pending, the keyring does not contain exactly one primary public
-key, or the fingerprint does not match:
+After the bootstrap deployment is available, download and inspect the scoped
+archive key. The command stops before installing it unless the keyring has
+exactly one primary public key with the published fingerprint:
 
 ```sh
 (
   set -e
   keyring_tmp="$(mktemp)"
   trap 'rm -f "$keyring_tmp"' EXIT
-  expected_fingerprint='PENDING'
+  expected_fingerprint='AA93668ABF0040387C7EB51C1632F50E2226409D'
   curl --fail --show-error --silent --location \
     https://epsalmond.github.io/oshioki/oshioki-archive-keyring.gpg \
     --output "$keyring_tmp"
@@ -58,7 +62,7 @@ key, or the fingerprint does not match:
     | awk -F: '$1 == "pub" { count++ } END { print count + 0 }')"
   actual_fingerprint="$(printf '%s\n' "$keyring_info" \
     | awk -F: '$1 == "fpr" { print toupper($10); exit }')"
-  if [ "$public_key_count" != 1 ] || [ "$expected_fingerprint" = PENDING ] || [ "$actual_fingerprint" != "$expected_fingerprint" ]; then
+  if [ "$public_key_count" != 1 ] || [ "$actual_fingerprint" != "$expected_fingerprint" ]; then
     echo 'Oshioki archive key must contain exactly one public key matching the published fingerprint.' >&2
     exit 1
   fi

@@ -29,9 +29,11 @@ Debian or Ubuntu (amd64), from the
 sudo apt install ./oshioki_X.Y.Z_amd64.deb
 ```
 
-The signed apt repository is not active yet; setup and fingerprint status are
-in the [apt repository guide](docs/apt-repository.md). Once it is active, run
-`sudo apt update` and `sudo apt upgrade` when you choose to update.
+The signed apt repository is ready for its first publication. Until the
+bootstrap deploys its package index, install from the GitHub release; the
+[apt repository guide](docs/apt-repository.md) has the verified fingerprint
+and setup details. After publication, run `sudo apt update` and
+`sudo apt upgrade` when you choose to update.
 
 The Mac setup creates a Touch ID identity and starts the agent; no server is
 needed. On Linux, install the package, then choose an approval device below.

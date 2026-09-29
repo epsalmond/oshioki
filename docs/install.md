@@ -20,8 +20,10 @@ unlocked login keychain.
 
 ## Debian or Ubuntu
 
-The signed [apt repository](apt-repository.md) is not active yet. Until its
-signing fingerprint is published there, install from a GitHub release:
+The signed [apt repository](apt-repository.md) is ready for its first
+publication. After bootstrap, follow its `Signed-By` steps to install through
+apt. Until the bootstrap deploys the package index, install from a GitHub
+release:
 
 Download the amd64 `.deb` from a
 [release](https://github.com/epsalmond/oshioki/releases), then:
