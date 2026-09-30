@@ -50,6 +50,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
+      # Release runs on tag refs, which cannot share caches with each other, so
+      # this restores the default branch's cache and never writes. Only
+      # dependencies are cached; workspace crates rebuild from the tagged source.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: compat-upgrade
+          save-if: false
       # The oshioki-pam workspace member links libpam.
       - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
       - run: cargo build --locked --release -p oshioki-hook -p oshioki-server -p oshioki-plugin -p oshioki-pam -p oshioki-browser-relay
@@ -82,6 +89,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
+      # No compat job builds for macOS, so only a manual run on main writes
+      # this cache; tag runs restore it.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-macos-arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/build-darwin-artifact dist
       # COPYFILE_DISABLE keeps bsdtar from writing ._ AppleDouble members for
       # extended attributes. Inside Oshioki.app those would be unsealed
@@ -123,10 +136,17 @@ jobs:
         with:
           fetch-depth: 0
       - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: compat-upgrade
+          save-if: false
+          cache-directories: ${{ runner.temp }}/compat-prev-target
       - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
       - run: cargo test --workspace --locked
       - run: scripts/test-nats-lane-upgrade
       - run: scripts/test-compat-upgrade
+        env:
+          OSHIOKI_COMPAT_PREV_TARGET: ${{ runner.temp }}/compat-prev-target
 
   release:
     needs: [gate, build-deb, build-mac, compat]

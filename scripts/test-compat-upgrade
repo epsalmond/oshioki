@@ -59,19 +59,21 @@ git fetch --tags --force >/dev/null 2>&1 || true
 git worktree add --detach "$PREV_SRC" "$PREV_TAG"
 
 build_side() {
-  local src="$1" dest="$2"
+  local src="$1" dest="$2" target="${3:-$1/target}"
   mkdir -p "$dest"
   cargo build --manifest-path "$src/Cargo.toml" --locked --release \
-    -p oshioki-hook -p oshioki-server
+    --target-dir "$target" -p oshioki-hook -p oshioki-server
   cargo build --manifest-path "$src/Cargo.toml" --locked --release \
-    -p oshioki-agent --features unattended --target-dir "$src/target/unattended"
-  install -m 0755 "$src/target/release/oshioki" "$dest/oshioki"
-  install -m 0755 "$src/target/release/oshioki-server" "$dest/oshioki-server"
-  install -m 0755 "$src/target/unattended/release/oshioki-agent" "$dest/oshioki-agent"
+    -p oshioki-agent --features unattended --target-dir "$target/unattended"
+  install -m 0755 "$target/release/oshioki" "$dest/oshioki"
+  install -m 0755 "$target/release/oshioki-server" "$dest/oshioki-server"
+  install -m 0755 "$target/unattended/release/oshioki-agent" "$dest/oshioki-agent"
 }
 
 echo "building $PREV_TAG"
-build_side "$PREV_SRC" "$PREV_BIN"
+# The previous release is built in a throwaway worktree, so CI points its
+# target directory somewhere it can cache between runs.
+build_side "$PREV_SRC" "$PREV_BIN" "${OSHIOKI_COMPAT_PREV_TARGET:-$PREV_SRC/target}"
 echo "building current"
 build_side "$REPO_ROOT" "$CUR_BIN"
 

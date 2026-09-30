@@ -35,6 +35,12 @@ jobs:
         with:
           fetch-depth: 0
       - run: rustup show active-toolchain
+      # Caches dependencies only; workspace crates always rebuild. PRs restore
+      # main's cache but never write one, which keeps eviction bounded.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: compat-goldens
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
       - uses: actions/setup-node@v4
         with:
@@ -51,8 +57,17 @@ jobs:
         with:
           fetch-depth: 0
       - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: compat-upgrade
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # test-compat-upgrade builds the previous release in a temp worktree;
+          # OSHIOKI_COMPAT_PREV_TARGET (set below) puts that build here.
+          cache-directories: ${{ runner.temp }}/compat-prev-target
       - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
       - name: NATS lane repair
         run: scripts/test-nats-lane-upgrade
       - name: Mixed-version upgrade
         run: scripts/test-compat-upgrade
+        env:
+          OSHIOKI_COMPAT_PREV_TARGET: ${{ runner.temp }}/compat-prev-target
