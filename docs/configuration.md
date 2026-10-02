@@ -13,6 +13,7 @@ For setup commands, use [local sudo](local-sudo.md),
 | `/etc/oshioki/devices.json` | Pinned device registry |
 | `~/.config/oshioki/agent.json` | User-owned, mode 0600; native identity |
 | `~/.config/oshioki/agent.env` | Agent environment for terminal startup |
+| `${XDG_CONFIG_HOME:-~/.config}/oshioki/approvals/<profile>/` | User-owned, mode 0700; browser approval profile and pinned browser devices |
 | Mac LaunchAgent plist | Agent environment for autostart; private because it can contain credentials |
 | `/etc/oshioki/server.env` | Environment for the Debian system server |
 

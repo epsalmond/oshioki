@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 use url::{Host, Url};
 use uuid::Uuid;
 
+mod approvals;
 #[path = "../../cli/terminal_logo.rs"]
 mod terminal_logo;
 
@@ -139,6 +140,11 @@ enum Verb {
     Status,
     /// Open browser approval pages for incoming requests.
     Watch,
+    /// Configure browser approvals for native coding-agent permission prompts.
+    Approvals {
+        #[command(subcommand)]
+        command: approvals::ApprovalCommand,
+    },
     /// Send a synthetic request through the approval flow.
     Test,
     /// Private installer verb. `scripts/install-oshioki-hook --contextual-pam`
@@ -200,6 +206,7 @@ async fn main() -> Result<()> {
         Verb::PinRecord { path } => cmd_pin_record(&path),
         Verb::Status => cmd_status(),
         Verb::Watch => cmd_watch().await,
+        Verb::Approvals { command } => approvals::run(command).await,
         Verb::Test => cmd_test().await,
         Verb::PamSelftest { module } => pam_selftest::run(&module),
     };
@@ -2531,17 +2538,26 @@ async fn enrollment_transport(
 
 async fn cmd_enroll(resume: Option<&str>, allow_localhost: bool) -> Result<()> {
     let directory = config_dir();
-    require_enroll_privileges(&directory)?;
-    let config = load_hook_config_from(&directory)?;
+    cmd_enroll_at(&directory, resume, allow_localhost, false).await
+}
+
+async fn cmd_enroll_at(
+    directory: &Path,
+    resume: Option<&str>,
+    allow_localhost: bool,
+    browser_only: bool,
+) -> Result<()> {
+    require_enroll_privileges(directory)?;
+    let config = load_hook_config_from(directory)?;
     let origin = enrollment_origin(&config, allow_localhost)?;
     preflight_enrollment_server(&config, &origin).await?;
     let state = if let Some(id) = resume {
-        load_enrollment_state(id)?
+        load_enrollment_state_at(directory, id)?
     } else {
-        create_enrollment_state()?
+        create_enrollment_state_at(directory)?
     };
-    let state_path = enrollment_path(&state.enrollment_id)?;
-    prune_expired_enrollment_states(&state.enrollment_id);
+    let state_path = enrollment_path_at(directory, &state.enrollment_id)?;
+    prune_expired_enrollment_states_at(directory, &state.enrollment_id);
     if state.expires_at <= now() {
         remove_enrollment_state(&state_path);
         bail!("enrollment expired");
@@ -2549,8 +2565,8 @@ async fn cmd_enroll(resume: Option<&str>, allow_localhost: bool) -> Result<()> {
     let secret_bytes: [u8; 32] = oshioki_protocol::decode_base64url(&state.secret)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid enrollment secret"))?;
-    let nats_display = enrollment_transport_display(&directory);
-    let transport = enrollment_transport(&directory, &nats_display).await?;
+    let nats_display = enrollment_transport_display(directory);
+    let transport = enrollment_transport(directory, &nats_display).await?;
     let reply_subject = format!("oshioki.enrollment.submission.{}", state.enrollment_id);
     let intent = EnrollmentIntentV1 {
         version: VERSION_V1,
@@ -2581,12 +2597,20 @@ async fn cmd_enroll(resume: Option<&str>, allow_localhost: bool) -> Result<()> {
         ),
         Ok(result) => result?,
     };
-    println!(
-        "Enrollment URL (expires in five minutes):\n  {enrollment_url}\nNative agent:\n  oshioki-agent pair '{enrollment_url}'"
-    );
+    if browser_only {
+        println!("Enrollment URL (expires in five minutes):\n  {enrollment_url}");
+    } else {
+        println!(
+            "Enrollment URL (expires in five minutes):\n  {enrollment_url}\nNative agent:\n  oshioki-agent pair '{enrollment_url}'"
+        );
+    }
     let submission = transport
         .await_submission(&state.enrollment_id, reply_stream, submission_deadline)
         .await?;
+    if browser_only && !matches!(&submission, EnrollmentSubmissionV1::Webauthn(_)) {
+        remove_enrollment_state(&state_path);
+        bail!("this profile accepts browser authenticators only");
+    }
     let device = match &submission {
         EnrollmentSubmissionV1::Webauthn(submission) => {
             verify_enrollment_v1(submission, &secret_bytes, &config).context("verify enrollment")?
@@ -2600,7 +2624,7 @@ async fn cmd_enroll(resume: Option<&str>, allow_localhost: bool) -> Result<()> {
                 .context("verify native enrollment")?
         }
     };
-    let mut registry = load_registry()?;
+    let mut registry = load_registry_from(directory)?;
     if registry.devices.iter().any(|stored| {
         stored.credential_id == device.credential_id && stored.fingerprint != device.fingerprint
     }) {
@@ -2611,7 +2635,7 @@ async fn cmd_enroll(resume: Option<&str>, allow_localhost: bool) -> Result<()> {
         .retain(|stored| stored.fingerprint != device.fingerprint);
     registry.devices.push(device.clone());
     registry.validate()?;
-    write_registry(&registry)?;
+    write_registry_to(directory, &registry)?;
     let confirmation =
         activate_device(transport.as_ref(), &state.enrollment_id, &device, &config).await;
     // The enrollment itself is spent either way: the device is pinned here
@@ -3242,7 +3266,7 @@ fn write_registry_to(directory: &Path, registry: &DeviceRegistryV1) -> Result<()
     atomic_write_json(&directory.join("devices.json"), registry, 0o600)
 }
 
-fn create_enrollment_state() -> Result<EnrollmentStateV1> {
+fn create_enrollment_state_at(directory: &Path) -> Result<EnrollmentStateV1> {
     let mut secret = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut secret);
     let state = EnrollmentStateV1 {
@@ -3251,17 +3275,21 @@ fn create_enrollment_state() -> Result<EnrollmentStateV1> {
         secret: URL_SAFE_NO_PAD.encode(secret),
         expires_at: now() + 300,
     };
-    atomic_write_json(&enrollment_path(&state.enrollment_id)?, &state, 0o600)?;
+    atomic_write_json(
+        &enrollment_path_at(directory, &state.enrollment_id)?,
+        &state,
+        0o600,
+    )?;
     Ok(state)
 }
-fn load_enrollment_state(id: &str) -> Result<EnrollmentStateV1> {
-    let state: EnrollmentStateV1 = read_json(&enrollment_path(id)?)?;
+fn load_enrollment_state_at(directory: &Path, id: &str) -> Result<EnrollmentStateV1> {
+    let state: EnrollmentStateV1 = read_json(&enrollment_path_at(directory, id)?)?;
     if state.version != VERSION_V1 || state.enrollment_id != id {
         bail!("invalid enrollment state");
     }
     Ok(state)
 }
-fn enrollment_path(id: &str) -> Result<PathBuf> {
+fn enrollment_path_at(directory: &Path, id: &str) -> Result<PathBuf> {
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -3270,7 +3298,7 @@ fn enrollment_path(id: &str) -> Result<PathBuf> {
     {
         bail!("invalid enrollment id");
     }
-    Ok(config_dir().join("enrollments").join(format!("{id}.json")))
+    Ok(directory.join("enrollments").join(format!("{id}.json")))
 }
 
 fn remove_enrollment_state(path: &Path) {
@@ -3282,8 +3310,8 @@ fn remove_enrollment_state(path: &Path) {
     }
 }
 
-fn prune_expired_enrollment_states(current_id: &str) {
-    let directory = config_dir().join("enrollments");
+fn prune_expired_enrollment_states_at(config_directory: &Path, current_id: &str) {
+    let directory = config_directory.join("enrollments");
     let Ok(entries) = fs::read_dir(&directory) else {
         return;
     };
