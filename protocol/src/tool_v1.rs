@@ -1,7 +1,7 @@
 //! Opt-in browser approval for native tool permission prompts.
 //!
 //! Tool approvals deliberately use a distinct envelope, decision tags, NATS
-//! subject tree, and WebAuthn challenge domains. The signed bytes are the
+//! subject tree, and `WebAuthn` challenge domains. The signed bytes are the
 //! exact JSON received from the hook, including its complete tool input.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -245,7 +245,7 @@ impl ToolApprovalRequestV1 {
 }
 
 /// Parse a request while rejecting duplicate object keys at every depth.
-/// serde_json's ordinary Value parser keeps the last duplicate key, which
+/// `serde_json`'s ordinary `Value` parser keeps the last duplicate key, which
 /// would make the displayed value differ from the value a reviewer expects.
 pub fn parse_tool_request_at(raw: &[u8], now: i64) -> Result<ToolApprovalRequestV1, Error> {
     if raw.len() > MAX_REQUEST_BYTES {
@@ -260,7 +260,7 @@ pub fn parse_tool_request_at(raw: &[u8], now: i64) -> Result<ToolApprovalRequest
 
 fn context_matches(event: &Value, key: &str, expected: Option<&str>) -> bool {
     match (event.get(key), expected) {
-        (None, None) | (Some(Value::Null), None) => true,
+        (None | Some(Value::Null), None) => true,
         (Some(Value::String(actual)), Some(expected)) => actual == expected,
         _ => false,
     }
@@ -593,15 +593,6 @@ fn verify_webauthn_for_challenge(
 ) -> Result<AssertionOutcomeV1, Error> {
     config.validate()?;
     let client_data_json = decode_base64url(client_data_json)?;
-    #[derive(Deserialize)]
-    struct ClientData {
-        #[serde(rename = "type")]
-        type_: String,
-        challenge: String,
-        origin: String,
-        #[serde(default)]
-        cross_origin: bool,
-    }
     let client_data: ClientData = serde_json::from_value(strict_json_value(&client_data_json)?)
         .map_err(|_| Error::MalformedClientData)?;
     if client_data.type_ != "webauthn.get" {
@@ -646,6 +637,16 @@ fn verify_webauthn_for_challenge(
             && device.sign_count > 0
             && observed_sign_count <= device.sign_count,
     })
+}
+
+#[derive(Deserialize)]
+struct ClientData {
+    #[serde(rename = "type")]
+    type_: String,
+    challenge: String,
+    origin: String,
+    #[serde(default)]
+    cross_origin: bool,
 }
 
 #[cfg(test)]
