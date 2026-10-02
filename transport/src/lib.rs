@@ -17,7 +17,8 @@ use futures::Stream;
 pub use mock::MockTransport;
 pub use nats::NatsTransport;
 use oshioki_protocol::{
-    ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1, auth_v1::AuthDecisionV1,
+    ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1, ToolApprovalDecisionV1,
+    auth_v1::AuthDecisionV1,
 };
 
 /// A transport reports these control-plane milestones before a verdict. A
@@ -113,6 +114,18 @@ pub trait HookTransport: Send + Sync {
         has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
     ) -> BoxFuture<'_, AuthDecisionV1>;
+
+    /// Publishes one browser-only tool approval request on its isolated lane
+    /// and waits for the first terminal signed decision until `timeout`.
+    /// This path never subscribes to or publishes on native Mac approval
+    /// subjects.
+    fn request_tool_approval(
+        &self,
+        request_id: &str,
+        payload: Vec<u8>,
+        timeout: std::time::Duration,
+        progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
+    ) -> BoxFuture<'_, ToolApprovalDecisionV1>;
 
     /// Publishes the enrollment intent, confirming server-side delivery
     /// before returning. Returns the pre-publish reply subscription so the

@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use oshioki_protocol::{
-    ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1, auth_v1::AuthDecisionV1,
+    ActivationV1, DecisionV1, EnrollmentIntentV1, EnrollmentSubmissionV1, ToolApprovalDecisionV1,
+    auth_v1::AuthDecisionV1,
 };
 
 use crate::{
@@ -37,6 +38,8 @@ struct MockState {
     hook_verdicts: VecDeque<Result<DecisionV1>>,
     /// Verdicts queued by the test for `request_authentication`.
     hook_auth_verdicts: VecDeque<Result<AuthDecisionV1>>,
+    /// Verdicts queued by the test for `request_tool_approval`.
+    hook_tool_verdicts: VecDeque<Result<ToolApprovalDecisionV1>>,
     /// Submissions queued by the test for `publish_enrollment_intent`.
     hook_submissions: VecDeque<Result<EnrollmentSubmissionV1>>,
     /// Requests queued by the test for `ServerTransport::requests`.
@@ -68,6 +71,11 @@ impl MockTransport {
     /// `request_authentication` call.
     pub fn push_auth_verdict(&self, decision: AuthDecisionV1) {
         self.lock().hook_auth_verdicts.push_back(Ok(decision));
+    }
+
+    /// Queues one browser tool verdict for the next tool approval call.
+    pub fn push_tool_verdict(&self, decision: ToolApprovalDecisionV1) {
+        self.lock().hook_tool_verdicts.push_back(Ok(decision));
     }
 
     /// Queues one submission for the next enrollment round trip.
@@ -141,6 +149,29 @@ impl HookTransport for MockTransport {
                 .hook_auth_verdicts
                 .pop_front()
                 .unwrap_or_else(|| Err(anyhow!("mock transport timed out: no queued verdict")))
+        };
+        Box::pin(async move {
+            progress(HookProgress::WaitingForApproval);
+            outcome
+        })
+    }
+
+    fn request_tool_approval(
+        &self,
+        _request_id: &str,
+        payload: Vec<u8>,
+        _timeout: std::time::Duration,
+        progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
+    ) -> BoxFuture<'_, ToolApprovalDecisionV1> {
+        let outcome = {
+            let mut state = self.lock();
+            state
+                .published
+                .push((oshioki_protocol::TOOL_APPROVAL_SUBJECT.to_owned(), payload));
+            state
+                .hook_tool_verdicts
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow!("mock transport timed out: no queued tool verdict")))
         };
         Box::pin(async move {
             progress(HookProgress::WaitingForApproval);

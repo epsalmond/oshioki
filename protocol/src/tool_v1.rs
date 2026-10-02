@@ -411,6 +411,14 @@ pub fn seal_tool_request_v1(
     if devices.is_empty() || devices.len() > MAX_DEVICES {
         return Err(Error::InvalidRequest("invalid tool recipient count".into()));
     }
+    if devices
+        .iter()
+        .any(|device| device.kind != DeviceKindV1::Webauthn || !device.active)
+    {
+        return Err(Error::InvalidRequest(
+            "tool approval recipients must be active WebAuthn devices".into(),
+        ));
+    }
     let raw =
         serde_json::to_vec(request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
     if raw.len() > MAX_REQUEST_BYTES {
@@ -594,8 +602,8 @@ fn verify_webauthn_for_challenge(
         #[serde(default)]
         cross_origin: bool,
     }
-    let client_data: ClientData =
-        serde_json::from_slice(&client_data_json).map_err(|_| Error::MalformedClientData)?;
+    let client_data: ClientData = serde_json::from_value(strict_json_value(&client_data_json)?)
+        .map_err(|_| Error::MalformedClientData)?;
     if client_data.type_ != "webauthn.get" {
         return Err(Error::UnexpectedCredentialType);
     }
@@ -643,6 +651,8 @@ fn verify_webauthn_for_challenge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::ecdsa::{SigningKey, signature::Signer as _};
+    use x25519_dalek::PublicKey;
 
     fn request_json(input: &str) -> Vec<u8> {
         let native_event = format!(
@@ -715,5 +725,147 @@ mod tests {
         assert_eq!(MAX_ENVELOPE_BYTES, 3 * 1024 * 1024);
         assert_eq!(MAX_DEVICES, 8);
         assert!(parse_tool_request_at(&vec![b' '; MAX_REQUEST_BYTES + 1], 1000).is_err());
+    }
+
+    fn webauthn_device() -> (DevicePublicRecordV1, SigningKey, StaticSecret) {
+        let signing = SigningKey::from_bytes((&[31; 32]).into()).unwrap();
+        let point = signing.verifying_key().to_encoded_point(false);
+        let cose = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Integer(1.into()),
+                ciborium::Value::Integer(2.into()),
+            ),
+            (
+                ciborium::Value::Integer(3.into()),
+                ciborium::Value::Integer((-7).into()),
+            ),
+            (
+                ciborium::Value::Integer((-1).into()),
+                ciborium::Value::Integer(1.into()),
+            ),
+            (
+                ciborium::Value::Integer((-2).into()),
+                ciborium::Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                ciborium::Value::Integer((-3).into()),
+                ciborium::Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ]);
+        let mut credential_public_key = Vec::new();
+        ciborium::ser::into_writer(&cose, &mut credential_public_key).unwrap();
+        let credential_id = vec![9; 16];
+        let box_secret = StaticSecret::from([17; 32]);
+        let box_public_key = PublicKey::from(&box_secret).to_bytes().to_vec();
+        let fingerprint =
+            crate::v1::device_fingerprint(&credential_id, &credential_public_key, &box_public_key);
+        (
+            DevicePublicRecordV1 {
+                version: 1,
+                kind: DeviceKindV1::Webauthn,
+                fingerprint,
+                credential_id: crate::encode_base64url(&credential_id),
+                credential_public_key: crate::encode_base64url(&credential_public_key),
+                box_public_key: crate::encode_base64url(&box_public_key),
+                label: "test browser".into(),
+                api_token_hash: crate::encode_base64url(&[22; 32]),
+                sign_count: 0,
+                active: true,
+            },
+            signing,
+            box_secret,
+        )
+    }
+
+    fn config() -> HookConfigV1 {
+        HookConfigV1 {
+            version: 1,
+            origin: "https://sudo.test".into(),
+            rp_id: "sudo.test".into(),
+            server_base_url: "https://sudo.test".into(),
+        }
+    }
+
+    fn signed_decision(
+        raw: &[u8],
+        action: ToolDecisionActionV1,
+        device: &DevicePublicRecordV1,
+        signing: &SigningKey,
+    ) -> ToolApprovalDecisionV1 {
+        let client_data_json = serde_json::to_vec(&serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": URL_SAFE_NO_PAD.encode(tool_approval_challenge(action, raw)),
+            "origin": "https://sudo.test",
+            "crossOrigin": false,
+        }))
+        .unwrap();
+        let mut authenticator_data = Sha256::digest(b"sudo.test").to_vec();
+        authenticator_data.extend_from_slice(&[0x05, 0, 0, 0, 1]);
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&Sha256::digest(&client_data_json));
+        let signature: Signature = signing.sign(&signed);
+        let assertion = ToolApprovalWebauthnV1 {
+            version: TOOL_WIRE_VERSION,
+            request_id: "tool-1".into(),
+            device_fingerprint: device.fingerprint.clone(),
+            credential_id: device.credential_id.clone(),
+            authenticator_data: crate::encode_base64url(&authenticator_data),
+            client_data_json: crate::encode_base64url(&client_data_json),
+            signature: crate::encode_base64url(signature.to_der().as_bytes()),
+        };
+        match action {
+            ToolDecisionActionV1::Approve => ToolApprovalDecisionV1::Approve(assertion),
+            ToolDecisionActionV1::Deny => ToolApprovalDecisionV1::Deny(assertion),
+        }
+    }
+
+    #[test]
+    fn sealing_retains_signed_bytes_and_only_targets_active_webauthn_devices() {
+        let raw = request_json(r#"{"command":"echo hello"}"#);
+        let request = parse_tool_request_at(&raw, 1000).unwrap();
+        let (device, _, box_secret) = webauthn_device();
+        let (signed_raw, envelope) =
+            seal_tool_request_v1(&request, std::slice::from_ref(&device)).unwrap();
+        assert_eq!(signed_raw, serde_json::to_vec(&request).unwrap());
+        envelope.validate_at(1000).unwrap();
+        assert_eq!(
+            unseal_tool_body_v1(&envelope.sealed[0], &box_secret).unwrap(),
+            signed_raw
+        );
+
+        let mut inactive = device.clone();
+        inactive.active = false;
+        assert!(seal_tool_request_v1(&request, &[inactive]).is_err());
+        let mut software = device;
+        software.kind = DeviceKindV1::Software;
+        assert!(seal_tool_request_v1(&request, &[software]).is_err());
+    }
+
+    #[test]
+    fn approve_and_deny_assertions_use_distinct_webauthn_challenges() {
+        let raw = request_json(r#"{"command":"echo hello"}"#);
+        let (device, signing, _) = webauthn_device();
+        let approve = signed_decision(&raw, ToolDecisionActionV1::Approve, &device, &signing);
+        let deny = signed_decision(&raw, ToolDecisionActionV1::Deny, &device, &signing);
+        assert!(verify_tool_decision_v1(&approve, &raw, &device, &config(), 1000).is_ok());
+        assert!(verify_tool_decision_v1(&deny, &raw, &device, &config(), 1000).is_ok());
+
+        let ToolApprovalDecisionV1::Approve(assertion) = approve else {
+            unreachable!()
+        };
+        assert!(
+            verify_tool_decision_v1(
+                &ToolApprovalDecisionV1::Deny(assertion),
+                &raw,
+                &device,
+                &config(),
+                1000,
+            )
+            .is_err()
+        );
+
+        let changed = request_json(r#"{"command":"echo different"}"#);
+        assert!(verify_tool_decision_v1(&deny, &changed, &device, &config(), 1000).is_err());
+        assert!(verify_tool_decision_v1(&deny, &raw, &device, &config(), 1090).is_err());
     }
 }

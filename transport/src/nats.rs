@@ -16,8 +16,8 @@ use async_nats::jetstream::{
 use futures::StreamExt as _;
 use oshioki_protocol::{
     ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, AliveV1, DecisionV1, DeliveryV1, EnrollmentIntentV1,
-    EnrollmentSubmissionV1, allow_plaintext_nats, auth_v1::AuthDecisionV1, check_nats_url,
-    nats_url_is_tls,
+    EnrollmentSubmissionV1, TOOL_APPROVAL_SUBJECT, ToolAcknowledgementV1, ToolApprovalDecisionV1,
+    ToolDeliveryV1, allow_plaintext_nats, auth_v1::AuthDecisionV1, check_nats_url, nats_url_is_tls,
 };
 use tracing::info;
 
@@ -75,7 +75,8 @@ pub const REQUEST_CONSUMER: &str = "oshioki-server-v1";
 /// both subject trees. The server widens an existing stream and recreates the
 /// durable when it starts; `RUNBOOK.md` is the recovery path if that repair
 /// fails.
-pub const REQUEST_CONSUMER_FILTERS: [&str; 2] = ["oshioki.request.>", "oshioki.auth.>"];
+pub const REQUEST_CONSUMER_FILTERS: [&str; 3] =
+    ["oshioki.request.>", "oshioki.auth.>", TOOL_APPROVAL_SUBJECT];
 
 const CONSUMER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -739,6 +740,89 @@ impl HookTransport for NatsTransport {
         })
     }
 
+    fn request_tool_approval(
+        &self,
+        request_id: &str,
+        payload: Vec<u8>,
+        timeout: Duration,
+        progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
+    ) -> BoxFuture<'_, ToolApprovalDecisionV1> {
+        let request_id = request_id.to_owned();
+        let delivery_subject = format!("oshioki.tool.delivery.{request_id}");
+        let acknowledgement_subject = format!("oshioki.tool.ack.{request_id}");
+        let verdict_subject = format!("oshioki.tool.verdict.{request_id}");
+        Box::pin(async move {
+            let request_id_for_wait = request_id.clone();
+            let result = tokio::time::timeout(timeout, async {
+                // Subscribe and flush every response subject before sending
+                // the request. Otherwise a fast phone can answer before the
+                // requester is listening.
+                let mut deliveries = self.client.subscribe(delivery_subject).await?;
+                let mut acknowledgements = self.client.subscribe(acknowledgement_subject).await?;
+                let mut verdicts = self.client.subscribe(verdict_subject).await?;
+                self.client.flush().await?;
+                self.client
+                    .publish(TOOL_APPROVAL_SUBJECT, payload.into())
+                    .await?;
+                self.client.flush().await?;
+
+                let delivery = deliveries
+                    .next()
+                    .await
+                    .context("tool approval delivery stream closed")?;
+                let delivery: ToolDeliveryV1 = serde_json::from_slice(&delivery.payload)
+                    .context("decode tool approval delivery")?;
+                delivery
+                    .validate(&request_id_for_wait)
+                    .context("tool approval delivery did not match request")?;
+                progress(HookProgress::RequestDelivered);
+
+                let acknowledgement = acknowledgements
+                    .next()
+                    .await
+                    .context("tool browser acknowledgement stream closed")?;
+                let acknowledgement: ToolAcknowledgementV1 =
+                    serde_json::from_slice(&acknowledgement.payload)
+                        .context("decode tool browser acknowledgement")?;
+                acknowledgement
+                    .validate(&request_id_for_wait)
+                    .context("tool browser acknowledgement did not match request")?;
+                progress(HookProgress::WaitingForApproval);
+
+                let verdict = verdicts
+                    .next()
+                    .await
+                    .context("tool decision stream closed")?;
+                let verdict: ToolApprovalDecisionV1 = serde_json::from_slice(&verdict.payload)
+                    .context("decode tool approval decision")?;
+                if verdict.request_id() != request_id_for_wait {
+                    anyhow::bail!("tool approval decision did not match request");
+                }
+                verdict
+                    .validate_shape()
+                    .context("validate tool approval decision")?;
+                Ok::<_, anyhow::Error>(verdict)
+            })
+            .await;
+            match result {
+                Ok(Ok(decision)) => Ok(decision),
+                Ok(Err(error)) => {
+                    let detail = format!("{error:#}");
+                    progress(HookProgress::ProtocolFailed(detail));
+                    Err(failure(FailureKind::Protocol, &error))
+                }
+                Err(_) => {
+                    let detail = anyhow::anyhow!(
+                        "tool approval deadline exceeded after {}ms",
+                        timeout.as_millis()
+                    );
+                    progress(HookProgress::DaemonNotResponding(format!("{detail:#}")));
+                    Err(failure(FailureKind::Expired, &detail))
+                }
+            }
+        })
+    }
+
     fn publish_enrollment_intent(
         &self,
         intent: &EnrollmentIntentV1,
@@ -944,7 +1028,12 @@ mod tests {
         assert!(!subjects_cover(&existing, &REQUEST_CONSUMER_FILTERS));
         assert_eq!(
             merge_subjects(&existing, &REQUEST_CONSUMER_FILTERS),
-            vec!["oshioki.request.>", "oshioki.other.>", "oshioki.auth.>",]
+            vec![
+                "oshioki.request.>",
+                "oshioki.other.>",
+                "oshioki.auth.>",
+                "oshioki.tool.request",
+            ]
         );
         let already = merge_subjects(&existing, &REQUEST_CONSUMER_FILTERS);
         assert!(subjects_cover(&already, &REQUEST_CONSUMER_FILTERS));
@@ -969,7 +1058,14 @@ mod tests {
         let active = consumer_filter_list("oshioki.request.>", &[]);
         assert_eq!(active, vec!["oshioki.request.>"]);
         assert!(!filters_match(&active, &REQUEST_CONSUMER_FILTERS));
-        let both = consumer_filter_list("", &["oshioki.auth.>".into(), "oshioki.request.>".into()]);
+        let both = consumer_filter_list(
+            "",
+            &[
+                "oshioki.auth.>".into(),
+                "oshioki.request.>".into(),
+                "oshioki.tool.request".into(),
+            ],
+        );
         assert!(filters_match(&both, &REQUEST_CONSUMER_FILTERS));
     }
 }
