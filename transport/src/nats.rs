@@ -934,8 +934,10 @@ impl ServerTransport for NatsTransport {
                         // Payload out first, then the handle moves into one
                         // closure: the consumer names the acknowledgement it
                         // wants and only that future is ever built.
+                        let subject = message.subject.to_string();
                         let payload = message.payload.to_vec();
                         vec![JetStreamMessage {
+                            subject,
                             payload,
                             ack: Box::new(move |kind| match kind {
                                 Ack::Term => Box::pin(async move {

@@ -189,6 +189,8 @@ pub type AckFn = Box<dyn FnOnce(Ack) -> AckFuture + Send>;
 /// One durable request-stream delivery. `ack` is single-use: calling it
 /// consumes the message's acknowledgement exactly once.
 pub struct JetStreamMessage {
+    /// Original NATS subject attached to the durable delivery.
+    pub subject: String,
     pub payload: Vec<u8>,
     pub ack: AckFn,
 }

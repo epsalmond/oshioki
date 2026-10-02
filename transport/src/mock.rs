@@ -27,6 +27,7 @@ const ENROLLMENT_INTENT_SUBJECT: &str = "oshioki.enrollment.intent";
 /// acknowledgement resolves, so the test observes which ack the consumer
 /// reached (Term vs `DoubleAck`).
 pub struct JetStreamMessageStub {
+    pub subject: String,
     pub payload: Vec<u8>,
     pub on_term: Option<Sender<()>>,
     pub on_ack: Option<Sender<()>>,
@@ -266,6 +267,7 @@ impl ServerTransport for MockTransport {
             .map(|stub| {
                 let (on_term, on_ack) = (stub.on_term, stub.on_ack);
                 Ok(vec![JetStreamMessage {
+                    subject: stub.subject,
                     payload: stub.payload,
                     ack: Box::new(move |kind| match kind {
                         Ack::Term => stub_ack(on_term),

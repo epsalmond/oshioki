@@ -64,7 +64,7 @@ impl HarnessArg {
     }
 
     fn all_marker(self) -> String {
-        format!("--managed-hook={OWNED_HOOK_TAG}-{}", self.as_str())
+        format!("{OWNED_HOOK_TAG}-{}", self.as_str())
     }
 }
 
@@ -350,7 +350,7 @@ fn managed_command(harness: HarnessArg) -> Result<String> {
     let executable = std::env::current_exe().context("locate the oshioki executable")?;
     let marker = harness.all_marker();
     Ok(format!(
-        "{} approvals request --harness {} {marker}",
+        "{} approvals request --harness {} --managed-hook={marker}",
         shell_quote(&executable.to_string_lossy()),
         harness.as_str()
     ))

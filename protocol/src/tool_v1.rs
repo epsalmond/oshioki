@@ -19,8 +19,9 @@ use crate::{
     Error,
     v1::{
         DeviceKindV1, DevicePublicRecordV1, HookConfigV1, MAX_DEVICES, MAX_ENVELOPE_BYTES,
-        MAX_REQUEST_BYTES, SealedDeviceBodyV1, decode_base64url, decode_exact, seal_v1, unseal_v1,
-        valid_fingerprint, valid_id, validate_request_timing,
+        MAX_REQUEST_BYTES, MAX_REQUEST_ISSUANCE_SKEW_SECS, MAX_REQUEST_LIFETIME_SECS,
+        SealedDeviceBodyV1, decode_base64url, decode_exact, seal_v1, unseal_v1, valid_fingerprint,
+        valid_id, validate_request_timing,
     },
     webauthn_v1::{AssertionOutcomeV1, cose_p256_verifying_key},
 };
@@ -254,8 +255,29 @@ pub fn parse_tool_request_at(raw: &[u8], now: i64) -> Result<ToolApprovalRequest
     let value = strict_json_value(raw)?;
     let request: ToolApprovalRequestV1 = serde_json::from_value(value)
         .map_err(|error| Error::InvalidRequest(format!("decode tool request: {error}")))?;
-    request.validate_at(now)?;
+    request.validate()?;
+    validate_tool_decision_timing(request.issued_at, request.expires_at, now)?;
     Ok(request)
+}
+
+fn validate_tool_decision_timing(issued_at: i64, expires_at: i64, now: i64) -> Result<(), Error> {
+    if issued_at > now.saturating_add(MAX_REQUEST_ISSUANCE_SKEW_SECS) {
+        return Err(Error::InvalidRequest(
+            "request issuance time is outside clock skew".into(),
+        ));
+    }
+    if expires_at <= now {
+        return Err(Error::InvalidRequest("request has expired".into()));
+    }
+    let lifetime = expires_at
+        .checked_sub(issued_at)
+        .ok_or_else(|| Error::InvalidRequest("invalid request lifetime".into()))?;
+    if lifetime <= 0 || lifetime > MAX_REQUEST_LIFETIME_SECS {
+        return Err(Error::InvalidRequest(
+            "request lifetime is outside the allowed range".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn context_matches(event: &Value, key: &str, expected: Option<&str>) -> bool {
@@ -868,5 +890,35 @@ mod tests {
         let changed = request_json(r#"{"command":"echo different"}"#);
         assert!(verify_tool_decision_v1(&deny, &changed, &device, &config(), 1000).is_err());
         assert!(verify_tool_decision_v1(&deny, &raw, &device, &config(), 1090).is_err());
+    }
+
+    #[test]
+    fn signed_terminal_decisions_remain_valid_after_ingress_freshness_window() {
+        let raw = request_json(r#"{"command":"echo hello"}"#);
+        let (device, signing, _) = webauthn_device();
+        for action in [ToolDecisionActionV1::Approve, ToolDecisionActionV1::Deny] {
+            let decision = signed_decision(&raw, action, &device, &signing);
+            for now in [1031, 1084] {
+                assert!(
+                    verify_tool_decision_v1(&decision, &raw, &device, &config(), now).is_ok(),
+                    "{action:?} must remain valid at t={now}"
+                );
+            }
+            assert!(verify_tool_decision_v1(&decision, &raw, &device, &config(), 1090).is_err());
+        }
+
+        for expires_at in [999, 1000, 1091] {
+            let mut request = serde_json::from_slice::<Value>(&raw).unwrap();
+            request["expires_at"] = Value::from(expires_at);
+            assert!(
+                parse_tool_request_at(&serde_json::to_vec(&request).unwrap(), 990).is_err(),
+                "invalid lifetime ending at {expires_at} must be rejected"
+            );
+        }
+
+        let mut future = serde_json::from_slice::<Value>(&raw).unwrap();
+        future["issued_at"] = Value::from(1021);
+        future["expires_at"] = Value::from(1090);
+        assert!(parse_tool_request_at(&serde_json::to_vec(&future).unwrap(), 990).is_err());
     }
 }

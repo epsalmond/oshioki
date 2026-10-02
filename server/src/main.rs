@@ -20,8 +20,9 @@ use jwt_compact::{
 use oshioki_protocol::{
     AUTH_ENVELOPE_TYPE, ActivationV1, AliveV1, ApproveV1, AuthApproveWebauthnV1, AuthDecisionV1,
     AuthEnvelopeV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
-    RequestEnvelopeV1, SealedDeviceBodyV1, TOOL_ENVELOPE_TYPE, ToolAcknowledgementV1,
-    ToolApprovalDecisionV1, ToolApprovalEnvelopeV1, ToolSealedBodyV1, verify_tool_decision_v1,
+    RequestEnvelopeV1, SealedDeviceBodyV1, TOOL_APPROVAL_SUBJECT, TOOL_ENVELOPE_TYPE,
+    ToolAcknowledgementV1, ToolApprovalDecisionV1, ToolApprovalEnvelopeV1, ToolSealedBodyV1,
+    verify_tool_decision_v1,
 };
 use oshioki_transport::{Ack, JetStreamMessage, NatsTransport, ServerTransport};
 use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
@@ -428,7 +429,11 @@ async fn request_consumer(state: AppState) -> Result<()> {
         for message in batch? {
             // Payload and acknowledgement split apart: the ack closure is
             // single-use, and every arm below consumes it exactly once.
-            let JetStreamMessage { payload, ack } = message;
+            let JetStreamMessage {
+                subject,
+                payload,
+                ack,
+            } = message;
             let raw = payload.as_slice();
             if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
                 warn!(bytes = raw.len(), "terminating oversized request envelope");
@@ -436,29 +441,28 @@ async fn request_consumer(state: AppState) -> Result<()> {
                 state.consumer_last_ok.store(now(), Ordering::Relaxed);
                 continue;
             }
-            // The lane is decided by the envelope's own `type` tag, not by
-            // the subject it arrived on. The legacy command envelope carries
-            // no tag at all, so it routes exactly as it always has; a tag
-            // this build does not implement is terminated rather than
-            // guessed at, and never reaches the command decoder.
-            match envelope_type(raw) {
-                None => {}
-                Some(message_type) if message_type == AUTH_ENVELOPE_TYPE => {
+            // Both the durable subject and the envelope tag must identify the
+            // same lane. A compromised or misconfigured publisher cannot
+            // submit an auth/tool payload through the legacy command subject
+            // (or vice versa) and trigger another lane's storage or notice.
+            let Some(lane) = request_delivery_lane(&subject, raw) else {
+                warn!(%subject, "terminating request with mismatched subject and envelope type");
+                ack(Ack::Term).await?;
+                state.consumer_last_ok.store(now(), Ordering::Relaxed);
+                continue;
+            };
+            match lane {
+                RequestDeliveryLane::Authentication => {
                     ingest_auth_envelope(&state, raw, ack).await?;
                     state.consumer_last_ok.store(now(), Ordering::Relaxed);
                     continue;
                 }
-                Some(message_type) if message_type == TOOL_ENVELOPE_TYPE => {
+                RequestDeliveryLane::Tool => {
                     ingest_tool_envelope(&state, raw, ack).await?;
                     state.consumer_last_ok.store(now(), Ordering::Relaxed);
                     continue;
                 }
-                Some(message_type) => {
-                    warn!(%message_type, "terminating envelope of an unknown type");
-                    ack(Ack::Term).await?;
-                    state.consumer_last_ok.store(now(), Ordering::Relaxed);
-                    continue;
-                }
+                RequestDeliveryLane::Command => {}
             }
             let envelope = match serde_json::from_slice::<RequestEnvelopeV1>(raw) {
                 Ok(value) => value,
@@ -494,6 +498,35 @@ async fn request_consumer(state: AppState) -> Result<()> {
 /// anything decides how to parse the rest of it. `None` covers both an
 /// untagged legacy envelope and a payload that is not JSON at all; the
 /// command decode is what reports the latter, as it always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestDeliveryLane {
+    Command,
+    Authentication,
+    Tool,
+}
+
+fn request_delivery_lane(subject: &str, raw: &[u8]) -> Option<RequestDeliveryLane> {
+    let message_type = envelope_type(raw);
+    if subject
+        .strip_prefix("oshioki.request.")
+        .is_some_and(|host| !host.is_empty())
+        && message_type.is_none()
+    {
+        return Some(RequestDeliveryLane::Command);
+    }
+    if subject
+        .strip_prefix("oshioki.auth.")
+        .is_some_and(|host| !host.is_empty())
+        && message_type.as_deref() == Some(AUTH_ENVELOPE_TYPE)
+    {
+        return Some(RequestDeliveryLane::Authentication);
+    }
+    if subject == TOOL_APPROVAL_SUBJECT && message_type.as_deref() == Some(TOOL_ENVELOPE_TYPE) {
+        return Some(RequestDeliveryLane::Tool);
+    }
+    None
+}
+
 fn envelope_type(raw: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct EnvelopeTypeV1 {
@@ -2815,21 +2848,25 @@ mod tests {
         // Oversized envelopes are terminated on length alone, before any
         // parse: a redelivery would only cost the same bytes again.
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: vec![b'x'; oshioki_protocol::v1::MAX_ENVELOPE_BYTES + 1],
             on_term: Some(term_tx.clone()),
             on_ack: None,
         });
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: b"not json".to_vec(),
             on_term: Some(term_tx.clone()),
             on_ack: None,
         });
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: valid_raw.clone(),
             on_term: None,
             on_ack: Some(ack_tx),
         });
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: conflict_raw,
             on_term: Some(term_tx),
             on_ack: None,
@@ -3314,9 +3351,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The durable consumer decides the lane from the envelope, not the
-    /// subject: a command envelope and an authentication envelope both
-    /// store and Ack, each in its own table.
+    /// The durable consumer checks both subject and envelope type: command
+    /// and authentication envelopes store and Ack only in their own lanes.
     #[tokio::test]
     async fn the_consumer_stores_each_envelope_in_its_own_lane() {
         async fn wait_for(rx: &std::sync::mpsc::Receiver<()>, what: &str) {
@@ -3343,41 +3379,17 @@ mod tests {
         let transport = oshioki_transport::MockTransport::new();
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         let (auth_tx, auth_rx) = std::sync::mpsc::channel();
-        let (term_tx, term_rx) = std::sync::mpsc::channel();
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: serde_json::to_vec(&command_envelope("cmd-1", &device.fingerprint)).unwrap(),
             on_term: None,
             on_ack: Some(command_tx),
         });
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.auth.nas".into(),
             payload: serde_json::to_vec(&auth_envelope("auth-1", &device.fingerprint)).unwrap(),
             on_term: None,
             on_ack: Some(auth_tx),
-        });
-        // An authentication envelope that does not decode is terminated, not
-        // retried forever and not fed to the command decoder.
-        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
-            payload: serde_json::to_vec(&serde_json::json!({
-                "type": AUTH_ENVELOPE_TYPE,
-                "version": 2,
-                "request_id": "auth-broken",
-            }))
-            .unwrap(),
-            on_term: Some(term_tx),
-            on_ack: None,
-        });
-        // A type this build does not implement is terminated as well. It
-        // must never reach the command decoder: a tagged envelope that
-        // happens to carry the command lane's fields would otherwise be
-        // stored as a command approval request.
-        let (unknown_tx, unknown_rx) = std::sync::mpsc::channel();
-        let mut disguised =
-            serde_json::to_value(command_envelope("cmd-disguised", &device.fingerprint)).unwrap();
-        disguised["type"] = serde_json::json!("sudo_something_else");
-        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
-            payload: serde_json::to_vec(&disguised).unwrap(),
-            on_term: Some(unknown_tx),
-            on_ack: None,
         });
         let state = AppState {
             store: Arc::clone(&store),
@@ -3395,8 +3407,6 @@ mod tests {
         let worker = tokio::spawn(request_consumer(state));
         wait_for(&command_rx, "command envelope ack").await;
         wait_for(&auth_rx, "authentication envelope ack").await;
-        wait_for(&term_rx, "malformed authentication envelope term").await;
-        wait_for(&unknown_rx, "unknown envelope type term").await;
         worker.abort();
         assert!(store.request_lifecycle("cmd-1", now()).unwrap().is_some());
         assert!(
@@ -3412,20 +3422,149 @@ mod tests {
                 .is_some()
         );
         assert!(store.request_lifecycle("auth-1", now()).unwrap().is_none());
-        // The disguised envelope was stored by neither lane.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn malformed_auth_and_unknown_request_types_are_terminated() {
+        let (dir, state, transport, _token) = auth_test_state("malformed-request-types");
+        let device = test_device();
+        let (term_tx, term_rx) = std::sync::mpsc::channel();
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.auth.nas".into(),
+            payload: serde_json::to_vec(&serde_json::json!({
+                "type": AUTH_ENVELOPE_TYPE,
+                "version": 2,
+                "request_id": "auth-broken",
+            }))
+            .unwrap(),
+            on_term: Some(term_tx.clone()),
+            on_ack: None,
+        });
+        let mut disguised =
+            serde_json::to_value(command_envelope("cmd-disguised", &device.fingerprint)).unwrap();
+        disguised["type"] = serde_json::json!("sudo_something_else");
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
+            payload: serde_json::to_vec(&disguised).unwrap(),
+            on_term: Some(term_tx),
+            on_ack: None,
+        });
+
+        let worker = tokio::spawn(request_consumer(state.clone()));
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if term_rx.try_recv().is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("invalid request type was not terminated");
+        }
+        worker.abort();
         assert!(
-            store
+            state
+                .store
+                .auth_request_lifecycle("auth-broken", now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .store
                 .request_lifecycle("cmd-disguised", now())
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            store
-                .auth_request_lifecycle("cmd-disguised", now())
-                .unwrap()
-                .is_none()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn request_subject_and_envelope_type_mismatches_have_no_lane_side_effects() {
+        async fn wait_for(rx: &std::sync::mpsc::Receiver<()>) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if rx.try_recv().is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("mismatched delivery was not terminated");
+        }
+
+        let (dir, state, transport, _token) = auth_test_state("subject-type-mismatches");
+        let device = test_device();
+        let command =
+            |id: &str| serde_json::to_vec(&command_envelope(id, &device.fingerprint)).unwrap();
+        let authentication =
+            |id: &str| serde_json::to_vec(&auth_envelope(id, &device.fingerprint)).unwrap();
+        let tool = |id: &str| serde_json::to_vec(&tool_envelope(id, &device.fingerprint)).unwrap();
+        let mismatches = [
+            ("oshioki.auth.nas", "cmd-on-auth", command("cmd-on-auth")),
+            (
+                "oshioki.tool.request",
+                "cmd-on-tool",
+                command("cmd-on-tool"),
+            ),
+            (
+                "oshioki.request.nas",
+                "auth-on-command",
+                authentication("auth-on-command"),
+            ),
+            (
+                "oshioki.tool.request",
+                "auth-on-tool",
+                authentication("auth-on-tool"),
+            ),
+            (
+                "oshioki.request.nas",
+                "tool-on-command",
+                tool("tool-on-command"),
+            ),
+            ("oshioki.auth.nas", "tool-on-auth", tool("tool-on-auth")),
+        ];
+        let (term_tx, term_rx) = std::sync::mpsc::channel();
+        for (subject, _, payload) in &mismatches {
+            transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+                subject: (*subject).into(),
+                payload: payload.clone(),
+                on_term: Some(term_tx.clone()),
+                on_ack: None,
+            });
+        }
+
+        let worker = tokio::spawn(request_consumer(state.clone()));
+        for _ in &mismatches {
+            wait_for(&term_rx).await;
+        }
+        worker.abort();
+
+        for (_, id, _) in &mismatches {
+            assert!(state.store.request_lifecycle(id, now()).unwrap().is_none());
+            assert!(
+                state
+                    .store
+                    .auth_request_lifecycle(id, now())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                state
+                    .store
+                    .tool_request_lifecycle(id, now())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(state.store.pending_verdicts(32).unwrap().is_empty());
+        assert!(state.store.pending_notifications(32).unwrap().is_empty());
+        assert!(state.store.claim_push(now(), 30).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Neither lane answers for the other. A command approval or denial

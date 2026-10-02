@@ -338,7 +338,11 @@ function unb64url(value) {
 async function toolRequestEnvelope(requestId, device, publicDevice) {
   await sodium.ready;
   const issuedAt = Math.floor(Date.now() / 1000);
-  const input = { command: "printf '<img src=x onerror=alert(1)>'", description: "Print exact text" };
+  const input = {
+    command: "printf '<img src=x onerror=alert(1)>'",
+    description: "Print exact text",
+    large_value: Number("9007199254740993"),
+  };
   const nativeEvent = {
     hook_event_name: "PermissionRequest",
     tool_name: "Bash",
@@ -349,6 +353,11 @@ async function toolRequestEnvelope(requestId, device, publicDevice) {
     agent_type: "worker",
     permission_mode: "default",
   };
+  const largeNumberToken = '"large_value":9007199254740992';
+  const nativeEventJson = JSON.stringify(nativeEvent).replace(
+    largeNumberToken,
+    '"large_value":9007199254740993',
+  );
   const request = {
     type: "tool_approval_request",
     version: 3,
@@ -359,7 +368,7 @@ async function toolRequestEnvelope(requestId, device, publicDevice) {
     tool_name: "Bash",
     tool_input: input,
     cwd: nativeEvent.cwd,
-    native_event_json: JSON.stringify(nativeEvent),
+    native_event_json: nativeEventJson,
     context: {
       session_id: nativeEvent.session_id,
       agent_id: nativeEvent.agent_id,
@@ -370,13 +379,22 @@ async function toolRequestEnvelope(requestId, device, publicDevice) {
     issued_at: issuedAt,
     expires_at: issuedAt + 90,
   };
-  const raw = Buffer.from(JSON.stringify(request));
+  const requestJson = JSON.stringify(request).replace(
+    largeNumberToken,
+    '"large_value":9007199254740993',
+  );
+  if (!nativeEventJson.includes('"large_value":9007199254740993')
+      || !requestJson.includes('"large_value":9007199254740993')) {
+    throw new Error("large-number test fixture lost its exact JSON token");
+  }
+  const raw = Buffer.from(requestJson);
   const ephemeral = sodium.crypto_box_keypair();
   const shared = sodium.crypto_scalarmult(ephemeral.privateKey, unb64url(publicDevice.box_public_key));
   const nonce = sodium.randombytes_buf(12);
   const ciphertext = sodium.crypto_aead_chacha20poly1305_ietf_encrypt(raw, null, null, nonce, shared);
   return {
     request,
+    requestJson,
     envelope: {
       type: "tool_approval",
       version: 3,
@@ -405,7 +423,7 @@ async function exerciseToolDecision(profile, device, action) {
   const acknowledgement = await oneMessage(connection, `oshioki.tool.ack.${requestId}`);
   const verdict = await oneMessage(connection, `oshioki.tool.verdict.${requestId}`);
   await connection.flush();
-  const { request, envelope } = await toolRequestEnvelope(requestId, device, publicDevice);
+  const { request, requestJson, envelope } = await toolRequestEnvelope(requestId, device, publicDevice);
   connection.publish("oshioki.tool.request", Buffer.from(JSON.stringify(envelope)));
   await connection.flush();
   const delivered = JSON.parse(Buffer.from(await delivery.message).toString("utf8"));
@@ -413,8 +431,11 @@ async function exerciseToolDecision(profile, device, action) {
 
   await navigate(profile.page, `${origin}/t/${requestId}`);
   await expect(profile.page.locator("#tool-input")).toContainText("<img src=x onerror=alert(1)>");
-  await expect(profile.page.locator("#native-event")).toContainText("agent-subtask-1");
-  await expect(profile.page.locator("#native-event")).toContainText("PermissionRequest");
+  await expect(profile.page.locator("#tool-input")).toContainText("agent-subtask-1");
+  await expect(profile.page.locator("#tool-input")).toContainText("PermissionRequest");
+  expect(await profile.page.locator("#tool-input").textContent()).toBe(request.native_event_json);
+  expect(request.native_event_json).toContain('"large_value":9007199254740993');
+  expect(requestJson).toContain('"large_value":9007199254740993');
   expect(await profile.page.locator("img").count()).toBe(0);
   const acknowledged = JSON.parse(Buffer.from(await acknowledgement.message).toString("utf8"));
   expect(acknowledged).toEqual({ type: "tool_approval_ack", version: 3, request_id: requestId });

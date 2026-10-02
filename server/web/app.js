@@ -548,14 +548,17 @@ async function toolApproval() {
   text("cwd", request.cwd);
   text("permission-mode", context.permission_mode || "not supplied");
   text("session", context.session_id || "not supplied");
-  document.getElementById("tool-input").textContent = JSON.stringify(request.tool_input, null, 2);
-  document.getElementById("native-event").textContent = JSON.stringify(nativeEvent, null, 2);
+  // The retained native event is a JSON string inside the signed request.
+  // Render it verbatim: parsing and re-serializing can round integers above
+  // JavaScript's exact-number range and make the review differ from the bytes
+  // the WebAuthn assertion covers.
+  document.getElementById("tool-input").textContent = request.native_event_json;
   if (request.description) {
     text("description", request.description);
     document.getElementById("description").hidden = false;
   }
   text("status", `Expires ${new Date(request.expires_at * 1000).toLocaleTimeString()}`);
-  for (const element of ["request", "input-heading", "tool-input", "context-heading", "native-event", "actions", "cancel-note"]) {
+  for (const element of ["request", "input-heading", "tool-input", "actions", "cancel-note"]) {
     document.getElementById(element).hidden = false;
   }
 
