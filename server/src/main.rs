@@ -2106,7 +2106,7 @@ mod tests {
             .unwrap();
         let page = String::from_utf8(body.to_vec()).unwrap();
         assert!(page.contains("/assets/tool-approval-v1.js"));
-        assert!(page.contains("Complete tool input"));
+        assert!(page.contains("Exact native permission request (signed JSON)"));
         assert!(page.contains("Approve once"));
         assert!(page.contains("Deny"));
 
@@ -2117,8 +2117,11 @@ mod tests {
         let script = String::from_utf8(script.to_vec()).unwrap();
         assert!(script.contains(r"oshioki/tool-approval/approve/v1\0"));
         assert!(script.contains(r"oshioki/tool-approval/deny/v1\0"));
-        assert!(script.contains("textContent = JSON.stringify(request.tool_input"));
-        assert!(!script.contains("innerHTML = JSON.stringify(request.tool_input"));
+        assert!(
+            script
+                .contains("getElementById(\"tool-input\").textContent = request.native_event_json")
+        );
+        assert!(!script.contains("getElementById(\"tool-input\").innerHTML"));
 
         let worker_response = tool_service_worker().await;
         let worker = axum::body::to_bytes(worker_response.into_body(), usize::MAX)
