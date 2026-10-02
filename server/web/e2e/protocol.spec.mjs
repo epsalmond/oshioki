@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { connect } from "@nats-io/transport-node";
+import sodium from "libsodium-wrappers";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import https from "node:https";
@@ -17,6 +18,7 @@ const natsOptions = {
 };
 let proxy;
 const activeHooks = new Set();
+const activeConnections = new Set();
 const enrolledFingerprints = new Set();
 
 // The same proxy the rest of the E2E runs as a standalone process.
@@ -34,6 +36,10 @@ test.afterEach(async () => {
     if (processHandle.child.exitCode === null) processHandle.child.kill("SIGTERM");
   }
   await Promise.allSettled(running.map((processHandle) => processHandle.exited));
+
+  const connections = [...activeConnections];
+  activeConnections.clear();
+  await Promise.allSettled(connections.map((connection) => connection.drain()));
 
   const failures = [];
   const fingerprints = [...enrolledFingerprints];
@@ -209,6 +215,7 @@ async function pendingRequest() {
   const envelope = await Promise.race([message, timeout]);
   subscription.unsubscribe();
   await connection.drain();
+  activeConnections.delete(connection);
   return { envelope, processHandle };
 }
 
@@ -300,6 +307,134 @@ async function requestWith(profile, device, action) {
   }
 }
 
+async function oneMessage(connection, subject) {
+  let resolveMessage;
+  let rejectMessage;
+  const message = new Promise((resolve, reject) => {
+    resolveMessage = resolve;
+    rejectMessage = reject;
+  });
+  const subscription = connection.subscribe(subject, {
+    max: 1,
+    callback: (error, value) => error ? rejectMessage(error) : resolveMessage(value.data),
+  });
+  return { subscription, message };
+}
+
+async function testNatsConnection() {
+  const connection = await connect(natsOptions);
+  activeConnections.add(connection);
+  return connection;
+}
+
+function b64url(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function unb64url(value) {
+  return Buffer.from(value, "base64url");
+}
+
+async function toolRequestEnvelope(requestId, device, publicDevice) {
+  await sodium.ready;
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const input = { command: "printf '<img src=x onerror=alert(1)>'", description: "Print exact text" };
+  const nativeEvent = {
+    hook_event_name: "PermissionRequest",
+    tool_name: "Bash",
+    tool_input: input,
+    cwd: "/tmp/oshioki-project",
+    session_id: "session-tool-1",
+    agent_id: "agent-subtask-1",
+    agent_type: "worker",
+    permission_mode: "default",
+  };
+  const request = {
+    type: "tool_approval_request",
+    version: 3,
+    request_id: requestId,
+    nonce: b64url(sodium.randombytes_buf(16)),
+    harness: "claude",
+    event: "PermissionRequest",
+    tool_name: "Bash",
+    tool_input: input,
+    cwd: nativeEvent.cwd,
+    native_event_json: JSON.stringify(nativeEvent),
+    context: {
+      session_id: nativeEvent.session_id,
+      agent_id: nativeEvent.agent_id,
+      agent_type: nativeEvent.agent_type,
+      permission_mode: nativeEvent.permission_mode,
+    },
+    description: null,
+    issued_at: issuedAt,
+    expires_at: issuedAt + 90,
+  };
+  const raw = Buffer.from(JSON.stringify(request));
+  const ephemeral = sodium.crypto_box_keypair();
+  const shared = sodium.crypto_scalarmult(ephemeral.privateKey, unb64url(publicDevice.box_public_key));
+  const nonce = sodium.randombytes_buf(12);
+  const ciphertext = sodium.crypto_aead_chacha20poly1305_ietf_encrypt(raw, null, null, nonce, shared);
+  return {
+    request,
+    envelope: {
+      type: "tool_approval",
+      version: 3,
+      request_id: requestId,
+      issued_at: request.issued_at,
+      expires_at: request.expires_at,
+      sealed: [{
+        device_fingerprint: device.fingerprint,
+        ephemeral_pub: b64url(ephemeral.publicKey),
+        nonce: b64url(nonce),
+        ciphertext: b64url(ciphertext),
+      }],
+    },
+  };
+}
+
+async function exerciseToolDecision(profile, device, action) {
+  const publicDevice = await profile.page.evaluate(async fingerprint => {
+    const response = await fetch(`/api/v1/devices/${fingerprint}`);
+    return response.ok ? await response.json() : null;
+  }, device.fingerprint);
+  expect(publicDevice).toBeTruthy();
+  const connection = await testNatsConnection();
+  const requestId = `tool-${crypto.randomUUID()}`;
+  const delivery = await oneMessage(connection, `oshioki.tool.delivery.${requestId}`);
+  const acknowledgement = await oneMessage(connection, `oshioki.tool.ack.${requestId}`);
+  const verdict = await oneMessage(connection, `oshioki.tool.verdict.${requestId}`);
+  await connection.flush();
+  const { request, envelope } = await toolRequestEnvelope(requestId, device, publicDevice);
+  connection.publish("oshioki.tool.request", Buffer.from(JSON.stringify(envelope)));
+  await connection.flush();
+  const delivered = JSON.parse(Buffer.from(await delivery.message).toString("utf8"));
+  expect(delivered).toEqual({ type: "tool_approval_delivery", version: 3, request_id: requestId });
+
+  await navigate(profile.page, `${origin}/t/${requestId}`);
+  await expect(profile.page.locator("#tool-input")).toContainText("<img src=x onerror=alert(1)>");
+  await expect(profile.page.locator("#native-event")).toContainText("agent-subtask-1");
+  await expect(profile.page.locator("#native-event")).toContainText("PermissionRequest");
+  expect(await profile.page.locator("img").count()).toBe(0);
+  const acknowledged = JSON.parse(Buffer.from(await acknowledgement.message).toString("utf8"));
+  expect(acknowledged).toEqual({ type: "tool_approval_ack", version: 3, request_id: requestId });
+
+  await profile.page.getByRole("button", { name: action === "approve" ? "Approve once" : "Deny" }).click();
+  await expect(profile.page.locator("#status")).toContainText(action === "approve" ? "Approved once" : "Denied");
+  const decision = JSON.parse(Buffer.from(await verdict.message).toString("utf8"));
+  expect(decision.type).toBe(action === "approve" ? "tool_approval_approve_webauthn" : "tool_approval_deny_webauthn");
+  expect(decision.version).toBe(3);
+  expect(decision.request_id).toBe(requestId);
+  expect(decision.device_fingerprint).toBe(device.fingerprint);
+  expect(Buffer.from(decision.signature, "base64url").length).toBeGreaterThanOrEqual(8);
+  expect(Object.keys(decision).sort()).toEqual([
+    "authenticator_data", "client_data_json", "credential_id", "device_fingerprint", "request_id", "signature", "type", "version",
+  ]);
+  expect(request.native_event_json).toContain("agent_type");
+  await connection.drain();
+  activeConnections.delete(connection);
+}
+
 test("two browser profiles enroll independently and own their approvals", async ({ browser }) => {
   const consoleErrors = [];
   const first = await virtualProfile(browser, consoleErrors);
@@ -357,6 +492,53 @@ test("server delivery receipt permits a delayed browser open and approval", asyn
   expect(Date.now() - requestStarted).toBeGreaterThanOrEqual(19_000);
   expect(consoleErrors).toEqual([]);
 
+  await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
+  await profile.context.close();
+});
+
+test("tool approval browser signs approve once and deny as distinct terminal decisions", async ({ browser }) => {
+  const consoleErrors = [];
+  const profile = await virtualProfile(browser, consoleErrors);
+  const device = await enroll(profile);
+  await navigate(profile.page, `${origin}/healthz`);
+  await exerciseToolDecision(profile, device, "approve");
+  await navigate(profile.page, `${origin}/healthz`);
+  await exerciseToolDecision(profile, device, "deny");
+  expect(consoleErrors).toEqual([]);
+  await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
+  await profile.context.close();
+});
+
+test("cancelling the tool passkey sends no decision", async ({ browser }) => {
+  const consoleErrors = [];
+  const profile = await virtualProfile(browser, consoleErrors);
+  const device = await enroll(profile);
+  await navigate(profile.page, `${origin}/healthz`);
+  const publicDevice = await profile.page.evaluate(async fingerprint => {
+    const response = await fetch(`/api/v1/devices/${fingerprint}`);
+    return response.json();
+  }, device.fingerprint);
+  const connection = await testNatsConnection();
+  const requestId = `tool-cancel-${crypto.randomUUID()}`;
+  const delivery = await oneMessage(connection, `oshioki.tool.delivery.${requestId}`);
+  const acknowledgement = await oneMessage(connection, `oshioki.tool.ack.${requestId}`);
+  const verdict = await oneMessage(connection, `oshioki.tool.verdict.${requestId}`);
+  await connection.flush();
+  const { envelope } = await toolRequestEnvelope(requestId, device, publicDevice);
+  connection.publish("oshioki.tool.request", Buffer.from(JSON.stringify(envelope)));
+  await connection.flush();
+  await delivery.message;
+  await navigate(profile.page, `${origin}/t/${requestId}`);
+  await acknowledgement.message;
+  await profile.page.evaluate(() => {
+    navigator.credentials.get = () => Promise.reject(new DOMException("cancelled", "NotAllowedError"));
+  });
+  await profile.page.getByRole("button", { name: "Deny" }).click();
+  await expect(profile.page.locator("#status")).toContainText("No decision was sent");
+  await expect(profile.page.locator("#actions")).toBeVisible();
+  await expect(Promise.race([verdict.message.then(() => "received"), new Promise(resolve => setTimeout(() => resolve("none"), 300))])).resolves.toBe("none");
+  expect(consoleErrors).toEqual([]);
+  await connection.drain();
   await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
   await profile.context.close();
 });

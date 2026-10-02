@@ -29,9 +29,11 @@ vm.runInContext(fs.readFileSync(`${__dirname}/service-worker.js`, "utf8"), worke
 const workerApi = worker.OshiokiPushWorker;
 assert.equal(JSON.stringify(workerApi.pushPayload({ version: 1, lane: "request", request_id: "req-1" })), JSON.stringify({ version: 1, lane: "request", request_id: "req-1" }));
 assert.equal(workerApi.notificationTarget({ version: 1, lane: "auth", request_id: "auth-1" }), "https://sudo.test/a/auth-1");
+assert.equal(workerApi.notificationTarget({ version: 1, lane: "tool", request_id: "tool-1" }), "https://sudo.test/t/tool-1");
 assert.equal(workerApi.notificationTag({ version: 1, lane: "request", request_id: "req-1" }), "request:req-1");
 assert.equal(workerApi.pushPayload({ version: 1, lane: "request", request_id: "../r/evil" }), null);
 assert.equal(workerApi.notificationTarget({ version: 2, lane: "request", request_id: "req-1" }), null);
+assert.equal(workerApi.pushPayload({ version: 1, lane: "unknown", request_id: "req-1" }), null);
 
 let pushWait;
 events.push({

@@ -1,5 +1,5 @@
 //! Live NATS check that a stream/consumer created for command approval only
-//! is repaired so `oshioki.auth.>` is delivered. Run via
+//! is repaired so the authentication and tool approval lanes are delivered. Run via
 //! `scripts/test-nats-lane-upgrade` (sets `NATS_URL`).
 
 use std::time::Duration;
@@ -17,7 +17,7 @@ use oshioki_transport::{
 };
 
 #[tokio::test]
-async fn a_legacy_stream_and_consumer_gain_the_authentication_lane() -> Result<()> {
+async fn a_legacy_stream_and_consumer_gain_authentication_and_tool_lanes() -> Result<()> {
     if std::env::var_os("OSHIOKI_TEST_NATS_LANE").is_none() {
         eprintln!("skipping: set OSHIOKI_TEST_NATS_LANE=1 and NATS_URL for a throwaway broker");
         return Ok(());
@@ -87,25 +87,38 @@ async fn a_legacy_stream_and_consumer_gain_the_authentication_lane() -> Result<(
         );
     }
 
-    jetstream
-        .publish("oshioki.auth.compat-host", b"auth-lane".as_slice().into())
-        .await
-        .context("publish authentication-lane message")?
-        .await
-        .context("ack authentication-lane publish")?;
+    for (subject, payload) in [
+        ("oshioki.auth.compat-host", b"auth-lane".as_slice()),
+        ("oshioki.tool.request", b"tool-lane".as_slice()),
+    ] {
+        jetstream
+            .publish(subject, payload.into())
+            .await
+            .with_context(|| format!("publish {subject} message"))?
+            .await
+            .with_context(|| format!("ack {subject} publish"))?;
+    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut received_auth = false;
+    let mut received_tool = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, inbound.next()).await {
             Ok(Some(Ok(batch))) => {
-                if batch.iter().any(|message| message.payload == b"auth-lane") {
+                for message in &batch {
+                    received_auth |= message.payload == b"auth-lane";
+                    received_tool |= message.payload == b"tool-lane";
+                }
+                if received_auth && received_tool {
                     return Ok(());
                 }
             }
             Ok(Some(Err(error))) => return Err(error).context("read repaired consumer"),
-            Ok(None) => bail!("repaired consumer closed before the authentication message"),
-            Err(_) => bail!("authentication-lane message was not delivered within 5s"),
+            Ok(None) => bail!("repaired consumer closed before both lane messages"),
+            Err(_) => {
+                bail!("authentication and tool lane messages were not both delivered within 5s")
+            }
         }
     }
 }
