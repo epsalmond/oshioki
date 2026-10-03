@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Starts a throwaway NATS with a command-only OSHIOKI stream and checks that
-# the current server transport widens it to the authentication lane.
+# the current server transport widens it to the auth and tool approval lanes.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

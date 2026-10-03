@@ -20,7 +20,9 @@ use jwt_compact::{
 use oshioki_protocol::{
     AUTH_ENVELOPE_TYPE, ActivationV1, AliveV1, ApproveV1, AuthApproveWebauthnV1, AuthDecisionV1,
     AuthEnvelopeV1, DecisionV1, DenyV1, EnrollmentIntentV1, EnrollmentSubmissionV1,
-    RequestEnvelopeV1, SealedDeviceBodyV1,
+    RequestEnvelopeV1, SealedDeviceBodyV1, TOOL_APPROVAL_SUBJECT, TOOL_ENVELOPE_TYPE,
+    ToolAcknowledgementV1, ToolApprovalDecisionV1, ToolApprovalEnvelopeV1, ToolSealedBodyV1,
+    verify_tool_decision_v1,
 };
 use oshioki_transport::{Ack, JetStreamMessage, NatsTransport, ServerTransport};
 use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
@@ -136,6 +138,18 @@ struct RequestResponse {
     expires_at: i64,
 }
 
+#[derive(Debug, Serialize)]
+struct ToolRequestResponse {
+    sealed: ToolSealedBodyV1,
+    expires_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolDecisionSubmission {
+    request_json: String,
+    decision: ToolApprovalDecisionV1,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -178,12 +192,15 @@ async fn main() -> Result<()> {
     spawn_workers(&state);
     let app = Router::new()
         .route("/r/:id", get(request_page))
+        .route("/t/:id", get(tool_approval_page))
         .route("/a/:id", get(authentication_page))
         .route("/enroll/:id", get(enrollment_page))
         .route("/setup", get(setup_page))
         .route("/manifest.webmanifest", get(manifest))
         .route("/service-worker.js", get(service_worker))
+        .route("/service-worker-tool-v1.js", get(tool_service_worker))
         .route("/assets/app.js", get(app_js))
+        .route("/assets/tool-approval-v1.js", get(tool_approval_js))
         .route("/assets/app.css", get(app_css))
         .route("/assets/libsodium.js", get(libsodium_js))
         .route("/assets/icon-192.png", get(icon_192))
@@ -194,6 +211,16 @@ async fn main() -> Result<()> {
         .route("/api/v1/requests/:id/approve", post(approve_request))
         .route("/api/v1/requests/:id/deny", post(deny_request))
         .route("/api/v1/requests/:id/verdict", get(recorded_verdict))
+        .route("/api/v1/capabilities", get(capabilities))
+        .route("/api/v1/tool-requests/:id", get(get_tool_request))
+        .route(
+            "/api/v1/tool-requests/:id/ack",
+            post(acknowledge_tool_request),
+        )
+        .route(
+            "/api/v1/tool-requests/:id/decision",
+            post(submit_tool_decision),
+        )
         .route(AUTH_ROUTES[0], get(get_auth_request))
         .route(AUTH_ROUTES[1], post(acknowledge_auth_request))
         .route(AUTH_ROUTES[2], post(authenticate_webauthn))
@@ -402,7 +429,11 @@ async fn request_consumer(state: AppState) -> Result<()> {
         for message in batch? {
             // Payload and acknowledgement split apart: the ack closure is
             // single-use, and every arm below consumes it exactly once.
-            let JetStreamMessage { payload, ack } = message;
+            let JetStreamMessage {
+                subject,
+                payload,
+                ack,
+            } = message;
             let raw = payload.as_slice();
             if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
                 warn!(bytes = raw.len(), "terminating oversized request envelope");
@@ -410,24 +441,28 @@ async fn request_consumer(state: AppState) -> Result<()> {
                 state.consumer_last_ok.store(now(), Ordering::Relaxed);
                 continue;
             }
-            // The lane is decided by the envelope's own `type` tag, not by
-            // the subject it arrived on. The legacy command envelope carries
-            // no tag at all, so it routes exactly as it always has; a tag
-            // this build does not implement is terminated rather than
-            // guessed at, and never reaches the command decoder.
-            match envelope_type(raw) {
-                None => {}
-                Some(message_type) if message_type == AUTH_ENVELOPE_TYPE => {
+            // Both the durable subject and the envelope tag must identify the
+            // same lane. A compromised or misconfigured publisher cannot
+            // submit an auth/tool payload through the legacy command subject
+            // (or vice versa) and trigger another lane's storage or notice.
+            let Some(lane) = request_delivery_lane(&subject, raw) else {
+                warn!(%subject, "terminating request with mismatched subject and envelope type");
+                ack(Ack::Term).await?;
+                state.consumer_last_ok.store(now(), Ordering::Relaxed);
+                continue;
+            };
+            match lane {
+                RequestDeliveryLane::Authentication => {
                     ingest_auth_envelope(&state, raw, ack).await?;
                     state.consumer_last_ok.store(now(), Ordering::Relaxed);
                     continue;
                 }
-                Some(message_type) => {
-                    warn!(%message_type, "terminating envelope of an unknown type");
-                    ack(Ack::Term).await?;
+                RequestDeliveryLane::Tool => {
+                    ingest_tool_envelope(&state, raw, ack).await?;
                     state.consumer_last_ok.store(now(), Ordering::Relaxed);
                     continue;
                 }
+                RequestDeliveryLane::Command => {}
             }
             let envelope = match serde_json::from_slice::<RequestEnvelopeV1>(raw) {
                 Ok(value) => value,
@@ -463,6 +498,35 @@ async fn request_consumer(state: AppState) -> Result<()> {
 /// anything decides how to parse the rest of it. `None` covers both an
 /// untagged legacy envelope and a payload that is not JSON at all; the
 /// command decode is what reports the latter, as it always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestDeliveryLane {
+    Command,
+    Authentication,
+    Tool,
+}
+
+fn request_delivery_lane(subject: &str, raw: &[u8]) -> Option<RequestDeliveryLane> {
+    let message_type = envelope_type(raw);
+    if subject
+        .strip_prefix("oshioki.request.")
+        .is_some_and(|host| !host.is_empty())
+        && message_type.is_none()
+    {
+        return Some(RequestDeliveryLane::Command);
+    }
+    if subject
+        .strip_prefix("oshioki.auth.")
+        .is_some_and(|host| !host.is_empty())
+        && message_type.as_deref() == Some(AUTH_ENVELOPE_TYPE)
+    {
+        return Some(RequestDeliveryLane::Authentication);
+    }
+    if subject == TOOL_APPROVAL_SUBJECT && message_type.as_deref() == Some(TOOL_ENVELOPE_TYPE) {
+        return Some(RequestDeliveryLane::Tool);
+    }
+    None
+}
+
 fn envelope_type(raw: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct EnvelopeTypeV1 {
@@ -504,6 +568,38 @@ async fn ingest_auth_envelope(
         }
         Err(error) => {
             warn!(%error, "terminating invalid or expired authentication request");
+            ack(Ack::Term).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ingest_tool_envelope(
+    state: &AppState,
+    raw: &[u8],
+    ack: oshioki_transport::AckFn,
+) -> Result<()> {
+    let envelope = match serde_json::from_slice::<ToolApprovalEnvelopeV1>(raw) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(%error, "terminating malformed tool approval envelope");
+            ack(Ack::Term).await?;
+            return Ok(());
+        }
+    };
+    match state.store.ingest_tool_request(raw, &envelope, now()) {
+        Ok(result @ (InsertResult::Inserted | InsertResult::Identical)) => {
+            if result == InsertResult::Inserted {
+                queue_tool_notification(state, &envelope.request_id)?;
+            }
+            ack(Ack::Ok).await?;
+        }
+        Ok(InsertResult::Conflict) => {
+            warn!(request_id=%envelope.request_id, "terminating conflicting tool request id reuse");
+            ack(Ack::Term).await?;
+        }
+        Err(error) => {
+            warn!(%error, "terminating invalid or expired tool approval request");
             ack(Ack::Term).await?;
         }
     }
@@ -760,7 +856,7 @@ async fn push_worker(state: AppState) {
 }
 
 async fn send_push(state: &AppState, item: &db::PushItem) -> Result<PushDeliveryResult> {
-    if !matches!(item.request_kind.as_str(), "request" | "auth")
+    if !matches!(item.request_kind.as_str(), "request" | "auth" | "tool")
         || item.request_id.is_empty()
         || !(1..=db::PUSH_MAX_ATTEMPTS).contains(&item.attempts)
     {
@@ -984,8 +1080,25 @@ fn queue_auth_notification(state: &AppState, envelope: &AuthEnvelopeV1) -> Resul
         .queue_notification(&envelope.request_id, endpoint, &payload)
 }
 
+fn queue_tool_notification(state: &AppState, request_id: &str) -> Result<()> {
+    let Some(endpoint) = &state.ntfy_url else {
+        return Ok(());
+    };
+    let payload = serde_json::to_vec(&json!({
+        "title": "Tool permission request",
+        "message": format!("Review tool request ({request_id})"),
+        "click": format!("{}/t/{request_id}", state.origin),
+    }))?;
+    state
+        .store
+        .queue_notification(request_id, endpoint, &payload)
+}
+
 async fn request_page(Path(_id): Path<String>) -> Response {
     html(include_str!("../web/request.html"))
+}
+async fn tool_approval_page(Path(_id): Path<String>) -> Response {
+    html(include_str!("../web/tool-approval.html"))
 }
 /// The authentication lane has its own page at its own path. Keeping it off
 /// `/r/:id` is the simplest thing that leaves every existing request page
@@ -1008,6 +1121,13 @@ async fn manifest() -> Response {
     )
 }
 async fn service_worker() -> Response {
+    asset(
+        "application/javascript",
+        include_bytes!("../web/service-worker.js"),
+        false,
+    )
+}
+async fn tool_service_worker() -> Response {
     asset(
         "application/javascript",
         include_bytes!("../web/service-worker.js"),
@@ -1121,6 +1241,16 @@ async fn app_js() -> Response {
         false,
     )
 }
+async fn tool_approval_js() -> Response {
+    asset(
+        "application/javascript",
+        include_bytes!("../web/app.js"),
+        false,
+    )
+}
+async fn capabilities() -> Json<serde_json::Value> {
+    Json(json!({"tool_approval_version": 1}))
+}
 async fn app_css() -> Response {
     asset("text/css", include_bytes!("../web/app.css"), false)
 }
@@ -1171,6 +1301,110 @@ async fn get_request(
         sealed,
         expires_at: request.expires_at,
     }))
+}
+
+async fn get_tool_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ToolRequestResponse>, ApiError> {
+    require_pending_tool(&state, &id)?;
+    let token = bearer_token(&headers)?;
+    let request = state
+        .store
+        .sealed_tool_request_for_token(&id, token.as_bytes(), now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let sealed = serde_json::from_str(&request.body_json)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(Json(ToolRequestResponse {
+        sealed,
+        expires_at: request.expires_at,
+    }))
+}
+
+async fn acknowledge_tool_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(acknowledgement): Json<ToolAcknowledgementV1>,
+) -> Result<StatusCode, ApiError> {
+    acknowledgement
+        .validate(&id)
+        .map_err(|_| ApiError(StatusCode::CONFLICT))?;
+    require_pending_tool(&state, &id)?;
+    let token = bearer_token(&headers)?;
+    state
+        .store
+        .sealed_tool_request_for_token(&id, token.as_bytes(), now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let payload = serde_json::to_vec(&acknowledgement)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+    state
+        .transport
+        .publish(format!("oshioki.tool.ack.{id}"), payload)
+        .await
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE))?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn submit_tool_decision(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(submission): Json<ToolDecisionSubmission>,
+) -> Result<StatusCode, ApiError> {
+    submission
+        .decision
+        .validate_shape()
+        .map_err(|_| ApiError(StatusCode::CONFLICT))?;
+    if submission.decision.request_id() != id {
+        return Err(ApiError(StatusCode::CONFLICT));
+    }
+    require_pending_tool(&state, &id)?;
+    let token = bearer_token(&headers)?;
+    let sealed = state
+        .store
+        .sealed_tool_request_for_token(&id, token.as_bytes(), now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let sealed: ToolSealedBodyV1 = serde_json::from_str(&sealed.body_json)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+    if sealed.device_fingerprint != submission.decision.device_fingerprint() {
+        return Err(ApiError(StatusCode::UNAUTHORIZED));
+    }
+    let device = state
+        .store
+        .active_device(&sealed.device_fingerprint)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+    let config = oshioki_protocol::HookConfigV1 {
+        version: 1,
+        origin: state.origin.as_str().to_owned(),
+        rp_id: state.rp_id.as_str().to_owned(),
+        server_base_url: state.origin.as_str().to_owned(),
+    };
+    verify_tool_decision_v1(
+        &submission.decision,
+        submission.request_json.as_bytes(),
+        &device,
+        &config,
+        now(),
+    )
+    .map_err(|_| ApiError(StatusCode::CONFLICT))?;
+    match state.store.queue_tool_decision(
+        &id,
+        &sealed.device_fingerprint,
+        &submission.decision,
+        now(),
+    ) {
+        Ok(InsertResult::Inserted | InsertResult::Identical) => Ok(StatusCode::ACCEPTED),
+        Ok(InsertResult::Conflict) => Err(ApiError(StatusCode::GONE)),
+        Err(error) if error.to_string().contains("expired") => Err(ApiError(StatusCode::GONE)),
+        Err(error) if error.to_string().contains("unknown") => Err(ApiError(StatusCode::NOT_FOUND)),
+        Err(_) => Err(ApiError(StatusCode::CONFLICT)),
+    }
 }
 
 async fn approve_request(
@@ -1260,6 +1494,18 @@ fn require_pending(state: &AppState, id: &str) -> Result<(), ApiError> {
     match state
         .store
         .request_lifecycle(id, now())
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
+    {
+        Some(RequestLifecycle::Pending) => Ok(()),
+        Some(RequestLifecycle::Gone) => Err(ApiError(StatusCode::GONE)),
+        None => Err(ApiError(StatusCode::NOT_FOUND)),
+    }
+}
+
+fn require_pending_tool(state: &AppState, id: &str) -> Result<(), ApiError> {
+    match state
+        .store
+        .tool_request_lifecycle(id, now())
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?
     {
         Some(RequestLifecycle::Pending) => Ok(()),
@@ -1701,6 +1947,7 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oshioki_protocol::ToolApprovalRequestV1;
     use sha2::Digest as _;
     use tower::util::ServiceExt as _;
 
@@ -1846,6 +2093,42 @@ mod tests {
             .unwrap();
         assert!(csp.contains("default-src 'none'"));
         assert!(csp.contains("manifest-src 'self'"));
+    }
+
+    #[tokio::test]
+    async fn tool_approval_advertises_versioned_browser_contract() {
+        let Json(capabilities) = capabilities().await;
+        assert_eq!(capabilities["tool_approval_version"], 1);
+
+        let page = tool_approval_page(Path("tool-1".into())).await;
+        let body = axum::body::to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page = String::from_utf8(body.to_vec()).unwrap();
+        assert!(page.contains("/assets/tool-approval-v1.js"));
+        assert!(page.contains("Exact native permission request (signed JSON)"));
+        assert!(page.contains("Approve once"));
+        assert!(page.contains("Deny"));
+
+        let script_response = app_js().await;
+        let script = axum::body::to_bytes(script_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let script = String::from_utf8(script.to_vec()).unwrap();
+        assert!(script.contains(r"oshioki/tool-approval/approve/v1\0"));
+        assert!(script.contains(r"oshioki/tool-approval/deny/v1\0"));
+        assert!(
+            script
+                .contains("getElementById(\"tool-input\").textContent = request.native_event_json")
+        );
+        assert!(!script.contains("getElementById(\"tool-input\").innerHTML"));
+
+        let worker_response = tool_service_worker().await;
+        let worker = axum::body::to_bytes(worker_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let worker = String::from_utf8(worker.to_vec()).unwrap();
+        assert!(worker.contains("\"tool\""));
     }
 
     #[tokio::test]
@@ -2568,21 +2851,25 @@ mod tests {
         // Oversized envelopes are terminated on length alone, before any
         // parse: a redelivery would only cost the same bytes again.
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: vec![b'x'; oshioki_protocol::v1::MAX_ENVELOPE_BYTES + 1],
             on_term: Some(term_tx.clone()),
             on_ack: None,
         });
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: b"not json".to_vec(),
             on_term: Some(term_tx.clone()),
             on_ack: None,
         });
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: valid_raw.clone(),
             on_term: None,
             on_ack: Some(ack_tx),
         });
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: conflict_raw,
             on_term: Some(term_tx),
             on_ack: None,
@@ -2683,6 +2970,123 @@ mod tests {
                 nonce: oshioki_protocol::encode_base64url(&[5; 12]),
                 ciphertext: oshioki_protocol::encode_base64url(&[6; 32]),
             }],
+        }
+    }
+
+    fn tool_envelope(id: &str, fingerprint: &str) -> ToolApprovalEnvelopeV1 {
+        let issued_at = now() - 1;
+        ToolApprovalEnvelopeV1 {
+            message_type: TOOL_ENVELOPE_TYPE.into(),
+            version: oshioki_protocol::TOOL_WIRE_VERSION,
+            request_id: id.into(),
+            issued_at,
+            expires_at: issued_at + 90,
+            sealed: vec![ToolSealedBodyV1 {
+                device_fingerprint: fingerprint.to_owned(),
+                ephemeral_pub: oshioki_protocol::encode_base64url(&[4; 32]),
+                nonce: oshioki_protocol::encode_base64url(&[5; 12]),
+                ciphertext: oshioki_protocol::encode_base64url(&[6; 32]),
+            }],
+        }
+    }
+
+    fn tool_request(id: &str) -> (Vec<u8>, ToolApprovalRequestV1) {
+        let request_now = now();
+        let tool_input = json!({"command":"printf safe","description":"Print a short string"});
+        let native_event_json = serde_json::to_string(&json!({
+            "hook_event_name":"PermissionRequest",
+            "tool_name":"Bash",
+            "tool_input":tool_input.clone(),
+            "cwd":"/tmp/project",
+            "session_id":"session-1",
+            "turn_id":"turn-1",
+        }))
+        .unwrap();
+        let request = ToolApprovalRequestV1 {
+            message_type: oshioki_protocol::TOOL_REQUEST_TYPE.into(),
+            version: oshioki_protocol::TOOL_WIRE_VERSION,
+            request_id: id.into(),
+            nonce: oshioki_protocol::encode_base64url(&[6; 16]),
+            harness: oshioki_protocol::ToolHarnessV1::Codex,
+            event: "PermissionRequest".into(),
+            tool_name: "Bash".into(),
+            tool_input,
+            cwd: "/tmp/project".into(),
+            native_event_json,
+            context: oshioki_protocol::ToolContextV1 {
+                session_id: Some("session-1".into()),
+                turn_id: Some("turn-1".into()),
+                ..Default::default()
+            },
+            description: None,
+            issued_at: request_now - 1,
+            expires_at: request_now + 89,
+        };
+        let raw = serde_json::to_vec(&request).unwrap();
+        (raw, request)
+    }
+
+    fn seed_parallel_tool_and_command(
+        state: &AppState,
+        id: &str,
+        device: &oshioki_protocol::DevicePublicRecordV1,
+    ) -> ToolApprovalEnvelopeV1 {
+        let command = command_envelope(id, &device.fingerprint);
+        let command_raw = serde_json::to_vec(&command).unwrap();
+        assert_eq!(
+            state
+                .store
+                .ingest_request(&command_raw, &command, now())
+                .unwrap(),
+            InsertResult::Inserted
+        );
+        let envelope = tool_envelope(id, &device.fingerprint);
+        let envelope_raw = serde_json::to_vec(&envelope).unwrap();
+        assert_eq!(
+            state
+                .store
+                .ingest_tool_request(&envelope_raw, &envelope, now())
+                .unwrap(),
+            InsertResult::Inserted
+        );
+        envelope
+    }
+
+    fn signed_tool_decision(
+        request: &ToolApprovalRequestV1,
+        raw: &[u8],
+        device: &oshioki_protocol::DevicePublicRecordV1,
+        action: oshioki_protocol::ToolDecisionActionV1,
+    ) -> ToolApprovalDecisionV1 {
+        use p256::ecdsa::{SigningKey, signature::Signer as _};
+        let signing = SigningKey::from_bytes((&[2; 32]).into()).unwrap();
+        let challenge = oshioki_protocol::tool_approval_challenge(action, raw);
+        let client_data = serde_json::to_vec(&json!({
+            "type":"webauthn.get",
+            "challenge":oshioki_protocol::v1::encode_base64url(&challenge),
+            "origin":"https://sudo.test",
+            "crossOrigin":false,
+        }))
+        .unwrap();
+        let mut authenticator_data = sha2::Sha256::digest(b"sudo.test").to_vec();
+        authenticator_data.extend_from_slice(&[0x05, 0, 0, 0, 1]);
+        let mut signed = authenticator_data.clone();
+        signed.extend_from_slice(&sha2::Sha256::digest(&client_data));
+        let signature: p256::ecdsa::Signature = signing.sign(&signed);
+        let assertion = oshioki_protocol::ToolApprovalWebauthnV1 {
+            version: oshioki_protocol::TOOL_WIRE_VERSION,
+            request_id: request.request_id.clone(),
+            device_fingerprint: device.fingerprint.clone(),
+            credential_id: device.credential_id.clone(),
+            authenticator_data: oshioki_protocol::v1::encode_base64url(&authenticator_data),
+            client_data_json: oshioki_protocol::v1::encode_base64url(&client_data),
+            signature: oshioki_protocol::v1::encode_base64url(signature.to_der().as_bytes()),
+        };
+        match action {
+            oshioki_protocol::ToolDecisionActionV1::Approve => {
+                ToolApprovalDecisionV1::Approve(assertion)
+            }
+            oshioki_protocol::ToolDecisionActionV1::Deny => ToolApprovalDecisionV1::Deny(assertion),
         }
     }
 
@@ -2823,9 +3227,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The durable consumer decides the lane from the envelope, not the
-    /// subject: a command envelope and an authentication envelope both
-    /// store and Ack, each in its own table.
+    #[tokio::test]
+    async fn tool_request_serving_and_ack_use_the_tool_lane() {
+        let (dir, state, transport, token) = auth_test_state("tool-serving-ack");
+        let device = test_device();
+        let id = "tool-shared-lane";
+        let envelope = seed_parallel_tool_and_command(&state, id, &device);
+        let Json(served) = get_tool_request(State(state.clone()), Path(id.into()), bearer(&token))
+            .await
+            .unwrap();
+        assert_eq!(served.sealed.device_fingerprint, device.fingerprint);
+        assert_eq!(served.expires_at, envelope.expires_at);
+
+        let acknowledgement = ToolAcknowledgementV1::for_request(id);
+        assert_eq!(
+            acknowledge_tool_request(
+                State(state.clone()),
+                Path(id.into()),
+                bearer(&token),
+                Json(acknowledgement.clone()),
+            )
+            .await
+            .unwrap(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            transport.published(),
+            vec![(
+                format!("oshioki.tool.ack.{id}"),
+                serde_json::to_vec(&acknowledgement).unwrap(),
+            )]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn tool_request_requires_a_signed_terminal_choice_and_stays_in_its_lane() {
+        let (dir, state, _transport, token) = auth_test_state("tool-signed-decision");
+        let device = test_device();
+        let id = "tool-shared-lane";
+        seed_parallel_tool_and_command(&state, id, &device);
+        let (request_raw, request) = tool_request(id);
+        let deny = signed_tool_decision(
+            &request,
+            &request_raw,
+            &device,
+            oshioki_protocol::ToolDecisionActionV1::Deny,
+        );
+        let mut invalid = deny.clone();
+        match &mut invalid {
+            ToolApprovalDecisionV1::Approve(value) | ToolApprovalDecisionV1::Deny(value) => {
+                value.signature = oshioki_protocol::encode_base64url(&[9; 64]);
+            }
+        }
+        let submission = || ToolDecisionSubmission {
+            request_json: String::from_utf8(request_raw.clone()).unwrap(),
+            decision: invalid.clone(),
+        };
+        assert_eq!(
+            submit_tool_decision(
+                State(state.clone()),
+                Path(id.into()),
+                bearer(&token),
+                Json(submission()),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+
+        assert_eq!(
+            submit_tool_decision(
+                State(state.clone()),
+                Path(id.into()),
+                bearer(&token),
+                Json(ToolDecisionSubmission {
+                    request_json: String::from_utf8(request_raw.clone()).unwrap(),
+                    decision: deny.clone(),
+                }),
+            )
+            .await
+            .unwrap(),
+            StatusCode::ACCEPTED
+        );
+        let queued = state
+            .store
+            .pending_verdicts(8)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.subject == format!("oshioki.tool.verdict.{id}"))
+            .expect("signed tool denial is queued on its own subject");
+        assert_eq!(
+            serde_json::from_slice::<ToolApprovalDecisionV1>(&queued.payload).unwrap(),
+            deny
+        );
+        assert!(state.store.recorded_verdict(id).unwrap().is_none());
+        assert_eq!(
+            state.store.request_lifecycle(id, now()).unwrap(),
+            Some(RequestLifecycle::Pending),
+            "tool decision must not consume the command lane's same-ID request"
+        );
+
+        let allow = signed_tool_decision(
+            &request,
+            &request_raw,
+            &device,
+            oshioki_protocol::ToolDecisionActionV1::Approve,
+        );
+        assert_eq!(
+            submit_tool_decision(
+                State(state),
+                Path(id.into()),
+                bearer(&token),
+                Json(ToolDecisionSubmission {
+                    request_json: String::from_utf8(request_raw).unwrap(),
+                    decision: allow,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::GONE,
+            "the first verified terminal decision wins"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The durable consumer checks both subject and envelope type: command
+    /// and authentication envelopes store and Ack only in their own lanes.
     #[tokio::test]
     async fn the_consumer_stores_each_envelope_in_its_own_lane() {
         async fn wait_for(rx: &std::sync::mpsc::Receiver<()>, what: &str) {
@@ -2852,41 +3382,17 @@ mod tests {
         let transport = oshioki_transport::MockTransport::new();
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         let (auth_tx, auth_rx) = std::sync::mpsc::channel();
-        let (term_tx, term_rx) = std::sync::mpsc::channel();
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
             payload: serde_json::to_vec(&command_envelope("cmd-1", &device.fingerprint)).unwrap(),
             on_term: None,
             on_ack: Some(command_tx),
         });
         transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.auth.nas".into(),
             payload: serde_json::to_vec(&auth_envelope("auth-1", &device.fingerprint)).unwrap(),
             on_term: None,
             on_ack: Some(auth_tx),
-        });
-        // An authentication envelope that does not decode is terminated, not
-        // retried forever and not fed to the command decoder.
-        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
-            payload: serde_json::to_vec(&serde_json::json!({
-                "type": AUTH_ENVELOPE_TYPE,
-                "version": 2,
-                "request_id": "auth-broken",
-            }))
-            .unwrap(),
-            on_term: Some(term_tx),
-            on_ack: None,
-        });
-        // A type this build does not implement is terminated as well. It
-        // must never reach the command decoder: a tagged envelope that
-        // happens to carry the command lane's fields would otherwise be
-        // stored as a command approval request.
-        let (unknown_tx, unknown_rx) = std::sync::mpsc::channel();
-        let mut disguised =
-            serde_json::to_value(command_envelope("cmd-disguised", &device.fingerprint)).unwrap();
-        disguised["type"] = serde_json::json!("sudo_something_else");
-        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
-            payload: serde_json::to_vec(&disguised).unwrap(),
-            on_term: Some(unknown_tx),
-            on_ack: None,
         });
         let state = AppState {
             store: Arc::clone(&store),
@@ -2904,8 +3410,6 @@ mod tests {
         let worker = tokio::spawn(request_consumer(state));
         wait_for(&command_rx, "command envelope ack").await;
         wait_for(&auth_rx, "authentication envelope ack").await;
-        wait_for(&term_rx, "malformed authentication envelope term").await;
-        wait_for(&unknown_rx, "unknown envelope type term").await;
         worker.abort();
         assert!(store.request_lifecycle("cmd-1", now()).unwrap().is_some());
         assert!(
@@ -2921,20 +3425,149 @@ mod tests {
                 .is_some()
         );
         assert!(store.request_lifecycle("auth-1", now()).unwrap().is_none());
-        // The disguised envelope was stored by neither lane.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn malformed_auth_and_unknown_request_types_are_terminated() {
+        let (dir, state, transport, _token) = auth_test_state("malformed-request-types");
+        let device = test_device();
+        let (term_tx, term_rx) = std::sync::mpsc::channel();
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.auth.nas".into(),
+            payload: serde_json::to_vec(&serde_json::json!({
+                "type": AUTH_ENVELOPE_TYPE,
+                "version": 2,
+                "request_id": "auth-broken",
+            }))
+            .unwrap(),
+            on_term: Some(term_tx.clone()),
+            on_ack: None,
+        });
+        let mut disguised =
+            serde_json::to_value(command_envelope("cmd-disguised", &device.fingerprint)).unwrap();
+        disguised["type"] = serde_json::json!("sudo_something_else");
+        transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+            subject: "oshioki.request.nas".into(),
+            payload: serde_json::to_vec(&disguised).unwrap(),
+            on_term: Some(term_tx),
+            on_ack: None,
+        });
+
+        let worker = tokio::spawn(request_consumer(state.clone()));
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if term_rx.try_recv().is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("invalid request type was not terminated");
+        }
+        worker.abort();
         assert!(
-            store
+            state
+                .store
+                .auth_request_lifecycle("auth-broken", now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .store
                 .request_lifecycle("cmd-disguised", now())
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            store
-                .auth_request_lifecycle("cmd-disguised", now())
-                .unwrap()
-                .is_none()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn request_subject_and_envelope_type_mismatches_have_no_lane_side_effects() {
+        async fn wait_for(rx: &std::sync::mpsc::Receiver<()>) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if rx.try_recv().is_ok() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("mismatched delivery was not terminated");
+        }
+
+        let (dir, state, transport, _token) = auth_test_state("subject-type-mismatches");
+        let device = test_device();
+        let command =
+            |id: &str| serde_json::to_vec(&command_envelope(id, &device.fingerprint)).unwrap();
+        let authentication =
+            |id: &str| serde_json::to_vec(&auth_envelope(id, &device.fingerprint)).unwrap();
+        let tool = |id: &str| serde_json::to_vec(&tool_envelope(id, &device.fingerprint)).unwrap();
+        let mismatches = [
+            ("oshioki.auth.nas", "cmd-on-auth", command("cmd-on-auth")),
+            (
+                "oshioki.tool.request",
+                "cmd-on-tool",
+                command("cmd-on-tool"),
+            ),
+            (
+                "oshioki.request.nas",
+                "auth-on-command",
+                authentication("auth-on-command"),
+            ),
+            (
+                "oshioki.tool.request",
+                "auth-on-tool",
+                authentication("auth-on-tool"),
+            ),
+            (
+                "oshioki.request.nas",
+                "tool-on-command",
+                tool("tool-on-command"),
+            ),
+            ("oshioki.auth.nas", "tool-on-auth", tool("tool-on-auth")),
+        ];
+        let (term_tx, term_rx) = std::sync::mpsc::channel();
+        for (subject, _, payload) in &mismatches {
+            transport.push_request(oshioki_transport::mock::JetStreamMessageStub {
+                subject: (*subject).into(),
+                payload: payload.clone(),
+                on_term: Some(term_tx.clone()),
+                on_ack: None,
+            });
+        }
+
+        let worker = tokio::spawn(request_consumer(state.clone()));
+        for _ in &mismatches {
+            wait_for(&term_rx).await;
+        }
+        worker.abort();
+
+        for (_, id, _) in &mismatches {
+            assert!(state.store.request_lifecycle(id, now()).unwrap().is_none());
+            assert!(
+                state
+                    .store
+                    .auth_request_lifecycle(id, now())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                state
+                    .store
+                    .tool_request_lifecycle(id, now())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(state.store.pending_verdicts(32).unwrap().is_empty());
+        assert!(state.store.pending_notifications(32).unwrap().is_empty());
+        assert!(state.store.claim_push(now(), 30).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Neither lane answers for the other. A command approval or denial

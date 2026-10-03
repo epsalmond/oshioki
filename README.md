@@ -47,6 +47,7 @@ See [installation](docs/install.md) for source builds and host activation.
 | Approve sudo on this Mac | [Local sudo](docs/local-sudo.md) |
 | Approve a server or VM's sudo from my Mac | [Remote sudo](docs/remote-sudo.md) |
 | Approve sudo from my phone | [Phone enrollment](docs/phone-enrollment.md) |
+| Approve Codex or Claude Code permission prompts from a browser | [Harness approvals](docs/harness-approvals.md) |
 | Approve a Google CLI login with Touch ID, locally or remotely | [Browser ceremonies](docs/browser-ceremony-relay.md) |
 | Update an existing installation | [Update and restore](docs/update.md) |
 | Build, change, or test Oshioki | [Contributing](CONTRIBUTING.md) |

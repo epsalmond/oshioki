@@ -6,14 +6,15 @@ const SAFE_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 function pushPayload(value) {
   if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== PUSH_VERSION) return null;
-  if ((value.lane !== "request" && value.lane !== "auth") || typeof value.request_id !== "string") return null;
+  if (!(["request", "auth", "tool"].includes(value.lane)) || typeof value.request_id !== "string") return null;
   if (value.request_id.length === 0 || value.request_id.length > MAX_REQUEST_ID || !SAFE_REQUEST_ID.test(value.request_id)) return null;
   return { version: PUSH_VERSION, lane: value.lane, request_id: value.request_id };
 }
 function notificationTarget(value, origin = self.location.origin) {
   const payload = pushPayload(value);
   if (!payload) return null;
-  return new URL(`/${payload.lane === "request" ? "r" : "a"}/${payload.request_id}`, origin).href;
+  const path = payload.lane === "request" ? "r" : payload.lane === "auth" ? "a" : "t";
+  return new URL(`/${path}/${payload.request_id}`, origin).href;
 }
 function notificationTag(value) {
   const payload = pushPayload(value);
@@ -24,7 +25,11 @@ self.addEventListener("push", event => {
   let payload;
   try { payload = pushPayload(event.data?.json()); } catch { payload = null; }
   if (!payload) return;
-  const body = payload.lane === "request" ? "A sudo approval needs your attention." : "Sudo authentication needs your attention.";
+  const body = payload.lane === "request"
+    ? "A sudo approval needs your attention."
+    : payload.lane === "auth"
+      ? "Sudo authentication needs your attention."
+      : "A tool permission request needs your attention.";
   event.waitUntil(self.registration.showNotification("Oshioki", {
     body,
     tag: notificationTag(payload),

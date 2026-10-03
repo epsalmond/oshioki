@@ -12,7 +12,8 @@ brew install epsalmond/oshioki/oshioki
 ```
 
 Next, choose [local sudo](local-sudo.md), [remote sudo](remote-sudo.md),
-[phone approval](phone-enrollment.md), or [Google login](browser-ceremony-relay.md).
+[phone approval](phone-enrollment.md), [Codex or Claude Code browser
+approvals](harness-approvals.md), or [Google login](browser-ceremony-relay.md).
 
 Run setup helpers as your logged-in user. They request sudo when needed.
 Mac identity creation and Touch ID require a graphical login session with an

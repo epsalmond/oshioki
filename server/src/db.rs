@@ -7,9 +7,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use oshioki_protocol::{
     AuthDecisionV1, AuthEnvelopeV1, DecisionV1, DeliveryV1, DeviceKindV1, DevicePublicRecordV1,
-    EnrollmentStatusV1, EnrollmentSubmissionV1, RequestEnvelopeV1, native_credential_id,
+    EnrollmentStatusV1, EnrollmentSubmissionV1, RequestEnvelopeV1, ToolApprovalDecisionV1,
+    ToolApprovalEnvelopeV1, ToolDeliveryV1, native_credential_id,
 };
-use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -26,7 +27,7 @@ pub const PUSH_LEASE_SECS: i64 = 30;
 pub const PUSH_DISABLED_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 /// Schema version this binary writes after migrate. Older files snapshot,
 /// then move forward; newer files refuse to open. See `docs/compatibility.md`.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Store {
     connection: Mutex<Connection>,
@@ -41,6 +42,12 @@ pub enum InsertResult {
 
 #[derive(Debug)]
 pub struct SealedRequest {
+    pub body_json: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug)]
+pub struct SealedToolRequest {
     pub body_json: String,
     pub expires_at: i64,
 }
@@ -113,20 +120,26 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         match version {
-            0..=2 => {
+            0..=3 => {
                 create_verified_restore_snapshot(&connection, path, version)?;
                 match version {
                     0 => {
                         connection.execute_batch(MIGRATION_V1)?;
                         connection.execute_batch(MIGRATION_V2)?;
                         connection.execute_batch(MIGRATION_V3)?;
+                        connection.execute_batch(MIGRATION_V4)?;
                     }
                     1 => {
                         connection.execute_batch(MIGRATION_V2)?;
                         connection.execute_batch(MIGRATION_V3)?;
+                        connection.execute_batch(MIGRATION_V4)?;
                     }
-                    2 => connection.execute_batch(MIGRATION_V3)?,
-                    _ => unreachable!("matched 0|1|2"),
+                    2 => {
+                        connection.execute_batch(MIGRATION_V3)?;
+                        connection.execute_batch(MIGRATION_V4)?;
+                    }
+                    3 => connection.execute_batch(MIGRATION_V4)?,
+                    _ => unreachable!("matched 0|1|2|3"),
                 }
             }
             SCHEMA_VERSION => {}
@@ -144,6 +157,7 @@ impl Store {
         connection.execute_batch(MIGRATION_V1)?;
         connection.execute_batch(MIGRATION_V2)?;
         connection.execute_batch(MIGRATION_V3)?;
+        connection.execute_batch(MIGRATION_V4)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -509,6 +523,29 @@ impl Store {
     }
 }
 
+fn abandon_ineligible_pushes(transaction: &Transaction<'_>, now: i64) -> Result<()> {
+    transaction.execute(
+        "UPDATE push_outbox SET abandoned_at=?1, claim_token=NULL, claimed_until=NULL,
+         last_error='attempt_limit' WHERE sent_at IS NULL AND abandoned_at IS NULL
+         AND attempts>=?2 AND (claimed_until IS NULL OR claimed_until<=?1)",
+        params![now, PUSH_MAX_ATTEMPTS],
+    )?;
+    transaction.execute(
+        "UPDATE push_outbox SET abandoned_at=?1 WHERE sent_at IS NULL AND abandoned_at IS NULL
+         AND ((request_kind='request' AND NOT EXISTS
+              (SELECT 1 FROM requests r WHERE r.id=push_outbox.request_id AND r.state='pending' AND r.expires_at>?1))
+           OR (request_kind='auth' AND NOT EXISTS
+              (SELECT 1 FROM auth_requests a WHERE a.id=push_outbox.request_id AND a.state='pending' AND a.expires_at>?1))
+           OR (request_kind='tool' AND NOT EXISTS
+              (SELECT 1 FROM tool_requests t WHERE t.id=push_outbox.request_id AND t.state='pending' AND t.expires_at>?1))
+           OR NOT EXISTS (SELECT 1 FROM devices d JOIN push_subscriptions s ON s.device_fingerprint=d.fingerprint
+                          WHERE s.id=push_outbox.subscription_id AND d.active=1 AND s.disabled_at IS NULL
+                            AND (s.expiration_at IS NULL OR s.expiration_at>?1)))",
+        [now],
+    )?;
+    Ok(())
+}
+
 /// Whether an activation names the device its enrollment submitted. The
 /// server never sees the enrollment secret, so it cannot re-verify the
 /// submission's proof the way the hook does; what it can do is refuse an
@@ -707,6 +744,219 @@ impl Store {
         }
         transaction.commit()?;
         Ok(InsertResult::Inserted)
+    }
+
+    /// Stores an encrypted tool approval request in its isolated lane. It
+    /// only routes to active `WebAuthn` devices, and keeps the envelope and
+    /// first terminal decision in separate tables from sudo and auth.
+    pub fn ingest_tool_request(
+        &self,
+        raw: &[u8],
+        envelope: &ToolApprovalEnvelopeV1,
+        now: i64,
+    ) -> Result<InsertResult> {
+        if raw.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
+            bail!("oversized tool approval envelope");
+        }
+        envelope
+            .validate_at(now)
+            .context("validate tool approval envelope")?;
+        let hash = Sha256::digest(raw).to_vec();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old_hash = transaction
+            .query_row(
+                "SELECT envelope_hash FROM tool_requests WHERE id=?1",
+                [&envelope.request_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        if let Some(old_hash) = old_hash {
+            if old_hash == hash {
+                return Ok(InsertResult::Identical);
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO tombstones(kind, object_id, payload_hash, expires_at) VALUES ('tool_request_conflict', ?1, ?2, ?3)",
+                params![envelope.request_id, hash, envelope.expires_at.min(now.saturating_add(SERVER_REQUEST_RETENTION_SECS))],
+            )?;
+            transaction.commit()?;
+            return Ok(InsertResult::Conflict);
+        }
+        transaction.execute(
+            "INSERT INTO tool_requests(id, envelope_hash, envelope_json, issued_at, expires_at, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+            params![envelope.request_id, hash, raw, envelope.issued_at, envelope.expires_at, now],
+        )?;
+        for body in &envelope.sealed {
+            transaction.execute(
+                "INSERT INTO tool_sealed_bodies(request_id, fingerprint, body_json) VALUES (?1, ?2, ?3)",
+                params![envelope.request_id, body.device_fingerprint, serde_json::to_vec(body)?],
+            )?;
+        }
+        let browser_count = transaction.query_row(
+            "SELECT COUNT(*) FROM tool_sealed_bodies b
+             JOIN devices d ON d.fingerprint=b.fingerprint
+             WHERE b.request_id=?1 AND d.active=1
+               AND COALESCE(json_extract(d.public_record_json, '$.kind'), 'webauthn')='webauthn'",
+            [&envelope.request_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if usize::try_from(browser_count).ok() != Some(envelope.sealed.len()) {
+            bail!("tool approval recipients must all be active WebAuthn devices");
+        }
+        let push_payload = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "lane": "tool",
+            "request_id": envelope.request_id,
+        }))?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO push_outbox
+             (request_kind, request_id, subscription_id, payload, created_at, available_at)
+             SELECT 'tool', ?1, p.id, ?2, ?3, ?3
+             FROM push_subscriptions p
+             JOIN devices d ON d.fingerprint=p.device_fingerprint
+             JOIN tool_sealed_bodies b ON b.fingerprint=d.fingerprint AND b.request_id=?1
+             WHERE d.active=1 AND p.disabled_at IS NULL
+               AND COALESCE(json_extract(d.public_record_json, '$.kind'), 'webauthn')='webauthn'
+               AND (p.expiration_at IS NULL OR p.expiration_at>?3)",
+            params![envelope.request_id, push_payload, now],
+        )?;
+        let delivery = serde_json::to_vec(&ToolDeliveryV1::for_request(&envelope.request_id))?;
+        transaction.execute(
+            "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at, expires_at)
+             VALUES ('tool_delivery', ?1, ?2, ?3, ?4, ?5)",
+            params![
+                envelope.request_id,
+                format!("oshioki.tool.delivery.{}", envelope.request_id),
+                delivery,
+                now,
+                envelope.expires_at
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(InsertResult::Inserted)
+    }
+
+    pub fn sealed_tool_request_for_token(
+        &self,
+        request_id: &str,
+        token: &[u8],
+        now: i64,
+    ) -> Result<Option<SealedToolRequest>> {
+        let token_hash = Sha256::digest(token).to_vec();
+        self.lock()?
+            .query_row(
+                "SELECT CAST(b.body_json AS TEXT), r.expires_at FROM tool_requests r
+             JOIN tool_sealed_bodies b ON b.request_id=r.id
+             JOIN devices d ON d.fingerprint=b.fingerprint
+             WHERE r.id=?1 AND r.state='pending' AND r.expires_at>?2 AND d.active=1
+               AND COALESCE(json_extract(d.public_record_json, '$.kind'), 'webauthn')='webauthn'
+               AND d.api_token_hash=?3",
+                params![request_id, now, token_hash],
+                |row| {
+                    Ok(SealedToolRequest {
+                        body_json: row.get(0)?,
+                        expires_at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn queue_tool_decision(
+        &self,
+        request_id: &str,
+        fingerprint: &str,
+        decision: &ToolApprovalDecisionV1,
+        now: i64,
+    ) -> Result<InsertResult> {
+        decision
+            .validate_shape()
+            .context("validate tool decision")?;
+        if decision.request_id() != request_id {
+            bail!("tool decision request id mismatch");
+        }
+        let raw = serde_json::to_vec(decision)?;
+        let hash = Sha256::digest(&raw).to_vec();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = transaction
+            .query_row(
+                "SELECT state, expires_at, decision_hash FROM tool_requests WHERE id=?1",
+                [request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((state, expires_at, old_hash)) = row else {
+            bail!("unknown tool approval request")
+        };
+        if expires_at <= now {
+            bail!("expired tool approval request");
+        }
+        let owns = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM tool_sealed_bodies b JOIN devices d ON d.fingerprint=b.fingerprint
+                 WHERE b.request_id=?1 AND b.fingerprint=?2 AND d.active=1
+                   AND COALESCE(json_extract(d.public_record_json, '$.kind'), 'webauthn')='webauthn'
+             )",
+            params![request_id, fingerprint],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !owns {
+            bail!("device does not own tool approval request");
+        }
+        if state != "pending" {
+            return Ok(if old_hash.as_deref() == Some(hash.as_slice()) {
+                InsertResult::Identical
+            } else {
+                InsertResult::Conflict
+            });
+        }
+        transaction.execute(
+            "UPDATE tool_requests SET state='resolved', decision_hash=?2, resolved_at=?3 WHERE id=?1 AND state='pending'",
+            params![request_id, hash, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at)
+             VALUES ('tool_decision', ?1, ?2, ?3, ?4)",
+            params![
+                request_id,
+                format!("oshioki.tool.verdict.{request_id}"),
+                raw,
+                now
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(InsertResult::Inserted)
+    }
+
+    pub fn tool_request_lifecycle(
+        &self,
+        request_id: &str,
+        now: i64,
+    ) -> Result<Option<RequestLifecycle>> {
+        let row = self
+            .lock()?
+            .query_row(
+                "SELECT state, expires_at FROM tool_requests WHERE id=?1",
+                [request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(state, expiry)| {
+            if state == "pending" && expiry > now {
+                RequestLifecycle::Pending
+            } else {
+                RequestLifecycle::Gone
+            }
+        }))
     }
 
     /// Stores one contextual sudo authentication envelope.
@@ -1076,17 +1326,18 @@ impl Store {
     pub fn claim_push(&self, now: i64, lease_secs: i64) -> Result<Option<PushItem>> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<PushClaimRow> =
-            transaction
-                .query_row(
-                    "SELECT p.id, p.subscription_id, s.endpoint, s.p256dh, s.auth, p.payload,
+        let row: Option<PushClaimRow> = transaction
+            .query_row(
+                "SELECT p.id, p.subscription_id, s.endpoint, s.p256dh, s.auth, p.payload,
                             p.request_kind, p.request_id,
-                            CASE p.request_kind WHEN 'request' THEN r.expires_at ELSE a.expires_at END,
+                            CASE p.request_kind WHEN 'request' THEN r.expires_at
+                                 WHEN 'auth' THEN a.expires_at ELSE t.expires_at END,
                             p.attempts
                      FROM push_outbox p
                      JOIN push_subscriptions s ON s.id=p.subscription_id
                      LEFT JOIN requests r ON p.request_kind='request' AND r.id=p.request_id
                      LEFT JOIN auth_requests a ON p.request_kind='auth' AND a.id=p.request_id
+                     LEFT JOIN tool_requests t ON p.request_kind='tool' AND t.id=p.request_id
                      JOIN devices d ON d.fingerprint=s.device_fingerprint
                      WHERE p.sent_at IS NULL AND p.abandoned_at IS NULL
                        AND p.available_at<=?1
@@ -1095,17 +1346,26 @@ impl Store {
                        AND d.active=1 AND s.disabled_at IS NULL
                        AND (s.expiration_at IS NULL OR s.expiration_at>?1)
                        AND ((p.request_kind='request' AND r.state='pending' AND r.expires_at>?1)
-                            OR (p.request_kind='auth' AND a.state='pending' AND a.expires_at>?1))
+                            OR (p.request_kind='auth' AND a.state='pending' AND a.expires_at>?1)
+                            OR (p.request_kind='tool' AND t.state='pending' AND t.expires_at>?1))
                      ORDER BY p.id LIMIT 1",
-                    params![now, PUSH_MAX_ATTEMPTS],
-                    |row| {
-                        Ok((
-                            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                            row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
-                        ))
-                    },
-                )
-                .optional()?;
+                params![now, PUSH_MAX_ATTEMPTS],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()?;
         let Some((
             id,
             subscription_id,
@@ -1119,23 +1379,7 @@ impl Store {
             attempts,
         )) = row
         else {
-            transaction.execute(
-                "UPDATE push_outbox SET abandoned_at=?1, claim_token=NULL, claimed_until=NULL,
-                 last_error='attempt_limit' WHERE sent_at IS NULL AND abandoned_at IS NULL
-                 AND attempts>=?2 AND (claimed_until IS NULL OR claimed_until<=?1)",
-                params![now, PUSH_MAX_ATTEMPTS],
-            )?;
-            transaction.execute(
-                "UPDATE push_outbox SET abandoned_at=?1 WHERE sent_at IS NULL AND abandoned_at IS NULL
-                 AND ((request_kind='request' AND NOT EXISTS
-                      (SELECT 1 FROM requests r WHERE r.id=push_outbox.request_id AND r.state='pending' AND r.expires_at>?1))
-                   OR (request_kind='auth' AND NOT EXISTS
-                      (SELECT 1 FROM auth_requests a WHERE a.id=push_outbox.request_id AND a.state='pending' AND a.expires_at>?1))
-                   OR NOT EXISTS (SELECT 1 FROM devices d JOIN push_subscriptions s ON s.device_fingerprint=d.fingerprint
-                                  WHERE s.id=push_outbox.subscription_id AND d.active=1 AND s.disabled_at IS NULL
-                                    AND (s.expiration_at IS NULL OR s.expiration_at>?1)))",
-                [now],
-            )?;
+            abandon_ineligible_pushes(&transaction, now)?;
             transaction.commit()?;
             return Ok(None);
         };
@@ -1294,8 +1538,8 @@ impl Store {
 
     /// Drops undelivered rows whose request deadline has passed.
     ///
-    /// Only browser delivery receipts carry a deadline. A receipt says a
-    /// relay committed a request to an enrolled browser while that request
+    /// Browser delivery receipts carry a deadline. A receipt says a relay
+    /// committed a request or tool approval to an enrolled browser while it
     /// could still be answered; past its deadline it says nothing anyone can
     /// act on. The lane drains in id order, so after a NATS outage a backlog
     /// of dead receipts would sit in front of the live request the hook is
@@ -1309,7 +1553,7 @@ impl Store {
     /// refused before it can queue a second one.
     pub fn expire_stale_deliveries(&self, now: i64) -> Result<usize> {
         let dropped = self.lock()?.execute(
-            "DELETE FROM outbox WHERE kind='delivery' AND sent_at IS NULL
+            "DELETE FROM outbox WHERE kind IN ('delivery','tool_delivery') AND sent_at IS NULL
              AND expires_at IS NOT NULL AND expires_at<=?1",
             [now],
         )?;
@@ -1337,6 +1581,10 @@ impl Store {
         )?;
         connection.execute(
             "DELETE FROM auth_requests WHERE created_at < ?1",
+            [now.saturating_sub(SERVER_REQUEST_RETENTION_SECS)],
+        )?;
+        connection.execute(
+            "DELETE FROM tool_requests WHERE created_at < ?1",
             [now.saturating_sub(SERVER_REQUEST_RETENTION_SECS)],
         )?;
         connection.execute("DELETE FROM tombstones WHERE expires_at < ?1", [now])?;
@@ -1596,6 +1844,48 @@ PRAGMA user_version = 3;
 COMMIT;
 ";
 
+/// Adds the phone-only tool lane in separate storage. The push queue's kind
+/// constraint is rebuilt additively so existing request/auth rows survive.
+const MIGRATION_V4: &str = r"
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS tool_requests (
+  id TEXT PRIMARY KEY, envelope_hash BLOB NOT NULL, envelope_json BLOB NOT NULL,
+  issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+  state TEXT NOT NULL, decision_hash BLOB, created_at INTEGER NOT NULL,
+  resolved_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS tool_sealed_bodies (
+  request_id TEXT NOT NULL REFERENCES tool_requests(id) ON DELETE CASCADE,
+  fingerprint TEXT NOT NULL, body_json BLOB NOT NULL,
+  PRIMARY KEY(request_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS tool_requests_expiry_idx ON tool_requests(expires_at);
+CREATE INDEX IF NOT EXISTS tool_requests_created_idx ON tool_requests(created_at);
+ALTER TABLE push_outbox RENAME TO push_outbox_v3;
+CREATE TABLE push_outbox (
+  id INTEGER PRIMARY KEY,
+  request_kind TEXT NOT NULL CHECK(request_kind IN ('request','auth','tool')),
+  request_id TEXT NOT NULL,
+  subscription_id TEXT NOT NULL REFERENCES push_subscriptions(id) ON DELETE CASCADE,
+  payload BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  available_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  sent_at INTEGER,
+  abandoned_at INTEGER,
+  claim_token TEXT,
+  claimed_until INTEGER,
+  last_error TEXT,
+  UNIQUE(request_kind, request_id, subscription_id)
+);
+INSERT INTO push_outbox SELECT * FROM push_outbox_v3;
+DROP TABLE push_outbox_v3;
+CREATE INDEX push_outbox_pending_idx
+  ON push_outbox(sent_at, abandoned_at, available_at, id);
+PRAGMA user_version = 4;
+COMMIT;
+";
+
 const MIGRATION_V2: &str = r"
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS auth_requests (
@@ -1652,7 +1942,8 @@ mod tests {
     use super::*;
     use oshioki_protocol::{
         DenyV1, DeviceKindV1, EnrollmentSubmissionV1, NativeEnrollmentSubmissionV1,
-        SealedDeviceBodyV1, WebauthnEnrollmentSubmissionV1, native_credential_id,
+        SealedDeviceBodyV1, ToolApprovalDecisionV1, ToolApprovalEnvelopeV1, ToolApprovalWebauthnV1,
+        ToolSealedBodyV1, WebauthnEnrollmentSubmissionV1, native_credential_id,
         v1::{VERSION_V1, encode_base64url},
     };
     use p256::ecdsa::SigningKey;
@@ -1799,6 +2090,183 @@ mod tests {
         }
     }
 
+    fn tool_envelope(fingerprint: &str, id: &str, now: i64) -> ToolApprovalEnvelopeV1 {
+        ToolApprovalEnvelopeV1 {
+            message_type: oshioki_protocol::TOOL_ENVELOPE_TYPE.into(),
+            version: oshioki_protocol::TOOL_WIRE_VERSION,
+            request_id: id.into(),
+            issued_at: now - 1,
+            expires_at: now + 89,
+            sealed: vec![ToolSealedBodyV1 {
+                device_fingerprint: fingerprint.to_owned(),
+                ephemeral_pub: encode_base64url(&[4; 32]),
+                nonce: encode_base64url(&[5; 12]),
+                ciphertext: encode_base64url(&[6; 32]),
+            }],
+        }
+    }
+
+    #[test]
+    fn tool_lane_storage_is_isolated_and_first_terminal_decision_wins() {
+        let store = Store::memory().unwrap();
+        let token = b"tool-browser-token";
+        let browser = device(token);
+        store.put_device(&browser).unwrap();
+
+        // A request and tool approval may share an ID because their state and
+        // terminal decisions live in separate tables and subject trees.
+        let command = envelope(&browser.fingerprint);
+        let command_raw = serde_json::to_vec(&command).unwrap();
+        assert_eq!(
+            store.ingest_request(&command_raw, &command, 20).unwrap(),
+            InsertResult::Inserted
+        );
+        let tool = tool_envelope(&browser.fingerprint, &command.request_id, 20);
+        let tool_raw = serde_json::to_vec(&tool).unwrap();
+        assert_eq!(
+            store.ingest_tool_request(&tool_raw, &tool, 20).unwrap(),
+            InsertResult::Inserted
+        );
+        assert_eq!(
+            store.request_lifecycle(&command.request_id, 20).unwrap(),
+            Some(RequestLifecycle::Pending)
+        );
+        assert_eq!(
+            store.tool_request_lifecycle(&tool.request_id, 20).unwrap(),
+            Some(RequestLifecycle::Pending)
+        );
+
+        let sealed = store
+            .sealed_tool_request_for_token(&tool.request_id, token, 20)
+            .unwrap()
+            .unwrap();
+        let body: ToolSealedBodyV1 = serde_json::from_str(&sealed.body_json).unwrap();
+        assert_eq!(body.device_fingerprint, browser.fingerprint);
+
+        let assertion = ToolApprovalWebauthnV1 {
+            version: oshioki_protocol::TOOL_WIRE_VERSION,
+            request_id: tool.request_id.clone(),
+            device_fingerprint: browser.fingerprint.clone(),
+            credential_id: browser.credential_id.clone(),
+            authenticator_data: encode_base64url(&[7; 37]),
+            client_data_json: encode_base64url(br#"{"type":"webauthn.get"}"#),
+            signature: encode_base64url(&[8; 64]),
+        };
+        let deny = ToolApprovalDecisionV1::Deny(assertion.clone());
+        assert_eq!(
+            store
+                .queue_tool_decision(&tool.request_id, &browser.fingerprint, &deny, 21)
+                .unwrap(),
+            InsertResult::Inserted
+        );
+        assert_eq!(
+            store
+                .queue_tool_decision(&tool.request_id, &browser.fingerprint, &deny, 22)
+                .unwrap(),
+            InsertResult::Identical
+        );
+        let allow = ToolApprovalDecisionV1::Approve(assertion);
+        assert_eq!(
+            store
+                .queue_tool_decision(&tool.request_id, &browser.fingerprint, &allow, 22)
+                .unwrap(),
+            InsertResult::Conflict
+        );
+
+        let subjects = store
+            .pending_verdicts(10)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.subject)
+            .collect::<Vec<_>>();
+        assert!(
+            subjects
+                .iter()
+                .any(|subject| subject == &format!("oshioki.tool.delivery.{}", tool.request_id))
+        );
+        assert!(
+            subjects
+                .iter()
+                .any(|subject| subject == &format!("oshioki.tool.verdict.{}", tool.request_id))
+        );
+        assert!(store.expire_stale_deliveries(tool.expires_at).unwrap() > 0);
+        let live_subjects = store
+            .pending_verdicts(10)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.subject)
+            .collect::<Vec<_>>();
+        assert!(
+            !live_subjects
+                .iter()
+                .any(|subject| subject == &format!("oshioki.tool.delivery.{}", tool.request_id))
+        );
+        assert!(
+            live_subjects
+                .iter()
+                .any(|subject| subject == &format!("oshioki.tool.verdict.{}", tool.request_id))
+        );
+    }
+
+    #[test]
+    fn concurrent_tool_decisions_commit_only_one_terminal_result() {
+        let store = std::sync::Arc::new(Store::memory().unwrap());
+        let token = b"concurrent-tool-token";
+        let browser = device(token);
+        store.put_device(&browser).unwrap();
+        let envelope = tool_envelope(&browser.fingerprint, "tool-race", 100);
+        let raw = serde_json::to_vec(&envelope).unwrap();
+        store.ingest_tool_request(&raw, &envelope, 100).unwrap();
+        let assertion = ToolApprovalWebauthnV1 {
+            version: oshioki_protocol::TOOL_WIRE_VERSION,
+            request_id: envelope.request_id.clone(),
+            device_fingerprint: browser.fingerprint.clone(),
+            credential_id: browser.credential_id.clone(),
+            authenticator_data: encode_base64url(&[7; 37]),
+            client_data_json: encode_base64url(br#"{"type":"webauthn.get"}"#),
+            signature: encode_base64url(&[8; 64]),
+        };
+        let decisions = [
+            ToolApprovalDecisionV1::Approve(assertion.clone()),
+            ToolApprovalDecisionV1::Deny(assertion),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = decisions.map(|decision| {
+            let store = std::sync::Arc::clone(&store);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let fingerprint = browser.fingerprint.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .queue_tool_decision("tool-race", &fingerprint, &decision, 101)
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        let results = workers.map(|worker| worker.join().unwrap());
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == InsertResult::Inserted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == InsertResult::Conflict)
+                .count(),
+            1
+        );
+        let verdicts = store
+            .pending_verdicts(10)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.subject == "oshioki.tool.verdict.tool-race")
+            .count();
+        assert_eq!(verdicts, 1);
+    }
+
     fn push_material() -> (Vec<u8>, Vec<u8>) {
         let signing = SigningKey::from_bytes((&[8; 32]).into()).unwrap();
         let point = signing.verifying_key().to_encoded_point(false);
@@ -1806,6 +2274,35 @@ mod tests {
         p256dh.extend_from_slice(point.x().unwrap());
         p256dh.extend_from_slice(point.y().unwrap());
         (p256dh, vec![9; PUSH_AUTH_BYTES])
+    }
+
+    #[test]
+    fn tool_requests_queue_separate_web_push_items() {
+        let store = Store::memory().unwrap();
+        let token = b"tool-push-token";
+        let browser = device(token);
+        store.put_device(&browser).unwrap();
+        let (p256dh, auth) = push_material();
+        store
+            .register_push_subscription(
+                token,
+                "https://push.example/send/tool-lane",
+                &p256dh,
+                &auth,
+                None,
+                20,
+            )
+            .unwrap();
+        let envelope = tool_envelope(&browser.fingerprint, "tool-push", 20);
+        let raw = serde_json::to_vec(&envelope).unwrap();
+        store.ingest_tool_request(&raw, &envelope, 20).unwrap();
+
+        let item = store.claim_push(20, 30).unwrap().unwrap();
+        assert_eq!(item.request_kind, "tool");
+        assert_eq!(item.request_id, "tool-push");
+        let payload: serde_json::Value = serde_json::from_slice(&item.payload).unwrap();
+        assert_eq!(payload["lane"], "tool");
+        assert_eq!(payload["request_id"], "tool-push");
     }
 
     #[test]
@@ -1823,7 +2320,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         drop(store);
         let snapshot = restore_snapshot_path(&path, 1);
         assert!(snapshot.exists(), "{}", snapshot.display());
@@ -2256,7 +2753,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         let browser = device(b"upgrade-token");
         store.put_device(&browser).unwrap();

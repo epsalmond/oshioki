@@ -9,6 +9,8 @@ const APPROVE_DOMAIN = enc.encode("oshioki/approve/v1\0");
 // Contextual sudo authentication has its own challenge domain, so a command
 // approval signature can never satisfy an authentication verifier.
 const AUTH_CHALLENGE_DOMAIN = enc.encode("oshioki/authenticate/sudo/v1\0");
+const TOOL_APPROVE_DOMAIN = enc.encode("oshioki/tool-approval/approve/v1\0");
+const TOOL_DENY_DOMAIN = enc.encode("oshioki/tool-approval/deny/v1\0");
 
 function b64(bytes) {
   return sodium.to_base64(new Uint8Array(bytes), sodium.base64_variants.URLSAFE_NO_PADDING);
@@ -119,7 +121,7 @@ function registerPushWorker() {
   const support = pushSupport();
   if (!support.supported) return Promise.resolve(null);
   if (!pushWorkerPromise) {
-    pushWorkerPromise = navigator.serviceWorker.register("/service-worker.js", { scope: "/" }).catch((error) => {
+    pushWorkerPromise = navigator.serviceWorker.register("/service-worker-tool-v1.js", { scope: "/" }).catch((error) => {
       pushWorkerPromise = undefined;
       throw error;
     });
@@ -487,6 +489,132 @@ async function approval() {
   }, { once: true });
 }
 
+async function toolApproval() {
+  await sodium.ready;
+  const id = requestId();
+  let selected;
+  for (const device of await allDevices()) {
+    const response = await fetch(`/api/v1/tool-requests/${id}`, {
+      headers: { authorization: `Bearer ${device.apiToken}` },
+      cache: "no-store",
+    });
+    if (response.status === 401) continue;
+    if (!response.ok) throw new Error(`tool request failed ${response.status}`);
+    selected = { device, payload: await response.json() };
+    break;
+  }
+  if (!selected) throw new Error("no enrolled browser profile owns this tool request");
+  if (!window.PublicKeyCredential || !navigator.credentials) {
+    text("status", "This browser cannot use a passkey. The native permission prompt remains available.");
+    return;
+  }
+  const sealed = selected.payload.sealed;
+  const shared = sodium.crypto_scalarmult(unb64(selected.device.boxSecret), unb64(sealed.ephemeral_pub));
+  if (shared.every(value => value === 0)) throw new Error("invalid shared secret");
+  const raw = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(
+    null, unb64(sealed.ciphertext), null, unb64(sealed.nonce), shared,
+  );
+  const requestText = dec.decode(raw);
+  const request = JSON.parse(requestText);
+  if (request.type !== "tool_approval_request" || request.version !== 3 || request.request_id !== id) {
+    throw new Error("tool request mismatch");
+  }
+  const nativeEvent = JSON.parse(request.native_event_json);
+  const normalize = value => Array.isArray(value)
+    ? value.map(normalize)
+    : value && typeof value === "object"
+      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, normalize(value[key])]))
+      : value;
+  if (nativeEvent.hook_event_name !== request.event
+      || nativeEvent.tool_name !== request.tool_name
+      || JSON.stringify(normalize(nativeEvent.tool_input)) !== JSON.stringify(normalize(request.tool_input))
+      || nativeEvent.cwd !== request.cwd) {
+    throw new Error("tool event does not match the signed review fields");
+  }
+  const headers = {
+    authorization: `Bearer ${selected.device.apiToken}`,
+    "content-type": "application/json",
+  };
+  const acknowledgement = await fetch(`/api/v1/tool-requests/${id}/ack`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ type: "tool_approval_ack", version: 3, request_id: id }),
+  });
+  if (!acknowledgement.ok) throw new Error(`tool acknowledgement failed ${acknowledgement.status}`);
+
+  const context = request.context || {};
+  text("harness", request.harness);
+  text("tool", request.tool_name);
+  text("cwd", request.cwd);
+  text("permission-mode", context.permission_mode || "not supplied");
+  text("session", context.session_id || "not supplied");
+  // The retained native event is a JSON string inside the signed request.
+  // Render it verbatim: parsing and re-serializing can round integers above
+  // JavaScript's exact-number range and make the review differ from the bytes
+  // the WebAuthn assertion covers.
+  document.getElementById("tool-input").textContent = request.native_event_json;
+  if (request.description) {
+    text("description", request.description);
+    document.getElementById("description").hidden = false;
+  }
+  text("status", `Expires ${new Date(request.expires_at * 1000).toLocaleTimeString()}`);
+  for (const element of ["request", "input-heading", "tool-input", "actions", "cancel-note"]) {
+    document.getElementById(element).hidden = false;
+  }
+
+  let sending = false;
+  const submit = async action => {
+    if (sending) return;
+    sending = true;
+    const approveButton = document.getElementById("approve");
+    const denyButton = document.getElementById("deny");
+    approveButton.disabled = true;
+    denyButton.disabled = true;
+    try {
+      const domain = action === "approve" ? TOOL_APPROVE_DOMAIN : TOOL_DENY_DOMAIN;
+      const challenge = await sha256(domain, raw);
+      const assertion = await navigator.credentials.get({ publicKey: {
+        challenge,
+        rpId: location.hostname,
+        allowCredentials: [{ type: "public-key", id: unb64(selected.device.credentialId) }],
+        userVerification: "required",
+        timeout: 90000,
+      }});
+      const decision = {
+        type: action === "approve" ? "tool_approval_approve_webauthn" : "tool_approval_deny_webauthn",
+        version: 3,
+        request_id: id,
+        device_fingerprint: selected.device.fingerprint,
+        credential_id: b64(assertion.rawId),
+        authenticator_data: b64(assertion.response.authenticatorData),
+        client_data_json: b64(assertion.response.clientDataJSON),
+        signature: b64(assertion.response.signature),
+      };
+      const response = await fetch(`/api/v1/tool-requests/${id}/decision`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ request_json: requestText, decision }),
+      });
+      if (!response.ok) throw new Error(`tool decision failed ${response.status}`);
+      text("status", action === "approve" ? "Approved once." : "Denied.");
+      document.getElementById("actions").hidden = true;
+      document.getElementById("cancel-note").hidden = true;
+    } catch (error) {
+      if (error?.name === "NotAllowedError" || error?.name === "AbortError") {
+        text("status", "Passkey cancelled. No decision was sent; the native permission prompt remains available.");
+      } else {
+        console.error(error);
+        text("status", "The decision could not be verified. No decision was sent; the native permission prompt remains available.");
+      }
+      sending = false;
+      approveButton.disabled = false;
+      denyButton.disabled = false;
+    }
+  };
+  document.getElementById("approve").addEventListener("click", () => submit("approve"));
+  document.getElementById("deny").addEventListener("click", () => submit("deny"));
+}
+
 // Renders the submitted invocation with its status intact. A truncated or
 // missing command line is labelled as such: PAM does not know what sudo will
 // finally run, and nothing on this page may present partial context as if it
@@ -589,6 +717,7 @@ if (typeof document !== "undefined" && document.body) {
   if (page === "setup") flow = setupPage();
   else if (page === "enroll") flow = enrollment();
   else if (page === "auth") flow = authentication();
+  else if (page === "tool") flow = toolApproval();
   else flow = approval();
   flow?.catch(failure);
 }

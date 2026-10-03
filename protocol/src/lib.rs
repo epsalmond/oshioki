@@ -16,6 +16,7 @@ pub mod native_v1;
 pub mod nats_policy;
 pub mod socket_v1;
 pub mod terminal;
+pub mod tool_v1;
 pub mod v1;
 pub mod webauthn_v1;
 
@@ -40,6 +41,14 @@ pub use socket_v1::{
     AliveV1, ControlMessageOutcome, ControlMessageV1, DeliveryV1, decode_control_message,
 };
 pub use terminal::escape_for_terminal;
+pub use tool_v1::{
+    TOOL_ACK_TYPE, TOOL_APPROVAL_SUBJECT, TOOL_APPROVE_TYPE, TOOL_DELIVERY_TYPE, TOOL_DENY_TYPE,
+    TOOL_ENVELOPE_TYPE, TOOL_REQUEST_TYPE, TOOL_WIRE_VERSION, ToolAcknowledgementV1,
+    ToolApprovalDecisionV1, ToolApprovalEnvelopeV1, ToolApprovalRequestV1, ToolApprovalWebauthnV1,
+    ToolContextV1, ToolDecisionActionV1, ToolDeliveryV1, ToolHarnessV1, ToolSealedBodyV1,
+    parse_tool_request_at, seal_tool_request_v1, tool_approval_challenge, unseal_tool_body_v1,
+    verify_tool_decision_v1,
+};
 pub use v1::{
     ActivationV1, ApproveNativeV1, ApproveV1, DecisionV1, DenyV1, DeviceKindV1,
     DevicePublicRecordV1, DeviceRegistryV1, EnrollmentIntentV1, EnrollmentStatusV1,

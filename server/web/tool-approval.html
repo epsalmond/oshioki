@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08783e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Oshioki">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
+  <title>Tool permission request</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body data-page="tool">
+  <main>
+    <h1>Tool permission request</h1>
+    <p id="status">Loading encrypted request…</p>
+    <p id="description" hidden></p>
+    <dl id="request" hidden>
+      <dt>Harness</dt><dd id="harness"></dd>
+      <dt>Tool</dt><dd id="tool"></dd>
+      <dt>Working directory</dt><dd id="cwd"></dd>
+      <dt>Permission mode</dt><dd id="permission-mode"></dd>
+      <dt>Session</dt><dd id="session"></dd>
+      <dt>Invocation scope</dt><dd>One tool invocation</dd>
+    </dl>
+    <h2 id="input-heading" hidden>Exact native permission request (signed JSON)</h2>
+    <pre id="tool-input" hidden></pre>
+    <div id="actions" hidden>
+      <button id="approve" type="button">Approve once</button>
+      <button id="deny" type="button">Deny</button>
+    </div>
+    <p id="cancel-note" hidden>Passkey cancellation sends no decision; the native permission prompt remains available.</p>
+  </main>
+  <script src="/assets/libsodium.js"></script>
+  <script src="/assets/tool-approval-v1.js"></script>
+</body>
+</html>
