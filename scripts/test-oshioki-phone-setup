@@ -80,14 +80,14 @@ class PhoneSetupTests(unittest.TestCase):
             staged = json.loads(staging.read_text(encoding="utf-8"))
             self.assertEqual(staged["nats_pass"], "p")
 
-        args = phone._parser().parse_args([
-            "--server-url", "https://phone.example",
-            "--nats-config", str(self.nats_env),
-            "--state-dir", str(self.state),
-            "--config-dir", str(self.config),
-        ])
-        with mock.patch.object(phone, "_health_request"), mock.patch.object(phone, "_nats_probe"), mock.patch.object(phone, "_sudo_install", side_effect=fake_sudo), mock.patch.object(phone, "_tailscale_status", side_effect=AssertionError("Tailscale must not be queried")):
-            phone._external_mode(args, self.config)
+        with mock.patch.object(phone.os, "geteuid", return_value=501), mock.patch.object(phone, "_health_request"), mock.patch.object(phone, "_nats_probe"), mock.patch.object(phone, "_sudo_install", side_effect=fake_sudo), mock.patch.object(phone, "_tailscale_status", side_effect=AssertionError("Tailscale must not be queried")), mock.patch.object(phone, "_binary", side_effect=AssertionError("Tailscale must not be required")):
+            result = phone.main([
+                "--server-url", "https://phone.example",
+                "--nats-config", str(self.nats_env),
+                "--state-dir", str(self.state),
+                "--config-dir", str(self.config),
+            ])
+        self.assertEqual(result, 0)
         self.assertEqual(len(sudo_calls), 1)
         self.assertEqual(sudo_calls[0][0].parent, self.state)
         self.assertFalse((self.state / ".config-staging.json").exists())
@@ -413,19 +413,48 @@ class PhoneSetupTests(unittest.TestCase):
         output = b"""LISTEN 0 128 0.0.0.0:18444 0.0.0.0:* users:((\"traefik\",pid=123,fd=3))
 LISTEN 0 128 [::]:18444 [::]:* users:((\"caddy\",pid=456,fd=9))
 LISTEN 0 128 100.64.0.7:18444 0.0.0.0:* users:((\"tailscaled\",pid=789,fd=4))
+LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*
 """
-        self.assertEqual(phone._parse_ss_listeners(output), [
+        self.assertEqual(phone._parse_ss_listeners(output, 18444), [
             ("0.0.0.0", 18444, {"traefik"}),
             ("::", 18444, {"caddy"}),
             ("100.64.0.7", 18444, {"tailscaled"}),
         ])
 
+    def test_linux_listener_adapter_filters_for_requested_port_before_parsing(self) -> None:
+        output = b"""LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*
+LISTEN 0 128 100.64.0.7:18444 0.0.0.0:* users:((\"tailscaled\",pid=789,fd=4))
+"""
+        completed = subprocess.CompletedProcess([], 0, output, b"")
+        with mock.patch.object(phone, "_platform", return_value="Linux"), mock.patch.object(phone.shutil, "which", return_value="/usr/bin/ss"), mock.patch.object(phone, "_run", return_value=completed) as run:
+            self.assertEqual(phone._port_listeners(18444), [("100.64.0.7", 18444, {"tailscaled"})])
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/ss", "-H", "-ltnp", "sport = :18444"])
+
+    def test_linux_listener_adapter_rejects_malformed_requested_port_listener(self) -> None:
+        for output in (
+            b"LISTEN 0 128 not-an-address:18444 0.0.0.0:*\n",
+            b"LISTEN 0 128 127.0.0.1:18444x 0.0.0.0:*\n",
+            b"LISTEN 0 128 127.0.0.1:70000 0.0.0.0:*\n",
+        ):
+            completed = subprocess.CompletedProcess([], 0, output, b"")
+            with self.subTest(output=output), mock.patch.object(phone, "_platform", return_value="Linux"), mock.patch.object(phone.shutil, "which", return_value="/usr/bin/ss"), mock.patch.object(phone, "_run", return_value=completed):
+                self.assert_setup_error(phone._port_listeners, 18444)
+
     def test_lsof_listener_parser_reads_field_output(self) -> None:
-        output = b"p123\nctailscaled\nn100.64.0.7:18444\np456\nctraefik\nn*:18444\n"
+        output = b"p123\nctailscaled\nf13\nn100.64.0.7:18444\np456\nctraefik\nf13\nn*:18444\n"
         self.assertEqual(phone._parse_lsof_listeners(output), [
             ("100.64.0.7", 18444, {"tailscaled"}),
             ("*", 18444, {"traefik"}),
         ])
+        for malformed in (
+            b"p123\nccaddy\nf\nn*:18444\n",
+            b"f13\np123\nccaddy\nn*:18444\n",
+            b"p123\nccaddy\nn*:18444\n",
+            b"p123\nccaddy\nf13\nn*:18444\np456\nctraefik\nn*:18444\n",
+            b"p123\nccaddy\nxunexpected\nn*:18444\n",
+        ):
+            with self.subTest(malformed=malformed):
+                self.assert_setup_error(phone._parse_lsof_listeners, malformed)
 
     def test_listener_inspection_fails_closed_when_missing_failed_or_malformed(self) -> None:
         with mock.patch.object(phone, "_platform", return_value="Linux"), mock.patch.object(phone.shutil, "which", return_value=None):
@@ -446,20 +475,112 @@ LISTEN 0 128 100.64.0.7:18444 0.0.0.0:* users:((\"tailscaled\",pid=789,fd=4))
                 self.assert_setup_error(phone._tailscale_status, fake)
 
     def test_darwin_listener_adapter_accepts_clean_no_match_and_parses_owners(self) -> None:
+        netstat_empty = b"""Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat shiwat  pid   epid
+"""
+        self.assertEqual(phone._parse_netstat_listeners(b"", 18444), [])
+        self.assert_setup_error(phone._parse_netstat_listeners, b"tcp4 0 0 malformed", 18444)
+        self.assert_setup_error(phone._parse_netstat_listeners, netstat_empty + b"unexpected output\n", 18444)
+        self.assert_setup_error(phone._parse_netstat_listeners, b"Active Internet connections (including servers)\n", 18444)
+        real_darwin_inventory = b"""Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat shiwat  pid   epid state      options
+tcp4       0      0  *.18444                *.*                    LISTEN      131072 131072  321   0     0x0000     0x00000000
+"""
+        self.assertEqual(phone._parse_netstat_listeners(real_darwin_inventory, 18444), [
+            ("0.0.0.0", 18444, set()),
+        ])
         no_match = subprocess.CompletedProcess([], 1, b"", b"")
-        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", return_value="/usr/sbin/lsof"), mock.patch.object(phone, "_run", return_value=no_match) as run:
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, netstat_empty, b""), no_match]) as run:
             self.assertEqual(phone._port_listeners(18444), [])
-        self.assertEqual(run.call_args.args[0], ["/usr/sbin/lsof", "-nP", "-iTCP:18444", "-sTCP:LISTEN", "-Fpcn"])
-        found = subprocess.CompletedProcess([], 0, b"p321\nccaddy\nn[::]:18444\n", b"")
-        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", return_value="/usr/sbin/lsof"), mock.patch.object(phone, "_run", return_value=found):
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ["/usr/sbin/netstat", "-anv", "-p", "tcp"],
+            ["/usr/sbin/lsof", "-nP", "-iTCP:18444", "-sTCP:LISTEN", "-Fpcn"],
+        ])
+        no_sockets = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[no_sockets, no_match]):
+            self.assertEqual(phone._port_listeners(18444), [])
+
+        churn_warning = b"Some tcp sockets may have been created or deleted"
+        for stream in ("stdout", "stderr"):
+            completed = subprocess.CompletedProcess(
+                [],
+                0,
+                churn_warning if stream == "stdout" else b"",
+                churn_warning if stream == "stderr" else b"",
+            )
+            with self.subTest(churn_warning_stream=stream), mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", return_value="/usr/sbin/netstat"), mock.patch.object(phone, "_run", return_value=completed):
+                self.assert_setup_error(phone._port_listeners, 18444)
+
+        netstat_listener = b"""Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat shiwat  pid   epid
+tcp6       0      0  *.18444                *.*                    LISTEN      131072 131072  321   0
+"""
+        found = subprocess.CompletedProcess([], 0, b"p321\nccaddy\nf13\nn[::]:18444\n", b"")
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, netstat_listener, b""), found]):
             self.assertEqual(phone._port_listeners(18444), [("::", 18444, {"caddy"})])
-        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", return_value="/usr/sbin/lsof"), mock.patch.object(phone, "_run", return_value=subprocess.CompletedProcess([], 1, b"", b"permission denied")):
+
+        netstat_dual_stack = b"""Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat shiwat  pid   epid
+tcp46      0      0  *.18444                *.*                    LISTEN      131072 131072  321   0
+"""
+        dual_stack_lsof = subprocess.CompletedProcess([], 0, b"p321\nccaddy\nf13\nn[::]:18444\n", b"")
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, netstat_dual_stack, b""), dual_stack_lsof]):
+            dual_stack_listener = phone._port_listeners(18444)
+        self.assertEqual(dual_stack_listener, [("*", 18444, {"caddy"})])
+        with mock.patch.object(phone, "_port_listeners", return_value=dual_stack_listener):
+            self.assert_setup_error(phone._check_https_listener, 18444, {"100.64.0.7"}, True)
+
+        duplicate_netstat = b"""Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat shiwat  pid   epid
+tcp4       0      0  100.64.0.7.18444       *.*                    LISTEN      131072 131072  321   0
+tcp4       0      0  100.64.0.7.18444       *.*                    LISTEN      131072 131072  322   0
+"""
+        one_lsof_owner = subprocess.CompletedProcess([], 0, b"p321\nctailscaled\nf13\nn100.64.0.7:18444\n", b"")
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, duplicate_netstat, b""), one_lsof_owner]):
+            duplicate_listeners = phone._port_listeners(18444)
+        self.assertEqual(duplicate_listeners, [
+            ("100.64.0.7", 18444, set()),
+            ("100.64.0.7", 18444, set()),
+        ])
+        with mock.patch.object(phone, "_port_listeners", return_value=duplicate_listeners):
+            self.assert_setup_error(phone._check_https_listener, 18444, {"100.64.0.7"}, True)
+
+        for protocol_row in (
+            b"tcp4       0      0  ::1.18444              *.*                    LISTEN      131072 131072  321   0\n",
+            b"tcp6       0      0  100.64.0.7.18444       *.*                    LISTEN      131072 131072  321   0\n",
+            b"tcp46      0      0  ::ffff:100.64.0.999.18444 *.*                   LISTEN      131072 131072  321   0\n",
+        ):
+            with self.subTest(protocol_row=protocol_row):
+                self.assert_setup_error(phone._parse_netstat_listeners, netstat_empty + protocol_row, 18444)
+        mapped_ipv6 = netstat_empty + b"tcp6       0      0  ::ffff:100.64.0.7.18444 *.*                    LISTEN      131072 131072  321   0\n"
+        self.assertEqual(phone._parse_netstat_listeners(mapped_ipv6, 18444), [("100.64.0.7", 18444, set())])
+
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, netstat_empty, b""), found]):
             self.assert_setup_error(phone._port_listeners, 18444)
-        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", return_value="/usr/sbin/lsof"), mock.patch.object(phone, "_run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+
+        root_listener = b"""Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat shiwat  pid   epid
+tcp4       0      0  *.443                  *.*                    LISTEN      131072 131072  1     0
+"""
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, root_listener, b""), no_match]):
+            ownerless_listener = phone._port_listeners(443)
+        self.assertEqual(ownerless_listener, [("0.0.0.0", 443, set())])
+        with mock.patch.object(phone, "_port_listeners", return_value=ownerless_listener):
+            with self.assertRaisesRegex(
+                phone.SetupError,
+                r"TCP port 443 already has listeners: 0\.0\.0\.0:443 \(owner unavailable\)",
+            ):
+                phone._check_https_listener(443, set(), False)
+
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 1, b"", b"netstat failed"), no_match]):
             self.assert_setup_error(phone._port_listeners, 18444)
-        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", return_value="/usr/sbin/lsof"), mock.patch.object(phone, "_run", return_value=subprocess.CompletedProcess([], 0, b"p321\n", b"")):
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, netstat_empty, b""), subprocess.CompletedProcess([], 1, b"", b"permission denied")]):
             self.assert_setup_error(phone._port_listeners, 18444)
-        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", return_value="/usr/sbin/lsof"), mock.patch.object(phone, "_run", return_value=subprocess.CompletedProcess([], 0, b"p321\nccaddy\nn[::]:443\n", b"")):
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, netstat_empty, b""), subprocess.CompletedProcess([], 0, b"", b"")]):
+            self.assert_setup_error(phone._port_listeners, 18444)
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, netstat_empty, b""), subprocess.CompletedProcess([], 0, b"p321\n", b"")]):
+            self.assert_setup_error(phone._port_listeners, 18444)
+        with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, netstat_empty, b""), subprocess.CompletedProcess([], 0, b"p321\nccaddy\nn[::]:443\n", b"")]):
             self.assert_setup_error(phone._port_listeners, 18444)
 
     def test_exact_owned_serve_exempts_only_sole_tailscaled_tailnet_listener(self) -> None:
