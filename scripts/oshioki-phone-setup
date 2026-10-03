@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import secrets
 import shlex
 import shutil
@@ -26,14 +27,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, NoReturn
 from urllib.parse import urlsplit
 
 
 VERSION = 1
 DEFAULT_NATS_PORT = 14222
 DEFAULT_SERVER_PORT = 18443
-DEFAULT_HTTPS_PORT = 443
+DEFAULT_HTTPS_PORT = 18444
 DEFAULT_TIMEOUT = 5.0
 MAX_HEALTH_BYTES = 128 * 1024
 STATE_ENV = "OSHIOKI_PHONE_SETUP_STATE"
@@ -49,7 +50,7 @@ class SetupError(Exception):
     """An actionable setup failure safe to show to the operator."""
 
 
-def fail(message: str) -> "NoReturn":
+def fail(message: str) -> NoReturn:
     raise SetupError(message)
 
 
@@ -568,7 +569,7 @@ def _expected_serve(rp_id: str, https_port: int, server_port: int) -> dict[str, 
     }
 
 
-def _tailscale_status(binary: Path) -> tuple[str, str]:
+def _tailscale_status(binary: Path) -> tuple[str, str, set[str]]:
     result = _run([str(binary), "status", "--json"])
     if result.returncode != 0:
         fail("Tailscale is not running; install/start Tailscale or use --server-url with --nats-config")
@@ -576,12 +577,24 @@ def _tailscale_status(binary: Path) -> tuple[str, str]:
         status = json.loads(result.stdout.decode("utf-8"))
         self_info = status["Self"]
         dns = str(self_info["DNSName"]).rstrip(".").lower()
+        raw_ips = self_info["TailscaleIPs"]
     except (UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        fail("Tailscale status did not contain Self.DNSName")
+        fail("Tailscale status did not contain Self.DNSName and TailscaleIPs")
     if self_info.get("Online") is not True or not dns or _local_host(dns) or "/" in dns:
         fail("Tailscale is offline or has no phone-reachable DNS name")
+    if not isinstance(raw_ips, list) or not raw_ips:
+        fail("Tailscale status did not contain the node's Tailscale IP addresses")
+    tailscale_ips: set[str] = set()
+    try:
+        for raw_ip in raw_ips:
+            address = ipaddress.ip_address(raw_ip)
+            if address.is_loopback or address.is_unspecified or address.is_multicast:
+                fail("Tailscale status contained an invalid node IP address")
+            tailscale_ips.add(address.compressed)
+    except (TypeError, ValueError):
+        fail("Tailscale status contained an invalid node IP address")
     _origin_parts(f"https://{dns}")
-    return dns, f"https://{dns}"
+    return dns, f"https://{dns}", tailscale_ips
 
 
 def _serve_config(binary: Path) -> Any:
@@ -601,6 +614,311 @@ def _check_serve_route(binary: Path, expected: dict[str, Any]) -> bool:
     if _canonical(current) == _canonical(expected):
         return True
     fail("Tailscale Serve already has another route; refusing to replace it (remove it or choose an external server)")
+
+
+def _socket_endpoint(value: str) -> tuple[str, int]:
+    """Parse an ss/lsof local TCP endpoint, returning a normalized address and port."""
+    if value.startswith("["):
+        closing = value.find("]")
+        if closing < 0 or value[closing + 1 : closing + 2] != ":":
+            fail("listener inspection returned a malformed IPv6 endpoint")
+        host, raw_port = value[1:closing], value[closing + 2 :]
+    else:
+        if ":" not in value:
+            fail("listener inspection returned a malformed TCP endpoint")
+        host, raw_port = value.rsplit(":", 1)
+    try:
+        if not re.fullmatch(r"[0-9]{1,5}", raw_port):
+            fail("listener inspection returned a malformed TCP port")
+        port = int(raw_port)
+        address = ipaddress.ip_address(host).compressed if host not in ("*", "") else host
+    except (ValueError, TypeError):
+        fail("listener inspection returned a malformed TCP endpoint")
+    if not 1 <= port <= 65535:
+        fail("listener inspection returned an invalid TCP port")
+    try:
+        parsed = ipaddress.ip_address(address)
+        if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+            address = parsed.ipv4_mapped.compressed
+    except ValueError:
+        if address != "*":
+            fail("listener inspection returned an unknown TCP bind address")
+    return address, port
+
+
+def _parse_ss_listeners(output: bytes, requested_port: int) -> list[tuple[str, int, set[str]]]:
+    """Parse the requested port from `ss -H -ltnp`; ignore other ports early."""
+    try:
+        lines = output.decode("utf-8").splitlines()
+    except UnicodeError:
+        fail("ss returned non-UTF-8 listener data")
+    listeners: list[tuple[str, int, set[str]]] = []
+    for line in lines:
+        columns = line.split()
+        if len(columns) < 5 or columns[0] != "LISTEN":
+            fail("ss returned malformed TCP listener data")
+        raw_endpoint = columns[3]
+        raw_port = raw_endpoint.rsplit(":", 1)[-1]
+        if not re.fullmatch(r"[0-9]{1,5}", raw_port):
+            fail("ss returned a malformed TCP listener port")
+        port = int(raw_port)
+        if not 1 <= port <= 65535:
+            fail("ss returned an invalid TCP listener port")
+        if port != requested_port:
+            continue
+        address, port = _socket_endpoint(raw_endpoint)
+        owners: set[str] = set()
+        users = re.search(r"users:\((.*)\)$", line)
+        if users is not None:
+            fields = list(re.finditer(r'\("([^"(),]+)",pid=([1-9][0-9]*),fd=([0-9]+)\)', users.group(1)))
+            if fields and ",".join(field.group(0) for field in fields) == users.group(1):
+                owners = {field.group(1) for field in fields}
+        listeners.append((address, port, owners))
+    return listeners
+
+
+def _parse_lsof_listeners(output: bytes) -> list[tuple[str, int, set[str]]]:
+    """Parse lsof field output (`-Fpcn`) for selected TCP listeners."""
+    try:
+        lines = output.decode("utf-8").splitlines()
+    except UnicodeError:
+        fail("lsof returned non-UTF-8 listener data")
+    if not lines:
+        fail("lsof returned no listener data")
+    listeners: list[tuple[str, int, set[str]]] = []
+    pid: str | None = None
+    command: str | None = None
+    current_has_endpoint = False
+    current_has_file_set = False
+
+    def finish_process() -> None:
+        if pid is not None and not current_has_endpoint:
+            fail("lsof returned incomplete listener process data")
+
+    def add_endpoint(value: str) -> None:
+        nonlocal current_has_endpoint
+        if pid is None or command is None or not pid.isdigit() or not command or not current_has_file_set:
+            fail("lsof returned incomplete process ownership data")
+        address, port = _socket_endpoint(value)
+        listeners.append((address, port, {command}))
+        current_has_endpoint = True
+
+    for line in lines:
+        if not line:
+            fail("lsof returned malformed listener data")
+        field, value = line[0], line[1:]
+        if field == "p":
+            if not value.isascii() or not value.isdecimal() or int(value) < 1:
+                fail("lsof returned malformed process ownership data")
+            finish_process()
+            pid, command = value, None
+            current_has_endpoint = False
+            current_has_file_set = False
+        elif field == "c":
+            if pid is None or command is not None or not value:
+                fail("lsof returned malformed process ownership data")
+            command = value
+        elif field == "f":
+            if pid is None or not re.fullmatch(r"(?:[0-9]+[rwu]*|cwd|rtd|txt|mem|DEL|NOFD)", value):
+                fail("lsof returned malformed file descriptor data")
+            current_has_file_set = True
+        elif field == "n":
+            add_endpoint(value)
+        else:
+            fail("lsof returned an unexpected listener field")
+    finish_process()
+    if lines and not listeners:
+        fail("lsof returned no TCP endpoint data")
+    return listeners
+
+
+def _parse_netstat_listeners(output: bytes, requested_port: int) -> list[tuple[str, int, set[str]]]:
+    """Read Darwin's TCP listener inventory from `netstat -anv -p tcp`."""
+    if not output:
+        # Apple netstat prints its title and Proto header only after it finds a
+        # socket row, so a clean empty TCP inventory can have no stdout.
+        return []
+    if b"some tcp sockets may have been" in output.lower():
+        fail("netstat reported TCP socket churn; refusing Tailscale Serve setup")
+    try:
+        lines = output.decode("utf-8").splitlines()
+    except UnicodeError:
+        fail("netstat returned non-UTF-8 listener data")
+    listeners: list[tuple[str, int, set[str]]] = []
+    saw_header = False
+    saw_title = False
+    minimum_row_fields = 0
+    for line in lines:
+        columns = line.split()
+        if not columns:
+            continue
+        if columns[0] == "Active":
+            if saw_title or saw_header or columns not in (
+                ["Active", "Internet", "connections"],
+                ["Active", "Internet", "connections", "(including", "servers)"],
+            ):
+                fail("netstat returned malformed TCP listener data")
+            saw_title = True
+            continue
+        if columns[0] == "Proto":
+            if saw_header or columns[:8] != [
+                "Proto", "Recv-Q", "Send-Q", "Local", "Address", "Foreign", "Address", "(state)"
+            ] or columns[8:] not in (
+                ["rhiwat", "shiwat", "pid", "epid"],
+                ["rhiwat", "shiwat", "pid", "epid", "state", "options"],
+                [
+                    "rxbytes", "txbytes", "rhiwat", "shiwat", "pid", "epid",
+                    "state", "options", "gencnt", "flags", "flags1", "usecnt",
+                    "rtncnt", "fltrs",
+                ],
+            ):
+                fail("netstat returned malformed TCP listener data")
+            saw_header = True
+            minimum_row_fields = len(columns) - 2
+            continue
+        if not columns[0].startswith("tcp"):
+            fail("netstat returned unexpected TCP listener data")
+        protocol = columns[0]
+        if protocol not in ("tcp4", "tcp6", "tcp46"):
+            fail("netstat returned an unexpected TCP protocol record")
+        if not saw_header or len(columns) < minimum_row_fields:
+            fail("netstat returned malformed TCP listener data")
+        if columns[5] != "LISTEN":
+            continue
+        raw_endpoint = columns[3]
+        if "." not in raw_endpoint:
+            fail("netstat returned a malformed TCP listener endpoint")
+        raw_address, raw_port = raw_endpoint.rsplit(".", 1)
+        if not re.fullmatch(r"[0-9]{1,5}", raw_port):
+            fail("netstat returned a malformed TCP listener port")
+        port = int(raw_port)
+        if not 1 <= port <= 65535:
+            fail("netstat returned an invalid TCP listener port")
+        if port != requested_port:
+            continue
+        if raw_address == "*":
+            address = {"tcp4": "0.0.0.0", "tcp6": "::", "tcp46": "*"}[protocol]
+        else:
+            try:
+                parsed_address = ipaddress.ip_address(raw_address)
+            except ValueError:
+                fail("netstat returned a malformed TCP listener endpoint")
+            if protocol == "tcp4" and not isinstance(parsed_address, ipaddress.IPv4Address):
+                fail("netstat returned a TCP address that does not match its protocol family")
+            if protocol == "tcp6" and not isinstance(parsed_address, ipaddress.IPv6Address):
+                fail("netstat returned a TCP address that does not match its protocol family")
+            if protocol == "tcp46" and parsed_address.is_unspecified:
+                # tcp46 is dual-stack. Keep an unspecified address as a
+                # wildcard instead of turning it into an IPv4-only or
+                # IPv6-only listener during lsof corroboration.
+                address = "*"
+            else:
+                endpoint = f"[{raw_address}]:{port}" if ":" in raw_address else f"{raw_address}:{port}"
+                address, parsed_port = _socket_endpoint(endpoint)
+                if parsed_port != port:
+                    fail("netstat returned a malformed TCP listener endpoint")
+        listeners.append((address, port, set()))
+    if not saw_header:
+        fail("netstat returned no TCP listener inventory")
+    return listeners
+
+
+def _listener_addresses_match(first: str, second: str) -> bool:
+    if first == second:
+        return True
+    # lsof may report a wildcard as `*` or with a family-specific unspecified
+    # address. Preserve netstat's family, and preserve tcp46's `*`, while using
+    # those spellings only to corroborate the same listener.
+    if first == "*":
+        return second in ("*", "0.0.0.0", "::")
+    if first == "0.0.0.0":
+        return second in ("*", "0.0.0.0")
+    if first == "::":
+        return second in ("*", "::")
+    return False
+
+
+def _port_listeners(port: int) -> list[tuple[str, int, set[str]]]:
+    """Inspect TCP listeners with process names; inability to inspect fails closed."""
+    platform = _platform()
+    if platform == "Linux":
+        binary = shutil.which("ss")
+        if not binary:
+            fail("cannot check HTTPS port ownership: install iproute2 (ss) or use --server-url")
+        result = _run([binary, "-H", "-ltnp", f"sport = :{port}"])
+        if result.returncode != 0:
+            fail("cannot inspect TCP listeners with ss; refusing Tailscale Serve setup")
+        return _parse_ss_listeners(result.stdout, port)
+    if platform == "Darwin":
+        netstat_binary = shutil.which("netstat")
+        if not netstat_binary:
+            fail("cannot check HTTPS port ownership: netstat is required on macOS or use --server-url")
+        inventory_result = _run([netstat_binary, "-anv", "-p", "tcp"])
+        if inventory_result.returncode != 0:
+            fail("cannot inspect TCP listeners with netstat; refusing Tailscale Serve setup")
+        if b"some tcp sockets may have been" in inventory_result.stderr.lower():
+            fail("netstat reported TCP socket churn; refusing Tailscale Serve setup")
+        if inventory_result.stderr:
+            fail("netstat returned diagnostics; refusing Tailscale Serve setup")
+        inventory = _parse_netstat_listeners(inventory_result.stdout, port)
+
+        lsof_binary = shutil.which("lsof")
+        if not lsof_binary:
+            fail("cannot check HTTPS port ownership: lsof is required on macOS or use --server-url")
+        result = _run([lsof_binary, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpcn"])
+        if result.returncode == 1 and not result.stdout and not result.stderr:
+            return inventory
+        if result.returncode != 0:
+            fail("cannot inspect TCP listeners with lsof; refusing Tailscale Serve setup")
+        listeners = _parse_lsof_listeners(result.stdout)
+        if any(listener_port != port for _address, listener_port, _owners in listeners):
+            fail("lsof returned listener data for an unexpected TCP port")
+        if not inventory:
+            fail("netstat and lsof listener inventories disagree; refusing Tailscale Serve setup")
+
+        inventory_matches: list[list[int]] = [[] for _ in inventory]
+        lsof_matches: list[list[int]] = [[] for _ in listeners]
+        for inventory_index, (address, listener_port, _owners) in enumerate(inventory):
+            for lsof_index, (lsof_address, lsof_port, _lsof_owners) in enumerate(listeners):
+                if listener_port == lsof_port and _listener_addresses_match(address, lsof_address):
+                    inventory_matches[inventory_index].append(lsof_index)
+                    lsof_matches[lsof_index].append(inventory_index)
+        if any(not matching_inventory for matching_inventory in lsof_matches):
+            fail("netstat and lsof listener inventories disagree; refusing Tailscale Serve setup")
+        corroborated: list[tuple[str, int, set[str]]] = []
+        for (address, listener_port, _owners), matching_lsof in zip(inventory, inventory_matches):
+            owners: set[str] = set()
+            # Transfer process ownership only across a unique one-to-one
+            # correspondence. Duplicate netstat rows or lsof candidates stay
+            # ownerless, so one visible descriptor cannot label another socket.
+            if len(matching_lsof) == 1:
+                lsof_index = matching_lsof[0]
+                if lsof_matches[lsof_index] and len(lsof_matches[lsof_index]) == 1:
+                    owners = set(listeners[lsof_index][2])
+            corroborated.append((address, listener_port, owners))
+        return corroborated
+    fail(f"cannot inspect TCP listeners on unsupported platform {platform}; use --server-url")
+
+
+def _check_https_listener(port: int, tailscale_ips: set[str], existing_owned_route: bool) -> None:
+    collisions: list[str] = []
+    for address, listener_port, owners in _port_listeners(port):
+        if listener_port != port:
+            continue
+        # Tailscale Serve can expose a local listener on the node's exact
+        # tailnet address. It is exempt only when the complete current Serve
+        # config is ours and tailscaled is the sole verified owner. Wildcards,
+        # other addresses, and any additional process always remain conflicts.
+        if existing_owned_route and address in tailscale_ips and owners == {"tailscaled"}:
+            continue
+        owner = ",".join(sorted(owners)) if owners else "owner unavailable"
+        collisions.append(f"{address}:{listener_port} ({owner})")
+    if collisions:
+        fail(
+            f"TCP port {port} already has listeners: {', '.join(collisions)}; "
+            "Tailscale Serve takes this port for all tailnet traffic to the host. "
+            "Choose another --https-port or use --server-url with your existing HTTPS proxy"
+        )
 
 
 def _credentials(state: Path) -> dict[str, str]:
@@ -690,7 +1008,6 @@ def _nats_config(state: Path, credentials: dict[str, str], port: int) -> Path:
 
 
 def _runtime(state: Path, *, nats_bin: Path, server_bin: Path, nats_port: int, server_port: int, origin: str, rp_id: str, credentials: dict[str, str]) -> dict[str, Any]:
-    runtime_path = state / "runtime.json"
     value = {
         "version": VERSION,
         "nats_bin": str(nats_bin),
@@ -701,15 +1018,58 @@ def _runtime(state: Path, *, nats_bin: Path, server_bin: Path, nats_port: int, s
         "rp_id": rp_id,
         "script": str(_script_path()),
     }
-    if runtime_path.exists() or runtime_path.is_symlink():
-        old = _load_json(runtime_path, "phone setup runtime")
-        if not isinstance(old, dict) or set(old) != set(value) or old.get("version") != VERSION:
-            fail(f"invalid phone setup runtime: {runtime_path}")
-        for key in ("nats_port", "server_port", "origin", "rp_id"):
-            if old.get(key) != value[key]:
-                fail(f"phone setup state uses different {key}; choose a new --state-dir")
+    runtime_path = state / "runtime.json"
+    old = _existing_runtime(state)
+    if old is not None:
+        _check_runtime_compatibility(old, value)
     _write_json(runtime_path, value, "phone setup runtime")
     return value
+
+
+def _existing_runtime(state: Path) -> dict[str, Any] | None:
+    """Read and validate existing runtime metadata without changing it."""
+    runtime_path = state / "runtime.json"
+    if not runtime_path.exists() and not runtime_path.is_symlink():
+        return None
+    old = _load_json(runtime_path, "phone setup runtime")
+    expected_keys = {"version", "nats_bin", "server_bin", "nats_port", "server_port", "origin", "rp_id", "script"}
+    if not isinstance(old, dict) or set(old) != expected_keys or old.get("version") != VERSION:
+        fail(f"invalid phone setup runtime: {runtime_path}")
+    for key in ("nats_bin", "server_bin", "origin", "rp_id", "script"):
+        if not isinstance(old.get(key), str) or not old[key]:
+            fail(f"invalid phone setup runtime: {runtime_path}")
+    if type(old.get("nats_port")) is not int or type(old.get("server_port")) is not int:
+        fail(f"invalid phone setup runtime: {runtime_path}")
+    try:
+        _port(old["nats_port"], "stored NATS port")
+        _port(old["server_port"], "stored server port")
+        canonical_origin, old_rp_id, _old_port = _origin_parts(old["origin"])
+    except (TypeError, ValueError):
+        fail(f"invalid phone setup runtime: {runtime_path}")
+    if canonical_origin != old["origin"] or old_rp_id != old["rp_id"]:
+        fail(f"invalid phone setup runtime: {runtime_path}")
+    return old
+
+
+def _check_runtime_compatibility(old: dict[str, Any], value: dict[str, Any]) -> None:
+    for key in ("nats_port", "server_port", "rp_id"):
+        if old.get(key) != value[key]:
+            fail(f"phone setup state uses a different {key}; keep the existing settings or use a separate --state-dir")
+    if old.get("origin") != value["origin"]:
+        fail(
+            f"phone setup state is pinned to browser origin {old.get('origin')}; refusing to change it to {value['origin']} "
+            "because passkeys and browser enrollment data are scoped to the origin. Keep the current origin or use "
+            "--server-url with an existing HTTPS proxy; origin migration needs a separate restoration plan"
+        )
+
+
+def _effective_https_port(args: argparse.Namespace, old_runtime: dict[str, Any] | None) -> int:
+    if args.https_port is not None:
+        return _port(args.https_port, "HTTPS port")
+    if old_runtime is not None:
+        _canonical, _rp_id, old_port = _origin_parts(old_runtime["origin"])
+        return old_port or 443
+    return DEFAULT_HTTPS_PORT
 
 
 def _service_args(role: str, state: Path) -> list[str]:
@@ -1134,18 +1494,31 @@ def _local_mode(args: argparse.Namespace, config_dir: Path) -> None:
     nats_bin = _binary(args.nats_bin, NATS_ENV, [], "nats-server")
     script = _script_path()
     server_bin = _binary(args.server_bin, SERVER_ENV, [script.parent / "oshioki-server", script.parent.parent / "target" / "release" / "oshioki-server", script.parent.parent / "target" / "debug" / "oshioki-server", Path("/usr/local/sbin/oshioki-server"), Path("/usr/sbin/oshioki-server")], "oshioki-server")
-    dns, origin = _tailscale_status(tailscale)
-    origin, rp_id, _ = _origin_parts(origin + (f":{args.https_port}" if args.https_port != 443 else ""))
-    expected = _expected_serve(rp_id, args.https_port, args.server_port)
+    dns, _origin, tailscale_ips = _tailscale_status(tailscale)
+    state = Path(args.state_dir or os.environ.get(STATE_ENV, Path.home() / ".local" / "share" / "oshioki" / "phone-server"))
+    old_runtime = _existing_runtime(state)
+    https_port = _effective_https_port(args, old_runtime)
+    origin, rp_id, _ = _origin_parts(f"https://{dns}" + (f":{https_port}" if https_port != 443 else ""))
+    runtime_candidate = {
+        "nats_port": args.nats_port,
+        "server_port": args.server_port,
+        "origin": origin,
+        "rp_id": rp_id,
+    }
+    if old_runtime is not None:
+        _check_runtime_compatibility(old_runtime, runtime_candidate)
+    expected = _expected_serve(rp_id, https_port, args.server_port)
     existing_owned_route = _check_serve_route(tailscale, expected)
+    _check_https_listener(https_port, tailscale_ips, existing_owned_route)
     if args.check:
         print(f"Would run local Oshioki server at {origin} through Tailscale Serve (RP ID {rp_id}).")
         print("Tailscale Serve is already owned by this setup." if existing_owned_route else "Tailscale Serve is empty and can be configured.")
+        print(f"HTTPS listener port {https_port} is available for Tailscale Serve.")
         print(f"NATS: loopback port {args.nats_port}; server: loopback port {args.server_port}")
         print("No files, services, or routes were changed")
         return
 
-    state = _owned_directory(Path(args.state_dir or os.environ.get(STATE_ENV, Path.home() / ".local" / "share" / "oshioki" / "phone-server")), "phone setup state", 0o700)
+    state = _owned_directory(state, "phone setup state", 0o700)
     credentials = _credentials(state)
 
     nats_conf = _nats_config(state, credentials, args.nats_port)
@@ -1165,12 +1538,14 @@ def _local_mode(args: argparse.Namespace, config_dir: Path) -> None:
     route_added = False
     try:
         if not existing_owned_route:
-            # Re-check immediately before mutation so a route added by another
-            # operator while services started is never silently replaced.
+            # Re-check the route and port immediately before mutation so an
+            # operator change or a new listener during service startup is
+            # never silently taken over.
             if _check_serve_route(tailscale, expected):
                 existing_owned_route = True
             else:
-                result = _run([str(tailscale), "serve", "--bg", f"--https={args.https_port}", local_url], timeout=30)
+                _check_https_listener(https_port, tailscale_ips, existing_owned_route=False)
+                result = _run([str(tailscale), "serve", "--bg", f"--https={https_port}", local_url], timeout=30)
                 if result.returncode != 0:
                     fail("could not configure Tailscale Serve; no hook configuration was changed")
                 route_added = True
@@ -1190,7 +1565,7 @@ def _local_mode(args: argparse.Namespace, config_dir: Path) -> None:
             try:
                 current = _serve_config(tailscale)
                 if _canonical(current) == _canonical(expected):
-                    _run([str(tailscale), "serve", "reset"], timeout=30)
+                    _run([str(tailscale), "serve", "--bg", f"--https={https_port}", "off"], timeout=30)
             except SetupError:
                 pass
         raise
@@ -1211,7 +1586,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config-dir", default=os.environ.get("OSHIOKI_CONFIG_DIR", "/etc/oshioki"), help=argparse.SUPPRESS)
     parser.add_argument("--nats-port", type=int, default=DEFAULT_NATS_PORT, help=f"owned loopback NATS port (default: {DEFAULT_NATS_PORT})")
     parser.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT, help=f"owned loopback server port (default: {DEFAULT_SERVER_PORT})")
-    parser.add_argument("--https-port", type=int, default=DEFAULT_HTTPS_PORT, help=f"Tailscale HTTPS port (default: {DEFAULT_HTTPS_PORT})")
+    parser.add_argument("--https-port", type=int, help=f"Tailscale HTTPS port (default: {DEFAULT_HTTPS_PORT})")
     parser.add_argument("--tailscale-bin", help=argparse.SUPPRESS)
     parser.add_argument("--nats-bin", help=argparse.SUPPRESS)
     parser.add_argument("--server-bin", help=argparse.SUPPRESS)
@@ -1241,8 +1616,10 @@ def main(argv: list[str] | None = None) -> int:
             if not args.role:
                 fail("service mode requires --role")
             return _run_service(args.role, Path(args.state_dir))
-        for value, name in ((args.nats_port, "NATS port"), (args.server_port, "server port"), (args.https_port, "HTTPS port")):
+        for value, name in ((args.nats_port, "NATS port"), (args.server_port, "server port")):
             _port(value, name)
+        if args.https_port is not None:
+            _port(args.https_port, "HTTPS port")
         if bool(args.server_url) != bool(args.nats_config):
             fail("--server-url and --nats-config must be supplied together")
         config_dir = Path(args.config_dir)
