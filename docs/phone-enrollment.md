@@ -22,8 +22,16 @@ oshioki-phone-setup
 ```
 
 Setup starts a local server and JetStream broker on loopback and publishes
-HTTPS through Tailscale Serve. It refuses to replace an unrelated Serve
-configuration. On Linux it requires a systemd user service manager.
+HTTPS through Tailscale Serve on port 18444 by default. Serve takes that port
+for **all tailnet traffic to this host**, not only its `*.ts.net` name. Setup
+refuses an unrelated Serve configuration or an existing TCP listener on the
+chosen port, and stops if it cannot inspect listeners. On Linux it requires a
+systemd user service manager.
+
+Choose another free port with `--https-port <port>` if needed. You can request
+`--https-port 443`, but Serve will intercept port 443 for every tailnet client;
+setup refuses if another process already listens there. Use `--server-url`
+with your existing HTTPS proxy when that proxy should keep serving the phone.
 
 For an existing server, put `NATS_URL`, `NATS_USER`, and `NATS_PASS` in a
 mode-600 file, then:
@@ -88,8 +96,11 @@ stable: passkeys are scoped to the RP ID. Do not substitute `localhost`;
 on the phone it refers to the phone itself.
 
 Managed state and logs live under `~/.local/share/oshioki/phone-server`.
-The default ports are NATS 14222 and HTTP 18443, configurable with
-`--nats-port` and `--server-port`. Re-run setup after a package update. On
+The default ports are NATS 14222, HTTP 18443, and Tailscale HTTPS 18444,
+configurable with `--nats-port`, `--server-port`, and `--https-port`. Re-run
+setup after a package update. Existing phone setup state keeps its recorded
+browser origin; setup refuses an origin change because passkeys and browser
+enrollment data are scoped to that origin. On
 Linux, setup may leave a running service on the previous binary when its unit
 is unchanged. Restart and verify the server unit:
 
