@@ -766,6 +766,11 @@ def _parse_netstat_listeners(output: bytes, requested_port: int) -> list[tuple[s
             ] or columns[8:] not in (
                 ["rhiwat", "shiwat", "pid", "epid"],
                 ["rhiwat", "shiwat", "pid", "epid", "state", "options"],
+                [
+                    "rxbytes", "txbytes", "rhiwat", "shiwat", "pid", "epid",
+                    "state", "options", "gencnt", "flags", "flags1", "usecnt",
+                    "rtncnt", "fltrs",
+                ],
             ):
                 fail("netstat returned malformed TCP listener data")
             saw_header = True

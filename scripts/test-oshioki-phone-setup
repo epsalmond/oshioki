@@ -489,6 +489,13 @@ tcp4       0      0  *.18444                *.*                    LISTEN      1
         self.assertEqual(phone._parse_netstat_listeners(real_darwin_inventory, 18444), [
             ("0.0.0.0", 18444, set()),
         ])
+        current_darwin_inventory = b"""Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat    pid   epid state  options           gencnt    flags   flags1 usecnt rtncnt fltrs
+tcp4 0 0 192.0.2.44.18444 *.* LISTEN 0 0 131072 131072 321 0 0x0000 0x00000000 123456 0x00000000 0x00000000 1 0 0
+"""
+        self.assertEqual(phone._parse_netstat_listeners(current_darwin_inventory, 18444), [
+            ("192.0.2.44", 18444, set()),
+        ])
         no_match = subprocess.CompletedProcess([], 1, b"", b"")
         with mock.patch.object(phone, "_platform", return_value="Darwin"), mock.patch.object(phone.shutil, "which", side_effect=["/usr/sbin/netstat", "/usr/sbin/lsof"]), mock.patch.object(phone, "_run", side_effect=[subprocess.CompletedProcess([], 0, netstat_empty, b""), no_match]) as run:
             self.assertEqual(phone._port_listeners(18444), [])
