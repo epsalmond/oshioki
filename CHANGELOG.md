@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-03
+
+### Added
+
+- Add one-invocation phone approval for Codex and Claude Code permission
+  requests, with browser passkey decisions and native permission fallback.
+
+### Fixed
+
+- Phone setup uses its own HTTPS port and refuses to alter local state when
+  that port is already occupied or listener ownership cannot be determined.
+
 ## [0.3.2] - 2026-09-29
 
 ### Added
