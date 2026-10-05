@@ -59,6 +59,13 @@ through unchanged. Vercel login is not supported yet. See the
 
 ## Reference
 
+### Vault authorization
+
+`oshioki access` allows a secrets broker such as Agent Vault to request authorization.
+The vault uses `oshioki access verify --config-dir <service-owned-pins> --approver <pinned-fingerprint>`.
+
+See the [integration guide](docs/vault-authorization.md) for setup and usage.
+
 [Configuration](docs/configuration.md) ·
 [Native identity and pairing](docs/native-agent.md) ·
 [Mac approval behavior](docs/mac-approvals.md) ·

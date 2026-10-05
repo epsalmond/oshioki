@@ -371,7 +371,7 @@ impl NatsTransport {
     /// subscription, receipt, and deadline rule below is identical for
     /// command approval and contextual authentication.
     #[allow(clippy::too_many_lines)]
-    fn request_verdict_bytes(
+    pub fn request_verdict_bytes(
         &self,
         request_subject: String,
         request_id: &str,

@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 use url::{Host, Url};
 use uuid::Uuid;
 
+mod access;
 mod approvals;
 #[path = "../../cli/terminal_logo.rs"]
 mod terminal_logo;
@@ -90,6 +91,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Verb {
+    /// Authorize timed broker credential use (fails closed, no sudo fallback).
+    Access {
+        #[command(subcommand)]
+        command: access::AccessCommand,
+    },
     /// Private handshake used by the sudo plugin.
     #[command(hide = true)]
     Check {
@@ -190,6 +196,7 @@ async fn main() -> Result<()> {
     let checking = matches!(cli.verb, Verb::Check { .. } | Verb::Authenticate { .. });
     logging::init(checking);
     let result = match cli.verb {
+        Verb::Access { command } => access::run(command).await,
         Verb::Check {
             plugin_protocol_version,
         } => cmd_check(plugin_protocol_version).await,

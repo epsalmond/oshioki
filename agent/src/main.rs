@@ -33,6 +33,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
+mod access;
 #[path = "../../cli/terminal_logo.rs"]
 mod terminal_logo;
 
@@ -706,15 +707,23 @@ async fn cmd_run(
 /// authentication arrive on separate subject trees and are dispatched by
 /// envelope type, not by the subject they came in on. The authentication
 /// half is absent on a device that may never answer one.
-type Lane = futures::stream::Select<async_nats::Subscriber, AuthLane>;
+type Lane =
+    futures::stream::Select<futures::stream::Select<async_nats::Subscriber, AuthLane>, AuthLane>;
 
 /// The authentication half of [`Lane`]: one subscription, or none at all on
 /// a device that may never answer an authentication.
 type AuthLane =
     futures::stream::Flatten<futures::stream::Iter<std::option::IntoIter<async_nats::Subscriber>>>;
 
-fn lane(requests: async_nats::Subscriber, authentications: Option<async_nats::Subscriber>) -> Lane {
-    futures::stream::select(requests, futures::stream::iter(authentications).flatten())
+fn lane(
+    requests: async_nats::Subscriber,
+    authentications: Option<async_nats::Subscriber>,
+    access: Option<async_nats::Subscriber>,
+) -> Lane {
+    futures::stream::select(
+        futures::stream::select(requests, futures::stream::iter(authentications).flatten()),
+        futures::stream::iter(access).flatten(),
+    )
 }
 
 /// Reads only the envelope's `type` tag, so one delivery can be routed to a
@@ -745,6 +754,8 @@ fn dispatch_nats_request(
         }) => {
             if message_type == AUTH_ENVELOPE_TYPE {
                 dispatch_nats_authentication(payload, identity, decider, nats, admission);
+            } else if message_type == oshioki_protocol::access_v1::ACCESS_ENVELOPE_TYPE {
+                access::dispatch(payload, identity, decider, nats, admission);
             } else {
                 warn!(
                     envelope_type = %escape_for_terminal(&message_type),
@@ -1277,7 +1288,16 @@ async fn subscribe_requests(identity: &Identity) -> Result<Option<(async_nats::C
         fingerprint = %identity.fingerprint(),
         "NATS connection in progress; requests are answered once it is up"
     );
-    Ok(Some((nats, lane(requests, authentications))))
+    let access = if identity.device_kind() == DeviceKindV1::SecureEnclave {
+        Some(
+            nats.subscribe("oshioki.access.>")
+                .await
+                .context("subscribe credential access")?,
+        )
+    } else {
+        None
+    };
+    Ok(Some((nats, lane(requests, authentications, access))))
 }
 
 /// Answer one opened request. `Ok(None)` means no verdict was produced —
@@ -1537,6 +1557,9 @@ async fn handle_socket(
         .message_type
     {
         None => {}
+        Some(message_type) if message_type == oshioki_protocol::access_v1::ACCESS_ENVELOPE_TYPE => {
+            return access::socket(&bytes, identity, decider, permit, writer).await;
+        }
         Some(message_type) if message_type == AUTH_ENVELOPE_TYPE => {
             return handle_socket_authentication(&bytes, identity, decider, permit, writer).await;
         }

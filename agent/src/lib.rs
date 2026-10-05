@@ -690,6 +690,46 @@ impl Identity {
         }))
     }
 
+    /// Opens the separate timed credential access purpose for this device.
+    pub fn open_access_request(
+        &self,
+        envelope: &oshioki_protocol::access_v1::AccessEnvelopeV1,
+    ) -> Result<Option<(oshioki_protocol::access_v1::AccessRequestV1, Vec<u8>)>> {
+        if self.device_kind() != DeviceKindV1::SecureEnclave {
+            bail!("a software identity cannot approve credential access");
+        }
+        envelope
+            .open(
+                &self.fingerprint(),
+                &self.box_secret,
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .map_err(Into::into)
+    }
+
+    /// The Secure Enclave signs only the access challenge, never an approval boolean.
+    pub fn approve_access(
+        &self,
+        raw: &[u8],
+        reason: &str,
+    ) -> Result<oshioki_protocol::access_v1::AccessDecisionV1> {
+        use oshioki_protocol::access_v1::{
+            ACCESS_VERSION, AccessDecisionV1, access_challenge, parse_access_request_at,
+        };
+        if self.device_kind() != DeviceKindV1::SecureEnclave {
+            bail!("a software identity cannot approve credential access");
+        }
+        let request =
+            parse_access_request_at(raw, time::OffsetDateTime::now_utc().unix_timestamp())?;
+        let signature = self.signer.sign_der(&access_challenge(raw), reason)?;
+        Ok(AccessDecisionV1::Native {
+            version: ACCESS_VERSION,
+            request_id: request.request_id,
+            device_fingerprint: self.fingerprint(),
+            signature: encode_base64url(&signature),
+        })
+    }
+
     /// The protocol assurance kind corresponding to this identity's signer.
     pub fn device_kind(&self) -> DeviceKindV1 {
         match self.signer_kind() {
@@ -1164,6 +1204,24 @@ mod tests {
                 .open_request_at(&command_envelope, 1_000)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn a_software_identity_cannot_approve_timed_credential_access() {
+        use oshioki_protocol::access_v1::{ACCESS_ENVELOPE_TYPE, ACCESS_VERSION, AccessEnvelopeV1};
+        let software = identity();
+        let envelope = AccessEnvelopeV1 {
+            message_type: ACCESS_ENVELOPE_TYPE.into(),
+            version: ACCESS_VERSION,
+            request_id: "access-test".into(),
+            sealed: Vec::new(),
+        };
+        assert!(software.open_access_request(&envelope).is_err());
+        assert!(
+            software
+                .approve_access(b"{}", "allow credential use")
+                .is_err()
         );
     }
 
