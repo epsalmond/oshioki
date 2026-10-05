@@ -541,6 +541,23 @@ pub fn verify_webauthn_authentication_v1(
         ));
     }
 
+    verify_webauthn_challenge(
+        approval,
+        device,
+        config,
+        &auth_challenge(raw_auth_request_json),
+    )
+}
+
+/// Shared hardware assertion verification for purpose-specific challenges.
+/// Callers validate their own wire purpose, request binding and active pins.
+pub fn verify_webauthn_challenge(
+    approval: &AuthApproveWebauthnV1,
+    device: &DevicePublicRecordV1,
+    config: &HookConfigV1,
+    challenge: &[u8; 32],
+) -> Result<AssertionOutcomeV1, Error> {
+    config.validate()?;
     let client_data_json = decode_base64url(&approval.client_data_json)?;
     let client_data: ClientData =
         serde_json::from_slice(&client_data_json).map_err(|_| Error::MalformedClientData)?;
@@ -550,7 +567,7 @@ pub fn verify_webauthn_authentication_v1(
     if client_data.origin != config.origin || client_data.cross_origin {
         return Err(Error::BadOrigin);
     }
-    let expected_challenge = URL_SAFE_NO_PAD.encode(auth_challenge(raw_auth_request_json));
+    let expected_challenge = URL_SAFE_NO_PAD.encode(challenge);
     if client_data.challenge != expected_challenge {
         return Err(Error::BadChallenge);
     }
