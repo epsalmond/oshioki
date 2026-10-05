@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Verify a release using the committed SSH policy on reviewed origin/main."""
+
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+
+def git(*args):
+    return subprocess.check_output(["git", *args], text=True).strip()
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def verify(tag, expected_commit=None, expected_object=None):
+    require(re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag),
+            "expected a stable vMAJOR.MINOR.PATCH tag")
+    version = tag[1:]
+    require(tuple(map(int, version.split("."))) >= (0, 4, 1), "tag predates signing checkpoint")
+    require(git("rev-parse", "--is-shallow-repository") == "false", "full history is required")
+    require(not git("status", "--porcelain", "--untracked-files=all"), "source worktree must be clean")
+    ref = f"refs/tags/{tag}"
+    tag_object = git("rev-parse", "--verify", ref)
+    require(git("cat-file", "-t", tag_object) == "tag", "release tag must be annotated")
+    headers = dict(line.split(" ", 1) for line in git("cat-file", "tag", tag_object).split("\n\n", 1)[0].splitlines())
+    require(headers.get("type") == "commit", "tag must point directly to a commit")
+    require(headers.get("tag") == tag, "tag object's name does not match ref")
+    commit = headers["object"]
+    require(expected_commit is None or commit == expected_commit, "source commit mismatch")
+    require(expected_object is None or tag_object == expected_object, "tag object mismatch")
+    # The caller fetches reviewed main from the canonical repository. Trust is
+    # never read from an unverified tag or a caller-selected file/environment.
+    main = git("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")
+    subprocess.run(["git", "merge-base", "--is-ancestor", commit, main], check=True)
+    # Bootstrap files must already be committed before creating the tag. The
+    # current reviewed policy remains the verification authority for revocation.
+    for path in (".github/signing/allowed_signers", ".github/signing/revoked_keys",
+                 "scripts/verify-release-tag", ".github/workflows/release.yml"):
+        require(git("show", f"{commit}:{path}"), f"tag source is missing bootstrap artifact: {path}")
+    with tempfile.TemporaryDirectory(prefix="oshioki-tag-policy-") as directory:
+        policy = pathlib.Path(directory)
+        for name in ("allowed_signers", "revoked_keys"):
+            content = git("show", f"{main}:.github/signing/{name}")
+            (policy / name).write_text(content + "\n")
+        require((policy / "allowed_signers").read_text().strip(), "missing allowed signers")
+        subprocess.run([
+            "git", "-c", "gpg.format=ssh", "-c", "gpg.ssh.program=/usr/bin/ssh-keygen",
+            "-c", f"gpg.ssh.allowedSignersFile={policy / 'allowed_signers'}",
+            "-c", f"gpg.ssh.revocationFile={policy / 'revoked_keys'}",
+            "verify-tag", ref,
+        ], check=True)
+    manifest = tomllib.loads(git("show", f"{commit}:Cargo.toml"))
+    require(manifest["workspace"]["package"]["version"] == version, "workspace version mismatch")
+    names = set()
+    for member in manifest["workspace"]["members"]:
+        package = tomllib.loads(git("show", f"{commit}:{member}/Cargo.toml"))["package"]
+        member_version = package["version"]
+        require(member_version == version or member_version == {"workspace": True}, "package version mismatch")
+        names.add(package["name"])
+    lock = tomllib.loads(git("show", f"{commit}:Cargo.lock"))
+    locked = {package["name"]: package["version"] for package in lock["package"] if package["name"] in names}
+    require(set(locked) == names and all(value == version for value in locked.values()), "lockfile version mismatch")
+    return {"schema_version": 1, "tag": tag, "version": version,
+            "source_commit": commit, "tag_object": tag_object}
+
+
+if __name__ == "__main__":
+    try:
+        if not 2 <= len(sys.argv) <= 4:
+            raise ValueError("usage: verify-release-tag TAG [EXPECTED_COMMIT [EXPECTED_TAG_OBJECT]]")
+        print(json.dumps(verify(*sys.argv[1:]), sort_keys=True))
+    except (ValueError, KeyError, subprocess.CalledProcessError) as error:
+        print(f"verify-release-tag: {error}", file=sys.stderr)
+        sys.exit(1)

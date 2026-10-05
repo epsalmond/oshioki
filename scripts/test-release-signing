@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Offline release-policy tests; all private keys are disposable fixtures."""
+
+import json
+import os
+import pathlib
+import subprocess
+import tempfile
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def run(*args, cwd=None, check=True):
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_AUTHOR_DATE": "2026-10-05T00:00:00Z", "GIT_COMMITTER_DATE": "2026-10-05T00:00:00Z"}
+    return subprocess.run(args, cwd=cwd, env=env, check=check, capture_output=True, text=True)
+
+
+def commit_version(repo, version):
+    (repo / "Cargo.toml").write_text('[workspace]\nmembers = ["test"]\n[workspace.package]\nversion = "' + version + '"\n')
+    (repo / "test").mkdir(exist_ok=True)
+    (repo / "test/Cargo.toml").write_text('[package]\nname = "oshioki-test"\nversion.workspace = true\n')
+    (repo / "Cargo.lock").write_text('version = 3\n[[package]]\nname = "oshioki-test"\nversion = "' + version + '"\n')
+    run("git", "add", ".", cwd=repo)
+    run("git", "commit", "--no-gpg-sign", "-m", "fixture " + version, cwd=repo)
+    run("git", "update-ref", "refs/remotes/origin/main", "HEAD", cwd=repo)
+    run("git", "tag", "-s", "v" + version, "-m", "fixture " + version, cwd=repo)
+
+
+def make_source(directory):
+    directory = pathlib.Path(directory)
+    key = directory / "disposable-key"
+    run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key))
+    repo = directory / "source"
+    repo.mkdir()
+    run("git", "init", "-q", "-b", "main", str(repo))
+    for name, value in {"user.name": "Release test", "user.email": "release@example.invalid",
+                        "gpg.format": "ssh", "user.signingkey": str(key), "tag.gpgsign": "false"}.items():
+        run("git", "config", name, value, cwd=repo)
+    policy = repo / ".github/signing"
+    policy.mkdir(parents=True)
+    public = key.with_suffix(".pub").read_text().strip()
+    (policy / "allowed_signers").write_text('release@example.invalid namespaces="git" ' + public + "\n")
+    (policy / "revoked_keys").write_text("# none\n")
+    (repo / "scripts").mkdir()
+    (repo / "scripts/verify-release-tag").write_text("# disposable bootstrap fixture\n")
+    (repo / ".github/workflows").mkdir()
+    (repo / ".github/workflows/release.yml").write_text("# disposable bootstrap fixture\n")
+    commit_version(repo, "0.4.1")
+    return repo, key
+
+
+class ReleaseTagTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="oshioki-signing-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = pathlib.Path(self.temporary.name)
+        self.repo, self.key = make_source(self.directory)
+
+    def verify(self, tag="v0.4.1", *expected, succeeds=False):
+        result = run(str(ROOT / "scripts/verify-release-tag"), tag, *expected, cwd=self.repo, check=False)
+        self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+        return result
+
+    def test_signed(self):
+        identity = json.loads(self.verify(succeeds=True).stdout)
+        self.assertEqual(identity["source_commit"], run("git", "rev-parse", "HEAD", cwd=self.repo).stdout.strip())
+
+    def test_unsigned(self):
+        run("git", "tag", "-a", "--no-sign", "v0.4.2", "-m", "unsigned", cwd=self.repo)
+        self.verify("v0.4.2")
+
+    def test_lightweight(self):
+        run("git", "tag", "--no-sign", "v0.4.2", cwd=self.repo)
+        self.verify("v0.4.2")
+
+    def test_wrong_key(self):
+        wrong = self.directory / "wrong-key"
+        run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(wrong))
+        run("git", "-c", f"user.signingkey={wrong}", "tag", "-s", "v0.4.2", "-m", "wrong key", cwd=self.repo)
+        self.verify("v0.4.2")
+
+    def test_off_main(self):
+        run("git", "checkout", "-q", "-b", "unreviewed", cwd=self.repo)
+        (self.repo / "unreviewed").write_text("unreviewed\n")
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "commit", "--no-gpg-sign", "-m", "off main", cwd=self.repo)
+        run("git", "tag", "-s", "v0.4.2", "-m", "off main", cwd=self.repo)
+        self.verify("v0.4.2")
+
+    def test_wrong_version(self):
+        run("git", "tag", "-s", "v0.4.2", "-m", "wrong version", cwd=self.repo)
+        self.verify("v0.4.2")
+
+    def test_commit_and_object_mismatch(self):
+        self.verify("v0.4.1", "0" * 40)
+        commit = run("git", "rev-parse", "HEAD", cwd=self.repo).stdout.strip()
+        self.verify("v0.4.1", commit, "0" * 40)
+
+    def test_dirty_source(self):
+        (self.repo / "Cargo.toml").write_text("changed\n")
+        self.verify()
+
+    def test_revoked_key(self):
+        (self.repo / ".github/signing/revoked_keys").write_text(self.key.with_suffix(".pub").read_text())
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "commit", "--no-gpg-sign", "-m", "revoke fixture", cwd=self.repo)
+        run("git", "update-ref", "refs/remotes/origin/main", "HEAD", cwd=self.repo)
+        self.verify()
+
+    def test_missing_policy(self):
+        run("git", "rm", ".github/signing/allowed_signers", cwd=self.repo)
+        run("git", "commit", "--no-gpg-sign", "-m", "remove policy", cwd=self.repo)
+        run("git", "update-ref", "refs/remotes/origin/main", "HEAD", cwd=self.repo)
+        self.verify()
+
+    def test_policy_from_main_not_tag(self):
+        # A tag cannot grant itself permission by carrying an attacker key.
+        wrong = self.directory / "wrong-policy-key"
+        run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(wrong))
+        run("git", "checkout", "-q", "-b", "bad-policy", cwd=self.repo)
+        (self.repo / ".github/signing/allowed_signers").write_text(
+            'release@example.invalid namespaces="git" ' + wrong.with_suffix(".pub").read_text())
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "commit", "--no-gpg-sign", "-m", "attacker policy", cwd=self.repo)
+        run("git", "-c", f"user.signingkey={wrong}", "tag", "-s", "v0.4.2", "-m", "attacker policy", cwd=self.repo)
+        (self.repo / ".github/signing/allowed_signers").write_text(
+            'release@example.invalid namespaces="git" ' + self.key.with_suffix(".pub").read_text())
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "commit", "--no-gpg-sign", "-m", "reviewed main policy", cwd=self.repo)
+        run("git", "update-ref", "refs/remotes/origin/main", "HEAD", cwd=self.repo)
+        self.verify("v0.4.2")
+
+    def test_tag_before_bootstrap(self):
+        run("git", "rm", "scripts/verify-release-tag", cwd=self.repo)
+        run("git", "commit", "--no-gpg-sign", "-m", "missing bootstrap", cwd=self.repo)
+        run("git", "tag", "-s", "-f", "v0.4.1", "-m", "fixture replacement only", cwd=self.repo)
+        (self.repo / "scripts").mkdir(exist_ok=True)
+        (self.repo / "scripts/verify-release-tag").write_text("# later bootstrap\n")
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "commit", "--no-gpg-sign", "-m", "later bootstrap", cwd=self.repo)
+        run("git", "update-ref", "refs/remotes/origin/main", "HEAD", cwd=self.repo)
+        self.verify()
+
+    def test_lockfile_version(self):
+        (self.repo / "Cargo.lock").write_text('version = 3\n[[package]]\nname = "oshioki-test"\nversion = "0.4.0"\n')
+        run("git", "add", ".", cwd=self.repo)
+        run("git", "commit", "--no-gpg-sign", "-m", "wrong lockfile", cwd=self.repo)
+        run("git", "update-ref", "refs/remotes/origin/main", "HEAD", cwd=self.repo)
+        run("git", "tag", "-s", "-f", "v0.4.1", "-m", "fixture replacement only", cwd=self.repo)
+        self.verify()
+
+
+if __name__ == "__main__":
+    unittest.main()

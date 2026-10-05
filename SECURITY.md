@@ -8,6 +8,13 @@ Please treat it accordingly.
 Pre-1.0: only the current `main` branch receives security fixes. Once 1.0
 ships, the two most recent minor releases will be supported.
 
+From v0.4.1 forward, new commits and annotated release tags are signed, and
+published package hashes are bound to their verified source. The public
+signer fingerprint, rotation and emergency recovery procedures are in the
+[release guide](docs/releases.md). This is prospective: older history is
+not rewritten. After a security fix, recovery must use a fixed release or
+newer; do not roll back to a version known to be vulnerable.
+
 ## Reporting a vulnerability
 
 Do **not** open a public issue or PR for a suspected vulnerability.

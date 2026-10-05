@@ -16,6 +16,7 @@ die() {
   exit 1
 }
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPOSITORY="${GITHUB_REPOSITORY:-epsalmond/oshioki}"
 OUTPUT_DIR=
 SIGNING_KEY=
@@ -68,7 +69,7 @@ if [[ -n "$RELEASES_JSON" ]]; then
   [[ -r "$RELEASES_JSON" ]] || die "release metadata is not readable: $RELEASES_JSON"
 fi
 
-for command_name in curl date dpkg-deb dpkg-scanpackages gpg gzip jq sha256sum; do
+for command_name in curl date dpkg dpkg-deb dpkg-scanpackages git gpg gzip jq python3 sha256sum; do
   command -v "$command_name" >/dev/null 2>&1 || die "missing required command: $command_name"
 done
 if [[ -z "$RELEASES_JSON" ]]; then
@@ -124,6 +125,12 @@ while IFS= read -r release; do
     continue
   fi
 
+  # Older releases have no independently signed asset/source binding. Do not
+  # retroactively confer provenance by signing their mutable downloads.
+  if dpkg --compare-versions "$release_version" lt 0.4.1; then
+    continue
+  fi
+
   deb_assets="$(jq -c '[.assets[]? | select(.name | test("^oshioki_[0-9][A-Za-z0-9.+:~_-]*_amd64[.]deb$"))]' <<<"$release")"
   deb_count="$(jq 'length' <<<"$deb_assets")"
   ((deb_count == 0)) && continue
@@ -147,6 +154,19 @@ while IFS= read -r release; do
     "$deb_url" --output "$deb_file" || die "could not download $tag_name package"
   curl --fail --show-error --silent --location --proto '=https,file' --proto-redir '=https,file' \
     "$checksum_url" --output "$checksum_file" || die "could not download $tag_name SHA256SUMS"
+
+  provenance_assets="$(jq -c '[.assets[]? | select(.name == "RELEASE-PROVENANCE.json.asc")]' <<<"$release")"
+  [[ "$(jq 'length' <<<"$provenance_assets")" == 1 ]] || die "$tag_name must contain exactly one signed provenance asset"
+  provenance_url="$(jq -r '.[0].browser_download_url // empty' <<<"$provenance_assets")"
+  [[ -n "$provenance_url" ]] || die "$tag_name provenance asset has no download URL"
+  provenance_file="$WORK_DIR/PROVENANCE-$release_version.asc"
+  curl --fail --show-error --silent --location --proto '=https,file' --proto-redir '=https,file' \
+    "$provenance_url" --output "$provenance_file" || die "could not download $tag_name provenance"
+  "$ROOT/scripts/verify-release-tag" "$tag_name" >"$WORK_DIR/source-$release_version.json" \
+    || die "$tag_name source tag verification failed"
+  "$ROOT/scripts/release-provenance" verify "$OUTPUT_DIR/oshioki-archive-keyring.gpg" "$FINGERPRINT" \
+    "$WORK_DIR/source-$release_version.json" "$provenance_file" "$deb_file" "$checksum_file" \
+    || die "$tag_name asset provenance verification failed"
 
   expected_hash="$(awk -v name="$deb_name" '$2 == name { count++; hash = $1 } END { if (count == 1) print hash; else exit 1 }' \
     "$checksum_file")" || die "$tag_name SHA256SUMS must list $deb_name exactly once"

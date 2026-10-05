@@ -160,11 +160,15 @@ private key. Set Actions variable `APT_SIGNING_KEY_FINGERPRINT` to the full
 primary fingerprint. Keep protected backups and renew the keys before expiry.
 
 The `github-pages` environment allows deployments from the default branch for
-bootstrap and from `v*` tags for releases. The release workflow indexes stable
-releases, verifies each `.deb` against its `SHA256SUMS`, checks package
-metadata, retains published versions, and excludes drafts and prereleases.
+rebuilds and from `v*` tags for releases. From v0.4.1, the release job also
+uses this APT signer to bind package and checksum hashes to a verified SSH
+source tag in `RELEASE-PROVENANCE.json.asc`. The repository builder verifies
+that signature and source identity before signing an index. It retains
+verified versions from v0.4.1 onward and excludes earlier unsigned-provenance
+packages, drafts and prereleases. See [release and recovery](docs/releases.md)
+for the SSH signer fingerprint, tag creation, rotation and emergency steps.
 
-To publish existing releases, run the `release` workflow from the default
+To rebuild verified releases, run the `release` workflow from the default
 branch with `publish_apt_repository` enabled. This does not create a release;
 the deployment summary reports the signing fingerprint. For a signing-subkey
 rotation, update the Actions secret and republish the public keyring. Replacing

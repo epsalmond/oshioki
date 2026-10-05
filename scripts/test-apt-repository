@@ -34,10 +34,11 @@ EOF
   )
 }
 
-make_deb 0.3.0
-make_deb 0.3.1
-make_deb 0.4.0~rc1
-make_deb 0.3.2
+make_deb 0.4.1
+make_deb 0.4.2
+make_deb 0.4.3~rc1
+make_deb 0.4.3
+make_deb 0.4.0
 
 python3 - "$TEST_ROOT/assets" "$TEST_ROOT/releases.json" <<'PY'
 import json
@@ -48,10 +49,11 @@ assets = pathlib.Path(sys.argv[1])
 releases_path = pathlib.Path(sys.argv[2])
 releases = []
 for version, prerelease, draft in (
-    ("0.3.0", False, False),
-    ("0.3.1", False, False),
-    ("0.4.0~rc1", True, False),
-    ("0.3.2", False, True),
+    ("0.4.1", False, False),
+    ("0.4.2", False, False),
+    ("0.4.3~rc1", True, False),
+    ("0.4.3", False, True),
+    ("0.4.0", False, False),
 ):
     deb_name = f"oshioki_{version}_amd64.deb"
     sums_name = f"SHA256SUMS-{version}"
@@ -76,7 +78,40 @@ SIGNING_FINGERPRINT="$(GNUPGHOME="$TEST_ROOT/gnupg" gpg --batch --with-colons --
 GNUPGHOME="$TEST_ROOT/gnupg" gpg --batch --armor --export-secret-keys "$SIGNING_FINGERPRINT" \
   >"$TEST_ROOT/signing-key.asc"
 
-printf '%064d  %s\n' 0 "oshioki_0.3.1_amd64.deb" >"$TEST_ROOT/assets/SHA256SUMS-invalid"
+# Build a disposable source policy and tags. No production key participates.
+python3 - "$ROOT" "$TEST_ROOT" "$SIGNING_FINGERPRINT" <<'PYFIXTURE'
+import json
+import pathlib
+import runpy
+import shutil
+import subprocess
+import sys
+
+root, test, fingerprint = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+fixtures = runpy.run_path(str(root / "scripts/test-release-signing"))
+repo, key = fixtures["make_source"](test)
+for version in ("0.4.1", "0.4.2"):
+    if version != "0.4.1":
+        fixtures["commit_version"](repo, version)
+    identity = test / f"source-{version}.json"
+    identity.write_text(subprocess.check_output([str(root / "scripts/verify-release-tag"), f"v{version}"], cwd=repo, text=True))
+    assets = test / f"assets-{version}"
+    assets.mkdir()
+    shutil.copy(test / "assets" / f"oshioki_{version}_amd64.deb", assets)
+    shutil.copy(test / "assets" / f"SHA256SUMS-{version}", assets / "SHA256SUMS")
+    (assets / f"oshioki-macos-arm64-{version}.tar.gz").write_bytes(b"disposable archive fixture")
+    subprocess.run([str(root / "scripts/release-provenance"), "sign", str(test / "signing-key.asc"), fingerprint, str(identity), str(assets)], check=True)
+    shutil.copy(assets / "RELEASE-PROVENANCE.json.asc", test / "assets" / f"PROVENANCE-{version}.asc")
+releases = json.loads((test / "releases.json").read_text())
+for release in releases:
+    if release["tag_name"] in ("v0.4.1", "v0.4.2"):
+        release["assets"].append({"name": "RELEASE-PROVENANCE.json.asc", "browser_download_url": (test / "assets" / f"PROVENANCE-{release['tag_name'][1:]}.asc").as_uri()})
+(test / "releases.json").write_text(json.dumps(releases))
+PYFIXTURE
+# Verification policy comes from this fixture's origin/main, never a trust-file override.
+cd "$TEST_ROOT/source"
+
+printf '%064d  %s\n' 0 "oshioki_0.4.2_amd64.deb" >"$TEST_ROOT/assets/SHA256SUMS-invalid"
 python3 - "$TEST_ROOT/releases.json" "$TEST_ROOT/releases-invalid-sums.json" \
   "$TEST_ROOT/assets/SHA256SUMS-invalid" <<'PY'
 import json
@@ -86,7 +121,7 @@ import sys
 releases = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 invalid_sums = pathlib.Path(sys.argv[3]).as_uri()
 for release in releases:
-    if release["tag_name"] == "v0.3.1":
+    if release["tag_name"] == "v0.4.2":
         for asset in release["assets"]:
             if asset["name"] == "SHA256SUMS":
                 asset["browser_download_url"] = invalid_sums
@@ -100,7 +135,49 @@ if "$BUILD_REPOSITORY" \
   echo 'test-apt-repository: package with an invalid release checksum was accepted' >&2
   exit 1
 fi
-grep -q 'package checksum does not match SHA256SUMS' "$TEST_ROOT/invalid-sums.log"
+grep -q 'provenance checksum hash mismatch' "$TEST_ROOT/invalid-sums.log"
+
+# Replacing both co-hosted package and checksum still fails signed provenance.
+cp "$TEST_ROOT/assets/oshioki_0.4.2_amd64.deb" "$TEST_ROOT/original.deb"
+cp "$TEST_ROOT/assets/SHA256SUMS-0.4.2" "$TEST_ROOT/original.sums"
+printf 'tamper\n' >>"$TEST_ROOT/assets/oshioki_0.4.2_amd64.deb"
+(cd "$TEST_ROOT/assets" && sha256sum oshioki_0.4.2_amd64.deb >SHA256SUMS-0.4.2)
+if "$BUILD_REPOSITORY" --releases-json "$TEST_ROOT/releases.json" \
+  --output-dir "$TEST_ROOT/repository-replaced-assets" \
+  --signing-key "$TEST_ROOT/signing-key.asc" --fingerprint "$SIGNING_FINGERPRINT" \
+  >"$TEST_ROOT/replaced-assets.log" 2>&1; then
+  echo 'test-apt-repository: replaced package and checksum accepted' >&2
+  exit 1
+fi
+grep -q 'provenance package hash mismatch' "$TEST_ROOT/replaced-assets.log"
+cp "$TEST_ROOT/original.deb" "$TEST_ROOT/assets/oshioki_0.4.2_amd64.deb"
+cp "$TEST_ROOT/original.sums" "$TEST_ROOT/assets/SHA256SUMS-0.4.2"
+
+# A valid provenance signature for another source is insufficient.
+cp "$TEST_ROOT/assets/PROVENANCE-0.4.2.asc" "$TEST_ROOT/original-provenance.asc"
+cp "$TEST_ROOT/assets/PROVENANCE-0.4.1.asc" "$TEST_ROOT/assets/PROVENANCE-0.4.2.asc"
+if "$BUILD_REPOSITORY" --releases-json "$TEST_ROOT/releases.json" \
+  --output-dir "$TEST_ROOT/repository-wrong-source" \
+  --signing-key "$TEST_ROOT/signing-key.asc" --fingerprint "$SIGNING_FINGERPRINT" \
+  >"$TEST_ROOT/wrong-source.log" 2>&1; then
+  echo 'test-apt-repository: provenance for another source accepted' >&2
+  exit 1
+fi
+grep -q 'provenance source identity mismatch' "$TEST_ROOT/wrong-source.log"
+cp "$TEST_ROOT/original-provenance.asc" "$TEST_ROOT/assets/PROVENANCE-0.4.2.asc"
+
+# Editing signed provenance is rejected even when the JSON is still valid.
+sed 's/"repository": "epsalmond\/oshioki"/"repository": "attacker\/oshioki"/' \
+  "$TEST_ROOT/original-provenance.asc" >"$TEST_ROOT/assets/PROVENANCE-0.4.2.asc"
+if "$BUILD_REPOSITORY" --releases-json "$TEST_ROOT/releases.json" \
+  --output-dir "$TEST_ROOT/repository-tampered-provenance" \
+  --signing-key "$TEST_ROOT/signing-key.asc" --fingerprint "$SIGNING_FINGERPRINT" \
+  >"$TEST_ROOT/tampered-provenance.log" 2>&1; then
+  echo 'test-apt-repository: altered provenance signature accepted' >&2
+  exit 1
+fi
+grep -q 'asset provenance verification failed' "$TEST_ROOT/tampered-provenance.log"
+cp "$TEST_ROOT/original-provenance.asc" "$TEST_ROOT/assets/PROVENANCE-0.4.2.asc"
 
 "$BUILD_REPOSITORY" \
   --releases-json "$TEST_ROOT/releases.json" \
@@ -110,9 +187,9 @@ grep -q 'package checksum does not match SHA256SUMS' "$TEST_ROOT/invalid-sums.lo
 
 REPOSITORY="$TEST_ROOT/repository"
 PACKAGES="$REPOSITORY/dists/stable/main/binary-amd64/Packages"
-grep -q '^Version: 0\.3\.0$' "$PACKAGES"
-grep -q '^Version: 0\.3\.1$' "$PACKAGES"
-if grep -q '^Version: 0\.4\.0~rc1$\|^Version: 0\.3\.2$' "$PACKAGES"; then
+grep -q '^Version: 0\.4\.1$' "$PACKAGES"
+grep -q '^Version: 0\.4\.2$' "$PACKAGES"
+if grep -q '^Version: 0\.4\.3~rc1$\|^Version: 0\.4\.3$\|^Version: 0\.4\.0$' "$PACKAGES"; then
   echo 'test-apt-repository: prerelease or draft package entered the repository' >&2
   exit 1
 fi
@@ -145,7 +222,7 @@ Status: install ok installed
 Priority: optional
 Section: admin
 Architecture: amd64
-Version: 0.3.0
+Version: 0.4.1
 Description: Installed synthetic Oshioki package
 
 EOF
@@ -222,13 +299,13 @@ fi
 
 apt_get "$APT_ROOT" update -qq
 SIMULATION="$(apt_get "$APT_ROOT" --simulate install --only-upgrade oshioki 2>&1)"
-if ! grep -Eq 'Inst oshioki \[0\.3\.0\] \(0\.3\.1 ' <<<"$SIMULATION"; then
+if ! grep -Eq 'Inst oshioki \[0\.4\.1\] \(0\.4\.2 ' <<<"$SIMULATION"; then
   printf '%s\n' "$SIMULATION" >&2
-  echo 'test-apt-repository: apt did not select 0.3.1 over installed 0.3.0' >&2
+  echo 'test-apt-repository: apt did not select 0.4.2 over installed 0.4.1' >&2
   exit 1
 fi
 
-printf 'tamper\n' >>"$REPOSITORY/pool/main/o/oshioki/oshioki_0.3.1_amd64.deb"
+printf 'tamper\n' >>"$REPOSITORY/pool/main/o/oshioki/oshioki_0.4.2_amd64.deb"
 if apt_get "$APT_ROOT" --download-only --assume-yes install --only-upgrade oshioki \
   >"$TEST_ROOT/tampered-download.log" 2>&1; then
   echo 'test-apt-repository: modified package unexpectedly passed apt hash verification' >&2
@@ -241,4 +318,4 @@ if ! grep -Eiq 'Hash Sum mismatch|File has unexpected size|expected.*checksum|ch
   exit 1
 fi
 
-echo 'test-apt-repository: PASS (stable versions retained, signed index verified, apt selects upgrade, signature and package tampering rejected)'
+echo 'test-apt-repository: PASS (signed-source versions retained, source provenance and signed index verified, apt selects upgrade, signature and package tampering rejected)'
