@@ -2,17 +2,16 @@
 
 <p align="center"><img src="assets/oshioki.svg" alt="Oshioki logo" width="160"></p>
 
-Oshioki (お仕置き) puts the pun in punishment.
+Oshioki (お仕置き) means punishment.
 
 Adds Touch ID, WebAuthn, or native device approval to `sudo`.
 
 WebAuthn runs in a WebAuthn-compatible browser. Native approvals use
 `oshioki-agent`.
 
-The command and environment are sealed for recipient devices. The request
-envelope exposes the host, user, request ID, timestamps, and recipient
-fingerprints. Approvals are signed. A local Unix socket is available for
-native approvals. NATS with JetStream connects your servers, VMs, etc to your
+The command and environment are entcrypted. Approvals are signed. 
+A local Unix socket is available for native approvals. 
+NATS with JetStream connects your servers, VMs, etc to your
 phone or laptop.
 
 ## Install
