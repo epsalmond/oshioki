@@ -102,6 +102,29 @@ def _private_file(path: Path, description: str) -> None:
             fail(f"cannot inspect {description} {path}: {exc}")
 
 
+def _prepare_config_directory(path: Path) -> None:
+    """Tighten trusted legacy setup state without replacing registry/lock inodes."""
+    _no_symlink(path, "Oshioki config directory")
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            current = os.fstat(fd)
+            selected = path.lstat()
+            if (current.st_dev, current.st_ino) != (selected.st_dev, selected.st_ino):
+                fail(f"Oshioki config directory changed while opening: {path}")
+            if current.st_uid != os.geteuid():
+                fail(f"Oshioki config directory must be owned by the effective user: {path}")
+            if current.st_mode & 0o022:
+                fail(f"Oshioki config directory must not be group/world writable: {path}")
+            os.fchmod(fd, 0o700)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        fail(f"cannot prepare private Oshioki config directory {path}: {exc}")
+
+
 def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     """Write a private file without exposing a partial or broad-mode file."""
     _regular_or_absent(path, "managed file")
@@ -1371,12 +1394,7 @@ def _install_config(staging: Path, config_dir: Path) -> None:
     if origin != value["origin"] or value["rp_id"] != host:
         fail("configuration staging origin and RP ID do not match")
     _nats_parts(value["nats_url"])
-    _no_symlink(config_dir, "Oshioki config directory")
-    if config_dir.exists() and not config_dir.is_dir():
-        fail(f"Oshioki config path is not a directory: {config_dir}")
-    config_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
-    if os.geteuid() == 0 and config_dir.stat().st_uid != 0:
-        fail(f"Oshioki config directory must be root-owned: {config_dir}")
+    _prepare_config_directory(config_dir)
 
     registry_path = config_dir / "devices.json"
     registry = _read_registry(registry_path)

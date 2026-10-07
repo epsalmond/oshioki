@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-06
+
+### Fixed
+
+- Fence local device revocation against outstanding command and contextual PAM
+  decisions. Successful approval now revalidates the enrolled device under the
+  registry lock used to commit revocation.
+- Keep registry state and stable lock files private, and preserve device
+  records, revocation epochs, counters, and lock identities when upgrading
+  hook, phone, contextual PAM, and Debian package setup.
+
 ## [0.4.1] - 2026-10-05
 
 ### Added

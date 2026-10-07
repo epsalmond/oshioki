@@ -351,15 +351,46 @@ OSHIOKI_AGENT_SOCKET=/env/agent.sock run_installer "$SOCKET_ENV" --prelaunch
 grep -Fq 'OSHIOKI_AGENT_SOCKET=/env/agent.sock' "$SOCKET_ENV/state/config.env" || fail "agent socket env missing from config.env"
 
 PRELAUNCH="$TEST_ROOT/prelaunch"; mkdir -p "$PRELAUNCH/sudoers.d" "$PRELAUNCH/state"
+chmod 0750 "$PRELAUNCH/state"
 printf 'outside-before\n' > "$PRELAUNCH/sudo.conf"
-printf '{"version":1,"devices":[{"sentinel":true,"active":true}]}\n' > "$PRELAUNCH/state/devices.json"
+printf '{"version":1,"revocation_epoch":37,"devices":[{"sentinel":true,"sign_count":42,"active":true}]}\n' > "$PRELAUNCH/state/devices.json"
+: > "$PRELAUNCH/state/.devices.lock"
+: > "$PRELAUNCH/state/.devices-lifecycle.lock"
+chmod 0600 "$PRELAUNCH/state/devices.json" "$PRELAUNCH/state/.devices"*.lock
+lock_identity() {
+  python3 -c 'import pathlib,sys; print([(p.stat().st_dev,p.stat().st_ino) for p in sorted(pathlib.Path(sys.argv[1]).glob(".devices*.lock"))])' "$1"
+}
+locks_before="$(lock_identity "$PRELAUNCH/state")"
 devices_hash="$(sha256_file "$PRELAUNCH/state/devices.json")"
 run_installer "$PRELAUNCH" --prelaunch
+python3 -c 'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o700' "$PRELAUNCH/state"
 [ "$(sha256_file "$PRELAUNCH/state/devices.json")" = "$devices_hash" ] || fail "existing device state changed"
 [ "$(grep -c '^# BEGIN oshioki$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "managed block duplicated"
 run_installer "$PRELAUNCH" --prelaunch
+[ "$(lock_identity "$PRELAUNCH/state")" = "$locks_before" ] || fail "reconfigure replaced registry locks"
+[ "$(sha256_file "$PRELAUNCH/state/devices.json")" = "$devices_hash" ] || fail "reconfigure changed devices/counters/epoch"
 [ "$(grep -c '^# BEGIN oshioki$' "$PRELAUNCH/sudo.conf")" -eq 1 ] || fail "rerun duplicated block"
 run_installer "$PRELAUNCH" --prelaunch-status | grep -Fq enabled || fail "status did not report enabled"
+
+for unsafe in foreign-owner writable symlink; do
+  UNSAFE_DIR="$TEST_ROOT/state-$unsafe"; mkdir -p "$UNSAFE_DIR/state"
+  chmod 0750 "$UNSAFE_DIR/state"
+  case "$unsafe" in
+    foreign-owner) owner=12345; mode=750 ;;
+    writable) owner=0; mode=770 ;;
+    symlink)
+      owner=0; mode=750
+      mv "$UNSAFE_DIR/state" "$UNSAFE_DIR/target"
+      ln -s "$UNSAFE_DIR/target" "$UNSAFE_DIR/state"
+      ;;
+  esac
+  if FAKE_STAT_SPECIAL_PATH="$UNSAFE_DIR/state" FAKE_STAT_SPECIAL_OWNER="$owner" \
+     FAKE_STAT_SPECIAL_MODE="$mode" run_installer "$UNSAFE_DIR" --prelaunch >"$UNSAFE_DIR/log" 2>&1; then
+    fail "accepted $unsafe state directory"
+  fi
+  [ ! -e "$UNSAFE_DIR/sbin/oshioki" ] || fail "$unsafe state directory installed artifacts"
+  python3 -c 'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o750' "$UNSAFE_DIR/state"
+done
 
 # An upgrade first removes both privilege artifacts and validates ordinary
 # sudo. A validation failure restores the old state without replacing either
@@ -806,6 +837,64 @@ pam_unchanged() {
   return 0
 }
 
+# Contextual-only setup must tighten legacy state before its early returns,
+# preserving registry bytes (including epoch/counters) and stable lock files.
+PRIVATE_PAM="$TEST_ROOT/pam-private-state"
+setup_legacy_host "$PRIVATE_PAM" ubuntu-24.04
+printf '{"version":1,"revocation_epoch":37,"devices":[{"version":1,"kind":"secure-enclave","fingerprint":"x","sign_count":42,"active":true}]}\n' > "$PRIVATE_PAM/state/devices.json"
+: > "$PRIVATE_PAM/state/.devices.lock"
+: > "$PRIVATE_PAM/state/.devices-lifecycle.lock"
+chmod 0600 "$PRIVATE_PAM/state/devices.json" "$PRIVATE_PAM/state/.devices"*.lock
+private_hash="$(sha256_file "$PRIVATE_PAM/state/devices.json")"
+private_locks="$(lock_identity "$PRIVATE_PAM/state")"
+chmod 0755 "$PRIVATE_PAM/state"
+run_installer --sudo-user testuser "$PRIVATE_PAM" --contextual-pam --dry-run >"$PRIVATE_PAM/dry.log" 2>&1 ||
+  fail "legacy private-state dry run failed"
+grep -Fq 'install -d -m 0700' "$PRIVATE_PAM/dry.log" || fail "dry run omitted private state migration"
+python3 -c 'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o755' "$PRIVATE_PAM/state"
+pam_unchanged "$PRIVATE_PAM" || fail "private-state dry run changed PAM"
+run_installer --sudo-user testuser "$PRIVATE_PAM" --contextual-pam >"$PRIVATE_PAM/log" 2>&1 ||
+  fail "0755 contextual-only migration failed"
+for mode in 0755 0750; do
+  # The first assertion covers full migration; subsequent runs hit the
+  # already-current-module return that also used to bypass preparation.
+  python3 -c 'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o700' "$PRIVATE_PAM/state"
+  [ "$(sha256_file "$PRIVATE_PAM/state/devices.json")" = "$private_hash" ] || fail "contextual setup changed registry/epoch/counters"
+  [ "$(lock_identity "$PRIVATE_PAM/state")" = "$private_locks" ] || fail "contextual setup replaced registry locks"
+  chmod "$mode" "$PRIVATE_PAM/state"
+  run_installer --sudo-user testuser "$PRIVATE_PAM" --contextual-pam >"$PRIVATE_PAM/current-$mode.log" 2>&1 ||
+    fail "already-current contextual setup failed for $mode"
+done
+python3 -c 'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o700' "$PRIVATE_PAM/state"
+[ "$(sha256_file "$PRIVATE_PAM/state/devices.json")" = "$private_hash" ] || fail "current contextual setup changed registry"
+[ "$(lock_identity "$PRIVATE_PAM/state")" = "$private_locks" ] || fail "current contextual setup replaced locks"
+
+for unsafe in foreign-owner group-writable world-writable symlink; do
+  UNSAFE_PAM="$TEST_ROOT/pam-state-$unsafe"
+  setup_legacy_host "$UNSAFE_PAM" ubuntu-24.04
+  chmod 0755 "$UNSAFE_PAM/state"
+  case "$unsafe" in
+    foreign-owner) owner=12345; mode=755 ;;
+    group-writable) owner=0; mode=775; chmod 0775 "$UNSAFE_PAM/state" ;;
+    world-writable) owner=0; mode=757; chmod 0757 "$UNSAFE_PAM/state" ;;
+    symlink)
+      owner=0; mode=755
+      mv "$UNSAFE_PAM/state" "$UNSAFE_PAM/target"
+      ln -s "$UNSAFE_PAM/target" "$UNSAFE_PAM/state"
+      ;;
+  esac
+  unsafe_hash="$(sha256_file "$UNSAFE_PAM/state/devices.json")"
+  if FAKE_STAT_SPECIAL_PATH="$UNSAFE_PAM/state" FAKE_STAT_SPECIAL_OWNER="$owner" \
+     FAKE_STAT_SPECIAL_MODE="$mode" run_installer --sudo-user testuser "$UNSAFE_PAM" \
+     --contextual-pam >"$UNSAFE_PAM/log" 2>&1; then
+    fail "contextual setup accepted $unsafe state"
+  fi
+  pam_unchanged "$UNSAFE_PAM" || fail "$unsafe state refusal changed PAM"
+  [ ! -e "$UNSAFE_PAM/security/liboshioki_pam.so" ] || fail "$unsafe state refusal installed module"
+  [ "$(sha256_file "$UNSAFE_PAM/state/devices.json")" = "$unsafe_hash" ] || fail "$unsafe state refusal changed registry"
+  python3 -c 'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == int(sys.argv[2], 8)' "$UNSAFE_PAM/state" "$mode"
+done
+
 # --- exact post-edit bytes, per stock distribution layout -----------------
 # The three assertions together pin the bytes: the block is exactly our three
 # lines, it sits immediately above the include it must precede, and deleting
@@ -902,13 +991,15 @@ pam_unchanged "$MULTIARCH" || fail "the multiarch refusal modified a PAM file"
 
 # No hardware-backed device is "not yet", not a failure: the .deb's opt-in
 # key is pre-seeded before any device is paired, so every postinst until
-# then would otherwise report an error. Nothing on the host is touched, and
+# then would otherwise report an error. No PAM/sudo artifacts are touched, and
 # the exit status has to be 0 for the package script to carry on.
 NODEVICE="$TEST_ROOT/pam-no-device"
 setup_legacy_host "$NODEVICE" ubuntu-24.04
 printf '{"version":1,"devices":[{"version":1,"kind":"software","active":true}]}\n' > "$NODEVICE/state/devices.json"
+chmod 0755 "$NODEVICE/state"
 run_installer --sudo-user testuser "$NODEVICE" --contextual-pam >"$NODEVICE/log" 2>&1 ||
   fail "a software-only registry was an error rather than a skip"
+python3 -c 'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o700' "$NODEVICE/state"
 grep -Fq 'no active hardware-backed approval device yet' "$NODEVICE/log" || fail "missing device skip message"
 grep -Fq -- '--contextual-pam' "$NODEVICE/log" || fail "the skip does not name the command to re-run"
 pam_unchanged "$NODEVICE" || fail "the device skip modified a PAM file"

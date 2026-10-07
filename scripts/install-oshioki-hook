@@ -669,6 +669,22 @@ path_is_root_owned_and_tight() {
   return 0
 }
 
+# Setup may tighten the legacy 0750 state directory, but must not adopt
+# someone else's directory or follow a symlink. Never replace registry/locks.
+validate_state_directory() {
+  [ ! -L "$STATE_DIR" ] || die "refusing symlink state directory: $STATE_DIR"
+  if [ -e "$STATE_DIR" ]; then
+    if [ ! -d "$STATE_DIR" ] || ! path_is_root_owned_and_tight "$STATE_DIR"; then
+      die "state directory must be root-owned and not group/world writable: $STATE_DIR"
+    fi
+  fi
+}
+
+prepare_state_directory() {
+  validate_state_directory
+  run install -d -m 0700 -o root -g "$ROOT_GROUP" "$STATE_DIR"
+}
+
 helper_path_secure() {
   local helper="$SBIN_DIR/oshioki" directory mode
   [ -f "$helper" ] && [ ! -L "$helper" ] || return 1
@@ -1344,6 +1360,7 @@ esac
 
 [ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || die "must run as root"
 safe_directory "$(dirname "$STATE_DIR")"; safe_directory "$STATE_DIR"; regular_or_absent "$SUDO_CONF"
+case "$MODE" in prelaunch|contextual-pam) validate_state_directory ;; esac
 safe_directory "$SBIN_DIR"; safe_directory "$PLUGIN_DIR"; regular_or_absent "$SBIN_DIR/oshioki"; regular_or_absent "$PLUGIN_DEST"
 regular_or_absent "$STATE_DIR/config.env"; regular_or_absent "$STATE_DIR/hook.json"; regular_or_absent "$STATE_DIR/devices.json"
 
@@ -1626,6 +1643,11 @@ if [ "$MODE" = contextual-pam ]; then
     die "$PAM_D/common-auth already references liboshioki_pam; refusing to touch this host"
   pam_trace "pam:prereq-ok"
 
+  # Every contextual-only path (including already-current refreshes and
+  # deferred enrollment) must leave state private before the helper can run.
+  # This only tightens trusted directory permissions; registry/locks remain.
+  prepare_state_directory
+
   # --- Upgrade path: the lane is already live and only the module file is
   # out of date. A package upgrade must refresh it, and must do so without
   # going through the migration again: the PAM block stays exactly as it is,
@@ -1695,7 +1717,7 @@ if [ "$MODE" = contextual-pam ]; then
   # pre-seeded before any device is paired, and every postinst until then
   # would otherwise abort the migration as an error. Prerequisite problems
   # above still die; this one only means "come back after pinning a device",
-  # and nothing on the host has been touched.
+  # and no PAM or sudo artifacts have been touched. State is now private.
   pam_registry_state="$(registry_device_state)"
   case "$pam_registry_state" in
     corrupt)
@@ -1747,7 +1769,8 @@ if [ "$MODE" = contextual-pam ]; then
     exit 0
   fi
 
-  # --- Step 0 invariant: nothing has changed. Arm every rollback input
+  # --- Step 0 invariant: no PAM or sudo artifacts have changed. Private
+  # directory permissions remain tightened even on rollback. Arm every input
   # before the first mutation, and snapshot the module destination alongside
   # the PAM files so rollback treats it as one ordered set.
   capture_dropin_backup
@@ -2035,7 +2058,7 @@ prepare_upgrade
 run install -d -m 0755 "$SBIN_DIR" "$PLUGIN_DIR"
 run install -m 0755 -o root -g "$ROOT_GROUP" "$HOOK_BIN" "$SBIN_DIR/oshioki"
 run install -m 0755 -o root -g "$ROOT_GROUP" "$PLUGIN_BIN" "$PLUGIN_DEST"
-run install -d -m 0750 -o root -g "$ROOT_GROUP" "$STATE_DIR"
+prepare_state_directory
 
 if [ "$DRY_RUN" -eq 1 ]; then
   if [ -n "$NATS_URL" ]; then printf 'DRY: write %s/config.env with NATS_PASS=<redacted>\n' "$STATE_DIR"; else printf 'DRY: write %s/config.env without NATS (socket-only)\n' "$STATE_DIR"; fi

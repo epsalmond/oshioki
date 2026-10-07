@@ -60,7 +60,7 @@ install -m 0644 "$STAGE_DIR/liboshioki_plugin.so" "$STAGE_DIR/liboshioki_pam.so"
 install -m 0755 "$STAGE_DIR/oshioki-server" "$TREE/usr/sbin/oshioki-server"
 install -m 0755 "$ROOT/scripts/oshioki-phone-setup" "$TREE/usr/sbin/oshioki-phone-setup"
 install -m 0755 "$ROOT/scripts/install-oshioki-hook" "$TREE/usr/share/oshioki/install-oshioki-hook"
-install -d -m 0750 "$TREE/etc/oshioki"
+install -d -m 0700 "$TREE/etc/oshioki"
 
 # The multiarch triplet this package was built for. The installer refuses to
 # drop the PAM module into a security directory that disagrees with it: a

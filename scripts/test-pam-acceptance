@@ -277,6 +277,23 @@ SUDOERS
     # host that has nothing capable of answering an authentication.
     install -o root -g root -m 0600 /run/oshioki-test/devices-hardware.json /etc/oshioki/devices.json
 
+    # Keep the legacy 0755 fixture: contextual-only setup must migrate it,
+    # rather than letting authentication return unavailable before transport.
+    python3 - <<"PY"
+import json
+from pathlib import Path
+registry = Path("/etc/oshioki/devices.json")
+state = json.loads(registry.read_text())
+state["revocation_epoch"] = 37
+registry.write_text(json.dumps(state) + "\n")
+PY
+    install -o root -g root -m 0600 /dev/null /etc/oshioki/.devices.lock
+    install -o root -g root -m 0600 /dev/null /etc/oshioki/.devices-lifecycle.lock
+    cp /etc/oshioki/devices.json /run/oshioki-obs/registry-before-migration.json
+    stat -c "%d:%i" /etc/oshioki/.devices.lock /etc/oshioki/.devices-lifecycle.lock \
+        >/run/oshioki-obs/locks-before-migration
+    [ "$(stat -c %a /etc/oshioki)" = 755 ]
+
     # The installer verifies the module against a checksum manifest. The
     # release mount is read-only, so the manifest is built next to it.
     ( cd /run/oshioki-release && sha256sum liboshioki_pam.so ) >/run/oshioki-obs/SHA256SUMS
@@ -288,6 +305,15 @@ SUDOERS
     OSHIOKI_CHECKSUMS=/run/oshioki-obs/SHA256SUMS \
     PAM_MODULE_BIN=/run/oshioki-release/liboshioki_pam.so \
         /run/oshioki-installer/scripts/install-oshioki-hook --contextual-pam
+
+    [ "$(stat -c %a /etc/oshioki)" = 700 ] || {
+        echo "contextual-only setup did not privatise legacy registry state" >&2; exit 1; }
+    cmp -s /etc/oshioki/devices.json /run/oshioki-obs/registry-before-migration.json || {
+        echo "contextual-only setup changed registry contents/epoch/counters" >&2; exit 1; }
+    stat -c "%d:%i" /etc/oshioki/.devices.lock /etc/oshioki/.devices-lifecycle.lock \
+        >/run/oshioki-obs/locks-after-migration
+    cmp -s /run/oshioki-obs/locks-before-migration /run/oshioki-obs/locks-after-migration || {
+        echo "contextual-only setup replaced stable registry locks" >&2; exit 1; }
 
     security_dir="$(dirname "$(dpkg-query -L libpam-modules | grep -E "/pam_unix[.]so$" | head -1)")"
     printf "%s\n" "$security_dir" >/run/oshioki-test/security-dir

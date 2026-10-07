@@ -25,6 +25,7 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 mod approvals;
+mod registry;
 #[path = "../../cli/terminal_logo.rs"]
 mod terminal_logo;
 
@@ -744,8 +745,9 @@ async fn execute_request_at(
     // before any request is built, not at the first sudo afterwards.
     let nats_url = transports_from(directory)?.nats_url;
     let raw_request = request.raw_json()?;
-    let mut registry = load_registry_from(directory)?;
-    let active = registry
+    let snapshot = registry::snapshot(directory)?;
+    let active = snapshot
+        .registry
         .devices
         .iter()
         .filter(|device| device.active)
@@ -916,7 +918,7 @@ async fn execute_request_at(
         &request,
         &raw_request,
         &active,
-        &mut registry,
+        snapshot.revocation_epoch,
         directory,
     )
     .await
@@ -1479,13 +1481,38 @@ fn decode_socket_auth_decision(bytes: &[u8]) -> Result<AuthDecisionV1> {
     }
 }
 
+fn final_authorization(
+    directory: &Path,
+    device: &DevicePublicRecordV1,
+    epoch: u64,
+    expires_at: i64,
+    observed: Option<u32>,
+    authentication: bool,
+) -> Result<()> {
+    registry::authorize(
+        directory,
+        device,
+        epoch,
+        expires_at,
+        observed,
+        authentication,
+    )
+    .map_err(|error| match error {
+        registry::GateError::Denied(reason) => anyhow::anyhow!(reason),
+        registry::GateError::Host(error) if authentication => {
+            host_fault("check the current device registry", &error)
+        }
+        registry::GateError::Host(error) => error,
+    })
+}
+
 /// Applies one decision to a request. Invalid decisions fail closed.
 async fn apply_decision(
     decision: DecisionV1,
     request: &RequestV1,
     raw_request: &[u8],
     active: &[DevicePublicRecordV1],
-    registry: &mut DeviceRegistryV1,
+    snapshot_epoch: u64,
     directory: &Path,
 ) -> Result<()> {
     // A verdict is an answer about one request during its lifetime. Once the
@@ -1543,19 +1570,14 @@ async fn apply_decision(
                 &load_hook_config_from(directory)?,
             )
             .context("approval verification failed")?;
-            if outcome.counter_regressed {
-                warn!(fingerprint=%device.fingerprint, stored=device.sign_count, observed=outcome.observed_sign_count, "authenticator signature counter regressed");
-            }
-            if outcome.observed_sign_count > device.sign_count {
-                if let Some(stored) = registry
-                    .devices
-                    .iter_mut()
-                    .find(|stored| stored.fingerprint == device.fingerprint)
-                {
-                    stored.sign_count = outcome.observed_sign_count;
-                }
-                write_registry_to(directory, registry)?;
-            }
+            final_authorization(
+                directory,
+                device,
+                snapshot_epoch,
+                request.expires_at,
+                Some(outcome.observed_sign_count),
+                false,
+            )?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
             Ok(())
         }
@@ -1577,6 +1599,14 @@ async fn apply_decision(
                 .context("native approval does not name one pinned native device")?;
             verify_native_approval_v1(&approval, raw_request, device)
                 .context("native approval verification failed")?;
+            final_authorization(
+                directory,
+                device,
+                snapshot_epoch,
+                request.expires_at,
+                None,
+                false,
+            )?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
             Ok(())
         }
@@ -2046,9 +2076,9 @@ async fn execute_auth_request_at(
     let raw_request = request
         .raw_json()
         .map_err(|error| host_fault("serialize the authentication request", &error.into()))?;
-    let mut registry = load_registry_from(directory)
+    let snapshot = registry::snapshot(directory)
         .map_err(|error| host_fault("read the device registry", &error))?;
-    let recipients = auth_recipients(&registry);
+    let recipients = auth_recipients(&snapshot.registry);
     if recipients.is_empty() {
         // Nothing is published in this case. With no hardware device to
         // answer, the honest result is unavailable and the PAM stack keeps
@@ -2115,7 +2145,7 @@ async fn execute_auth_request_at(
         &request,
         &raw_request,
         &recipients,
-        &mut registry,
+        snapshot.revocation_epoch,
         directory,
     )
 }
@@ -2305,7 +2335,7 @@ fn apply_auth_decision(
     request: &AuthRequestV1,
     raw_request: &[u8],
     recipients: &[DevicePublicRecordV1],
-    registry: &mut DeviceRegistryV1,
+    snapshot_epoch: u64,
     directory: &Path,
 ) -> Result<()> {
     let now = now();
@@ -2331,6 +2361,14 @@ fn apply_auth_decision(
                 .context("native authentication does not name one pinned Secure Enclave device")?;
             verify_native_authentication_v1(approval, raw_request, device, now)
                 .context("native authentication verification failed")?;
+            final_authorization(
+                directory,
+                device,
+                snapshot_epoch,
+                request.expires_at,
+                None,
+                true,
+            )?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, service=%request.trusted.service, pam_user=%request.trusted.pam_user, "sudo authentication accepted");
             Ok(())
         }
@@ -2358,32 +2396,14 @@ fn apply_auth_decision(
                 now,
             )
             .context("WebAuthn authentication verification failed")?;
-            // Decision: a regressed signature counter is warned about, not
-            // rejected, exactly as the command approval lane treats it. Some
-            // authenticators legitimately report zero or a stalled counter,
-            // and diverging here would make this lane refuse hardware the
-            // other lane accepts. Tightening it is its own decision for both
-            // lanes together, not a side effect of this one.
-            if outcome.counter_regressed {
-                warn!(fingerprint=%device.fingerprint, stored=device.sign_count, observed=outcome.observed_sign_count, "authenticator signature counter regressed");
-            }
-            if outcome.observed_sign_count > device.sign_count {
-                if let Some(stored) = registry
-                    .devices
-                    .iter_mut()
-                    .find(|stored| stored.fingerprint == device.fingerprint)
-                {
-                    stored.sign_count = outcome.observed_sign_count;
-                }
-                // The device already authenticated; persisting the counter is
-                // bookkeeping and must not turn a verified assertion into a
-                // denial (read-only /etc, ENOSPC). The legacy command lane
-                // still propagates this error; tightening both is a joint
-                // decision.
-                if let Err(error) = write_registry_to(directory, registry) {
-                    warn!(request_id=%request.request_id, fingerprint=%device.fingerprint, error=%format!("{error:#}"), "sign count was not persisted");
-                }
-            }
+            final_authorization(
+                directory,
+                device,
+                snapshot_epoch,
+                request.expires_at,
+                Some(outcome.observed_sign_count),
+                true,
+            )?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, service=%request.trusted.service, pam_user=%request.trusted.pam_user, "sudo authentication accepted");
             Ok(())
         }
@@ -2624,20 +2644,10 @@ async fn cmd_enroll_at(
                 .context("verify native enrollment")?
         }
     };
-    let mut registry = load_registry_from(directory)?;
-    if registry.devices.iter().any(|stored| {
-        stored.credential_id == device.credential_id && stored.fingerprint != device.fingerprint
-    }) {
-        bail!("credential id is already enrolled under another record");
-    }
-    registry
-        .devices
-        .retain(|stored| stored.fingerprint != device.fingerprint);
-    registry.devices.push(device.clone());
-    registry.validate()?;
-    write_registry_to(directory, &registry)?;
-    let confirmation =
-        activate_device(transport.as_ref(), &state.enrollment_id, &device, &config).await;
+    let confirmation = enroll_device_with(directory, &device, || {
+        activate_device(transport.as_ref(), &state.enrollment_id, &device, &config)
+    })
+    .await;
     // The enrollment itself is spent either way: the device is pinned here
     // and the server has consumed the intent, so there is nothing for
     // `--resume` to redo. What may still be missing is the server's copy.
@@ -2759,23 +2769,186 @@ async fn server_device_matches(url: &str, device: &DevicePublicRecordV1) -> Resu
     Ok(served == *device && served.active)
 }
 
-async fn cmd_revoke(fingerprint: &str) -> Result<()> {
-    let mut registry = load_registry()?;
-    let original = registry.devices.len();
-    if !registry
-        .devices
-        .iter()
-        .any(|device| device.fingerprint == fingerprint)
-    {
-        bail!("unknown device fingerprint");
+// Lifecycle operations hold only the independent management lock over network
+// work. All waits are bounded; decisions can continue their short registry gate.
+async fn enroll_device_with<F, Fut>(
+    directory: &Path,
+    device: &DevicePublicRecordV1,
+    activate: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let _lifecycle = registry::LifecycleGuard::acquire(directory)?;
+    registry::pin(directory, device)?;
+    tokio::time::timeout(ENROLLMENT_TRANSPORT_TIMEOUT, activate())
+        .await
+        .context("device pinned locally; remote activation confirmation timed out")?
+}
+
+#[derive(Debug)]
+struct RevokeFailure {
+    phase: &'static str,
+    detail: anyhow::Error,
+    readback: String,
+}
+impl fmt::Display for RevokeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {:#}; {}", self.phase, self.detail, self.readback)
     }
-    let transport = transport_from(&config_dir()).await?;
-    transport.revoke(fingerprint).await?;
-    registry
-        .devices
-        .retain(|device| device.fingerprint != fingerprint);
-    debug_assert!(registry.devices.len() < original);
-    write_registry(&registry)?;
+}
+impl StdError for RevokeFailure {}
+
+fn revoke_failure(
+    directory: &Path,
+    fingerprint: &str,
+    phase: &'static str,
+    detail: anyhow::Error,
+) -> anyhow::Error {
+    // Readback is evidence of present state, never proof of a failed fsync's
+    // durability. A cleanup rename may have completed despite the error.
+    let readback = match registry::snapshot(directory) {
+        Ok(state) => match state
+            .registry
+            .devices
+            .iter()
+            .find(|device| device.fingerprint == fingerprint)
+        {
+            Some(device) if device.active => "local readback: device active".into(),
+            Some(_) => "local readback: device inactive".into(),
+            None => "local readback: device absent".into(),
+        },
+        Err(error) => format!("local readback unavailable: {error:#}"),
+    };
+    anyhow::Error::new(RevokeFailure {
+        phase,
+        detail,
+        readback,
+    })
+}
+
+async fn revoke_with<F, Fut, W>(
+    directory: &Path,
+    fingerprint: &str,
+    remote: F,
+    mut write: W,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+    W: FnMut(&registry::Transaction<'_>, &registry::LocalRegistry) -> Result<()>,
+{
+    // Same shape as protocol fingerprints; do not permit subject/path injection.
+    if oshioki_protocol::decode_base64url(fingerprint).map_or(true, |bytes| bytes.len() != 16) {
+        bail!("invalid device fingerprint");
+    }
+    let _lifecycle = registry::LifecycleGuard::acquire(directory)?;
+    let pending = (|| -> Result<_> {
+        let transaction = registry::Transaction::acquire(directory)?;
+        let mut state = transaction.load()?;
+        if let Some(device) = state
+            .registry
+            .devices
+            .iter_mut()
+            .find(|device| device.fingerprint == fingerprint)
+        {
+            let was_active = device.active;
+            device.active = false;
+            let tombstone = device.clone();
+            if was_active {
+                state.revocation_epoch = state
+                    .revocation_epoch
+                    .checked_add(1)
+                    .context("local revocation epoch exhausted")?;
+            }
+            // Recommit a pending tombstone too: a prior rename may have failed fsync.
+            write(&transaction, &state)?;
+            Ok(Some((tombstone, state.revocation_epoch)))
+        } else {
+            // Retry after a cleanup rename whose directory fsync failed.
+            Ok(None)
+        }
+    })()
+    .map_err(|error| {
+        revoke_failure(
+            directory,
+            fingerprint,
+            "local disable not durably confirmed; remote revoke was not attempted",
+            error,
+        )
+    })?;
+    // Construct/connect the transport only after the durable inactive commit.
+    tokio::time::timeout(ENROLLMENT_TRANSPORT_TIMEOUT + ACTIVATION_TIMEOUT, remote())
+        .await
+        .context("remote revocation confirmation timed out")
+        .and_then(std::convert::identity)
+        .map_err(|error| {
+            revoke_failure(
+                directory,
+                fingerprint,
+                if pending.is_some() {
+                    "local device disabled; remote revoke pending"
+                } else {
+                    "local device absent; remote revoke pending"
+                },
+                error,
+            )
+        })?;
+    (|| -> Result<()> {
+        let transaction = registry::Transaction::acquire(directory)?;
+        let mut state = transaction.load()?;
+        if let Some((device, epoch)) = pending {
+            if state.revocation_epoch != epoch
+                || !state
+                    .registry
+                    .devices
+                    .iter()
+                    .any(|stored| stored == &device && !stored.active)
+            {
+                bail!("pending revocation identity changed before cleanup");
+            }
+            state
+                .registry
+                .devices
+                .retain(|stored| stored.fingerprint != fingerprint);
+            write(&transaction, &state)?;
+        } else {
+            // No cooperating lifecycle operation can pin between these phases.
+            if state
+                .registry
+                .devices
+                .iter()
+                .any(|stored| stored.fingerprint == fingerprint)
+            {
+                bail!("device appeared during absent revocation retry");
+            }
+            fs::File::open(directory)?.sync_all()?;
+        }
+        Ok(())
+    })()
+    .map_err(|error| {
+        revoke_failure(
+            directory,
+            fingerprint,
+            "remote revoke confirmed; local cleanup not durably confirmed",
+            error,
+        )
+    })
+}
+
+async fn cmd_revoke(fingerprint: &str) -> Result<()> {
+    let directory = config_dir();
+    revoke_with(
+        &directory,
+        fingerprint,
+        || async {
+            let transport = transport_from(&directory).await?;
+            transport.revoke(fingerprint).await
+        },
+        registry::persist,
+    )
+    .await?;
     println!("Device revoked: {fingerprint}");
     Ok(())
 }
@@ -2832,13 +3005,8 @@ fn pin_device_record(
     if confirmation.trim() != device.fingerprint {
         bail!("fingerprint confirmation mismatch");
     }
-    let mut registry = load_registry_from(directory)?;
-    registry
-        .devices
-        .retain(|stored| stored.fingerprint != device.fingerprint);
-    registry.devices.push(device.clone());
-    registry.validate()?;
-    write_registry_to(directory, &registry)?;
+    let _lifecycle = registry::LifecycleGuard::acquire(directory)?;
+    registry::pin(directory, device)?;
     println!("Device pinned: {}", device.fingerprint);
     Ok(())
 }
@@ -3247,21 +3415,11 @@ fn load_registry() -> Result<DeviceRegistryV1> {
     load_registry_from(&config_dir())
 }
 fn load_registry_from(directory: &Path) -> Result<DeviceRegistryV1> {
-    let path = directory.join("devices.json");
-    if !path.exists() {
-        return Ok(DeviceRegistryV1 {
-            version: VERSION_V1,
-            devices: Vec::new(),
-        });
-    }
-    let registry: DeviceRegistryV1 = read_json(&path)?;
-    registry.validate()?;
-    Ok(registry)
+    Ok(registry::snapshot(directory)?.registry)
 }
-fn write_registry(registry: &DeviceRegistryV1) -> Result<()> {
-    write_registry_to(&config_dir(), registry)
-}
+#[cfg(test)]
 fn write_registry_to(directory: &Path, registry: &DeviceRegistryV1) -> Result<()> {
+    // Fixture writer only. Production mutations always load inside a transaction.
     registry.validate()?;
     atomic_write_json(&directory.join("devices.json"), registry, 0o600)
 }
@@ -3330,7 +3488,22 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtomicWriteStage {
+    BeforeRename,
+    AfterRename,
+}
+
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<()> {
+    atomic_write_json_with(path, value, mode, |_| Ok(()))
+}
+
+fn atomic_write_json_with<T: Serialize>(
+    path: &Path,
+    value: &T,
+    mode: u32,
+    stage: impl Fn(AtomicWriteStage) -> Result<()>,
+) -> Result<()> {
     let parent = path.parent().context("state file has no parent")?;
     fs::create_dir_all(parent)?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
@@ -3348,8 +3521,13 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<
         serde_json::to_writer_pretty(&mut file, value)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        fs::File::open(parent)?.sync_all()?;
+        stage(AtomicWriteStage::BeforeRename).context("atomic state write failed before rename")?;
+        fs::rename(&temporary, path).context("atomic state rename failed")?;
+        stage(AtomicWriteStage::AfterRename)
+            .context("atomic state write failed after rename; durability unconfirmed")?;
+        fs::File::open(parent)?
+            .sync_all()
+            .context("atomic state directory fsync failed after rename; durability unconfirmed")?;
         Ok(())
     })();
     if result.is_err() {
@@ -4023,10 +4201,6 @@ mod tests {
         let mut request = build_synthetic_request();
         request.expires_at = now() - 1;
         let fingerprint = URL_SAFE_NO_PAD.encode([1; 16]);
-        let mut registry = DeviceRegistryV1 {
-            version: 1,
-            devices: Vec::new(),
-        };
         let decisions = [
             DecisionV1::Deny(oshioki_protocol::DenyV1 {
                 version: VERSION_V1,
@@ -4051,16 +4225,9 @@ mod tests {
             }),
         ];
         for decision in decisions {
-            let error = apply_decision(
-                decision,
-                &request,
-                &[],
-                &[],
-                &mut registry,
-                Path::new("/nonexistent"),
-            )
-            .await
-            .unwrap_err();
+            let error = apply_decision(decision, &request, &[], &[], 0, Path::new("/nonexistent"))
+                .await
+                .unwrap_err();
             assert!(
                 error.to_string().contains("expired before its verdict"),
                 "{error:#}"
@@ -4151,17 +4318,9 @@ mod tests {
             decision: DecisionV1,
             request: &RequestV1,
             active: &[DevicePublicRecordV1],
-            registry: &mut DeviceRegistryV1,
+            _registry: &mut DeviceRegistryV1,
         ) -> Result<()> {
-            apply_decision(
-                decision,
-                request,
-                &[],
-                active,
-                registry,
-                Path::new("/nonexistent"),
-            )
-            .await
+            apply_decision(decision, request, &[], active, 0, Path::new("/nonexistent")).await
         }
         let (device, signing) = deny_test_device();
         let mut request = build_synthetic_request();
@@ -4225,6 +4384,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oshioki-pinrecord-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let (device, _) = deny_test_device();
         let mut input = std::io::Cursor::new(format!("{}\n", device.fingerprint));
         pin_device_record(&dir, &device, &mut input).unwrap();
@@ -4620,16 +4780,20 @@ mod tests {
                     panic!("replacement socket verdict was ignored")
                 }
             };
-        let mut registry = DeviceRegistryV1 {
-            version: VERSION_V1,
-            devices: Vec::new(),
-        };
+        write_registry_to(
+            &dir,
+            &DeviceRegistryV1 {
+                version: VERSION_V1,
+                devices: vec![device.clone()],
+            },
+        )
+        .unwrap();
         apply_decision(
             decision,
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             &dir,
         )
         .await
@@ -5533,16 +5697,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut registry = DeviceRegistryV1 {
-            version: 1,
-            devices: Vec::new(),
-        };
         let error = apply_decision(
             decision,
             &request,
             &[],
             &[device],
-            &mut registry,
+            0,
             Path::new("/nonexistent"),
         )
         .await
@@ -5561,10 +5721,15 @@ mod tests {
         let raw = request.raw_json().unwrap();
         let challenge = oshioki_protocol::v1::approve_challenge(&raw);
         let signature: p256::ecdsa::Signature = signing.sign(&challenge);
-        let mut registry = DeviceRegistryV1 {
-            version: 1,
-            devices: Vec::new(),
-        };
+        let directory = std::env::temp_dir().join(format!("oshioki-signed-{}", Uuid::new_v4()));
+        write_registry_to(
+            &directory,
+            &DeviceRegistryV1 {
+                version: VERSION_V1,
+                devices: vec![device.clone()],
+            },
+        )
+        .unwrap();
         let approval = DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
             version: VERSION_V1,
             request_id: request.request_id.clone(),
@@ -5589,11 +5754,12 @@ mod tests {
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
-            Path::new("/nonexistent"),
+            0,
+            &directory,
         )
         .await
         .expect("signed approval must approve");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     /// The one supported mechanism: a `session.OSHIOKI_SESSION` bound value
@@ -5664,6 +5830,8 @@ mod tests {
 /// stop short of a verified hardware assertion.
 #[cfg(test)]
 mod auth_tests {
+    include!("revocation_tests.rs");
+
     use super::*;
     use oshioki_protocol::auth_v1::{AuthApproveNativeV1, auth_challenge};
     use p256::ecdsa::{SigningKey, signature::Signer as _};
@@ -5784,7 +5952,7 @@ mod auth_tests {
             rp_id: TEST_RP_ID.into(),
             server_base_url: TEST_ORIGIN.into(),
         };
-        atomic_write_json(&directory.join("hook.json"), &config, 0o644).unwrap();
+        atomic_write_json(&directory.join("hook.json"), &config, 0o600).unwrap();
     }
 
     /// One assertion as a browser would produce it: authenticator data over
@@ -5828,13 +5996,6 @@ mod auth_tests {
     fn auth_request() -> AuthRequestV1 {
         let pam = parse_pam_request(argv_json(false, false, "").as_bytes()).unwrap();
         build_auth_request(&pam, &identities()).unwrap()
-    }
-
-    fn empty_registry() -> DeviceRegistryV1 {
-        DeviceRegistryV1 {
-            version: VERSION_V1,
-            devices: Vec::new(),
-        }
     }
 
     // --- stdin bounds -----------------------------------------------------
@@ -6151,16 +6312,18 @@ mod auth_tests {
         let request = auth_request();
         let raw = request.raw_json().unwrap();
         let decision = native_decision(&signing, &device, &request.request_id, &raw);
-        let mut registry = empty_registry();
+        let directory = auth_config_dir("native-ok");
+        seed_registry(&directory, vec![device.clone()]);
         apply_auth_decision(
             &decision,
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
-            Path::new("/nonexistent"),
+            0,
+            &directory,
         )
         .unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     /// A signature over different bytes is a failure, not unavailable: a
@@ -6173,13 +6336,12 @@ mod auth_tests {
         let raw = request.raw_json().unwrap();
         let other = auth_request().raw_json().unwrap();
         let decision = native_decision(&signing, &device, &request.request_id, &other);
-        let mut registry = empty_registry();
         let error = apply_auth_decision(
             &decision,
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             Path::new("/nonexistent"),
         )
         .unwrap_err();
@@ -6195,16 +6357,9 @@ mod auth_tests {
         let request = auth_request();
         let raw = request.raw_json().unwrap();
         let decision = native_decision(&impostor, &device, &request.request_id, &raw);
-        let mut registry = empty_registry();
-        let error = apply_auth_decision(
-            &decision,
-            &request,
-            &raw,
-            &[],
-            &mut registry,
-            Path::new("/nonexistent"),
-        )
-        .unwrap_err();
+        let error =
+            apply_auth_decision(&decision, &request, &raw, &[], 0, Path::new("/nonexistent"))
+                .unwrap_err();
         assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
         assert!(
             display_error(&error).contains("does not name one pinned Secure Enclave device"),
@@ -6218,7 +6373,7 @@ mod auth_tests {
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             Path::new("/nonexistent"),
         )
         .unwrap_err();
@@ -6232,13 +6387,12 @@ mod auth_tests {
         let request = auth_request();
         let raw = request.raw_json().unwrap();
         let decision = native_decision(&signing, &device, &Uuid::new_v4().to_string(), &raw);
-        let mut registry = empty_registry();
         let error = apply_auth_decision(
             &decision,
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             Path::new("/nonexistent"),
         )
         .unwrap_err();
@@ -6261,16 +6415,13 @@ mod auth_tests {
         let request = auth_request();
         let raw = request.raw_json().unwrap();
         let decision = webauthn_decision(&signing, &device, &request.request_id, &raw, 1);
-        let mut registry = DeviceRegistryV1 {
-            version: VERSION_V1,
-            devices: vec![device.clone()],
-        };
+        seed_registry(&directory, vec![device.clone()]);
         apply_auth_decision(
             &decision,
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             &directory,
         )
         .unwrap();
@@ -6293,13 +6444,12 @@ mod auth_tests {
             panic!("expected a WebAuthn decision")
         };
         approval.credential_id = URL_SAFE_NO_PAD.encode([99; 32]);
-        let mut registry = empty_registry();
         let error = apply_auth_decision(
             &AuthDecisionV1::AuthenticateWebauthn(approval),
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             &directory,
         )
         .unwrap_err();
@@ -6323,7 +6473,6 @@ mod auth_tests {
         let (native, native_key) = auth_test_device();
         let request = auth_request();
         let raw = request.raw_json().unwrap();
-        let mut registry = empty_registry();
 
         // A WebAuthn assertion offered against the Secure Enclave record.
         let mut impostor = native.clone();
@@ -6335,7 +6484,7 @@ mod auth_tests {
             &request,
             &raw,
             std::slice::from_ref(&impostor),
-            &mut registry,
+            0,
             &directory,
         )
         .unwrap_err();
@@ -6350,7 +6499,7 @@ mod auth_tests {
             &request,
             &raw,
             std::slice::from_ref(&impostor),
-            &mut registry,
+            0,
             &directory,
         )
         .unwrap_err();
@@ -6370,17 +6519,19 @@ mod auth_tests {
         let request = auth_request();
         let raw = request.raw_json().unwrap();
         let decision = webauthn_decision(&signing, &device, &request.request_id, &raw, 17);
-        let mut registry = load_registry_from(&directory).unwrap();
         apply_auth_decision(
             &decision,
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             &directory,
         )
         .unwrap();
-        assert_eq!(registry.devices[0].sign_count, 17);
+        assert_eq!(
+            load_registry_from(&directory).unwrap().devices[0].sign_count,
+            17
+        );
         let reloaded = load_registry_from(&directory).unwrap();
         assert_eq!(reloaded.devices[0].sign_count, 17);
         let _ = std::fs::remove_dir_all(&directory);
@@ -6399,13 +6550,13 @@ mod auth_tests {
         let request = auth_request();
         let raw = request.raw_json().unwrap();
         let decision = webauthn_decision(&signing, &device, &request.request_id, &raw, 9);
-        let mut registry = load_registry_from(&directory).unwrap();
+        let registry = load_registry_from(&directory).unwrap();
         apply_auth_decision(
             &decision,
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             &directory,
         )
         .unwrap();
@@ -6431,13 +6582,12 @@ mod auth_tests {
         let request = auth_request();
         let raw = request.raw_json().unwrap();
         let decision = webauthn_decision(&signing, &device, &request.request_id, &raw, 1);
-        let mut registry = empty_registry();
         let error = apply_auth_decision(
             &decision,
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             &directory,
         )
         .unwrap_err();
@@ -6486,13 +6636,12 @@ mod auth_tests {
         request.expires_at = now() - 300;
         let raw = serde_json::to_vec(&request).unwrap();
         let decision = native_decision(&signing, &device, &request.request_id, &raw);
-        let mut registry = empty_registry();
         let error = apply_auth_decision(
             &decision,
             &request,
             &raw,
             std::slice::from_ref(&device),
-            &mut registry,
+            0,
             Path::new("/nonexistent"),
         )
         .unwrap_err();

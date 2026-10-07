@@ -9,14 +9,66 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # Under /tmp: macOS limits unix socket paths to 104 bytes and sandbox
 # TMPDIRs exceed that.
 TEST_ROOT="$(mktemp -d /tmp/oshioki-laptop-setup-test.XXXXXX)"
-# Every bootstrap spawns a socket holder; stop them all before removing the
-# tree or rm fails on the still-open sockets.
+# Match the physical paths emitted by setup (macOS /tmp is /private/tmp).
+TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
+# Every bootstrap can spawn socket holders and delayed log writers. Stop
+# all owned helpers before removing the fixture tree.
 stop_holders() {
   [ -f "$TEST_ROOT/holder-pids" ] || return 0
-  while read -r pid; do kill "$pid" 2>/dev/null || true; done < "$TEST_ROOT/holder-pids"
-  sleep 1
+  python3 - "$TEST_ROOT" <<'PY'
+import os, signal, subprocess, sys, time
+from pathlib import Path
+
+root = sys.argv[1]
+pids = {int(line) for line in Path(root, "holder-pids").read_text().splitlines()}
+
+def owned_running():
+    rows = subprocess.run(["ps", "-ww", "-axo", "pid=,stat=,args="], check=True,
+                          capture_output=True, text=True, timeout=2).stdout.splitlines()
+    # Finished helpers can be awaiting the OS orphan reaper. Never signal a
+    # recycled PID: each owned helper has this fixture path in its arguments.
+    live = []
+    for row in rows:
+        fields = row.strip().split(None, 2)
+        if len(fields) == 3:
+            pid, state, args = fields
+            if int(pid) in pids and not state.startswith("Z") and root in args:
+                live.append(int(pid))
+    return live
+
+def terminate(sig):
+    for pid in owned_running():
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+def survivors():
+    deadline = time.monotonic() + 1
+    while True:
+        live = owned_running()
+        if not live or time.monotonic() >= deadline:
+            return live
+        time.sleep(0.05)
+
+terminate(signal.SIGTERM)
+if survivors():
+    terminate(signal.SIGKILL)
+if survivors():
+    sys.exit("fixture helpers survived cleanup")
+PY
 }
-trap 'stop_holders; if [ -n "${STUB_PID:-}" ]; then kill "$STUB_PID" 2>/dev/null || true; fi; rm -rf "$TEST_ROOT"' EXIT
+cleanup() {
+  local rc=$?
+  stop_holders || rc=1
+  if [ -n "${STUB_PID:-}" ]; then
+    kill "$STUB_PID" 2>/dev/null || true
+    wait "$STUB_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TEST_ROOT"
+  exit "$rc"
+}
+trap cleanup EXIT
 fail() { echo "test-oshioki-laptop-setup: $*" >&2; exit 1; }
 
 # The verify step ends differently per platform: macOS boots the agent and
@@ -256,7 +308,9 @@ cat > "$TEST_ROOT/fake-bin/launchctl" <<'SH'
 echo "$*" >> "$CALL_LOG"
 if [ "${1:-}" = bootstrap ] && [ -n "${SOCKET_TO_MAKE:-}" ]; then
   rm -f "$SOCKET_TO_MAKE"
-  nc -k -lU "$SOCKET_TO_MAKE" &
+  # A fake service must shed the caller's PTY, just as launchd would.
+  # Otherwise pty.spawn can wait for this listener after setup has exited.
+  nc -k -lU "$SOCKET_TO_MAKE" </dev/null >/dev/null 2>&1 &
   echo "$!" >> "$HOLDER_PIDS"
   for _ in $(seq 1 50); do
     if python3 -c 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(1);s.connect(sys.argv[1])' "$SOCKET_TO_MAKE" 2>/dev/null; then break; fi
@@ -277,7 +331,15 @@ if [ "${1:-}" = bootstrap ] && [ -n "${AGENT_STATE:-}" ]; then
   # poll (which samples once a second) sees it on a later iteration than the
   # connected line above, not the same one.
   if [ -n "${AGENT_LOG_DELAYED_LINE:-}" ]; then
-    ( sleep "${AGENT_LOG_DELAY:-1}"; printf '%s\n' "$AGENT_LOG_DELAYED_LINE" >> "$AGENT_STATE/agent.log" ) &
+    # One owned process, with no external sleep descendant to orphan during
+    # an early failure. Keep its standard descriptors detached from setup.
+    python3 -c '
+import sys, time
+time.sleep(float(sys.argv[3]))
+with open(sys.argv[1], "a") as handle:
+    handle.write(sys.argv[2] + "\n")
+' "$AGENT_STATE/agent.log" "$AGENT_LOG_DELAYED_LINE" "${AGENT_LOG_DELAY:-1}" </dev/null >/dev/null 2>&1 &
+    echo "$!" >> "$HOLDER_PIDS"
   fi
 fi
 SH
@@ -430,7 +492,90 @@ run_setup() {
   # the run has no tty at all, which is the ssh / `launchctl asuser` shape.
   local -a pty_wrap=()
   if [ -n "${SETUP_PTY:-}" ]; then
-    pty_wrap=(python3 -c 'import os,pty,sys; raise SystemExit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))')
+    pty_wrap=(python3 -c '
+import os, pty, signal, sys, time
+# Preserve zombie ownership even if our caller ignored child-exit signals.
+signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+owned = []
+completed = []
+original_fork = pty.fork
+original_close = pty.close
+original_waitpid = pty.waitpid
+def timeout(*_):
+    if not completed:
+        sys.exit("PTY setup did not finish within 30s")
+signal.signal(signal.SIGALRM, timeout)
+def fork_owned():
+    pid, master = original_fork()
+    if pid != pty.CHILD:
+        owned.extend((pid, master))
+        signal.alarm(30)
+    return pid, master
+def close_owned(master):
+    # A pending alarm must not interrupt between closing the fd and giving
+    # up ownership: the descriptor number could already have been reused.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    try:
+        original_close(master)
+    finally:
+        if owned and owned[1] == master:
+            owned[1] = None
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+def wait_owned(pid, _options):
+    # pty.spawn normally reaps internally. Keep the alarm blocked across each
+    # nonblocking wait and status/ownership transition, including a pending
+    # timeout after a successful reap. Leave it enabled while the child runs.
+    while True:
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        try:
+            done, status = original_waitpid(pid, os.WNOHANG)
+            if done:
+                completed.append(status)
+                signal.alarm(0)
+                return done, status
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        time.sleep(0.01)
+pty.fork = fork_owned
+pty.close = close_owned
+pty.waitpid = wait_owned
+try:
+    status = pty.spawn(sys.argv[1:])
+except BaseException:
+    signal.alarm(0)
+    if owned:
+        pid, master = owned
+        # Only a still-owned, unreaped child pins its PID and session/group
+        # identifiers against reuse. An exit between this check and kill is
+        # safe: its zombie remains ours until the final wait below. There is
+        # no concurrent reaper in this single-threaded wrapper.
+        try:
+            running = original_waitpid(pid, os.WNOHANG)[0] == 0
+        except ChildProcessError:
+            running = False
+        if running:
+            # pty.fork gives the child its own session/process group. Kill
+            # descendants too, even if they ignore PTY hangup or termination.
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if master is not None:
+            try:
+                close_owned(master)
+            except OSError:
+                pass
+        if running:
+            original_waitpid(pid, 0)
+    raise
+finally:
+    signal.alarm(0)
+raise SystemExit(os.waitstatus_to_exitcode(status))
+')
   fi
   ${pty_wrap[@]+"${pty_wrap[@]}"} \
   env -i PATH="$TEST_ROOT/fake-bin:${SETUP_PATH:-/usr/bin:/bin}" HOME="$TEST_ROOT/home" \
@@ -640,12 +785,30 @@ fi
 # With a tty: the Terminal shape, where sudo keys by controlling terminal.
 # The final proof then runs, and because the install already took the ticket
 # it must say so rather than announce another prompt.
+# Record the listener's descriptors before execing the real nc. PTY hangup
+# differs by host, so returning alone does not prove it shed the PTY.
+command -v nc > "$HOLDER_PIDS.nc"
+cat > "$TEST_ROOT/fake-bin/nc" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+null = os.stat(os.devnull)
+with open(os.environ["HOLDER_PIDS"] + ".fds", "w") as log:
+    log.write(" ".join(str(os.path.samestat(os.fstat(fd), null)) for fd in range(3)))
+with open(os.environ["HOLDER_PIDS"] + ".nc") as handle:
+    binary = handle.read().strip()
+os.execv(binary, [binary] + sys.argv[1:])
+PY
+chmod 0755 "$TEST_ROOT/fake-bin/nc"
 reset_sudo_ticket
 rm -f "${LAUNCHAGENTS_DIR:-$TEST_ROOT/home/Library/LaunchAgents}/com.oshioki.agent.plist"
 : > "$TEST_ROOT/pam-lane"
 SETUP_PTY=1 FAKE_UNAME=Darwin DEVICES_ACTIVE=1 run_setup --yes --contextual-pam \
   >"$TEST_ROOT/one-elevation-tty.log" 2>&1 ||
   { sed -n '1,40p' "$TEST_ROOT/one-elevation-tty.log" >&2; fail "tty --contextual-pam run did not finish"; }
+[ "$(cat "$HOLDER_PIDS.fds")" = 'True True True' ] ||
+  fail "fake listener retained a setup descriptor instead of /dev/null"
+rm -f "$TEST_ROOT/fake-bin/nc"
+grep -Fq 'oshioki-laptop-setup: ready:' "$TEST_ROOT/one-elevation-tty.log" || fail "tty setup never reached ready"
 tty_auths="$(sudo_auth_count)"
 [ "$tty_auths" = 1 ] ||
   { cat "$TEST_ROOT/sudo-auth.log" >&2; fail "tty run authenticated $tty_auths times, want exactly 1"; }
@@ -933,6 +1096,8 @@ fi
 # state, no NATS values staged, so the install is socket-only: no NATS keys
 # anywhere, never placeholders.
 rm -f "$TEST_ROOT/etc/install.env" "$AGENT_STATE/agent.json" "$AGENT_STATE/pinned" "$TEST_ROOT/plugin-enabled"
+# Earlier server-mode runs leave a NATS plist that an ordinary rerun preserves.
+rm -f "$TEST_ROOT/home/Library/LaunchAgents/com.oshioki.agent.plist"
 reset_sudo_ticket
 DEVICES_ACTIVE=0 run_setup_local --local --yes >"$TEST_ROOT/local.log" 2>&1 || fail "local setup failed"
 # --local does all its privileged work inside one re-invocation of this script
@@ -1577,24 +1742,8 @@ prog_y="$(plist_program "$plist_t")"
   fail "keg-nomanifest: expected the flat binary at the opt path, got: $prog_y"
 mv "$TEST_ROOT/Oshioki.app.stash" "$CELLAR_KEG/Oshioki.app"
 
-# Self-policing teardown: the EXIT trap removes the tree, but rm succeeds
-# even with live holders (open files unlink), so leaked processes would go
-# unnoticed behind a green run. Prove every holder died instead.
-if [ -f "$TEST_ROOT/holder-pids" ]; then
-  stop_holders
-  tries=0
-  live=1
-  while [ "$tries" -lt 50 ] && [ "$live" -eq 1 ]; do
-    live=0
-    while read -r pid; do
-      if kill -0 "$pid" 2>/dev/null && [ -n "$(ps -p "$pid" -o comm= 2>/dev/null | grep -iE 'ython|nc' || true)" ]; then
-        live=1
-      fi
-    done < "$TEST_ROOT/holder-pids"
-    sleep 0.1
-    tries=$((tries + 1))
-  done
-  [ "$live" -eq 0 ] || fail "socket holders survived cleanup"
-fi
+# Self-policing teardown: check every tracked helper, including delayed
+# writers, rather than assuming rm or a listener-only name check proves exit.
+stop_holders || fail "fixture helpers survived cleanup"
 
 echo "test-oshioki-laptop-setup: PASS"

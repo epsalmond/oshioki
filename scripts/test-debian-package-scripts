@@ -19,8 +19,13 @@ SH
 cat > "$TEST_ROOT/fake-bin/stat" <<'SH'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
-  '-c %u'|'-f %u') echo 0 ;;
-  '-c %a'|'-f %Lp') echo 440 ;;
+  '-c %u'|'-f %u') echo "${FAKE_STAT_OWNER:-0}" ;;
+  '-c %a'|'-f %Lp')
+    case "${3:-}" in
+      "${CASE_ROOT:-}/state")
+        exec python3 -c 'import os,stat,sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$3" ;;
+      *) echo 440 ;;
+    esac ;;
   *) exec /usr/bin/stat "$@" ;;
 esac
 SH
@@ -53,7 +58,8 @@ for arg in "$@"; do
     /etc/oshioki|/var/lib/oshioki) exit 0 ;;
   esac
 done
-exec /usr/bin/install "$@"
+args=(); while [ "$#" -gt 0 ]; do case "$1" in -o|-g) shift 2;; *) args+=("$1"); shift;; esac; done
+exec /usr/bin/install "${args[@]}"
 SH
 cat > "$TEST_ROOT/fake-bin/systemctl" <<'SH'
 #!/usr/bin/env bash
@@ -79,6 +85,7 @@ new_case() {
   local name="$1"
   CASE_ROOT="$TEST_ROOT/$name"
   mkdir -p "$CASE_ROOT/state" "$CASE_ROOT/sudoers.d"
+  chmod 0750 "$CASE_ROOT/state"
   export CASE_ROOT
 }
 # A PAM fixture in the shape the installer discovers: a security directory
@@ -121,6 +128,7 @@ run_postinst() {
   PATH="$TEST_ROOT/fake-bin:/usr/bin:/bin" \
     OSHIOKI_INSTALLER="${INSTALLER_OVERRIDE:-$TEST_ROOT/installer}" \
     OSHIOKI_INSTALL_ENV="$CASE_ROOT/install.env" \
+    OSHIOKI_STATE_DIR="$CASE_ROOT/state" FAKE_STAT_OWNER="${FAKE_STAT_OWNER:-0}" \
     PAM_D="${PAM_D_OVERRIDE:-$CASE_ROOT/pam.d}" \
     STUB_LOG="$CASE_ROOT/installer.log" \
     bash "$SCRIPT_DIR/../packaging/debian/DEBIAN/postinst" configure
@@ -146,6 +154,43 @@ run_postrm_purge() {
     PAM_MODULE_GLOBS="${PAM_MODULE_GLOBS_OVERRIDE:-$CASE_ROOT/security/liboshioki_pam.so}" \
     bash "$SCRIPT_DIR/../packaging/debian/DEBIAN/postrm" purge
 }
+
+# Package configure safely tightens legacy setup state even with no install.env.
+new_case postinst-private-upgrade
+chmod 0750 "$CASE_ROOT/state"
+printf '{"version":1,"revocation_epoch":37,"devices":[{"sign_count":42}]}\n' > "$CASE_ROOT/state/devices.json"
+: > "$CASE_ROOT/state/.devices.lock"
+: > "$CASE_ROOT/state/.devices-lifecycle.lock"
+cp "$CASE_ROOT/state/devices.json" "$CASE_ROOT/before.json"
+lock_identity() {
+  python3 -c 'import pathlib,sys; print([(p.stat().st_dev,p.stat().st_ino) for p in sorted(pathlib.Path(sys.argv[1]).glob(".devices*.lock"))])' "$1"
+}
+locks_before="$(lock_identity "$CASE_ROOT/state")"
+state_mode() {
+  python3 -c 'import os,stat,sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' "$1"
+}
+for _ in 1 2; do
+  run_postinst >"$CASE_ROOT/log" 2>&1
+  [ "$(state_mode "$CASE_ROOT/state")" = 700 ] || fail "postinst did not leave mode 0700"
+  cmp -s "$CASE_ROOT/before.json" "$CASE_ROOT/state/devices.json" || fail "postinst changed devices/epoch/counters"
+  [ "$(lock_identity "$CASE_ROOT/state")" = "$locks_before" ] || fail "postinst replaced locks"
+done
+for unsafe in foreign-owner writable symlink; do
+  new_case "postinst-$unsafe"
+  chmod 0750 "$CASE_ROOT/state"
+  case "$unsafe" in
+    foreign-owner) owner=12345 ;;
+    writable) owner=0; chmod 0770 "$CASE_ROOT/state" ;;
+    symlink)
+      owner=0
+      mv "$CASE_ROOT/state" "$CASE_ROOT/target"
+      ln -s "$CASE_ROOT/target" "$CASE_ROOT/state"
+      ;;
+  esac
+  before_mode="$(state_mode "$CASE_ROOT/state")"
+  if FAKE_STAT_OWNER="$owner" run_postinst >"$CASE_ROOT/log" 2>&1; then fail "postinst accepted $unsafe state"; fi
+  [ "$(state_mode "$CASE_ROOT/state")" = "$before_mode" ] || fail "postinst changed refused state"
+done
 
 # Missing sudo.conf must not prevent an exact Oshioki drop-in from being
 # removed by prerm.

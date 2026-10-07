@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Offline upgrade through phone config setup and the actual registry CLI.
+
+The Cargo integration test supplies its freshly built hook executable. All
+writes are to a temporary owned tree; no sudo, services, broker or devices.
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+from unittest import mock
+
+
+SOURCE = Path(__file__).resolve().with_name("oshioki-phone-setup")
+LOADER = importlib.machinery.SourceFileLoader("phone_upgrade", str(SOURCE))
+SPEC = importlib.util.spec_from_loader("phone_upgrade", LOADER)
+assert SPEC and SPEC.loader
+phone = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(phone)
+
+# Existing fixed public WebAuthn credential from the revocation regressions.
+# No private signing material or real enrollment is used.
+RECORD = {
+    "version": 1,
+    "kind": "webauthn",
+    "fingerprint": "oM-OFsgl_X48qRapoZiCpQ",
+    "credential_id": "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4",
+    "credential_public_key": "pQECAyYgASFYIJGBsCWC9caFm2-T63iZ-l13LTjlcXKmSTZ0076c11VhIlggw-5DOtDeBwMmZkvPYmZAyiUpw9nFWwOjtsV7VlSK1L0",
+    "box_public_key": "Pz8_Pz8_Pz8_Pz8_Pz8_Pz8_Pz8_Pz8_Pz8_Pz8_Pz8",
+    "label": "synthetic upgrade",
+    "api_token_hash": "QEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEA",
+    "sign_count": 0,
+    "active": True,
+}
+
+
+def main() -> None:
+    hook = Path(sys.argv[1]).resolve(strict=True)
+    with tempfile.TemporaryDirectory(prefix="oshioki-registry-upgrade-") as temporary:
+        root = Path(temporary)
+        config = root / "config"
+        config.mkdir(mode=0o700)
+        record = root / "record.json"
+        record.write_text(json.dumps(RECORD), encoding="utf-8")
+        record.chmod(0o600)
+        environment = {
+            **os.environ,
+            "OSHIOKI_CONFIG_DIR": str(config),
+            "HOME": str(root),
+            "XDG_CONFIG_HOME": str(root / "xdg"),
+            "CODEX_HOME": str(root / "codex"),
+        }
+
+        def pin(expected: bool = True) -> None:
+            result = subprocess.run(
+                [str(hook), "pin-record", str(record)],
+                input=RECORD["fingerprint"] + "\n",
+                text=True,
+                capture_output=True,
+                env=environment,
+                timeout=10,
+            )
+            assert (result.returncode == 0) == expected, result.stderr
+
+        pin()
+        registry = config / "devices.json"
+        state = json.loads(registry.read_text())
+        state["revocation_epoch"] = 37
+        state["devices"][0]["sign_count"] = 42
+        registry.write_text(json.dumps(state) + "\n", encoding="utf-8")
+        registry.chmod(0o600)
+        before = registry.read_bytes()
+        locks = [config / ".devices.lock", config / ".devices-lifecycle.lock"]
+        identities = [(path.stat().st_dev, path.stat().st_ino) for path in locks]
+        config.chmod(0o750)  # Supported pre-upgrade installation.
+        pin(expected=False)  # Establish the runtime incompatibility first.
+        staging = root / "staging.json"
+        staging.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "origin": "https://phone.example",
+                    "rp_id": "phone.example",
+                    "nats_url": "nats://127.0.0.1:4222",
+                    "nats_user": "synthetic",
+                    "nats_pass": "synthetic",
+                }
+            ),
+            encoding="utf-8",
+        )
+        staging.chmod(0o600)
+        for _ in range(2):  # Reconfiguration must remain idempotent.
+            phone._install_config(staging, config)
+            assert stat.S_IMODE(config.stat().st_mode) == 0o700
+            assert registry.read_bytes() == before
+            assert identities == [
+                (path.stat().st_dev, path.stat().st_ino) for path in locks
+            ]
+        pin()  # Actual production locking/load/mutation after setup.
+        assert json.loads(registry.read_text()) == state
+        assert identities == [
+            (path.stat().st_dev, path.stat().st_ino) for path in locks
+        ]
+
+        # Inject foreign ownership metadata without chown or elevated rights.
+        config.chmod(0o750)
+        original_stat = phone.os.fstat
+
+        def foreign_owner(fd):
+            info = original_stat(fd)
+            if (info.st_dev, info.st_ino) == (
+                config.stat().st_dev,
+                config.stat().st_ino,
+            ):
+                fields = list(info)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return info
+
+        def refused(path: Path) -> None:
+            try:
+                phone._install_config(staging, path)
+            except phone.SetupError:
+                return
+            raise AssertionError("unsafe config directory accepted")
+
+        with mock.patch.object(phone.os, "fstat", side_effect=foreign_owner):
+            refused(config)
+        assert stat.S_IMODE(config.stat().st_mode) == 0o750
+        linked = root / "linked"
+        linked.symlink_to(config, target_is_directory=True)
+        refused(linked)
+        assert stat.S_IMODE(config.stat().st_mode) == 0o750
+        config.chmod(0o770)
+        refused(config)
+        assert stat.S_IMODE(config.stat().st_mode) == 0o770
+        assert json.loads(registry.read_text()) == state
+        assert identities == [
+            (path.stat().st_dev, path.stat().st_ino) for path in locks
+        ]
+    print(
+        "registry setup upgrade: PASS (0700, records/epoch/counters/locks, unsafe refusal)"
+    )
+
+
+if __name__ == "__main__":
+    main()

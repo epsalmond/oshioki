@@ -144,7 +144,7 @@ class PhoneSetupTests(unittest.TestCase):
         self.assertEqual(captured["runtime"]["origin"], "https://phone.example:18444")
 
     def test_install_config_preserves_socket_local_and_registry(self) -> None:
-        self.config.mkdir(parents=True)
+        self.config.mkdir(mode=0o750, parents=True)
         hook = self.config / "hook.json"
         hook.write_text(json.dumps({"version": 1, "origin": "https://old.example", "rp_id": "old.example", "server_base_url": "https://old.example", "future": "keep"}), encoding="utf-8")
         hook.chmod(0o600)
@@ -170,7 +170,7 @@ class PhoneSetupTests(unittest.TestCase):
         self.assertEqual(json.loads(hook.read_text())["origin"], "https://phone.example")
 
     def test_install_config_refuses_active_browser_origin_migration(self) -> None:
-        self.config.mkdir(parents=True)
+        self.config.mkdir(mode=0o750, parents=True)
         hook = self.config / "hook.json"
         hook.write_text('{"version":1,"origin":"https://old.example","rp_id":"old.example","server_base_url":"https://old.example"}', encoding="utf-8")
         hook.chmod(0o600)
@@ -183,7 +183,7 @@ class PhoneSetupTests(unittest.TestCase):
         self.assert_setup_error(phone._install_config, staging, self.config)
 
     def test_symlink_and_unknown_staging_are_refused(self) -> None:
-        self.config.mkdir(parents=True)
+        self.config.mkdir(mode=0o750, parents=True)
         real = self.root / "real-staging.json"
         real.write_text("{}", encoding="utf-8")
         real.chmod(0o600)
@@ -194,7 +194,7 @@ class PhoneSetupTests(unittest.TestCase):
         self.assert_setup_error(phone._install_config, real, self.config)
 
     def test_config_write_failure_restores_original_bytes(self) -> None:
-        self.config.mkdir(parents=True)
+        self.config.mkdir(mode=0o750, parents=True)
         hook = self.config / "hook.json"
         hook_before = b'{"version":1,"origin":"https://old.example"}\n'
         hook.write_bytes(hook_before)

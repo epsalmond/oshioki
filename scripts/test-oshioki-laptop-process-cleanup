@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Focused path and ownership regressions for the laptop fixture, without sockets/sudo."""
+import ctypes
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+FIXTURE_PATH = Path(sys.argv.pop(1) if len(sys.argv) > 1 else
+                    Path(__file__).with_name("test-oshioki-laptop-setup"))
+SOURCE = FIXTURE_PATH.read_text()
+SETUP_SOURCE = FIXTURE_PATH.with_name("oshioki-laptop-setup").read_text()
+WRAPPER = re.search(r"pty_wrap=\(python3 -c '(.*?)'\)", SOURCE, re.S).group(1)
+# Exercise the actual wrapper, shortening only its deadline for this regression.
+TIMEOUT_WRAPPER = WRAPPER.replace("signal.alarm(30)", "signal.alarm(1)")
+LAUNCHCTL = re.search(r'cat > "\$TEST_ROOT/fake-bin/launchctl" <<\x27SH\x27\n(.*?)\nSH',
+                     SOURCE, re.S).group(1)
+FIXTURE_ROOT = ("# Under /tmp:" + SOURCE.split("# Under /tmp:", 1)[1].split("# Every bootstrap", 1)[0])
+# Keep the actual B2 assertions: accepting an alias must not accept another keg.
+KEG_ASSERTIONS = SOURCE.split('grep -Fq "installed $KEG/bin/oshioki"', 1)[1].split(
+    "\n# ... and a readlink", 1)[0]
+KEG_ASSERTIONS = 'grep -Fq "installed $KEG/bin/oshioki"' + KEG_ASSERTIONS
+CLEANUP = re.search(r'(stop_holders\(\) \{.*?\n\})', SOURCE, re.S).group(1)
+LOCAL_PREPARATION = SOURCE.split("# Scenario E:", 1)[1].split("reset_sudo_ticket", 1)[0]
+LOCAL_PREPARATION = "# Scenario E:" + LOCAL_PREPARATION
+DARWIN_AUTOSTART = SETUP_SOURCE.split('info "step $AUTOSTART_STEP/$TOTAL_STEPS: agent autostart"', 1)[1]
+DARWIN_AUTOSTART = DARWIN_AUTOSTART.split("  Darwin)\n", 1)[1].split("  Linux)\n", 1)[0].rsplit("    ;;", 1)[0]
+PLUTIL = re.search(r'cat > "\$TEST_ROOT/fake-bin/plutil" <<\x27SH\x27\n(.*?)\nSH',
+                  SOURCE, re.S).group(1)
+
+# Linux PID 1 need not reap promptly in a test container. Adopt only this
+# regression process's orphaned children so the probes can clean up failures.
+# macOS launchd already owns orphan reaping; no Linux API is used there.
+if sys.platform.startswith("linux"):
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "could not become a test subreaper")
+
+
+def running(pid):
+    result = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                            capture_output=True, text=True, timeout=2)
+    return result.returncode == 0 and bool(result.stdout.strip()) and not result.stdout.lstrip().startswith("Z")
+
+
+def reap(pid):
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass  # On macOS these orphans belong to launchd.
+
+
+def kill_group(pgid):
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+class FixturePathTests(unittest.TestCase):
+    def test_local_autostart_ignores_inherited_launchagents_dir(self):
+        with tempfile.TemporaryDirectory(prefix="oshioki-inherited-plist-", dir="/tmp") as inherited:
+            outside = Path(inherited) / "com.oshioki.agent.plist"
+            original = plistlib.dumps({"ProgramArguments": ["/outside-fixture/agent", "run"]})
+            outside.write_bytes(original)
+            outside.chmod(0o600)
+            with patch.dict(os.environ, LAUNCHAGENTS_DIR=inherited):
+                try:
+                    self.test_fresh_local_scenario_replaces_prior_nats_autostart()
+                finally:
+                    self.assertEqual(outside.read_bytes(), original)
+                    self.assertEqual(outside.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(list(Path(inherited).iterdir()), [outside])
+
+    def test_fresh_local_scenario_replaces_prior_nats_autostart(self):
+        with tempfile.TemporaryDirectory(prefix="oshioki-local-plist-", dir="/tmp") as root:
+            root = Path(root)
+            state = root / "home/.config/oshioki"
+            state.mkdir(parents=True)
+            plist = root / "home/Library/LaunchAgents/com.oshioki.agent.plist"
+            plist.parent.mkdir(parents=True)
+            # This is the preceding server-mode fixture's retained config,
+            # matching the Mac log's preservation message in scenario E.
+            plist.write_bytes(plistlib.dumps({
+                "ProgramArguments": ["/prior/agent", "run"],
+                "EnvironmentVariables": {"NATS_URL": "nats://prior.test:4222",
+                                         "NATS_USER": "prior-agent", "NATS_PASS": "prior-secret",
+                                         "OSHIOKI_AGENT_SOCKET": str(state / "agent.sock"),
+                                         "OSHIOKI_AGENT_STATE": str(state)},
+            }))
+            launchctl = root / "launchctl"
+            launchctl.write_text('''#!/usr/bin/env bash
+if [ "$1" = bootstrap ]; then
+  cp "$3" "$TEST_ROOT/launched.plist"
+  printf '%s\\n' "$3" > "$TEST_ROOT/launched-path"
+  if grep -q '<key>NATS_URL</key>' "$3"; then
+    printf 'NATS connected\\n' >> "$AGENT_STATE/agent.log"
+  fi
+fi
+''')
+            plutil = root / "plutil"
+            plutil.write_text(PLUTIL + "\n")
+            launchctl.chmod(0o755)
+            plutil.chmod(0o755)
+            env = dict(os.environ, TEST_ROOT=str(root), HOME=str(root / "home"),
+                       LAUNCHAGENTS_DIR=str(plist.parent),
+                       AGENT_STATE=str(state), AGENT_SOCKET_V=str(state / "agent.sock"),
+                       AGENT_BIN="/new/agent", LABEL="com.oshioki.agent", RECONFIGURE="0",
+                       NATS_USER_V="", LAUNCHCTL=str(launchctl), PLUTIL=str(plutil),
+                       OSHIOKI_AGENT_NATS_VERIFY_TIMEOUT="1")
+            helpers = ('set -euo pipefail\ninfo() { echo "$*" >&2; }\n'
+                       'die() { echo "$*" >&2; exit 1; }\n'
+                       'stable_keg_path() { printf "%s\\n" "$1"; }\n')
+            for mode in ("socket-only", "local-with-nats"):
+                with self.subTest(mode=mode):
+                    staged = mode == "local-with-nats"
+                    env.update(AGENT_NATS_URL_V="nats://staged.test:4222" if staged else "",
+                               AGENT_NATS_USER_V="staged-agent" if staged else "",
+                               AGENT_NATS_PASS_V="staged-secret" if staged else "")
+                    # Run the actual fresh-state preparation only for E.
+                    # The next staged local run must still write its NATS.
+                    script = helpers + ("" if staged else LOCAL_PREPARATION) + DARWIN_AUTOSTART
+                    result = subprocess.run(["bash", "-c", script], env=env,
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((root / "launched-path").read_text().strip(), str(plist))
+                    launched = plistlib.loads((root / "launched.plist").read_bytes())
+                    self.assertEqual(launched["ProgramArguments"], ["/new/agent", "run"])
+                    configured = launched["EnvironmentVariables"]
+                    self.assertEqual(configured["OSHIOKI_AGENT_SOCKET"], env["AGENT_SOCKET_V"])
+                    if staged:
+                        self.assertEqual(configured["NATS_URL"], env["AGENT_NATS_URL_V"])
+                        self.assertEqual(configured["NATS_USER"], env["AGENT_NATS_USER_V"])
+                        self.assertEqual(configured["NATS_PASS"], env["AGENT_NATS_PASS_V"])
+                        self.assertIn("agent connected to its NATS bus", result.stderr)
+                    else:
+                        self.assertFalse(any(key.startswith("NATS_") for key in configured), configured)
+                        self.assertNotIn("agent connected to its NATS bus", result.stderr)
+
+    def test_symlinked_temp_parent_keeps_exact_keg_checks(self):
+        # Model Darwin's /tmp -> /private/tmp on every host. Spaces also catch
+        # accidental word splitting when canonicalizing the fixture root.
+        with tempfile.TemporaryDirectory(prefix="oshioki-path-alias-", dir="/tmp") as root:
+            parent = Path(root)
+            physical = parent / "private tmp"
+            physical.mkdir()
+            alias = parent / "tmp alias"
+            alias.symlink_to(physical, target_is_directory=True)
+            for wrong in ("", "hook", "manifest"):
+                with self.subTest(wrong=wrong or "correct"):
+                    fixture = physical / (wrong or "correct")
+                    keg = fixture / "keg/0.1.8"
+                    (keg / "bin").mkdir(parents=True)
+                    (keg / "libexec").mkdir()
+                    hook = keg / "bin/oshioki"
+                    manifest = keg / "libexec/SHA256SUMS"
+                    if wrong == "hook":
+                        hook = fixture / "keg/brew-bin/oshioki"
+                    if wrong == "manifest":
+                        manifest = fixture / "keg/0.1.9/libexec/SHA256SUMS"
+                    (fixture / "keg.log").write_text("installed " + str(hook.resolve()) + "\n")
+                    (fixture / "seen-checksums").write_text(str(manifest.resolve()))
+                    # Intercept only mktemp so the committed initialization
+                    # receives an existing fixture through its lexical alias.
+                    script = ('set -euo pipefail\nmktemp() { printf "%s\\n" "$LEXICAL_ROOT"; }\n'
+                              + FIXTURE_ROOT
+                              + '\nfail() { echo "$*" >&2; exit 1; }\nKEG="$TEST_ROOT/keg/0.1.8"\n'
+                              + KEG_ASSERTIONS)
+                    result = subprocess.run(["bash", "-c", script],
+                                            env=dict(os.environ, LEXICAL_ROOT=str(alias / fixture.name)),
+                                            capture_output=True, text=True, timeout=5)
+                    if wrong:
+                        self.assertNotEqual(result.returncode, 0, "another keg was accepted")
+                        self.assertIn("HOOK_BIN" if wrong == "hook" else "manifest", result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class CleanupTests(unittest.TestCase):
+    def test_pty_alarm_after_reap_preserves_status_and_never_signals(self):
+        # Deliver a real alarm at both sides of pty.spawn returning its status.
+        # Intercept termination only, so the broken wrapper cannot signal a
+        # reused PID. Reuse its closed master fd to catch a stale close too.
+        probe = '''import json, os, pty, signal, sys
+from pathlib import Path
+wrapper, report_path, boundary = sys.argv[1:]
+original_kill, original_waitpid, original_close = os.kill, pty.waitpid, pty.close
+report = {"boundary": boundary, "signals": [], "reaps": 0, "injected": False}
+reused_fd = None
+def inject(pid, master=None):
+    global reused_fd
+    if report["injected"]:
+        return
+    report["injected"] = True
+    try:
+        original_waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        report["child_reaped"] = True
+    if master is not None:
+        reused_fd = os.open(os.devnull, os.O_RDONLY)
+        if reused_fd != master:
+            os.dup2(reused_fd, master)
+            original_close(reused_fd)
+            reused_fd = master
+    original_kill(os.getpid(), signal.SIGALRM)
+def waitpid(pid, options):
+    result = original_waitpid(pid, options)
+    if result[0]:
+        report["reaps"] += 1
+        if boundary == "waitpid-return":
+            inject(pid)
+    return result
+pty.waitpid = waitpid
+os.kill = lambda pid, sig: report["signals"].append(["pid", pid, int(sig)])
+os.killpg = lambda pid, sig: report["signals"].append(["group", pid, int(sig)])
+def trace(frame, event, arg):
+    if frame.f_code is pty.spawn.__code__ and event == "return" and boundary == "spawn-return":
+        sys.settrace(None)
+        inject(frame.f_locals["pid"], frame.f_locals["master_fd"])
+    return trace
+sys.settrace(trace)
+sys.argv = ["wrapper", sys.executable, "-c", 'print("completed PTY output", flush=True); raise SystemExit(7)']
+try:
+    exec(compile(Path(wrapper).read_text(), "committed-pty-wrapper", "exec"), {})
+except SystemExit as exc:
+    report["status"] = exc.code
+finally:
+    signal.alarm(0)
+    sys.settrace(None)
+    if reused_fd is not None:
+        try:
+            os.fstat(reused_fd)
+            report["reused_fd_open"] = True
+            original_close(reused_fd)
+        except OSError:
+            report["reused_fd_open"] = False
+Path(report_path).write_text(json.dumps(report))
+'''
+        with tempfile.TemporaryDirectory(prefix="oshioki-pty-reap-", dir="/tmp") as root:
+            root = Path(root)
+            wrapper = root / "wrapper.py"
+            wrapper.write_text(WRAPPER)
+            for boundary in ("waitpid-return", "spawn-return"):
+                with self.subTest(boundary=boundary):
+                    report_path = root / "report.json"
+                    result = subprocess.run([sys.executable, "-c", probe, str(wrapper),
+                                             str(report_path), boundary], stdin=subprocess.DEVNULL,
+                                            capture_output=True, timeout=8)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    report = json.loads(report_path.read_text())
+                    self.assertTrue(report["injected"], report)
+                    self.assertTrue(report["child_reaped"], report)
+                    self.assertEqual(report["signals"], [], report)
+                    self.assertEqual(report["reaps"], 1, report)
+                    self.assertEqual(report["status"], 7, report)
+                    self.assertIn(b"completed PTY output", result.stdout)
+                    if boundary == "spawn-return":
+                        self.assertTrue(report["reused_fd_open"], report)
+
+    def test_pty_timeout_terminates_owned_child_and_group(self):
+        with tempfile.TemporaryDirectory(prefix="oshioki-pty-cleanup-", dir="/tmp") as root:
+            root = Path(root)
+            child = root / "child.py"
+            pid_file = root / "pids"
+            child.write_text('''import os, signal, sys, time
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+descendant = os.fork()
+if descendant == 0:
+    time.sleep(60)
+    os._exit(0)
+with open(sys.argv[1], "w") as handle:
+    handle.write(str(os.getpid()) + " " + str(descendant))
+print("child ready", flush=True)
+time.sleep(60)
+''')
+            pids = []
+            try:
+                result = subprocess.run([sys.executable, "-c", TIMEOUT_WRAPPER, sys.executable,
+                                         str(child), str(pid_file)], stdin=subprocess.DEVNULL,
+                                        capture_output=True, timeout=8)
+                pids = [int(value) for value in pid_file.read_text().split()]
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(b"PTY setup did not finish", result.stderr)
+                self.assertIn(b"child ready", result.stdout)
+                self.assertFalse(running(pids[0]), "PTY setup child survived its wrapper timeout")
+                self.assertFalse(running(pids[1]), "PTY setup descendant survived its wrapper timeout")
+                # The wrapper must reap the direct child itself, rather than
+                # leaving a zombie for this regression's Linux subreaper.
+                if sys.platform.startswith("linux"):
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(pids[0], os.WNOHANG)
+            finally:
+                if not pids and pid_file.exists():
+                    pids = [int(value) for value in pid_file.read_text().split()]
+                if pids:
+                    kill_group(pids[0])
+                    for pid in pids:
+                        reap(pid)
+
+    def test_pty_normal_output_and_status(self):
+        result = subprocess.run([sys.executable, "-c", WRAPPER, sys.executable, "-c",
+                                 'print("ordinary PTY output", flush=True); raise SystemExit(7)'],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=8)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn(b"ordinary PTY output", result.stdout)
+        self.assertEqual(result.stderr, b"")
+
+    def test_pty_inherited_sigchld_ignore_still_reaps_normally(self):
+        launcher = "import signal; signal.signal(signal.SIGCHLD, signal.SIG_IGN); exec(" + repr(WRAPPER) + ")"
+        result = subprocess.run([sys.executable, "-c", launcher, sys.executable, "-c",
+                                 'print("inherited SIGCHLD output", flush=True); raise SystemExit(7)'],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=8)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn(b"inherited SIGCHLD output", result.stdout)
+        self.assertEqual(result.stderr, b"")
+
+    def test_delayed_writer_cannot_outlive_stop_holders(self):
+        with tempfile.TemporaryDirectory(prefix="oshioki-helper-cleanup-", dir="/tmp") as root:
+            root = Path(root)
+            fake = root / "launchctl"
+            fake.write_text(LAUNCHCTL + "\n")
+            env = dict(os.environ, TEST_ROOT=str(root), CALL_LOG=str(root / "calls"),
+                       HOLDER_PIDS=str(root / "holder-pids"), AGENT_STATE=str(root / "state"),
+                       SOCKET_TO_MAKE="", AGENT_LOG_DELAYED_LINE="must never be written",
+                       AGENT_LOG_DELAY="60")
+            launch = subprocess.Popen(["bash", str(fake), "bootstrap"], env=env,
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, start_new_session=True)
+            pids = []
+            try:
+                launch.communicate(timeout=4)
+                self.assertEqual(launch.returncode, 0)
+                self.assertTrue((root / "holder-pids").exists(), "delayed helper was not tracked")
+                pids = [int(value) for value in (root / "holder-pids").read_text().split()]
+                self.assertEqual(len(pids), 1)
+                self.assertTrue(running(pids[0]), "delayed helper never started")
+                subprocess.run(["bash", "-c", CLEANUP + "\nstop_holders\n"],
+                               env=env, capture_output=True, timeout=8, check=True)
+                self.assertFalse(running(pids[0]), "delayed helper survived stop_holders")
+                # All commands in this isolated launchctl group must be gone,
+                # including an unrecorded shell sleep descendant.
+                rows = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="],
+                                      capture_output=True, text=True, timeout=2).stdout.splitlines()
+                live = [row for row in rows if len(row.split()) == 3 and
+                        row.split()[1] == str(launch.pid) and not row.split()[2].startswith("Z")]
+                self.assertEqual(live, [], "a delayed-writer descendant survived cleanup")
+                self.assertNotIn("must never be written", (root / "state/agent.log").read_text())
+            finally:
+                kill_group(launch.pid)
+                launch.wait(timeout=4)
+                if sys.platform.startswith("linux"):
+                    # All adopted children are ours: this standalone test
+                    # creates no unowned background processes.
+                    while True:
+                        try:
+                            os.waitpid(-1, 0)
+                        except ChildProcessError:
+                            break
+
+
+if __name__ == "__main__":
+    unittest.main()

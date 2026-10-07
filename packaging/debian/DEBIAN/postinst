@@ -7,6 +7,7 @@ set -e
 
 INSTALLER="${OSHIOKI_INSTALLER:-/usr/share/oshioki/install-oshioki-hook}"
 INSTALL_ENV="${OSHIOKI_INSTALL_ENV:-/etc/oshioki/install.env}"
+STATE_DIR="${OSHIOKI_STATE_DIR:-/etc/oshioki}"
 # Same spelling and default as the installer's own PAM_D, so a test harness
 # or a packager overriding one overrides both.
 PAM_D="${PAM_D:-/etc/pam.d}"
@@ -44,7 +45,25 @@ case "$1" in
         --home /var/lib/oshioki --gecos "Oshioki approval server" oshioki
     fi
     install -d -m 0750 -o oshioki -g oshioki /var/lib/oshioki
-    install -d -m 0750 -o root -g root /etc/oshioki
+    # Reconfigure/upgrade must preserve the registry and stable lock files.
+    # Tighten owner-controlled legacy 0750 state; never adopt an unsafe path.
+    if [ -L "$STATE_DIR" ]; then
+      echo "oshioki: refusing symlink state directory: $STATE_DIR" >&2
+      exit 1
+    fi
+    if [ -e "$STATE_DIR" ]; then
+      if [ ! -d "$STATE_DIR" ] || [ "$(stat -c '%u' "$STATE_DIR")" != 0 ]; then
+        echo "oshioki: state directory must be root-owned: $STATE_DIR" >&2
+        exit 1
+      fi
+      state_mode="$(stat -c '%a' "$STATE_DIR")"
+      case "$state_mode" in ''|*[!0-7]*) exit 1 ;; esac
+      if [ "$((0$state_mode & 022))" -ne 0 ]; then
+        echo "oshioki: state directory must not be group/world writable: $STATE_DIR" >&2
+        exit 1
+      fi
+    fi
+    install -d -m 0700 -o root -g root "$STATE_DIR"
 
     if [ -f "$INSTALL_ENV" ]; then
       # --prelaunch first, always: it writes the hook state (config.env,
