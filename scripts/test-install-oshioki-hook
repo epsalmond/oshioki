@@ -75,6 +75,22 @@ if [ -n "${FAIL_SUDO_ON_CALL:-}" ] && [ -n "${SUDO_CALL_COUNTER:-}" ]; then
   calls="$(wc -c <"$SUDO_CALL_COUNTER" | tr -d '[:space:]')"
   [ "$calls" = "$FAIL_SUDO_ON_CALL" ] && exit 1
 fi
+# `sudo -V` as root models the real thing: classic sudo prints its version
+# and then every loaded approval plugin's show_version line, and it loads
+# the plugin only when sudo.conf names it. FAKE_SUDO_PLUGIN_UNLOADED models
+# a classic sudo that does not load it; FAKE_SUDO_FLAVOR=sudo-rs models
+# sudo-rs, which has no plugin API and ignores sudo.conf entirely.
+if [ "${1:-}" = -V ]; then
+  if [ "${FAKE_SUDO_FLAVOR:-}" = sudo-rs ]; then
+    echo 'sudo-rs 0.2.8' >&2
+    exit 0
+  fi
+  echo 'Sudo version 1.9.15p5'
+  if [ "${FAKE_SUDO_PLUGIN_UNLOADED:-0}" != 1 ] && [ -f "${SUDO_CONF:-}" ] &&
+     grep -q '^Plugin approval_exec ' "$SUDO_CONF"; then
+    echo 'Oshioki approval plugin version 0.0.0-test'
+  fi
+fi
 exit 0
 SH
 cat > "$TEST_ROOT/fake-bin/file" <<'SH'
@@ -213,6 +229,15 @@ cat > "$TEST_ROOT/fake-bin/uname" <<'SH'
 if [ -n "${FAKE_UNAME_S:-}" ] && [ "${1:-}" = -s ]; then echo "$FAKE_UNAME_S"; exit 0; fi
 exec /usr/bin/uname "$@"
 SH
+# dpkg-query answers for the sudo-rs package only, so the host's own
+# package database never decides a test.
+cat > "$TEST_ROOT/fake-bin/dpkg-query" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *sudo-rs*) [ "${FAKE_SUDO_RS_PACKAGE:-0}" = 1 ] && { printf 'install ok installed'; exit 0; } ;;
+esac
+exit 1
+SH
 cat > "$TEST_ROOT/fake-bin/visudo" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "${VISUDO_CALLS:-/dev/null}"
@@ -274,6 +299,9 @@ run_installer() {
     FAIL_SUDO_ON_CALL="${FAIL_SUDO_ON_CALL:-}" \
     SUDO_CALL_COUNTER="$root/sudo.calls" \
     FAKE_UNAME_S="${FAKE_UNAME_S:-}" \
+    OSHIOKI_SUDO_RS_PATHS="${OSHIOKI_SUDO_RS_PATHS:-$root/absent-sudo-rs}" \
+    OSHIOKI_SETUID_SCAN_DIRS="${OSHIOKI_SETUID_SCAN_DIRS:-$root/absent-setuid-bin}" \
+    FAKE_SUDO_RS_PACKAGE="${FAKE_SUDO_RS_PACKAGE:-0}" \
     "${INSTALLER_CMD:-$TEST_ROOT/service/scripts/install-oshioki-hook}" "$@"
 }
 
@@ -620,6 +648,201 @@ if run_installer --sudo-user testuser "$SUDOERS" --prelaunch-status >/dev/null 2
 run_installer "$SUDOERS" --disable-prelaunch
 if grep -Fq '# BEGIN oshioki' "$SUDOERS/sudo.conf"; then fail "disable left managed block"; fi
 [ ! -e "$SUDOERS/sudoers.d/oshioki" ] || fail "disable left the drop-in"
+
+# The passwordless rule needs positive proof that the sudo on this host
+# loads the approval plugin. A classic sudo whose `sudo -V` lists no Oshioki
+# plugin gets no drop-in, and an existing one is removed: sudo keeps its
+# password path instead of becoming a silent allow.
+hardware_registry() {
+  mkdir -p "$1/state" "$1/sudoers.d"
+  printf '{"version":1,"devices":[{"fingerprint":"x","active":true}]}\n' > "$1/state/devices.json"
+  printf '@includedir %s\n' "$1/sudoers.d" > "$1/sudoers"
+}
+status_ok() { run_installer --sudo-user testuser "$1" --prelaunch-status >"$1/status.log" 2>&1; }
+NOPROOF="$TEST_ROOT/plugin-unloaded"; hardware_registry "$NOPROOF"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$NOPROOF/sudoers.d/oshioki"
+noproof_rc=0
+FAKE_SUDO_PLUGIN_UNLOADED=1 run_installer --sudo-user testuser "$NOPROOF" --prelaunch >"$NOPROOF/log" 2>&1 || noproof_rc=$?
+[ "$noproof_rc" = 3 ] || { cat "$NOPROOF/log" >&2; fail "unproven plugin: expected exit 3, got $noproof_rc"; }
+[ ! -e "$NOPROOF/sudoers.d/oshioki" ] || fail "unproven plugin: the passwordless drop-in survived"
+grep -Fq 'does not list the Oshioki approval plugin' "$NOPROOF/log" || fail "unproven plugin: refusal not explained"
+[ -x "$NOPROOF/sbin/oshioki" ] || fail "unproven plugin: the hook was not installed"
+if FAKE_SUDO_PLUGIN_UNLOADED=1 status_ok "$NOPROOF"; then fail "status accepted an unloaded plugin"; fi
+grep -Fxq 'plugin loaded: no' "$NOPROOF/status.log" || fail "status did not report plugin loaded: no"
+# The same host on a sudo that does load it gets the rule, and says so.
+run_installer --sudo-user testuser "$NOPROOF" --prelaunch >"$NOPROOF/proved.log" 2>&1 ||
+  { cat "$NOPROOF/proved.log" >&2; fail "proven plugin: install failed"; }
+grep -Fxq 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL' "$NOPROOF/sudoers.d/oshioki" || fail "proven plugin: no drop-in"
+status_ok "$NOPROOF" || { cat "$NOPROOF/status.log" >&2; fail "status rejected a proven plugin"; }
+grep -Fxq 'plugin loaded: yes' "$NOPROOF/status.log" || fail "status did not report plugin loaded: yes"
+# The plugin line lost from sudo.conf (conffile prompt, sudo reinstall) while
+# the drop-in remains is the silent allow; status must call it out.
+sed -i.bak '/oshioki/d' "$NOPROOF/sudo.conf"; rm -f "$NOPROOF/sudo.conf.bak"
+if status_ok "$NOPROOF"; then fail "status accepted a drop-in without the plugin"; fi
+grep -Fq 'passwordless sudoers rule without the approval plugin' "$NOPROOF/status.log" ||
+  fail "status did not name the orphaned drop-in: $(cat "$NOPROOF/status.log")"
+grep -Fxq 'plugin loaded: no' "$NOPROOF/status.log" || fail "orphaned drop-in status omitted plugin loaded: no"
+# Re-running the installer on that host restores the coupled pair.
+run_installer --sudo-user testuser "$NOPROOF" --prelaunch >"$NOPROOF/rerun.log" 2>&1 ||
+  { cat "$NOPROOF/rerun.log" >&2; fail "rerun after a lost plugin line failed"; }
+status_ok "$NOPROOF" || fail "rerun after a lost plugin line did not restore the plugin"
+
+# The dry plan names the proof it will require.
+NOPROOF_DRY="$TEST_ROOT/plugin-proof-dry"; hardware_registry "$NOPROOF_DRY"
+run_installer --sudo-user testuser "$NOPROOF_DRY" --prelaunch --dry-run >"$NOPROOF_DRY/log" 2>&1
+grep -Fq 'require root'"'"'s sudo -V to list the Oshioki approval plugin' "$NOPROOF_DRY/log" || fail "dry run omitted the plugin proof"
+
+# sudo-rs has no approval-plugin API and ignores sudo.conf, while still
+# honouring sudoers.d NOPASSWD. The plugin lane is refused outright: no
+# managed block, no drop-in, and an existing pair is taken out. The hook and
+# config are still installed so the contextual PAM lane can use them.
+SUDORS="$TEST_ROOT/sudo-rs"; hardware_registry "$SUDORS"
+printf '%s\n' 'outside-before' '# BEGIN oshioki' "Plugin approval_exec $SUDORS/plugin/$PLUGIN_NAME" '# END oshioki' > "$SUDORS/sudo.conf"
+printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$SUDORS/sudoers.d/oshioki"
+sudors_rc=0
+FAKE_SUDO_FLAVOR=sudo-rs run_installer --sudo-user testuser "$SUDORS" --prelaunch >"$SUDORS/log" 2>&1 || sudors_rc=$?
+[ "$sudors_rc" = 3 ] || { cat "$SUDORS/log" >&2; fail "sudo-rs: expected exit 3, got $sudors_rc"; }
+[ ! -e "$SUDORS/sudoers.d/oshioki" ] || fail "sudo-rs: the passwordless drop-in survived"
+if grep -Fq 'oshioki' "$SUDORS/sudo.conf"; then fail "sudo-rs: the managed block survived"; fi
+grep -Fxq 'outside-before' "$SUDORS/sudo.conf" || fail "sudo-rs: unrelated sudo.conf text changed"
+grep -Fq 'sudo-rs' "$SUDORS/log" || fail "sudo-rs: refusal does not name sudo-rs"
+grep -Fq -- '--contextual-pam' "$SUDORS/log" || fail "sudo-rs: refusal does not point at the PAM lane"
+[ -x "$SUDORS/sbin/oshioki" ] || fail "sudo-rs: the hook was not installed for the PAM lane"
+if FAKE_SUDO_FLAVOR=sudo-rs status_ok "$SUDORS"; then fail "status accepted the plugin lane on sudo-rs"; fi
+grep -Fq 'sudo-rs' "$SUDORS/status.log" || fail "sudo-rs status does not name sudo-rs"
+# A fresh sudo-rs host never gets either artifact, and the dry plan says so.
+SUDORS_FRESH="$TEST_ROOT/sudo-rs-fresh"; hardware_registry "$SUDORS_FRESH"
+if FAKE_SUDO_FLAVOR=sudo-rs run_installer --sudo-user testuser "$SUDORS_FRESH" --prelaunch --dry-run >"$SUDORS_FRESH/dry.log" 2>&1; then
+  fail "sudo-rs dry run did not refuse"
+fi
+grep -Fq 'sudo-rs' "$SUDORS_FRESH/dry.log" || fail "sudo-rs dry run does not name sudo-rs"
+[ ! -e "$SUDORS_FRESH/sudo.conf" ] || fail "sudo-rs dry run wrote sudo.conf"
+if FAKE_SUDO_FLAVOR=sudo-rs run_installer --sudo-user testuser "$SUDORS_FRESH" --prelaunch >"$SUDORS_FRESH/log" 2>&1; then
+  fail "sudo-rs fresh install did not refuse"
+fi
+[ ! -e "$SUDORS_FRESH/sudoers.d/oshioki" ] || fail "sudo-rs fresh install wrote the drop-in"
+if [ -f "$SUDORS_FRESH/sudo.conf" ] && grep -Fq oshioki "$SUDORS_FRESH/sudo.conf"; then
+  fail "sudo-rs fresh install wrote the managed block"
+fi
+
+# Alternatives switched to classic sudo, sudo-rs still installed: the sudo on
+# PATH loads the plugin and passes the banner proof, but the setuid sudo-rs
+# beside it still reads sudoers.d and would honour NOPASSWD with no plugin.
+# The rule is refused (and an existing one removed) whichever way sudo-rs is
+# found; the plugin lane itself stays, since classic sudo does run it.
+sudo_rs_case() {
+  local name="$1"; shift
+  local root="$TEST_ROOT/sudo-rs-beside-$name" rc=0
+  hardware_registry "$root"
+  mkdir -p "$root/bin"
+  printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$root/sudoers.d/oshioki"
+  case "$name" in
+    path) : > "$root/bin/sudo-rs"; export OSHIOKI_SUDO_RS_PATHS="$root/bin/sudo-rs" ;;
+    package) export FAKE_SUDO_RS_PACKAGE=1 ;;
+    setuid)
+      printf '#!/usr/bin/env bash\necho "sudo-rs 0.2.8" >&2\n' > "$root/bin/sudo-renamed"
+      printf '#!/usr/bin/env bash\necho "Sudo version 1.9.15p5"\n' > "$root/bin/sudo.ws"
+      chmod 4755 "$root/bin/sudo-renamed" "$root/bin/sudo.ws"
+      [ -u "$root/bin/sudo-renamed" ] || fail "this filesystem cannot model a setuid fixture"
+      export OSHIOKI_SETUID_SCAN_DIRS="$root/bin"
+      ;;
+  esac
+  run_installer --sudo-user testuser "$root" --prelaunch >"$root/log" 2>&1 || rc=$?
+  [ "$rc" = 3 ] || { cat "$root/log" >&2; fail "sudo-rs beside classic ($name): expected exit 3, got $rc"; }
+  [ ! -e "$root/sudoers.d/oshioki" ] || fail "sudo-rs beside classic ($name): the drop-in survived"
+  grep -Fq 'sudo-rs is installed' "$root/log" || fail "sudo-rs beside classic ($name): refusal not explained"
+  grep -Fq 'Remove the sudo-rs package' "$root/log" || fail "sudo-rs beside classic ($name): no removal advice"
+  grep -Fq '# BEGIN oshioki' "$root/sudo.conf" || fail "sudo-rs beside classic ($name): the plugin lane was dropped"
+  # Status flags a rule put back by hand while sudo-rs is still there.
+  printf 'testuser ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' > "$root/sudoers.d/oshioki"
+  if status_ok "$root"; then fail "sudo-rs beside classic ($name): status accepted the rule"; fi
+  grep -Fq 'while sudo-rs is installed' "$root/status.log" ||
+    fail "sudo-rs beside classic ($name): status did not name sudo-rs: $(cat "$root/status.log")"
+  # And the drift check takes it back out.
+  run_installer "$root" --reconcile-plugin-rule >"$root/reconcile.log" 2>&1 ||
+    fail "sudo-rs beside classic ($name): reconcile failed"
+  [ ! -e "$root/sudoers.d/oshioki" ] || fail "sudo-rs beside classic ($name): reconcile kept the rule"
+  unset OSHIOKI_SUDO_RS_PATHS OSHIOKI_SETUID_SCAN_DIRS FAKE_SUDO_RS_PACKAGE
+}
+sudo_rs_case path
+sudo_rs_case package
+sudo_rs_case setuid
+# The classic setuid sudo alone is not mistaken for sudo-rs.
+CLASSIC_SETUID="$TEST_ROOT/classic-setuid"; hardware_registry "$CLASSIC_SETUID"; mkdir -p "$CLASSIC_SETUID/bin"
+printf '#!/usr/bin/env bash\necho "Sudo version 1.9.15p5"\n' > "$CLASSIC_SETUID/bin/sudo"
+chmod 4755 "$CLASSIC_SETUID/bin/sudo"
+OSHIOKI_SETUID_SCAN_DIRS="$CLASSIC_SETUID/bin" run_installer --sudo-user testuser "$CLASSIC_SETUID" --prelaunch >"$CLASSIC_SETUID/log" 2>&1 ||
+  { cat "$CLASSIC_SETUID/log" >&2; fail "a classic setuid sudo was treated as sudo-rs"; }
+[ -e "$CLASSIC_SETUID/sudoers.d/oshioki" ] || fail "a classic setuid sudo blocked the drop-in"
+
+# The scan never runs a setuid file that root does not own (it would run as
+# root), and a probe that hangs is cut off rather than hanging the caller.
+SCAN_SAFETY="$TEST_ROOT/setuid-scan-safety"; hardware_registry "$SCAN_SAFETY"; mkdir -p "$SCAN_SAFETY/bin"
+printf '#!/usr/bin/env bash\n: > "%s"\necho "sudo-rs 0.2.8" >&2\n' "$SCAN_SAFETY/foreign-ran" > "$SCAN_SAFETY/bin/sudo-foreign"
+printf '#!/usr/bin/env bash\ncat >/dev/null\nsleep 30\n' > "$SCAN_SAFETY/bin/sudo-hang"
+chmod 4755 "$SCAN_SAFETY/bin/sudo-foreign" "$SCAN_SAFETY/bin/sudo-hang"
+scan_started=$SECONDS
+FAKE_STAT_SPECIAL_PATH="$SCAN_SAFETY/bin/sudo-foreign" FAKE_STAT_SPECIAL_OWNER=1000 \
+  OSHIOKI_SETUID_SCAN_DIRS="$SCAN_SAFETY/bin" \
+  run_installer --sudo-user testuser "$SCAN_SAFETY" --prelaunch >"$SCAN_SAFETY/log" 2>&1 ||
+  { cat "$SCAN_SAFETY/log" >&2; fail "setuid scan safety: install failed"; }
+[ ! -e "$SCAN_SAFETY/foreign-ran" ] || fail "the setuid scan executed a file root does not own"
+[ $((SECONDS - scan_started)) -lt 25 ] || fail "a hanging setuid probe was not cut off"
+[ -e "$SCAN_SAFETY/sudoers.d/oshioki" ] || fail "setuid scan safety: an unprobed or hung file blocked the drop-in"
+
+# --reconcile-plugin-rule is the drift check the package's path unit runs.
+# It only ever removes the rule: kept while the proof holds, removed when
+# the plugin line is lost, sudo stops loading it, or the PATH sudo becomes
+# sudo-rs; never written when absent; a foreign file is left alone.
+RECONCILE="$TEST_ROOT/reconcile"; hardware_registry "$RECONCILE"
+run_installer --sudo-user testuser "$RECONCILE" --prelaunch >"$RECONCILE/log" 2>&1 || fail "reconcile fixture: install failed"
+[ -e "$RECONCILE/sudoers.d/oshioki" ] || fail "reconcile fixture: no drop-in"
+run_installer "$RECONCILE" --reconcile-plugin-rule >"$RECONCILE/keep.log" 2>&1 || fail "reconcile failed while the proof held"
+[ -e "$RECONCILE/sudoers.d/oshioki" ] || fail "reconcile removed a proven rule"
+FAKE_SUDO_PLUGIN_UNLOADED=1 run_installer "$RECONCILE" --reconcile-plugin-rule >"$RECONCILE/unloaded.log" 2>&1 ||
+  fail "reconcile failed on an unloaded plugin"
+[ ! -e "$RECONCILE/sudoers.d/oshioki" ] || fail "reconcile kept a rule whose plugin is not loaded"
+grep -Fq 'does not list the Oshioki approval plugin' "$RECONCILE/unloaded.log" || fail "reconcile did not explain the removal"
+# Never writes: with the proof holding and no rule, it stays absent.
+run_installer "$RECONCILE" --reconcile-plugin-rule >"$RECONCILE/absent.log" 2>&1 || fail "reconcile failed with no rule"
+[ ! -e "$RECONCILE/sudoers.d/oshioki" ] || fail "reconcile wrote the rule"
+grep -Fq 'nothing to reconcile' "$RECONCILE/absent.log" || fail "reconcile did not report the no-op"
+# Plugin line lost from sudo.conf.
+run_installer --sudo-user testuser "$RECONCILE" --prelaunch >/dev/null 2>&1 || fail "reconcile fixture: reinstall failed"
+sed -i.bak '/oshioki/d' "$RECONCILE/sudo.conf"; rm -f "$RECONCILE/sudo.conf.bak"
+cp "$RECONCILE/sudo.conf" "$RECONCILE/sudo.conf.expected"
+run_installer "$RECONCILE" --reconcile-plugin-rule >"$RECONCILE/lost.log" 2>&1 || fail "reconcile failed on a lost plugin line"
+[ ! -e "$RECONCILE/sudoers.d/oshioki" ] || fail "reconcile kept a rule after the plugin line was lost"
+cmp -s "$RECONCILE/sudo.conf" "$RECONCILE/sudo.conf.expected" || fail "reconcile edited sudo.conf"
+# The PATH sudo switched (back) to sudo-rs.
+run_installer --sudo-user testuser "$RECONCILE" --prelaunch >/dev/null 2>&1 || fail "reconcile fixture: reinstall failed"
+FAKE_SUDO_FLAVOR=sudo-rs run_installer "$RECONCILE" --reconcile-plugin-rule >"$RECONCILE/rs.log" 2>&1 ||
+  fail "reconcile failed on a sudo-rs PATH sudo"
+[ ! -e "$RECONCILE/sudoers.d/oshioki" ] || fail "reconcile kept a rule under sudo-rs"
+# A sudo -V that does not run at all is not evidence: the rule is kept (it
+# may be the only sudo path for its account), after one retry.
+run_installer --sudo-user testuser "$RECONCILE" --prelaunch >/dev/null 2>&1 || fail "reconcile fixture: reinstall failed"
+FAIL_SUDO=1 OSHIOKI_RECONCILE_RETRY_DELAY=0 run_installer "$RECONCILE" --reconcile-plugin-rule >"$RECONCILE/novers.log" 2>&1 ||
+  fail "reconcile failed when sudo -V did not run"
+[ -e "$RECONCILE/sudoers.d/oshioki" ] || fail "reconcile removed the rule on an unanswered sudo -V"
+grep -Fq 'sudo -V did not run; keeping' "$RECONCILE/novers.log" || fail "reconcile did not log the kept rule"
+# The retry: the first probe fails, the second answers. Call 1 is the
+# sudo-rs PATH check, call 2 the first probe, call 3 the retry.
+rm -f "$RECONCILE/sudo.calls"
+FAIL_SUDO_ON_CALL=2 OSHIOKI_RECONCILE_RETRY_DELAY=0 run_installer "$RECONCILE" --reconcile-plugin-rule >"$RECONCILE/retry-ok.log" 2>&1 ||
+  fail "reconcile retry failed"
+[ -e "$RECONCILE/sudoers.d/oshioki" ] || fail "reconcile retry removed a proven rule"
+rm -f "$RECONCILE/sudo.calls"
+FAKE_SUDO_PLUGIN_UNLOADED=1 FAIL_SUDO_ON_CALL=2 OSHIOKI_RECONCILE_RETRY_DELAY=0 \
+  run_installer "$RECONCILE" --reconcile-plugin-rule >"$RECONCILE/retry-unloaded.log" 2>&1 || fail "reconcile retry failed"
+[ ! -e "$RECONCILE/sudoers.d/oshioki" ] || fail "reconcile retry kept a rule whose plugin the retry showed unloaded"
+rm -f "$RECONCILE/sudo.calls"
+# A foreign rule at the reserved path is not ours to remove.
+printf 'administrator ALL=(ALL) NOPASSWD: /usr/bin/id\n' > "$RECONCILE/sudoers.d/oshioki"
+FAKE_SUDO_PLUGIN_UNLOADED=1 run_installer "$RECONCILE" --reconcile-plugin-rule >"$RECONCILE/foreign.log" 2>&1 ||
+  fail "reconcile failed on a foreign file"
+grep -Fxq 'administrator ALL=(ALL) NOPASSWD: /usr/bin/id' "$RECONCILE/sudoers.d/oshioki" || fail "reconcile touched a foreign file"
+rm -f "$RECONCILE/sudoers.d/oshioki"
 
 # Package removal must clean the drop-in even when sudo.conf was removed or
 # its managed markers were damaged. The drop-in mode checks ownership, mode,
@@ -1119,6 +1342,20 @@ grep -Fq 'sudo -V failed after the PAM edit' "$FAULT_SUDO/log" || fail "post-edi
 grep -q '^pam:edit:sudo-i$' "$FAULT_SUDO/trace" || fail "the post-edit check ran before both edits"
 assert_rollback_chain "$FAULT_SUDO/trace" 'post-edit sudo -V failure'
 assert_legacy_restored "$FAULT_SUDO" 'post-edit sudo -V failure'
+
+# The same rollback on a host whose sudo answers but does not load the
+# plugin (the legacy pair was left behind by an older installer) restores
+# sudo.conf but not the passwordless rule: that rule would be a silent allow.
+FAULT_NOPROOF="$TEST_ROOT/pam-fault-sudo-unloaded"
+setup_legacy_host "$FAULT_NOPROOF" ubuntu-24.04
+if FAKE_SUDO_PLUGIN_UNLOADED=1 FAIL_SUDO_ON_CALL=2 \
+   run_installer --sudo-user testuser "$FAULT_NOPROOF" --contextual-pam >"$FAULT_NOPROOF/log" 2>&1; then
+  fail "unloaded plugin: a failed post-edit sudo -V reported success"
+fi
+pam_unchanged "$FAULT_NOPROOF" || fail "unloaded plugin: a PAM file was left edited"
+grep -Fq '# BEGIN oshioki' "$FAULT_NOPROOF/sudo.conf" || fail "unloaded plugin: sudo.conf was not restored"
+[ ! -e "$FAULT_NOPROOF/sudoers.d/oshioki" ] || fail "unloaded plugin: rollback restored the passwordless rule"
+grep -Fq 'rollback is not restoring' "$FAULT_NOPROOF/log" || fail "unloaded plugin: rollback did not explain the missing rule"
 
 # A signal between the two PAM edits runs the same chain through the EXIT
 # trap rather than resuming a half-applied migration.

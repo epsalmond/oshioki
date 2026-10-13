@@ -43,6 +43,15 @@ const SUDO_API_VERSION: c_uint = 1 << 16;
 const SUDO_RC_OK: c_int = 1;
 const SUDO_RC_ERROR: c_int = -1;
 
+/// `sudo_plugin.h` message type for informational output on stdout.
+const SUDO_CONV_INFO_MSG: c_int = 0x0004;
+
+/// The line `sudo -V` (run as root) prints for this plugin. The installer
+/// treats its presence as positive proof that the sudo on this host actually
+/// loaded the approval plugin, and refuses the passwordless sudoers rule
+/// without it. Keep the prefix stable.
+const VERSION_BANNER_PREFIX: &str = "Oshioki approval plugin version ";
+
 // ---------------------------------------------------------------------------
 // Callback type aliases matching sudo_plugin.h
 // ---------------------------------------------------------------------------
@@ -60,6 +69,20 @@ type SudoConv = unsafe extern "C" fn(
     *mut c_void,   // callback closure
 ) -> c_int;
 
+/// The approval plugin's `open` callback. The printf callback is nullable.
+type ApprovalOpen = unsafe extern "C" fn(
+    c_uint,
+    SudoConv,
+    Option<SudoPrintf>,   // printf; may be NULL
+    *const *const c_char, // settings
+    *const *const c_char, // user_info
+    c_int,                // submit_optind
+    *const *const c_char, // submit_argv
+    *const *const c_char, // submit_envp
+    *const *const c_char, // plugin_options
+    *const *const c_char, // errstr (out)
+) -> c_int;
+
 // ---------------------------------------------------------------------------
 // approval_plugin vtable layout
 // ---------------------------------------------------------------------------
@@ -72,20 +95,7 @@ type SudoConv = unsafe extern "C" fn(
 pub struct ApprovalPlugin {
     type_: c_uint,
     version: c_uint,
-    open: Option<
-        unsafe extern "C" fn(
-            c_uint,
-            SudoConv,
-            SudoPrintf,
-            *const *const c_char, // settings
-            *const *const c_char, // user_info
-            c_int,                // submit_optind
-            *const *const c_char, // submit_argv
-            *const *const c_char, // submit_envp
-            *const *const c_char, // plugin_options
-            *const *const c_char, // errstr (out)
-        ) -> c_int,
-    >,
+    open: Option<ApprovalOpen>,
     close: Option<unsafe extern "C" fn()>,
     check: Option<
         unsafe extern "C" fn(
@@ -120,8 +130,47 @@ pub static approval_exec: ApprovalPlugin = ApprovalPlugin {
     open: Some(plugin_open),
     close: None,
     check: Some(check),
-    show_version: None,
+    show_version: Some(show_version),
 };
+
+/// The printf callback from the most recent `open`, used by `show_version`.
+/// Sudo calls `open` immediately before `show_version` in version mode.
+static SUDO_PRINTF: Mutex<Option<SudoPrintf>> = Mutex::new(None);
+
+fn version_banner() -> CString {
+    // The prefix and the package version contain no NUL bytes.
+    CString::new(format!(
+        "{VERSION_BANNER_PREFIX}{}\n",
+        env!("CARGO_PKG_VERSION")
+    ))
+    .unwrap_or_default()
+}
+
+/// `sudo -V` opens every approval plugin that has this callback, calls it,
+/// and exits. Printing an identifiable line lets the installer prove the
+/// plugin is loaded rather than inferring it from `/etc/sudo.conf`, which a
+/// sudo without approval-plugin support (sudo-rs) silently ignores.
+extern "C" fn show_version(_verbose: c_int) -> c_int {
+    // No panics may cross the FFI boundary.
+    let _ = catch_unwind(|| {
+        // Version mode never reaches `check`; drop the identity `open`
+        // captured so it cannot outlive this call.
+        if let Ok(mut state) = OPEN_STATE.lock() {
+            *state = None;
+        }
+        let printf = SUDO_PRINTF.lock().ok().and_then(|stored| *stored);
+        if let Some(printf) = printf {
+            let banner = version_banner();
+            // SAFETY: `printf` is the callback sudo passed to `open` for this
+            // process. The format string and its single `%s` argument are
+            // valid NUL-terminated strings that outlive the call.
+            unsafe {
+                printf(SUDO_CONV_INFO_MSG, c"%s".as_ptr(), banner.as_ptr());
+            }
+        }
+    });
+    SUDO_RC_OK
+}
 
 /// `open` and `check` receive different parts of one sudo request. Copy the
 /// invoking identity while sudo owns it, then consume it exactly once in
@@ -157,7 +206,7 @@ const SESSION_ENV_VARS: &[&str] = &["OSHIOKI_SESSION"];
 extern "C" fn plugin_open(
     _version: c_uint,
     _conversation: SudoConv,
-    _sudo_plugin_printf: SudoPrintf,
+    sudo_plugin_printf: Option<SudoPrintf>,
     settings: *const *const c_char,
     user_info: *const *const c_char,
     _submit_optind: c_int,
@@ -166,6 +215,10 @@ extern "C" fn plugin_open(
     _plugin_options: *const *const c_char,
     _errstr: *const *const c_char,
 ) -> c_int {
+    if let Ok(mut stored) = SUDO_PRINTF.lock() {
+        // A NULL callback is stored as None; show_version then prints nothing.
+        *stored = sudo_plugin_printf;
+    }
     // SAFETY: sudo supplies valid, callback-scoped settings, user_info, and
     // submit_envp arrays. The capture function copies all three before this
     // callback returns.
@@ -594,15 +647,25 @@ const HOOK_ARGV: &[&str] = &["oshioki", "check", HOOK_PROTOCOL_ARG];
 /// Fork the hook and wait for its verdict. On Linux, a cancellable password/PAM
 /// attempt races the hook. Hook status 0 approves, status 1 explicitly denies,
 /// and status 2 means that the approval transport was unavailable, leaving the
-/// password branch eligible to win.
+/// password branch eligible to win. A hook that could not be started or
+/// executed is unavailable too; see [`hook_result`].
 fn run_hook(ctx: &SudoContext) -> c_int {
     INTERRUPTED.store(false, Ordering::Relaxed);
     let Some(_signals) = InterruptGuard::install() else {
         return 0;
     };
-    let Some(mut hook) = spawn_hook(ctx) else {
-        return 0;
-    };
+    // A hook that cannot be started (pipe or fork failure) asked no device.
+    // It races as unavailable, so the password lane still decides.
+    let mut hook = spawn_hook(ctx).unwrap_or_else(|| {
+        write_fd(
+            libc::STDERR_FILENO,
+            b"[sudo/oshioki] could not start the approval hook\n",
+        );
+        HookChild {
+            pid: None,
+            stderr: None,
+        }
+    });
 
     #[cfg(target_os = "linux")]
     return run_hook_with_password(ctx, &mut hook);
@@ -903,7 +966,28 @@ struct PasswordWorker {
 /// Spawn the hook, feed its context, and return its verified child identity.
 /// The parent owns the returned pid and must reap it on every path.
 fn spawn_hook(ctx: &SudoContext) -> Option<HookChild> {
-    use nix::unistd::{ForkResult, execvp, fork};
+    let path = CString::new(HOOK_PATH).expect("hook path contains no NUL");
+    let arg0 = CString::new(HOOK_ARGV[0]).expect("argv[0] contains no NUL");
+    let arg1 = CString::new(HOOK_ARGV[1]).expect("argv[1] contains no NUL");
+    let arg2 = CString::new(HOOK_ARGV[2]).expect("argv[2] contains no NUL");
+    let hook_args: [&CStr; 3] = [arg0.as_c_str(), arg1.as_c_str(), arg2.as_c_str()];
+    spawn_hook_with(&ctx.payload, path.as_c_str(), &hook_args)
+}
+
+/// The child's entire environment. Sudo hands the plugin the invoking user's
+/// environment, and the hook runs as root, so nothing of it may cross into
+/// the hook: no `OSHIOKI_CONFIG_DIR`, `HOME`/`CURL_HOME` (curl config),
+/// `SSL_CERT_*`, proxies, or key-log paths. The PAM module does the same
+/// with an empty environment; the hook uses absolute paths throughout.
+const HOOK_ENV: &str = "PATH=/usr/bin:/bin";
+
+fn spawn_hook_with(payload: &[u8], path: &CStr, hook_args: &[&CStr]) -> Option<HookChild> {
+    use nix::unistd::{ForkResult, chdir, execve, fork};
+
+    // Allocate before fork; the child only calls async-signal-safe functions.
+    let hook_env = CString::new(HOOK_ENV).expect("hook environment contains no NUL");
+    let hook_envp: [&CStr; 1] = [hook_env.as_c_str()];
+    let root = c"/";
 
     // Build the stdin and stderr pipes before forking so the child inherits
     // both. The parent forwards only stderr, leaving command stdout alone.
@@ -924,7 +1008,7 @@ fn spawn_hook(ctx: &SudoContext) -> Option<HookChild> {
             let raw_write = write_fd.into_raw_fd();
             // SAFETY: raw_write is a valid, open file descriptor we own.
             let mut w = unsafe { std::fs::File::from_raw_fd(raw_write) };
-            let _ = w.write_all(&ctx.payload);
+            let _ = w.write_all(payload);
             let _ = w.flush();
             drop(w); // close write end so child sees EOF
 
@@ -953,18 +1037,17 @@ fn spawn_hook(ctx: &SudoContext) -> Option<HookChild> {
             let _ = nix::unistd::close(raw_stderr_read);
             let _ = nix::unistd::close(raw_stderr_write);
             reset_child_signals();
+            // Start in `/` so no caller-chosen working directory is
+            // inherited; the hook resolves every path absolutely.
+            let _ = chdir(root);
 
-            // Build CStrings for exec.
-            let path = CString::new(HOOK_PATH).expect("hook path contains no NUL");
-            let arg0 = CString::new(HOOK_ARGV[0]).expect("argv[0] contains no NUL");
-            let arg1 = CString::new(HOOK_ARGV[1]).expect("argv[1] contains no NUL");
-            let arg2 = CString::new(HOOK_ARGV[2]).expect("argv[2] contains no NUL");
-            let hook_args: [&CStr; 3] = [arg0.as_c_str(), arg1.as_c_str(), arg2.as_c_str()];
-
-            let _ = execvp(path.as_c_str(), &hook_args);
-            // If execvp returns, it failed. Exit with a distinctive code the
-            // parent maps to deny.
-            std::process::exit(127);
+            let _ = execve(path, hook_args, &hook_envp);
+            // If execve returns, it failed. Exit with `HOOK_EXEC_FAILED`, which
+            // the parent maps to unavailable (the password lane stays open),
+            // without running sudo's atexit handlers or flushing its stdio
+            // buffers from this forked copy.
+            // SAFETY: _exit is async-signal-safe and never returns.
+            unsafe { libc::_exit(127) }
         }
         Err(_) => {
             // fork failed; OwnedFd drop closes both ends.
@@ -988,20 +1071,37 @@ fn set_nonblocking(fd: RawFd) {
     }
 }
 
+/// The status `spawn_hook`'s forked child exits with when `execvp` fails:
+/// the hook binary is missing or not executable.
+const HOOK_EXEC_FAILED: i32 = 127;
+
+/// Maps the hook's exit to the password race. Only an explicit denial (1)
+/// beats a password. A hook that never ran because it could not be executed
+/// (127) reached no device, so it is unavailable like exit 2 and leaves the
+/// password lane alive; the PAM module treats a spawn failure the same way.
+/// A signal or any other status means the hook started and died for a reason
+/// this side cannot see, and stays a failure.
 fn hook_result(status: nix::sys::wait::WaitStatus) -> HookResult {
     match status {
         nix::sys::wait::WaitStatus::Exited(_, 0) => HookResult::Approved,
         nix::sys::wait::WaitStatus::Exited(_, 1) => HookResult::Denied,
-        nix::sys::wait::WaitStatus::Exited(_, 2) => HookResult::Unavailable,
+        nix::sys::wait::WaitStatus::Exited(_, 2 | HOOK_EXEC_FAILED) => HookResult::Unavailable,
         _ => HookResult::Failed,
     }
 }
 
 /// Reap the child, optionally without blocking. The pid came directly from
 /// `fork`, so this cannot target an unrelated process.
+///
+/// A hook with no pid at this point was never started (`run_hook` builds one
+/// when the pipes or the fork fail); the race loops only reap a child they
+/// have not already reaped, so this is the only way to get here without a
+/// pid. It is unavailable: no device was asked.
 fn reap_hook(hook: &mut HookChild, nohang: bool) -> Option<HookResult> {
     use nix::sys::wait::{WaitPidFlag, waitpid};
-    let pid = hook.pid?;
+    let Some(pid) = hook.pid else {
+        return Some(HookResult::Unavailable);
+    };
     let flags = nohang.then_some(WaitPidFlag::WNOHANG);
     match waitpid(pid, flags) {
         Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(nix::errno::Errno::EINTR) => None,
@@ -2006,6 +2106,50 @@ mod tests {
         path
     }
 
+    /// The hook's exit contract: 0 approves, 1 is an explicit denial that
+    /// beats a password, 2 is unavailable. A hook that could not be executed
+    /// at all (`execvp` failed, so the forked child exits 127) never reached
+    /// a device and is unavailable too: a missing or non-executable hook must
+    /// not take the password lane away. Anything else -- a signal, another
+    /// status -- stays a failure.
+    #[test]
+    fn hook_exit_statuses_map_to_the_password_race_contract() {
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::WaitStatus;
+        let pid = nix::unistd::Pid::from_raw(1);
+        assert_eq!(
+            hook_result(WaitStatus::Exited(pid, 0)),
+            HookResult::Approved
+        );
+        assert_eq!(hook_result(WaitStatus::Exited(pid, 1)), HookResult::Denied);
+        assert_eq!(
+            hook_result(WaitStatus::Exited(pid, 2)),
+            HookResult::Unavailable
+        );
+        assert_eq!(
+            hook_result(WaitStatus::Exited(pid, HOOK_EXEC_FAILED)),
+            HookResult::Unavailable
+        );
+        assert_eq!(hook_result(WaitStatus::Exited(pid, 3)), HookResult::Failed);
+        assert_eq!(
+            hook_result(WaitStatus::Signaled(pid, Signal::SIGKILL, false)),
+            HookResult::Failed
+        );
+    }
+
+    /// A hook that could not be started at all (pipe or fork failure) never
+    /// reached a device. The race reads it as unavailable, so the password
+    /// lane still runs instead of the request being denied outright.
+    #[test]
+    fn a_hook_that_never_started_is_unavailable() {
+        let mut hook = HookChild {
+            pid: None,
+            stderr: None,
+        };
+        assert_eq!(reap_hook(&mut hook, true), Some(HookResult::Unavailable));
+        assert_eq!(reap_hook(&mut hook, false), Some(HookResult::Unavailable));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn contextual_pam_lane_detected_only_on_a_live_auth_line() {
@@ -2217,6 +2361,84 @@ mod tests {
             gather_after_captured_identity(&[b"command=/usr/bin/true"], &[b"/usr/bin/true"], &[],)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn show_version_is_exported_with_an_identifiable_banner() {
+        // The installer greps `sudo -V` (run as root) for this exact prefix as
+        // positive proof that sudo loaded this plugin before it writes the
+        // NOPASSWD drop-in. Changing it breaks that proof on every host.
+        assert!(approval_exec.show_version.is_some());
+        let banner = version_banner();
+        assert_eq!(
+            banner.to_str().unwrap(),
+            concat!(
+                "Oshioki approval plugin version ",
+                env!("CARGO_PKG_VERSION"),
+                "\n"
+            )
+        );
+        assert!(banner.to_str().unwrap().starts_with(VERSION_BANNER_PREFIX));
+    }
+
+    #[test]
+    fn show_version_consumes_the_identity_its_open_captured() {
+        let _serial = identity_test();
+        // `sudo -V` opens the plugin only to call show_version; that identity
+        // must not survive for a later check.
+        assert!(capture_test_identity(&[
+            b"user=approvalcaller",
+            b"uid=12345"
+        ]));
+        // SAFETY: show_version takes no pointers; no printf was stored by the
+        // capture helper, so it prints nothing.
+        let shown = unsafe { (approval_exec.show_version.unwrap())(1) };
+        assert_eq!(shown, SUDO_RC_OK);
+        assert!(
+            gather_after_captured_identity(&[b"command=/usr/bin/true"], &[b"/usr/bin/true"], &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn show_version_tolerates_a_null_printf_from_open() {
+        let _serial = identity_test();
+        let (_settings, settings) = c_array(&[]);
+        let (_user_info, user_info) = c_array(&[b"user=root", b"uid=0"]);
+        let (_env, env) = c_array(&[]);
+        let open = approval_exec.open.unwrap();
+        // SAFETY: every array is NUL-terminated and outlives the call; a NULL
+        // printf is exactly what this test exercises.
+        let opened = unsafe {
+            open(
+                SUDO_API_VERSION,
+                noop_conversation,
+                None,
+                settings.as_ptr(),
+                user_info.as_ptr(),
+                0,
+                env.as_ptr(),
+                env.as_ptr(),
+                env.as_ptr(),
+                ptr::null(),
+            )
+        };
+        assert_eq!(opened, SUDO_RC_OK);
+        // SAFETY: show_version takes no pointers.
+        assert_eq!(
+            unsafe { (approval_exec.show_version.unwrap())(1) },
+            SUDO_RC_OK
+        );
+        assert!(SUDO_PRINTF.lock().unwrap().is_none());
+    }
+
+    unsafe extern "C" fn noop_conversation(
+        _count: c_int,
+        _messages: *const c_void,
+        _replies: *mut c_void,
+        _callback: *mut c_void,
+    ) -> c_int {
+        0
     }
 
     #[test]
@@ -2826,5 +3048,52 @@ mod tests {
             // before this test touched SIGINT, so later tests are unaffected.
             libc::sigaction(libc::SIGINT, baseline.as_ptr(), ptr::null_mut());
         }
+    }
+
+    /// The hook runs as root, but sudo hands the plugin the invoking user's
+    /// environment. The child must start in `/` with only the fixed
+    /// `HOOK_ENV`, so nothing the caller exported (`OSHIOKI_CONFIG_DIR`,
+    /// `CURL_HOME`, `HOME`, `SSL_CERT_FILE`, ...) reaches the root hook.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawned_hook_starts_in_root_with_only_the_fixed_environment() {
+        // The test process carries an ordinary environment; prove the child
+        // does not inherit it rather than assuming it is empty.
+        assert!(std::env::vars_os().next().is_some());
+        let program = CString::new("/bin/sh").unwrap();
+        let argv0 = CString::new("sh").unwrap();
+        let flag = CString::new("-c").unwrap();
+        let script =
+            CString::new("tr '\\0' '\\n' </proc/$$/environ >&2; echo \"cwd=$(pwd)\" >&2; cat >&2")
+                .unwrap();
+        let argv = [argv0.as_c_str(), flag.as_c_str(), script.as_c_str()];
+        let mut hook =
+            spawn_hook_with(b"payload-line\n", program.as_c_str(), &argv).expect("spawn the child");
+        let result = loop {
+            if let Some(result) = reap_hook(&mut hook, false) {
+                break result;
+            }
+        };
+        assert_eq!(result, HookResult::Approved);
+        let stderr = hook.stderr.take().expect("child stderr pipe");
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            // SAFETY: buffer is writable storage and stderr is an open pipe
+            // descriptor owned by this test.
+            let read =
+                unsafe { libc::read(stderr.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read <= 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..usize::try_from(read).unwrap()]);
+        }
+        let output = String::from_utf8(output).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            ["PATH=/usr/bin:/bin", "cwd=/", "payload-line"],
+            "unexpected child environment or cwd: {output}"
+        );
     }
 }

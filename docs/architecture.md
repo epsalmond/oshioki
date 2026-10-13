@@ -46,9 +46,13 @@ The hook verifies WebAuthn request ID, fingerprint, credential ID, origin,
 RP ID, challenge, flags, public key, and signature against retained request
 bytes. Native approvals sign the corresponding challenge with P-256.
 
-The first valid decision wins; a signed denial ends command approval.
-An invalid approval fails closed. The hook's command-approval deadline is
-90 seconds. Server decisions and outbox records commit together; the outbox
+The first valid decision wins, at the hook as well as the server. A decision
+that does not verify for the request (wrong request ID, unpinned device, bad
+signature, an unsigned denial the server does not confirm) is ignored and the
+hook keeps waiting, because anyone who can publish on the verdict subject can
+send one. A verified denial ends command approval. No valid decision by the
+deadline is unavailable, never a denial. The hook's command-approval deadline
+is 90 seconds. Server decisions and outbox records commit together; the outbox
 retries publication after restart.
 
 Liveness is separate from approval:
@@ -64,9 +68,12 @@ delivery receipt permits waiting for the browser within the overall deadline.
 See [transport rules](transports.md) for fallback behavior.
 
 On Linux, the command plugin also races an interactive password attempt through
-the system sudo PAM service. An explicit denial or invalid approval defeats that
-fallback. `sudo -n` never opens this plugin password prompt. Darwin has no
-plugin password branch.
+the system sudo PAM service. Only a verified denial, a genuine verdict that
+arrives after the request expired, a revocation found at final authorization,
+or a hook killed by a signal or panic defeats that fallback. Invalid decisions,
+transport outages, host faults (configuration, registry, no active device),
+and a hook that cannot be executed leave it open. `sudo -n` never opens this
+plugin password prompt. Darwin has no plugin password branch.
 
 ## Contextual PAM
 
@@ -80,9 +87,11 @@ separate from command requests and `/r/<id>`. Their trusted principal/service
 context is distinct from the advisory invocation. Software native identities
 cannot authenticate sudo.
 
-There is no signed Deny action on this operation. Unavailability and cancellation
-allow password fallback; malformed assertions remain failures. The installed
-Linux and macOS PAM controls differ for hard failures.
+There is no signed Deny action on this operation. Unavailability, cancellation,
+and assertions that do not verify allow password fallback; over NATS the helper
+ignores an unverifiable assertion and keeps waiting for a valid one. A verified
+assertion that fails final authorization (revocation, expiry) is a failure. The
+installed Linux and macOS PAM controls differ for hard failures.
 The [PAM contract](../pam/README.md) defines exact results, cancellation,
 and process cleanup.
 

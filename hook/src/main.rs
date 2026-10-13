@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 mod approvals;
 mod registry;
+mod sudo_lane;
 #[path = "../../cli/terminal_logo.rs"]
 mod terminal_logo;
 
@@ -73,6 +74,40 @@ impl StdError for ApprovalUnavailable {}
 
 fn approval_unavailable(detail: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ApprovalUnavailable(detail.into()))
+}
+
+/// A decision that arrived and could not be authenticated for this request:
+/// the wrong request ID, an unpinned or mismatched device, a bad signature,
+/// or an unsigned denial nobody can confirm. Anyone who can publish on a
+/// request's reply subject can produce one, so it is never a denial. The
+/// NATS wait discards it and reads the next decision; on the socket lane it
+/// ends the attempt as unavailable. Contrast a verified denial, which is an
+/// ordinary error (exit 1) and still beats a password.
+#[derive(Debug)]
+struct InvalidDecision(String);
+
+impl fmt::Display for InvalidDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl StdError for InvalidDecision {}
+
+fn invalid_decision(detail: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(InvalidDecision(detail.into()))
+}
+
+/// Marks a failed authenticity check as [`InvalidDecision`], keeping its
+/// cause in the message.
+fn invalid_because(context: &str, error: impl Into<anyhow::Error>) -> anyhow::Error {
+    invalid_decision(format!("{context}: {:#}", error.into()))
+}
+
+fn is_invalid_decision(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<InvalidDecision>().is_some())
 }
 /// How long enroll waits for the server to confirm it stored the device.
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -177,8 +212,7 @@ struct ServerHealthV1 {
     rp_id: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if terminal_logo::is_top_level_help(&arguments) {
         terminal_logo::maybe_print_for_arguments(&arguments);
@@ -189,27 +223,38 @@ async fn main() -> Result<()> {
     // Both privileged sudo verbs share the terminal/audit split and the
     // exit-status contract; only their payloads differ.
     let checking = matches!(cli.verb, Verb::Check { .. } | Verb::Authenticate { .. });
+    // The sudo verbs drop the caller's environment and working directory
+    // before any thread exists; this may replace the process.
+    let lane = if checking { sudo_lane::enter() } else { Ok(()) };
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli, checking, lane))
+}
+
+async fn run(cli: Cli, checking: bool, lane: Result<()>) -> Result<()> {
     logging::init(checking);
-    let result = match cli.verb {
-        Verb::Check {
+    let result = match lane.map(|()| cli.verb) {
+        Err(error) => Err(error),
+        Ok(Verb::Check {
             plugin_protocol_version,
-        } => cmd_check(plugin_protocol_version).await,
-        Verb::Authenticate {
+        }) => cmd_check(plugin_protocol_version).await,
+        Ok(Verb::Authenticate {
             pam_protocol_version,
             pam_liveness_fd,
-        } => Box::pin(cmd_authenticate(pam_protocol_version, pam_liveness_fd)).await,
-        Verb::Enroll {
+        }) => Box::pin(cmd_authenticate(pam_protocol_version, pam_liveness_fd)).await,
+        Ok(Verb::Enroll {
             resume,
             allow_localhost,
-        } => cmd_enroll(resume.as_deref(), allow_localhost).await,
-        Verb::Revoke { fingerprint } => cmd_revoke(&fingerprint).await,
-        Verb::Pin { fingerprint } => cmd_pin(&fingerprint).await,
-        Verb::PinRecord { path } => cmd_pin_record(&path),
-        Verb::Status => cmd_status(),
-        Verb::Watch => cmd_watch().await,
-        Verb::Approvals { command } => approvals::run(command).await,
-        Verb::Test => cmd_test().await,
-        Verb::PamSelftest { module } => pam_selftest::run(&module),
+        }) => cmd_enroll(resume.as_deref(), allow_localhost).await,
+        Ok(Verb::Revoke { fingerprint }) => cmd_revoke(&fingerprint).await,
+        Ok(Verb::Pin { fingerprint }) => cmd_pin(&fingerprint).await,
+        Ok(Verb::PinRecord { path }) => cmd_pin_record(&path),
+        Ok(Verb::Status) => cmd_status(),
+        Ok(Verb::Watch) => cmd_watch().await,
+        Ok(Verb::Approvals { command }) => approvals::run(command).await,
+        Ok(Verb::Test) => cmd_test().await,
+        Ok(Verb::PamSelftest { module }) => pam_selftest::run(&module),
     };
     if let Err(error) = result {
         let exit_code = checking.then(|| check_error_exit_code(&error));
@@ -271,14 +316,16 @@ fn redact_url_token(token: &str) -> String {
     format!("{scheme}://<redacted>@{host}")
 }
 
-/// Maps a failed check to the plugin's password-race contract. Explicit
-/// denials and malformed or invalid decisions fail closed. A transport that
-/// never became usable, or a request that expired without a decision, leaves
-/// password fallback available to the plugin.
+/// Maps a failed check to the plugin's password-race contract. A verified
+/// denial, a late verdict, and a revocation found at final authorization
+/// fail closed. A transport that never became usable, a host-local fault, a
+/// request that expired without a valid decision, or a decision that could
+/// not be authenticated leaves password fallback available to the plugin.
 fn check_error_exit_code(error: &anyhow::Error) -> i32 {
     if error.chain().any(|cause| {
         cause.downcast_ref::<ApprovalUnavailable>().is_some()
             || cause.downcast_ref::<HookTransportFailure>().is_some()
+            || cause.downcast_ref::<InvalidDecision>().is_some()
     }) {
         CHECK_RC_UNAVAILABLE
     } else {
@@ -736,16 +783,28 @@ async fn execute_request_at(
     directory: &Path,
     announce_url: bool,
 ) -> Result<()> {
-    eprintln!(
+    let _ = writeln!(
+        io::stderr(),
         "Oshioki is trying: {}",
         escape_for_terminal(&request.command)
     );
-    io::stderr().flush()?;
-    // The transport set first: a config naming no working transport fails
-    // before any request is built, not at the first sudo afterwards.
-    let nats_url = transports_from(directory)?.nats_url;
-    let raw_request = request.raw_json()?;
-    let snapshot = registry::snapshot(directory)?;
+    let _ = io::stderr().flush();
+    // Everything up to the transport wait is host-local, exactly as on the
+    // authentication lane: root's own configuration and registry, and a
+    // request this process just built. None of it is an answer about the
+    // operator, so a fault here is unavailable (`host_fault`) and the plugin
+    // keeps its password lane. Revoking the last device, a registry another
+    // sudo holds for longer than the lock budget, or a broken config.env must
+    // not leave sudo with no way in.
+    let nats_url = transports_from(directory)
+        .map_err(|error| host_fault("read the transport configuration", &error))?
+        .nats_url;
+    let raw_request = request
+        .raw_json()
+        .map_err(|error| host_fault("serialize the approval request", &error.into()))?;
+    let snapshot = registry::decision_snapshot(directory)
+        .await
+        .map_err(|error| host_fault("read the device registry", &error))?;
     let active = snapshot
         .registry
         .devices
@@ -754,7 +813,9 @@ async fn execute_request_at(
         .cloned()
         .collect::<Vec<_>>();
     if active.is_empty() {
-        bail!("no active approval devices");
+        return Err(approval_unavailable(
+            "no active approval devices are enrolled on this host",
+        ));
     }
     // This is the hook's trusted capability decision. A server delivery
     // receipt may extend the short native liveness wait only when a pinned,
@@ -762,8 +823,9 @@ async fn execute_request_at(
     let has_browser_recipient = active
         .iter()
         .any(|device| device.kind == DeviceKindV1::Webauthn);
-    let envelope = seal_request(&request, &raw_request, &active)?;
-    let payload = serde_json::to_vec(&envelope)?;
+    let payload = seal_request(&request, &raw_request, &active)
+        .and_then(|envelope| Ok(serde_json::to_vec(&envelope)?))
+        .map_err(|error| host_fault("seal the approval envelope", &error))?;
     if payload.len() > oshioki_protocol::v1::MAX_ENVELOPE_BYTES {
         bail!("request envelope exceeds 3 MiB");
     }
@@ -796,7 +858,7 @@ async fn execute_request_at(
     // NATS fallback configured the socket answer is final: silence denies at
     // once instead of waiting out a deadline nobody else can meet.
     let deadline = tokio::time::Instant::now() + timeout;
-    let decision = match try_agent_socket(
+    let decisions = match try_agent_socket(
         directory,
         &request.request_id,
         &payload,
@@ -805,7 +867,24 @@ async fn execute_request_at(
     )
     .await?
     {
-        SocketOutcome::Verdict(bytes) => decode_socket_command_decision(&bytes)?,
+        // The socket carries one decision. An agent that acknowledged and
+        // then sent something this host cannot authenticate is treated like
+        // one that dropped the connection: unavailable, no NATS retry.
+        SocketOutcome::Verdict(bytes) => {
+            let decision = decode_socket_command_decision(&bytes)?;
+            return socket_decision_outcome(
+                apply_decision(
+                    decision,
+                    DecisionLane::Socket,
+                    &request,
+                    &raw_request,
+                    &active,
+                    snapshot.revocation_epoch,
+                    directory,
+                )
+                .await,
+            );
+        }
         SocketOutcome::Unconfigured => match &nats_url {
             Some(url) => {
                 debug!("no agent socket configured; trying NATS");
@@ -824,10 +903,12 @@ async fn execute_request_at(
                 .await?
             }
             // The transport check above guarantees a fallback here.
-            None => bail!(
-                "no approval transports configured: OSHIOKI_AGENT_SOCKET is unset and NATS_URL is not set in {}",
-                directory.join("config.env").display()
-            ),
+            None => {
+                return Err(approval_unavailable(format!(
+                    "no approval transports configured: OSHIOKI_AGENT_SOCKET is unset and NATS_URL is not set in {}",
+                    directory.join("config.env").display()
+                )));
+            }
         },
         SocketOutcome::Silent(SocketSilence::NoAgent { path, error }) => match &nats_url {
             Some(url) => {
@@ -913,15 +994,95 @@ async fn execute_request_at(
             return Err(approval_unavailable(error));
         }
     };
-    apply_decision(
-        decision,
-        &request,
-        &raw_request,
-        &active,
-        snapshot.revocation_epoch,
-        directory,
-    )
+    first_valid_decision(decisions, deadline, |decision| {
+        apply_decision(
+            decision,
+            DecisionLane::Nats,
+            &request,
+            &raw_request,
+            &active,
+            snapshot.revocation_epoch,
+            directory,
+        )
+    })
     .await
+}
+
+/// Where a decision came from. It decides who may vouch for an unsigned
+/// denial: only the server's record can, and only for a decision the server
+/// relayed over NATS. Nothing on the local socket is ever unsigned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecisionLane {
+    Socket,
+    Nats,
+}
+
+/// The socket lane's answer for a decision it carried. An authenticated
+/// decision stands; one that fails authentication is unavailable, like a
+/// connection that dropped after acknowledging. Only a signed, verified
+/// decision may end a request as denied.
+fn socket_decision_outcome(result: Result<()>) -> Result<()> {
+    result.map_err(|error| {
+        if is_invalid_decision(&error) {
+            approval_unavailable(format!(
+                "the local agent sent a decision this host cannot authenticate: {}",
+                display_error(&error)
+            ))
+        } else {
+            error
+        }
+    })
+}
+
+/// Applies NATS decision candidates in arrival order until one is valid.
+///
+/// "The first valid decision wins" is literal here: a candidate that fails
+/// authentication ([`InvalidDecision`]) is logged and discarded, and the wait
+/// continues for the next one. Anyone with publish rights on the verdict
+/// subject can send such a candidate, so it must not be able to end the
+/// request. Every other result -- an approval, a verified denial, a
+/// revocation found at final authorization, a host fault -- is final. The
+/// transport ends the stream at the deadline, which is unavailable; checking
+/// one candidate (a server confirmation, say) is bounded by the same
+/// deadline.
+async fn first_valid_decision<T, F, Fut>(
+    mut decisions: oshioki_transport::DecisionStream<T>,
+    deadline: tokio::time::Instant,
+    mut apply: F,
+) -> Result<()>
+where
+    F: FnMut(T) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut ignored = 0_usize;
+    loop {
+        let decision = match decisions.next().await {
+            Some(Ok(decision)) => decision,
+            Some(Err(error)) if ignored > 0 => {
+                return Err(error.context(format!(
+                    "{ignored} decision(s) failed verification and were ignored"
+                )));
+            }
+            Some(Err(error)) => return Err(error),
+            None => {
+                return Err(approval_unavailable(
+                    "the decision wait ended without a valid decision",
+                ));
+            }
+        };
+        match tokio::time::timeout_at(deadline, apply(decision)).await {
+            Ok(Err(error)) if is_invalid_decision(&error) => {
+                ignored += 1;
+                warn!(target: "audit", error = %display_error(&error), "ignored a decision that failed verification; still waiting");
+            }
+            Ok(result) => return result,
+            Err(_) => {
+                return Err(approval_unavailable(
+                    "the decision deadline passed while a decision was being checked",
+                ));
+            }
+        }
+    }
 }
 
 /// The approval transports a config directory offers. At least one is always
@@ -977,7 +1138,7 @@ async fn nats_fallback(
     nats_url: &str,
     options: NatsFallbackOptions,
     progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-) -> Result<DecisionV1> {
+) -> Result<oshioki_transport::DecisionStream<DecisionV1>> {
     let remaining = deadline
         .checked_duration_since(tokio::time::Instant::now())
         .unwrap_or(Duration::ZERO);
@@ -1025,16 +1186,22 @@ async fn nats_fallback(
             "sudo decision deadline exceeded before the NATS verdict wait",
         ));
     }
-    if options.announce_url && options.has_browser_recipient {
-        let config = load_hook_config_from(directory)?;
-        eprintln!(
+    // The link is a convenience for a browser recipient; a missing or invalid
+    // `hook.json` must not fail a request the transport could still answer
+    // (the authentication lane follows the same rule).
+    if options.announce_url
+        && options.has_browser_recipient
+        && let Ok(config) = load_hook_config_from(directory)
+    {
+        let _ = writeln!(
+            io::stderr(),
             "Approval URL (expires in {} seconds):\n  {}",
             remaining.as_secs(),
             terminal_approval_url(&config.server_base_url, &request.request_id)
         );
-        io::stderr().flush()?;
+        let _ = io::stderr().flush();
     }
-    transport
+    let decisions = transport
         .request_decision(
             &request.host,
             &request.request_id,
@@ -1044,7 +1211,10 @@ async fn nats_fallback(
             progress,
         )
         .await
-        .with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))
+        .with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))?;
+    Ok(Box::pin(decisions.map(move |item| {
+        item.with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))
+    })))
 }
 
 /// Renders a NATS URL for error messages: scheme and host without
@@ -1115,11 +1285,13 @@ enum SocketSilence {
 /// the verdict position -- is treated as not yet answered and this function
 /// reads another frame instead, bounded by the same deadline; an
 /// acknowledgement-position "keepalive" re-ack or a delivery receipt arriving
-/// at the verdict position is skipped the same way. Only an explicit `Deny`,
-/// a verdict that decodes but then fails its own shape or signature
-/// validation, or a message that decodes fine as the wrong kind for its
-/// position (evidence of a real cross-lane bug) keep failing closed exactly
-/// as before.
+/// at the verdict position is skipped the same way. An acknowledgement for
+/// another request, or another message kind where the acknowledgement
+/// belongs, is `NoAck`; a message of the other lane's decision kind is
+/// unavailable at decode. Whoever holds the socket path can send any of
+/// these. Only a decision that then verifies -- a signed `Deny`, or an
+/// approval -- ends the request; one that fails verification is
+/// unavailable (`socket_decision_outcome`).
 ///
 /// A post-ack hangup or framing fault is reported as `Dropped` rather than
 /// decided here; the two lanes answer it identically (both fall back), but
@@ -1134,7 +1306,9 @@ async fn try_agent_socket(
     deadline: tokio::time::Instant,
     progress: &std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
 ) -> Result<SocketOutcome> {
-    let Some(path) = agent_socket_from(directory)? else {
+    let Some(path) = agent_socket_from(directory)
+        .map_err(|error| host_fault("read the transport configuration", &error))?
+    else {
         return Ok(SocketOutcome::Unconfigured);
     };
     let connect_wait = deadline
@@ -1200,7 +1374,7 @@ async fn try_agent_socket(
     // no agent has taken responsibility yet, so the caller still tries NATS
     // when one is configured. Issue #66.
     let ack_deadline = deadline.min(tokio::time::Instant::now() + DAEMON_ACK_TIMEOUT);
-    let acknowledgement = loop {
+    loop {
         let remaining = ack_deadline
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or(Duration::ZERO);
@@ -1242,17 +1416,30 @@ async fn try_agent_socket(
             }
         };
         match oshioki_protocol::decode_control_message(&bytes) {
+            // Only an acknowledgement for this request counts. One for another
+            // request, or a different message kind where the acknowledgement
+            // belongs, is something whoever holds the socket path can send;
+            // it is not evidence about this request, so it is a peer that
+            // never acknowledged (`NoAck`) and NATS may still answer.
             Ok(oshioki_protocol::ControlMessageOutcome::Message(
                 oshioki_protocol::ControlMessageV1::Alive(alive),
-            )) => break alive,
-            // A message decoded fine but is not an alive acknowledgement at the
-            // point in the exchange where one is required. That is evidence of a
-            // broken or cross-lane peer, not a local fault, so it keeps failing
-            // closed.
+            )) => match alive.validate(request_id) {
+                Ok(()) => break,
+                Err(error) => {
+                    return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                        path,
+                        error: format!(
+                            "invalid socket daemon acknowledgement: {error}; \
+                             upgrade oshioki-agent before using this hook"
+                        ),
+                    }));
+                }
+            },
             Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => {
-                bail!(
-                    "expected a socket daemon acknowledgement but got a different control message"
-                );
+                return Ok(SocketOutcome::Silent(SocketSilence::NoAck {
+                    path,
+                    error: "expected a socket daemon acknowledgement but got a different control message".into(),
+                }));
             }
             // A kind this build does not recognize is not evidence of
             // anything: keep waiting for the real acknowledgement instead of
@@ -1273,10 +1460,7 @@ async fn try_agent_socket(
                 }));
             }
         }
-    };
-    acknowledgement.validate(request_id).context(
-        "invalid socket daemon acknowledgement; upgrade oshioki-agent before using this hook",
-    )?;
+    }
     progress(HookProgress::WaitingForApproval);
     // The one coherent rule for everything past this point: a host-local
     // fault (a hangup, framing corruption, an unrecognized or merely
@@ -1435,19 +1619,19 @@ async fn read_frame(reader: &mut tokio::net::unix::OwnedReadHalf) -> Result<Fram
 
 /// Decode the socket's post-ack verdict as a command-approval `DecisionV1`.
 ///
-/// A message that decodes fine as a different kind (an authentication
-/// decision, an alive, a delivery receipt) is evidence of a cross-lane bug
-/// and keeps failing closed. A message this build does not recognize, or one
-/// that fails to decode at all, is a local fault per issues #66 and #68 and
-/// leaves password fallback eligible instead.
+/// Nothing but a decoded decision of this lane's kind is a decision. A
+/// message of another kind (an authentication decision on the command lane),
+/// a kind this build does not recognize, or bytes that fail to decode are
+/// all unavailable (issues #66 and #68): whoever holds the socket path can
+/// send any of them, so none may fail closed and take the password away.
 fn decode_socket_command_decision(bytes: &[u8]) -> Result<DecisionV1> {
     match oshioki_protocol::decode_control_message(bytes) {
         Ok(oshioki_protocol::ControlMessageOutcome::Message(
             oshioki_protocol::ControlMessageV1::Decision(decision),
         )) => Ok(decision),
-        Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => {
-            bail!("expected a socket decision but got a different control message")
-        }
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => Err(approval_unavailable(
+            "expected a socket decision but got a different control message",
+        )),
         Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(kind)) => {
             Err(approval_unavailable(format!(
                 "socket agent sent an unrecognized control message kind {kind:?} instead of a decision"
@@ -1467,9 +1651,9 @@ fn decode_socket_auth_decision(bytes: &[u8]) -> Result<AuthDecisionV1> {
         Ok(oshioki_protocol::ControlMessageOutcome::Message(
             oshioki_protocol::ControlMessageV1::AuthDecision(decision),
         )) => Ok(decision),
-        Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => {
-            bail!("expected a socket authentication decision but got a different control message")
-        }
+        Ok(oshioki_protocol::ControlMessageOutcome::Message(_)) => Err(approval_unavailable(
+            "expected a socket authentication decision but got a different control message",
+        )),
         Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(kind)) => {
             Err(approval_unavailable(format!(
                 "socket agent sent an unrecognized control message kind {kind:?} instead of an authentication decision"
@@ -1481,7 +1665,7 @@ fn decode_socket_auth_decision(bytes: &[u8]) -> Result<AuthDecisionV1> {
     }
 }
 
-fn final_authorization(
+async fn final_authorization(
     directory: &Path,
     device: &DevicePublicRecordV1,
     epoch: u64,
@@ -1497,63 +1681,92 @@ fn final_authorization(
         observed,
         authentication,
     )
+    .await
+    // A revocation, a replaced credential, or expiry found under the lock is a
+    // denial on both lanes (the 0.4.2 ordering fix). Lock contention past the
+    // retry budget and registry I/O faults say nothing about the operator and
+    // are unavailable on both lanes; nothing here ever approves.
     .map_err(|error| match error {
         registry::GateError::Denied(reason) => anyhow::anyhow!(reason),
-        registry::GateError::Host(error) if authentication => {
-            host_fault("check the current device registry", &error)
-        }
-        registry::GateError::Host(error) => error,
+        registry::GateError::Host(error) => host_fault("check the current device registry", &error),
     })
 }
 
-/// Applies one decision to a request. Invalid decisions fail closed.
+/// Applies one decision to a request.
+///
+/// A decision that cannot be authenticated for this request returns
+/// [`InvalidDecision`]: the caller keeps waiting (NATS) or reports the
+/// socket unavailable, and the request is never denied on its account. A
+/// verified denial, a late verdict, and a revocation found at final
+/// authorization are ordinary errors and deny. Host faults are unavailable.
+#[allow(clippy::too_many_lines)]
 async fn apply_decision(
     decision: DecisionV1,
+    lane: DecisionLane,
     request: &RequestV1,
     raw_request: &[u8],
     active: &[DevicePublicRecordV1],
     snapshot_epoch: u64,
     directory: &Path,
 ) -> Result<()> {
-    // A verdict is an answer about one request during its lifetime. Once the
-    // request has expired there is nothing left to decide, and a signature
-    // that arrives late must not stand in for one that arrived in time.
-    if request.expires_at <= now() {
-        bail!("request expired before its verdict was applied");
-    }
     match decision {
         DecisionV1::Deny(denial) => {
-            denial.validate_shape().context("validate deny decision")?;
+            denial
+                .validate_shape()
+                .map_err(|error| invalid_because("validate deny decision", error))?;
             if denial.version != VERSION_V1 || denial.request_id != request.request_id {
-                bail!("malformed deny decision");
+                return Err(invalid_decision("malformed deny decision"));
             }
             let device = active
                 .iter()
                 .find(|device| device.fingerprint == denial.device_fingerprint)
-                .context("deny from unpinned device")?;
+                .ok_or_else(|| invalid_decision("deny from unpinned device"))?;
             if denial.signature.is_some() {
                 // Native verdicts authenticate here: only the pinned device
                 // key can produce this signature, so no NATS credential
                 // suffices to deny for another device.
-                verify_deny_v1(&denial, device).context("deny verification failed")?;
+                verify_deny_v1(&denial, device)
+                    .map_err(|error| invalid_because("deny verification failed", error))?;
             } else {
                 // Browser verdicts carry no device signature (the key never
                 // leaves its authenticator); they arrive relayed by the
                 // server after bearer-token authentication, so the server's
-                // record confirms them. A direct forgery has no record.
-                let config = load_hook_config_from(directory)?;
-                if !server_confirms_denial(&config.server_base_url, &denial).await {
-                    bail!("denial is not server-confirmed");
+                // record confirms them. A direct forgery has no record and is
+                // ignored rather than honoured. Native devices always sign,
+                // and nothing on the local socket is relayed by the server, so
+                // an unsigned denial is only ever a candidate for a pinned
+                // browser device over NATS, and the server is asked only then.
+                if lane != DecisionLane::Nats {
+                    return Err(invalid_decision(
+                        "unsigned denial on the local socket; only the server relays unsigned denials",
+                    ));
                 }
+                if device.kind != DeviceKindV1::Webauthn {
+                    return Err(invalid_decision(
+                        "unsigned denial names a native device, which always signs",
+                    ));
+                }
+                let config = load_hook_config_from(directory).map_err(|error| {
+                    invalid_because("cannot confirm an unsigned denial without hook.json", error)
+                })?;
+                if !server_confirms_denial(&config.server_base_url, &denial).await {
+                    return Err(invalid_decision("denial is not server-confirmed"));
+                }
+            }
+            // A verdict is an answer about one request during its lifetime.
+            // Checked after authenticity so that only a genuine late verdict
+            // fails here; a forged one is ignored like any other forgery.
+            if request.expires_at <= now() {
+                bail!("request expired before its verdict was applied");
             }
             bail!("request explicitly denied");
         }
         DecisionV1::Approve(approval) => {
             approval
                 .validate_shape()
-                .context("validate approval decision")?;
+                .map_err(|error| invalid_because("validate approval decision", error))?;
             if approval.request_id != request.request_id {
-                bail!("approval request id mismatch");
+                return Err(invalid_decision("approval request id mismatch"));
             }
             let device = active
                 .iter()
@@ -1562,14 +1775,16 @@ async fn apply_decision(
                         && device.fingerprint == approval.device_fingerprint
                         && device.credential_id == approval.credential_id
                 })
-                .context("approval does not name one exact pinned credential")?;
-            let outcome = verify_approval_v1(
-                &approval,
-                raw_request,
-                device,
-                &load_hook_config_from(directory)?,
-            )
-            .context("approval verification failed")?;
+                .ok_or_else(|| {
+                    invalid_decision("approval does not name one exact pinned credential")
+                })?;
+            let config = load_hook_config_from(directory)
+                .map_err(|error| host_fault("read the hook configuration", &error))?;
+            let outcome = verify_approval_v1(&approval, raw_request, device, &config)
+                .map_err(|error| invalid_because("approval verification failed", error))?;
+            if request.expires_at <= now() {
+                bail!("request expired before its verdict was applied");
+            }
             final_authorization(
                 directory,
                 device,
@@ -1577,16 +1792,17 @@ async fn apply_decision(
                 request.expires_at,
                 Some(outcome.observed_sign_count),
                 false,
-            )?;
+            )
+            .await?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
             Ok(())
         }
         DecisionV1::ApproveNative(approval) => {
             approval
                 .validate_shape()
-                .context("validate native approval decision")?;
+                .map_err(|error| invalid_because("validate native approval decision", error))?;
             if approval.request_id != request.request_id {
-                bail!("approval request id mismatch");
+                return Err(invalid_decision("approval request id mismatch"));
             }
             let device = active
                 .iter()
@@ -1596,9 +1812,14 @@ async fn apply_decision(
                         DeviceKindV1::Software | DeviceKindV1::SecureEnclave
                     ) && device.fingerprint == approval.device_fingerprint
                 })
-                .context("native approval does not name one pinned native device")?;
+                .ok_or_else(|| {
+                    invalid_decision("native approval does not name one pinned native device")
+                })?;
             verify_native_approval_v1(&approval, raw_request, device)
-                .context("native approval verification failed")?;
+                .map_err(|error| invalid_because("native approval verification failed", error))?;
+            if request.expires_at <= now() {
+                bail!("request expired before its verdict was applied");
+            }
             final_authorization(
                 directory,
                 device,
@@ -1606,7 +1827,8 @@ async fn apply_decision(
                 request.expires_at,
                 None,
                 false,
-            )?;
+            )
+            .await?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, "sudo request approved");
             Ok(())
         }
@@ -2076,7 +2298,8 @@ async fn execute_auth_request_at(
     let raw_request = request
         .raw_json()
         .map_err(|error| host_fault("serialize the authentication request", &error.into()))?;
-    let snapshot = registry::snapshot(directory)
+    let snapshot = registry::decision_snapshot(directory)
+        .await
         .map_err(|error| host_fault("read the device registry", &error))?;
     let recipients = auth_recipients(&snapshot.registry);
     if recipients.is_empty() {
@@ -2127,9 +2350,22 @@ async fn execute_auth_request_at(
             }
         });
     let deadline = tokio::time::Instant::now() + timeout;
-    let decision = Box::pin(with_liveness(
-        liveness,
-        await_auth_decision(
+    let apply = async |decision: AuthDecisionV1| {
+        apply_auth_decision(
+            &decision,
+            &request,
+            &raw_request,
+            &recipients,
+            snapshot.revocation_epoch,
+            directory,
+        )
+        .await
+    };
+    // The whole wait, including reading past candidates that fail
+    // verification, stays under the liveness watch: a PAM caller that goes
+    // away ends it as unavailable.
+    Box::pin(with_liveness(liveness, async {
+        match await_auth_decision(
             directory,
             &request,
             payload,
@@ -2137,17 +2373,26 @@ async fn execute_auth_request_at(
             nats_url.as_deref(),
             has_browser_recipient,
             &progress,
-        ),
-    ))
-    .await?;
-    apply_auth_decision(
-        &decision,
-        &request,
-        &raw_request,
-        &recipients,
-        snapshot.revocation_epoch,
-        directory,
-    )
+        )
+        .await?
+        {
+            // See `socket_decision_outcome`: a socket decision this host
+            // cannot authenticate is unavailable, never `PAM_AUTH_ERR`.
+            PendingDecision::Socket(decision) => socket_decision_outcome(apply(decision).await),
+            PendingDecision::Nats(decisions) => {
+                first_valid_decision(decisions, deadline, &apply).await
+            }
+        }
+    }))
+    .await
+}
+
+/// Where a lane's decision will come from once a transport has taken the
+/// request: the one decision the local socket carried, or the NATS
+/// candidates to read until one is valid.
+enum PendingDecision<T> {
+    Socket(T),
+    Nats(oshioki_transport::DecisionStream<T>),
 }
 
 /// The same two-transport matrix `execute_request_at` uses, on the
@@ -2161,12 +2406,12 @@ async fn await_auth_decision(
     nats_url: Option<&str>,
     has_browser_recipient: bool,
     progress: &std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-) -> Result<AuthDecisionV1> {
+) -> Result<PendingDecision<AuthDecisionV1>> {
     let silence =
         match try_agent_socket(directory, &request.request_id, &payload, deadline, progress).await?
         {
             SocketOutcome::Verdict(bytes) => {
-                return decode_socket_auth_decision(&bytes);
+                return decode_socket_auth_decision(&bytes).map(PendingDecision::Socket);
             }
             SocketOutcome::Unconfigured => None,
             SocketOutcome::Silent(SocketSilence::NoAgent { path, error }) => {
@@ -2199,10 +2444,11 @@ async fn await_auth_decision(
             // unavailable and the stack keeps its password path -- the
             // command-approval lane now agrees (see its own `Dropped` arm).
             //
-            // A message that arrives and decodes as something other than the
-            // expected `AuthDecisionV1` is not folded in here: it is evidence
-            // (a malformed or cross-lane decision) and still fails closed at
-            // the `SocketOutcome::Verdict` decode above.
+            // A message that decodes as something other than the expected
+            // `AuthDecisionV1`, or a decision that fails verification, is
+            // unavailable too (`decode_socket_auth_decision`,
+            // `socket_decision_outcome`): whoever holds the socket path can
+            // send one.
             //
             // NATS is not tried afterwards. An agent that answered the socket
             // is the transport this host is using, and re-publishing would
@@ -2242,6 +2488,7 @@ async fn await_auth_decision(
         progress.clone(),
     )
     .await
+    .map(PendingDecision::Nats)
 }
 
 async fn nats_auth_fallback(
@@ -2252,7 +2499,7 @@ async fn nats_auth_fallback(
     nats_url: &str,
     has_browser_recipient: bool,
     progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-) -> Result<AuthDecisionV1> {
+) -> Result<oshioki_transport::DecisionStream<AuthDecisionV1>> {
     let display = nats_display_url(nats_url);
     let remaining = deadline
         .checked_duration_since(tokio::time::Instant::now())
@@ -2313,7 +2560,7 @@ async fn nats_auth_fallback(
         );
         let _ = io::stderr().flush();
     }
-    transport
+    let decisions = transport
         .request_authentication(
             &request.trusted.host,
             &request.request_id,
@@ -2323,14 +2570,19 @@ async fn nats_auth_fallback(
             progress,
         )
         .await
-        .with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))
+        .with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))?;
+    Ok(Box::pin(decisions.map(move |item| {
+        item.with_context(|| format!("NATS fallback to {display} failed: wait for a verdict"))
+    })))
 }
 
 /// Applies one authentication decision. There is no `Deny` arm on this lane:
 /// a decision either verifies against a pinned hardware device over the exact
-/// bytes that were sealed, or the helper fails. Nothing here may widen into a
-/// success.
-fn apply_auth_decision(
+/// bytes that were sealed, or it is [`InvalidDecision`] and the caller keeps
+/// waiting (NATS) or reports unavailable (socket). Nothing here may widen into
+/// a success, and nothing a co-tenant publisher can send may become
+/// `PAM_AUTH_ERR`, which a Linux `default=die` stack turns into a lockout.
+async fn apply_auth_decision(
     decision: &AuthDecisionV1,
     request: &AuthRequestV1,
     raw_request: &[u8],
@@ -2338,19 +2590,27 @@ fn apply_auth_decision(
     snapshot_epoch: u64,
     directory: &Path,
 ) -> Result<()> {
-    let now = now();
-    // A signature that arrives after the request expired must not stand in
-    // for one that arrived in time.
-    if request.expires_at <= now {
-        bail!("authentication request expired before its decision was applied");
-    }
+    // Authenticity first, expiry second, as on the command lane: a forged
+    // assertion must stay an invalid decision however late it arrives, or a
+    // publisher could turn it into `PAM_AUTH_ERR` once the request expired.
+    // Verification checks the signature over the exact sealed bytes; it runs
+    // at the request's own issue time so the protocol's freshness check does
+    // not fold expiry into an authenticity failure. Expiry is then checked
+    // against the real clock, and again under the registry lock.
+    let verified_at = request.issued_at;
+    let expired = || -> Result<()> {
+        if request.expires_at <= now() {
+            bail!("authentication request expired before its decision was applied");
+        }
+        Ok(())
+    };
     match decision {
         AuthDecisionV1::AuthenticateNative(approval) => {
-            approval
-                .validate_shape()
-                .context("validate native authentication decision")?;
+            approval.validate_shape().map_err(|error| {
+                invalid_because("validate native authentication decision", error)
+            })?;
             if approval.request_id != request.request_id {
-                bail!("authentication request id mismatch");
+                return Err(invalid_decision("authentication request id mismatch"));
             }
             let device = recipients
                 .iter()
@@ -2358,9 +2618,15 @@ fn apply_auth_decision(
                     device.kind == DeviceKindV1::SecureEnclave
                         && device.fingerprint == approval.device_fingerprint
                 })
-                .context("native authentication does not name one pinned Secure Enclave device")?;
-            verify_native_authentication_v1(approval, raw_request, device, now)
-                .context("native authentication verification failed")?;
+                .ok_or_else(|| {
+                    invalid_decision(
+                        "native authentication does not name one pinned Secure Enclave device",
+                    )
+                })?;
+            verify_native_authentication_v1(approval, raw_request, device, verified_at).map_err(
+                |error| invalid_because("native authentication verification failed", error),
+            )?;
+            expired()?;
             final_authorization(
                 directory,
                 device,
@@ -2368,16 +2634,17 @@ fn apply_auth_decision(
                 request.expires_at,
                 None,
                 true,
-            )?;
+            )
+            .await?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, service=%request.trusted.service, pam_user=%request.trusted.pam_user, "sudo authentication accepted");
             Ok(())
         }
         AuthDecisionV1::AuthenticateWebauthn(approval) => {
-            approval
-                .validate_shape()
-                .context("validate WebAuthn authentication decision")?;
+            approval.validate_shape().map_err(|error| {
+                invalid_because("validate WebAuthn authentication decision", error)
+            })?;
             if approval.request_id != request.request_id {
-                bail!("authentication request id mismatch");
+                return Err(invalid_decision("authentication request id mismatch"));
             }
             let device = recipients
                 .iter()
@@ -2386,16 +2653,23 @@ fn apply_auth_decision(
                         && device.fingerprint == approval.device_fingerprint
                         && device.credential_id == approval.credential_id
                 })
-                .context("WebAuthn authentication does not name one exact pinned credential")?;
+                .ok_or_else(|| {
+                    invalid_decision(
+                        "WebAuthn authentication does not name one exact pinned credential",
+                    )
+                })?;
             let outcome = verify_webauthn_authentication_v1(
                 approval,
                 raw_request,
                 device,
                 &load_hook_config_from(directory)
                     .map_err(|error| host_fault("read the hook configuration", &error))?,
-                now,
+                verified_at,
             )
-            .context("WebAuthn authentication verification failed")?;
+            .map_err(|error| {
+                invalid_because("WebAuthn authentication verification failed", error)
+            })?;
+            expired()?;
             final_authorization(
                 directory,
                 device,
@@ -2403,7 +2677,8 @@ fn apply_auth_decision(
                 request.expires_at,
                 Some(outcome.observed_sign_count),
                 true,
-            )?;
+            )
+            .await?;
             info!(target: "audit", request_id=%request.request_id, fingerprint=%device.fingerprint, kind=%device.kind, service=%request.trusted.service, pam_user=%request.trusted.pam_user, "sudo authentication accepted");
             Ok(())
         }
@@ -2497,11 +2772,15 @@ fn is_local_only_enrollment_host(host: &Host<&str>) -> bool {
 /// Checks that the public server is reachable over HTTPS and serves the same
 /// `WebAuthn` configuration as the hook. Older servers may omit the metadata,
 /// but a partial or conflicting pair is rejected.
-async fn preflight_enrollment_server(config: &HookConfigV1, origin: &Url) -> Result<()> {
+async fn preflight_enrollment_server(
+    config: &HookConfigV1,
+    origin: &Url,
+    curl: CurlConfig,
+) -> Result<()> {
     let health_url = origin
         .join("/healthz")
         .map_err(|_| anyhow::anyhow!("invalid enrollment health URL"))?;
-    let body = http_get(health_url.as_str())
+    let body = http_get(health_url.as_str(), curl)
         .await
         .context("enrollment server health check failed")?;
     let health: ServerHealthV1 = serde_json::from_slice(&body)
@@ -2570,7 +2849,7 @@ async fn cmd_enroll_at(
     require_enroll_privileges(directory)?;
     let config = load_hook_config_from(directory)?;
     let origin = enrollment_origin(&config, allow_localhost)?;
-    preflight_enrollment_server(&config, &origin).await?;
+    preflight_enrollment_server(&config, &origin, CurlConfig::for_directory(directory)).await?;
     let state = if let Some(id) = resume {
         load_enrollment_state_at(directory, id)?
     } else {
@@ -2645,7 +2924,13 @@ async fn cmd_enroll_at(
         }
     };
     let confirmation = enroll_device_with(directory, &device, || {
-        activate_device(transport.as_ref(), &state.enrollment_id, &device, &config)
+        activate_device(
+            transport.as_ref(),
+            &state.enrollment_id,
+            &device,
+            &config,
+            CurlConfig::for_directory(directory),
+        )
     })
     .await;
     // The enrollment itself is spent either way: the device is pinned here
@@ -2676,6 +2961,7 @@ async fn activate_device(
     enrollment_id: &str,
     device: &DevicePublicRecordV1,
     config: &HookConfigV1,
+    curl: CurlConfig,
 ) -> Result<()> {
     let activation = ActivationV1 {
         version: VERSION_V1,
@@ -2690,7 +2976,7 @@ async fn activate_device(
     let deadline = tokio::time::Instant::now() + ACTIVATION_TIMEOUT;
     let mut last_error;
     loop {
-        match server_device_matches(&url, device).await {
+        match server_device_matches(&url, device, curl).await {
             Ok(true) => return Ok(()),
             // A different record is settled state, not a missing message:
             // restating the activation cannot change what is stored.
@@ -2740,13 +3026,17 @@ fn denial_confirmed_by(recorded: &DecisionV1, denial: &DenyV1) -> bool {
 
 /// Fetches the server's recorded verdict for a request and checks it against
 /// an unsigned denial. Unreachable server, missing record, and mismatch all
-/// mean the same thing: no confirmation, fail closed.
+/// mean the same thing: no confirmation, so the denial is not a decision and
+/// the hook keeps waiting for one that is.
 async fn server_confirms_denial(server_base_url: &str, denial: &DenyV1) -> bool {
     let url = format!(
         "{server_base_url}/api/v1/requests/{}/verdict",
         denial.request_id
     );
-    let recorded: DecisionV1 = match http_get(&url).await {
+    // `apply_decision` does not pass its directory down; `config_dir()`
+    // and the lane check both pin a sudo verb to the system curl config.
+    let recorded: DecisionV1 = match http_get(&url, CurlConfig::for_directory(&config_dir())).await
+    {
         Ok(body) => match serde_json::from_slice(&body) {
             Ok(recorded) => recorded,
             Err(_) => return false,
@@ -2756,8 +3046,12 @@ async fn server_confirms_denial(server_base_url: &str, denial: &DenyV1) -> bool 
     denial_confirmed_by(&recorded, denial)
 }
 
-async fn server_device_matches(url: &str, device: &DevicePublicRecordV1) -> Result<bool> {
-    let body = http_get(url).await?;
+async fn server_device_matches(
+    url: &str,
+    device: &DevicePublicRecordV1,
+    curl: CurlConfig,
+) -> Result<bool> {
+    let body = http_get(url, curl).await?;
     let served: DevicePublicRecordV1 =
         serde_json::from_slice(&body).context("decode device record")?;
     served.validate()?;
@@ -2954,11 +3248,12 @@ async fn cmd_revoke(fingerprint: &str) -> Result<()> {
 }
 
 async fn cmd_pin(expected: &str) -> Result<()> {
-    let config = load_hook_config()?;
-    let body = http_get(&format!(
-        "{}/api/v1/devices/{expected}",
-        config.server_base_url
-    ))
+    let directory = config_dir();
+    let config = load_hook_config_from(&directory)?;
+    let body = http_get(
+        &format!("{}/api/v1/devices/{expected}", config.server_base_url),
+        CurlConfig::for_directory(&directory),
+    )
     .await?;
     let device: DevicePublicRecordV1 =
         serde_json::from_slice(&body).context("decode device record")?;
@@ -2966,7 +3261,7 @@ async fn cmd_pin(expected: &str) -> Result<()> {
     if device.fingerprint != expected {
         bail!("server device fingerprint mismatch");
     }
-    pin_device_record(&config_dir(), &device, &mut io::stdin().lock())
+    pin_device_record(&directory, &device, &mut io::stdin().lock())
 }
 
 /// Pins a device record file exported for offline pairing. The record is
@@ -3396,7 +3691,13 @@ fn parse_sudo_stdin() -> Result<Vec<(String, String)>> {
     Ok(values)
 }
 
+/// The operator's config directory for the non-sudo verbs; `OSHIOKI_CONFIG_DIR`
+/// selects a user-owned development configuration. The sudo verbs serve an
+/// untrusted caller and always get the system directory.
 fn config_dir() -> PathBuf {
+    if sudo_lane::active() {
+        return PathBuf::from(DEFAULT_CONFIG_DIR);
+    }
     std::env::var_os("OSHIOKI_CONFIG_DIR")
         .map_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR), PathBuf::from)
 }
@@ -3568,22 +3869,55 @@ fn read_env_file(path: &Path) -> Result<HashMap<String, String>> {
         .collect())
 }
 
-async fn http_get(url: &str) -> Result<Vec<u8>> {
-    let mut args = if config_dir() == Path::new(DEFAULT_CONFIG_DIR) {
-        vec!["-q"]
-    } else {
-        Vec::new()
-    };
-    args.extend(["--fail", "--silent", "--show-error"]);
-    // The system installation must not inherit a caller-controlled curl
-    // configuration (which could enable redirects or disable TLS checks).
-    // User-owned development configurations intentionally retain CURL_HOME;
-    // the local E2E harness uses it to resolve its throwaway test hostname.
-    args.extend(["--proto", "=https", "--max-time", "15", url]);
-    let output = tokio::process::Command::new("/usr/bin/curl")
-        .args(args)
-        .output()
-        .await?;
+/// Whose curl configuration a request may honour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CurlConfig {
+    /// The system configuration, and every request made by a sudo verb:
+    /// curl reads no `.curlrc`, which could otherwise redirect, disable TLS
+    /// checks, or write the response to an arbitrary path as root.
+    System,
+    /// A user-owned development configuration chosen with
+    /// `OSHIOKI_CONFIG_DIR` for a non-sudo verb. It keeps the caller's curl
+    /// config; the local E2E harness uses `CURL_HOME` to resolve its
+    /// throwaway test hostname.
+    Caller,
+}
+
+impl CurlConfig {
+    fn for_directory(directory: &Path) -> Self {
+        Self::resolve(directory, sudo_lane::active())
+    }
+
+    fn resolve(directory: &Path, sudo_lane: bool) -> Self {
+        if sudo_lane || directory == Path::new(DEFAULT_CONFIG_DIR) {
+            Self::System
+        } else {
+            Self::Caller
+        }
+    }
+}
+
+fn curl_command(url: &str, curl: CurlConfig) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("/usr/bin/curl");
+    // `-q` is only honoured as the first argument.
+    if curl == CurlConfig::System {
+        command.arg("-q");
+    }
+    command.args([
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--proto",
+        "=https",
+        "--max-time",
+        "15",
+        url,
+    ]);
+    command
+}
+
+async fn http_get(url: &str, curl: CurlConfig) -> Result<Vec<u8>> {
+    let output = curl_command(url, curl).output().await?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
         bail!("device lookup failed: {}", detail.trim());
@@ -3676,6 +4010,88 @@ fn pid_chain_darwin() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn curl_argv(url: &str, curl: CurlConfig) -> Vec<String> {
+        curl_command(url, curl)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn system_curl_ignores_curl_config_files_and_caller_lane_keeps_them() {
+        let url = "https://sudo.test/api/v1/requests/x/verdict";
+        let system = curl_argv(url, CurlConfig::System);
+        // `-q` only takes effect as the very first argument.
+        assert_eq!(system.first().map(String::as_str), Some("-q"));
+        assert_eq!(system.last().map(String::as_str), Some(url));
+        assert!(!curl_argv(url, CurlConfig::Caller).contains(&"-q".to_owned()));
+        assert_eq!(
+            CurlConfig::resolve(Path::new(DEFAULT_CONFIG_DIR), false),
+            CurlConfig::System
+        );
+        assert_eq!(
+            CurlConfig::resolve(Path::new("/home/dev/oshioki"), false),
+            CurlConfig::Caller
+        );
+        assert_eq!(
+            CurlConfig::resolve(Path::new("/home/dev/oshioki"), true),
+            CurlConfig::System
+        );
+    }
+
+    /// The root sudo verbs must not let a caller-exported
+    /// `OSHIOKI_CONFIG_DIR` pick a non-system config, nor a `CURL_HOME` /
+    /// `HOME` `.curlrc` reach the denial-confirmation GET. Run in a child
+    /// process so the lane flag and environment stay out of other tests.
+    #[test]
+    fn sudo_lane_curl_ignores_caller_config_dir_and_curl_home() {
+        let executable = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "tests::sudo_lane_curl_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("OSHIOKI_SUDO_LANE_TEST_CHILD", "1")
+            .env("OSHIOKI_CONFIG_DIR", "/tmp/oshioki-attacker")
+            .env("CURL_HOME", "/tmp/oshioki-attacker")
+            .env("HOME", "/tmp/oshioki-attacker")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("SUDO-LANE-CURL-OK"), "{stdout}");
+    }
+
+    #[test]
+    fn sudo_lane_curl_child() {
+        if std::env::var_os("OSHIOKI_SUDO_LANE_TEST_CHILD").is_none() {
+            return;
+        }
+        assert_eq!(
+            std::env::var_os("OSHIOKI_CONFIG_DIR").as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/oshioki-attacker"))
+        );
+        assert!(std::env::var_os("CURL_HOME").is_some());
+        sudo_lane::activate();
+        assert_eq!(config_dir(), Path::new(DEFAULT_CONFIG_DIR));
+        let curl = CurlConfig::for_directory(&config_dir());
+        assert_eq!(curl, CurlConfig::System);
+        assert_eq!(
+            CurlConfig::for_directory(Path::new("/tmp/oshioki-attacker")),
+            CurlConfig::System
+        );
+        let argv = curl_argv("https://sudo.test/", curl);
+        assert_eq!(argv.first().map(String::as_str), Some("-q"));
+        println!("SUDO-LANE-CURL-OK");
+    }
 
     /// Builds a throwaway /etc/pam.d + sudo.conf + security dir triple and
     /// returns what `oshioki status` would print for it.
@@ -4194,14 +4610,48 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Nothing decides a request that is already dead, whatever the verdict
-    /// says and whichever device kind signed it.
+    /// Nothing decides a request that is already dead. A genuine verdict that
+    /// arrives late is a failure (exit 1), whichever device kind signed it; a
+    /// forged one is an invalid decision and is ignored like any other
+    /// forgery, never a reason to deny.
     #[tokio::test]
     async fn an_expired_request_rejects_every_verdict() {
+        use p256::ecdsa::signature::Signer as _;
+        let (device, signing) = deny_test_device();
         let mut request = build_synthetic_request();
+        let raw = request.raw_json().unwrap();
         request.expires_at = now() - 1;
+        let signature: p256::ecdsa::Signature =
+            signing.sign(&oshioki_protocol::v1::approve_challenge(&raw));
+        let genuine = [
+            DecisionV1::Deny(deny_for(&signing, &request.request_id, &device)),
+            DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
+                version: VERSION_V1,
+                request_id: request.request_id.clone(),
+                device_fingerprint: device.fingerprint.clone(),
+                signature: URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+            }),
+        ];
+        for decision in genuine {
+            let error = apply_decision(
+                decision,
+                DecisionLane::Nats,
+                &request,
+                &raw,
+                std::slice::from_ref(&device),
+                0,
+                Path::new("/nonexistent"),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("expired before its verdict"),
+                "{error:#}"
+            );
+            assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        }
         let fingerprint = URL_SAFE_NO_PAD.encode([1; 16]);
-        let decisions = [
+        let forged = [
             DecisionV1::Deny(oshioki_protocol::DenyV1 {
                 version: VERSION_V1,
                 request_id: request.request_id.clone(),
@@ -4224,14 +4674,19 @@ mod tests {
                 signature: URL_SAFE_NO_PAD.encode([5; 64]),
             }),
         ];
-        for decision in decisions {
-            let error = apply_decision(decision, &request, &[], &[], 0, Path::new("/nonexistent"))
-                .await
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("expired before its verdict"),
-                "{error:#}"
-            );
+        for decision in forged {
+            let error = apply_decision(
+                decision,
+                DecisionLane::Nats,
+                &request,
+                &raw,
+                std::slice::from_ref(&device),
+                0,
+                Path::new("/nonexistent"),
+            )
+            .await
+            .unwrap_err();
+            assert!(is_invalid_decision(&error), "{error:#}");
         }
     }
 
@@ -4241,7 +4696,7 @@ mod tests {
     }
 
     /// One pinned Secure Enclave device with a real key, for denial tests.
-    fn deny_test_device() -> (DevicePublicRecordV1, p256::ecdsa::SigningKey) {
+    pub(super) fn deny_test_device() -> (DevicePublicRecordV1, p256::ecdsa::SigningKey) {
         let signing = p256::ecdsa::SigningKey::from_bytes((&[21; 32]).into()).unwrap();
         let public = signing
             .verifying_key()
@@ -4293,7 +4748,7 @@ mod tests {
         device
     }
 
-    fn deny_for(
+    pub(super) fn deny_for(
         signing: &p256::ecdsa::SigningKey,
         request_id: &str,
         device: &DevicePublicRecordV1,
@@ -4320,7 +4775,16 @@ mod tests {
             active: &[DevicePublicRecordV1],
             _registry: &mut DeviceRegistryV1,
         ) -> Result<()> {
-            apply_decision(decision, request, &[], active, 0, Path::new("/nonexistent")).await
+            apply_decision(
+                decision,
+                DecisionLane::Nats,
+                request,
+                &[],
+                active,
+                0,
+                Path::new("/nonexistent"),
+            )
+            .await
         }
         let (device, signing) = deny_test_device();
         let mut request = build_synthetic_request();
@@ -4514,26 +4978,54 @@ mod tests {
 
     /// Base directory for test directories that hold a unix socket.
     ///
-    /// macOS caps `sun_path` at 104 bytes, and its per-user `$TMPDIR`
-    /// (`/var/folders/<22 chars>/<28 chars>/T/`) already spends half of that
-    /// before a uniquely named subdirectory and `agent.sock` are appended, so
-    /// `bind` fails with "path must be shorter than `SUN_LEN`". `/tmp` is short,
-    /// always present on both platforms, and the directory names below it
+    /// Unix socket paths have a small platform limit (104 bytes on macOS,
+    /// 108 on Linux). Per-user or session-specific `$TMPDIR` paths can consume
+    /// most of it before the unique directory and socket name are appended.
+    /// `/tmp` is short and present on both platforms; the directories below it
     /// already carry their own uniqueness.
     pub(super) fn socket_temp_root() -> PathBuf {
-        if cfg!(target_os = "macos") {
-            PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        }
+        PathBuf::from("/tmp")
     }
 
-    fn socket_test_dir(name: &str) -> PathBuf {
-        let dir =
-            socket_temp_root().join(format!("oshioki-hook-socket-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    pub(super) fn private_socket_test_dir() -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let dir = socket_temp_root().join(format!("oshioki-test-{}", Uuid::new_v4().simple()));
+        // mkdir is atomic and fails on any existing entry, including symlinks.
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         dir
+    }
+
+    fn socket_test_dir(_name: &str) -> PathBuf {
+        private_socket_test_dir()
+    }
+
+    #[test]
+    fn socket_fixtures_are_fresh_private_and_short() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let first = socket_test_dir("private-fixture");
+        std::fs::write(first.join("preserve"), b"first fixture").unwrap();
+        let second = socket_test_dir("private-fixture");
+        assert_ne!(
+            first, second,
+            "a new fixture must not reuse an existing path"
+        );
+        assert_eq!(
+            std::fs::read(first.join("preserve")).unwrap(),
+            b"first fixture"
+        );
+        for directory in [&first, &second] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let socket = directory.join("agent.sock");
+            assert!(socket.as_os_str().as_encoded_bytes().len() < 104);
+            let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+            drop(listener);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     fn socket_test_config(dir: &Path, socket: Option<&Path>) {
@@ -4550,7 +5042,7 @@ mod tests {
         std::sync::Arc::new(|_| {})
     }
 
-    fn which_nats_server() -> Result<PathBuf, ()> {
+    pub(super) fn which_nats_server() -> Result<PathBuf, ()> {
         let path = std::env::var_os("PATH").ok_or(())?;
         std::env::split_paths(&path)
             .map(|dir| dir.join("nats-server"))
@@ -4558,7 +5050,7 @@ mod tests {
             .ok_or(())
     }
 
-    struct KillOnDrop(std::process::Child);
+    pub(super) struct KillOnDrop(pub(super) std::process::Child);
 
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
@@ -4790,6 +5282,7 @@ mod tests {
         .unwrap();
         apply_decision(
             decision,
+            DecisionLane::Nats,
             &request,
             &raw,
             std::slice::from_ref(&device),
@@ -5618,7 +6111,8 @@ mod tests {
             test_progress(),
         )
         .await
-        .unwrap_err();
+        .err()
+        .expect("the fallback must fail");
         let text = format!("{error:#}");
         assert!(!text.contains("hook.json"), "{text}");
         assert!(text.contains("daemon acknowledgement timeout"), "{text}");
@@ -5653,7 +6147,8 @@ mod tests {
             test_progress(),
         )
         .await
-        .unwrap_err();
+        .err()
+        .expect("the fallback must fail");
         assert!(started.elapsed() < Duration::from_secs(6));
         assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
         assert!(format!("{error:#}").contains("NATS fallback"), "{error:#}");
@@ -5696,9 +6191,14 @@ mod tests {
                 test_progress(),
             )
             .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
             .unwrap();
         let error = apply_decision(
             decision,
+            DecisionLane::Nats,
             &request,
             &[],
             &[device],
@@ -5748,9 +6248,14 @@ mod tests {
                 test_progress(),
             )
             .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
             .unwrap();
         apply_decision(
             decision,
+            DecisionLane::Nats,
             &request,
             &raw,
             std::slice::from_ref(&device),
@@ -6306,8 +6811,8 @@ mod auth_tests {
 
     /// The one path to exit 0: a signature over the exact bytes that were
     /// sealed, from a pinned active hardware device.
-    #[test]
-    fn a_verified_native_assertion_authenticates() {
+    #[tokio::test]
+    async fn a_verified_native_assertion_authenticates() {
         let (device, signing) = auth_test_device();
         let request = auth_request();
         let raw = request.raw_json().unwrap();
@@ -6322,15 +6827,17 @@ mod auth_tests {
             0,
             &directory,
         )
+        .await
         .unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 
-    /// A signature over different bytes is a failure, not unavailable: a
-    /// security failure must never leave the password branch looking like the
-    /// same outcome as a broken transport, and must never succeed.
-    #[test]
-    fn a_signature_over_other_bytes_fails() {
+    /// A signature over different bytes never succeeds. It is an invalid
+    /// decision: the NATS wait discards it and keeps reading, so a forged
+    /// assertion can neither authenticate nor become `PAM_AUTH_ERR` (which a
+    /// Linux `default=die` stack turns into a lockout).
+    #[tokio::test]
+    async fn a_signature_over_other_bytes_fails() {
         let (device, signing) = auth_test_device();
         let request = auth_request();
         let raw = request.raw_json().unwrap();
@@ -6344,14 +6851,15 @@ mod auth_tests {
             0,
             Path::new("/nonexistent"),
         )
+        .await
         .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(is_invalid_decision(&error), "{error:#}");
     }
 
     /// A correct signature from a key that is not among this request's
     /// recipients is a failure.
-    #[test]
-    fn an_unpinned_device_fails() {
+    #[tokio::test]
+    async fn an_unpinned_device_fails() {
         let (device, _) = auth_test_device();
         let impostor = SigningKey::from_bytes((&[51; 32]).into()).unwrap();
         let request = auth_request();
@@ -6359,8 +6867,9 @@ mod auth_tests {
         let decision = native_decision(&impostor, &device, &request.request_id, &raw);
         let error =
             apply_auth_decision(&decision, &request, &raw, &[], 0, Path::new("/nonexistent"))
+                .await
                 .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(is_invalid_decision(&error), "{error:#}");
         assert!(
             display_error(&error).contains("does not name one pinned Secure Enclave device"),
             "{error:#}"
@@ -6376,13 +6885,14 @@ mod auth_tests {
             0,
             Path::new("/nonexistent"),
         )
+        .await
         .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(is_invalid_decision(&error), "{error:#}");
     }
 
     /// A decision naming another request never authenticates this one.
-    #[test]
-    fn a_request_id_mismatch_fails() {
+    #[tokio::test]
+    async fn a_request_id_mismatch_fails() {
         let (device, signing) = auth_test_device();
         let request = auth_request();
         let raw = request.raw_json().unwrap();
@@ -6395,8 +6905,9 @@ mod auth_tests {
             0,
             Path::new("/nonexistent"),
         )
+        .await
         .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(is_invalid_decision(&error), "{error:#}");
         assert!(
             display_error(&error).contains("request id mismatch"),
             "{error:#}"
@@ -6407,8 +6918,8 @@ mod auth_tests {
 
     /// The happy path: a browser assertion over the exact sealed bytes, from
     /// the one pinned credential, with user presence and verification set.
-    #[test]
-    fn a_verified_webauthn_assertion_authenticates() {
+    #[tokio::test]
+    async fn a_verified_webauthn_assertion_authenticates() {
         let directory = auth_config_dir("webauthn-ok");
         seed_hook_config(&directory);
         let (device, signing) = webauthn_test_device();
@@ -6424,6 +6935,7 @@ mod auth_tests {
             0,
             &directory,
         )
+        .await
         .unwrap();
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -6431,8 +6943,8 @@ mod auth_tests {
     /// The credential id is pinned, not just the fingerprint. An assertion
     /// naming a different credential on the same device record is a failure:
     /// the key that signed is not the key that was enrolled.
-    #[test]
-    fn a_webauthn_credential_id_mismatch_fails() {
+    #[tokio::test]
+    async fn a_webauthn_credential_id_mismatch_fails() {
         let directory = auth_config_dir("webauthn-credid");
         seed_hook_config(&directory);
         let (device, signing) = webauthn_test_device();
@@ -6452,8 +6964,9 @@ mod auth_tests {
             0,
             &directory,
         )
+        .await
         .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(is_invalid_decision(&error), "{error:#}");
         assert!(
             display_error(&error).contains("does not name one exact pinned credential"),
             "{error:#}"
@@ -6465,8 +6978,8 @@ mod auth_tests {
     /// and a native decision can never be satisfied by a `WebAuthn` one. The
     /// two device kinds are separate assurance claims, so the arms must not
     /// cross over even when the fingerprint matches.
-    #[test]
-    fn the_two_decision_arms_do_not_cross_device_kinds() {
+    #[tokio::test]
+    async fn the_two_decision_arms_do_not_cross_device_kinds() {
         let directory = auth_config_dir("webauthn-kind");
         seed_hook_config(&directory);
         let (webauthn, webauthn_key) = webauthn_test_device();
@@ -6487,8 +7000,9 @@ mod auth_tests {
             0,
             &directory,
         )
+        .await
         .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(is_invalid_decision(&error), "{error:#}");
 
         // A native assertion offered against the WebAuthn record.
         let mut impostor = webauthn.clone();
@@ -6502,16 +7016,17 @@ mod auth_tests {
             0,
             &directory,
         )
+        .await
         .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(is_invalid_decision(&error), "{error:#}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// A counter that advanced is written back to the registry on disk, so
     /// the next request compares against what this authenticator last
     /// reported rather than against the enrolment value forever.
-    #[test]
-    fn an_advanced_sign_count_is_persisted() {
+    #[tokio::test]
+    async fn an_advanced_sign_count_is_persisted() {
         let directory = auth_config_dir("webauthn-counter");
         seed_hook_config(&directory);
         let (device, signing) = webauthn_test_device();
@@ -6527,6 +7042,7 @@ mod auth_tests {
             0,
             &directory,
         )
+        .await
         .unwrap();
         assert_eq!(
             load_registry_from(&directory).unwrap().devices[0].sign_count,
@@ -6540,8 +7056,8 @@ mod auth_tests {
     /// A regressed counter is warned about, not rejected, and the stored
     /// value is left alone. This matches the command approval lane; see the
     /// decision comment on `apply_auth_decision`.
-    #[test]
-    fn a_regressed_sign_count_is_warned_about_not_rejected() {
+    #[tokio::test]
+    async fn a_regressed_sign_count_is_warned_about_not_rejected() {
         let directory = auth_config_dir("webauthn-regress");
         seed_hook_config(&directory);
         let (mut device, signing) = webauthn_test_device();
@@ -6559,6 +7075,7 @@ mod auth_tests {
             0,
             &directory,
         )
+        .await
         .unwrap();
         assert_eq!(
             registry.devices[0].sign_count, 40,
@@ -6568,8 +7085,8 @@ mod auth_tests {
     }
 
     /// A browser assertion bound to a different origin does not authenticate.
-    #[test]
-    fn a_webauthn_assertion_for_another_origin_fails() {
+    #[tokio::test]
+    async fn a_webauthn_assertion_for_another_origin_fails() {
         let directory = auth_config_dir("webauthn-origin");
         let config = HookConfigV1 {
             version: VERSION_V1,
@@ -6590,8 +7107,9 @@ mod auth_tests {
             0,
             &directory,
         )
+        .await
         .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(is_invalid_decision(&error), "{error:#}");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -6628,12 +7146,15 @@ mod auth_tests {
     /// A verdict that arrives after the request expired is a failure. A
     /// verdict that never arrives is a timeout, which is unavailable; the two
     /// must not be confused.
-    #[test]
-    fn an_expired_request_is_not_authenticated_late() {
+    #[tokio::test]
+    async fn an_expired_request_is_not_authenticated_late() {
         let (device, signing) = auth_test_device();
         let mut request = auth_request();
-        request.issued_at = now() - 600;
-        request.expires_at = now() - 300;
+        // A real lifetime, already over: verification must still check the
+        // signature over these bytes before the expiry failure is reported.
+        request.issued_at = now() - 120;
+        request.expires_at = request.issued_at
+            + i64::try_from((AUTH_TIMEOUT + AUTH_EXPIRY_HEADROOM).as_secs()).unwrap();
         let raw = serde_json::to_vec(&request).unwrap();
         let decision = native_decision(&signing, &device, &request.request_id, &raw);
         let error = apply_auth_decision(
@@ -6644,7 +7165,54 @@ mod auth_tests {
             0,
             Path::new("/nonexistent"),
         )
+        .await
         .unwrap_err();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert!(display_error(&error).contains("expired"), "{error:#}");
+    }
+
+    /// After expiry, authenticity is still decided first. A forged assertion
+    /// stays an invalid decision (ignored on NATS, unavailable on the socket),
+    /// so it can never become `PAM_AUTH_ERR` however late it arrives; only a
+    /// genuine late assertion is the expiry failure.
+    #[tokio::test]
+    async fn after_expiry_a_forged_assertion_is_invalid_and_a_genuine_one_fails() {
+        let (device, signing) = auth_test_device();
+        let impostor = SigningKey::from_bytes((&[81; 32]).into()).unwrap();
+        let mut request = auth_request();
+        request.issued_at = now() - 120;
+        request.expires_at = request.issued_at
+            + i64::try_from((AUTH_TIMEOUT + AUTH_EXPIRY_HEADROOM).as_secs()).unwrap();
+        let raw = serde_json::to_vec(&request).unwrap();
+        for forged in [
+            native_decision(&impostor, &device, &request.request_id, &raw),
+            native_decision(&signing, &device, &Uuid::new_v4().to_string(), &raw),
+        ] {
+            let error = apply_auth_decision(
+                &forged,
+                &request,
+                &raw,
+                std::slice::from_ref(&device),
+                0,
+                Path::new("/nonexistent"),
+            )
+            .await
+            .unwrap_err();
+            assert!(is_invalid_decision(&error), "{error:#}");
+            assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
+        }
+        let genuine = native_decision(&signing, &device, &request.request_id, &raw);
+        let error = apply_auth_decision(
+            &genuine,
+            &request,
+            &raw,
+            std::slice::from_ref(&device),
+            0,
+            Path::new("/nonexistent"),
+        )
+        .await
+        .unwrap_err();
+        assert!(!is_invalid_decision(&error), "{error:#}");
         assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
         assert!(display_error(&error).contains("expired"), "{error:#}");
     }
@@ -6654,13 +7222,8 @@ mod auth_tests {
     /// A config directory whose only transport is the given socket. No NATS,
     /// so nothing can rescue the socket result and the classification of the
     /// socket event is what the test observes.
-    fn auth_socket_dir(name: &str) -> PathBuf {
-        // `super::tests::socket_temp_root`: macOS `sun_path` is 104 bytes and
-        // the per-user `$TMPDIR` does not leave room for a socket under it.
-        let directory = super::tests::socket_temp_root()
-            .join(format!("oshioki-auth-{name}-{}", Uuid::new_v4()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
+    fn auth_socket_dir(_name: &str) -> PathBuf {
+        let directory = super::tests::private_socket_test_dir();
         std::fs::write(
             directory.join("config.env"),
             format!(
@@ -6783,11 +7346,11 @@ mod auth_tests {
     }
 
     /// A legacy command-approval decision delivered over the authentication
-    /// socket is a cross-lane decision: bytes that arrived and are wrong. It
-    /// must not be softened into the transport-fault class by the connection
-    /// closing straight afterwards.
+    /// socket is a cross-lane message: it never authenticates. Whoever holds
+    /// the socket path can send one, so it is unavailable rather than
+    /// `PAM_AUTH_ERR` and the password path stays open.
     #[tokio::test]
-    async fn a_legacy_decision_after_an_acknowledgement_still_fails_closed() {
+    async fn a_legacy_decision_after_an_acknowledgement_is_unavailable() {
         let directory = auth_socket_dir("ack-legacy");
         let (device, signing) = auth_test_device();
         let request = auth_request();
@@ -6808,7 +7371,7 @@ mod auth_tests {
         let error = execute_auth_request_at(request, Duration::from_secs(30), &directory, None)
             .await
             .unwrap_err();
-        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
         assert!(
             display_error(&error).contains("different control message"),
             "{error:#}"
@@ -7147,5 +7710,704 @@ mod auth_tests {
         assert_eq!(identities.pam_uid, 0);
         assert_eq!(identities.invoking_uid, 0);
         assert_eq!(identities.invoking_user.as_deref(), Some("root"));
+    }
+
+    // --- invalid decisions keep waiting; host faults are unavailable -------
+    //
+    // Anyone who can publish on a request's verdict subject, or hold the
+    // agent socket path, can send a decision that does not verify. None of
+    // these may end a request as denied: that would take the password lane
+    // away (the plugin cancels it on exit 1, a Linux `default=die` PAM stack
+    // on `PAM_AUTH_ERR`). Only a verified denial still beats a password.
+
+    /// A throwaway core-NATS broker; `None` (the test skips) without one.
+    async fn h2_broker() -> Option<(super::tests::KillOnDrop, String)> {
+        let Ok(binary) = super::tests::which_nats_server() else {
+            eprintln!("nats-server not on PATH; skipping");
+            return None;
+        };
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = std::process::Command::new(binary)
+            .args(["-a", "127.0.0.1", "-p", &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn nats-server");
+        let broker = super::tests::KillOnDrop(child);
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "nats-server never became ready"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Some((broker, format!("nats://127.0.0.1:{port}")))
+    }
+
+    /// An owner-only config directory with `config` as its `config.env` and
+    /// `devices` pinned.
+    fn h2_dir(_name: &str, config: &str, devices: Vec<DevicePublicRecordV1>) -> PathBuf {
+        let directory = super::tests::private_socket_test_dir();
+        fs::write(directory.join("config.env"), config).unwrap();
+        seed_registry(&directory, devices);
+        directory
+    }
+
+    /// Plays the agent, and an attacker sharing its NATS subjects, for one
+    /// request: once the hook publishes on `request_subject`, it acknowledges
+    /// and publishes `verdicts` in order on the verdict subject.
+    async fn h2_nats_peer(
+        url: &str,
+        request_subject: String,
+        request_id: String,
+        verdicts: Vec<Vec<u8>>,
+    ) -> tokio::task::JoinHandle<()> {
+        use oshioki_transport::ServerTransport as _;
+        let scratch = super::tests::private_socket_test_dir();
+        fs::write(scratch.join("config.env"), format!("NATS_URL={url}\n")).unwrap();
+        let peer = NatsTransport::from_config_dir(&scratch).await.unwrap();
+        let _ = fs::remove_dir_all(&scratch);
+        let mut requests = peer.subscribe(&request_subject).await.unwrap();
+        // Publishing flushes the connection, so the subscription is live
+        // before the hook can publish.
+        peer.publish("oshioki.test.ready".into(), Vec::new())
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            requests
+                .next()
+                .await
+                .expect("the hook publishes its request");
+            let alive = serde_json::to_vec(&oshioki_protocol::AliveV1::for_request(&request_id));
+            peer.publish(format!("oshioki.ack.{request_id}"), alive.unwrap())
+                .await
+                .unwrap();
+            for verdict in verdicts {
+                peer.publish(format!("oshioki.verdict.{request_id}"), verdict)
+                    .await
+                    .unwrap();
+            }
+        })
+    }
+
+    /// A stand-in for the server's verdict lookup that counts connections and
+    /// drops each at once, so a confirmation attempt fails fast and is seen.
+    fn h2_counting_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!(
+            "https://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_ok() {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        (origin, count)
+    }
+
+    fn h2_server_config(directory: &Path, origin: &str) {
+        let config = HookConfigV1 {
+            version: VERSION_V1,
+            origin: origin.into(),
+            rp_id: "127.0.0.1".into(),
+            server_base_url: origin.into(),
+        };
+        atomic_write_json(&directory.join("hook.json"), &config, 0o600).unwrap();
+    }
+
+    fn h2_json(decision: &DecisionV1) -> Vec<u8> {
+        serde_json::to_vec(decision).unwrap()
+    }
+
+    fn h2_native_approval(
+        signing: &SigningKey,
+        device: &DevicePublicRecordV1,
+        request: &RequestV1,
+    ) -> DecisionV1 {
+        let raw = request.raw_json().unwrap();
+        let signature: p256::ecdsa::Signature =
+            signing.sign(&oshioki_protocol::v1::approve_challenge(&raw));
+        DecisionV1::ApproveNative(oshioki_protocol::ApproveNativeV1 {
+            version: VERSION_V1,
+            request_id: request.request_id.clone(),
+            device_fingerprint: device.fingerprint.clone(),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_der()),
+        })
+    }
+
+    /// Every way to send a decision that does not verify for this request,
+    /// as an unprivileged NATS publisher could.
+    fn h2_forgeries(request: &RequestV1, device: &DevicePublicRecordV1) -> Vec<Vec<u8>> {
+        let impostor = SigningKey::from_bytes((&[77; 32]).into()).unwrap();
+        let mut unpinned = super::tests::deny_for(&impostor, &request.request_id, device);
+        unpinned.device_fingerprint = URL_SAFE_NO_PAD.encode([78; 16]);
+        let mut wrong_request = h2_native_approval(&impostor, device, request);
+        if let DecisionV1::ApproveNative(approval) = &mut wrong_request {
+            approval.request_id = Uuid::new_v4().to_string();
+        }
+        vec![
+            b"{not json".to_vec(),
+            // Signed by a key that is not the pinned device's.
+            h2_json(&DecisionV1::Deny(super::tests::deny_for(
+                &impostor,
+                &request.request_id,
+                device,
+            ))),
+            h2_json(&h2_native_approval(&impostor, device, request)),
+            // From a device that is not pinned.
+            h2_json(&DecisionV1::Deny(unpinned)),
+            // An unsigned denial naming a native device, which always signs.
+            h2_json(&DecisionV1::Deny(DenyV1 {
+                version: VERSION_V1,
+                request_id: request.request_id.clone(),
+                device_fingerprint: device.fingerprint.clone(),
+                signature: None,
+            })),
+            // A malformed one.
+            h2_json(&DecisionV1::Deny(DenyV1 {
+                version: VERSION_V1,
+                request_id: request.request_id.clone(),
+                device_fingerprint: "not-a-fingerprint".into(),
+                signature: None,
+            })),
+            h2_json(&wrong_request),
+        ]
+    }
+
+    /// Forged and malformed decisions on the verdict subject are ignored and
+    /// the genuine approval that follows them still approves. The unsigned
+    /// native denial never reaches the server.
+    #[tokio::test]
+    async fn nats_invalid_decisions_do_not_end_the_request() {
+        let Some((_broker, url)) = h2_broker().await else {
+            return;
+        };
+        let (device, signing) = super::tests::deny_test_device();
+        let directory = h2_dir(
+            "nats-approve",
+            &format!("NATS_URL={url}\n"),
+            vec![device.clone()],
+        );
+        let (origin, contacted) = h2_counting_server();
+        h2_server_config(&directory, &origin);
+        let request = build_synthetic_request();
+        let mut verdicts = h2_forgeries(&request, &device);
+        verdicts.push(h2_json(&h2_native_approval(&signing, &device, &request)));
+        let peer = h2_nats_peer(
+            &url,
+            format!("oshioki.request.{}", request.host),
+            request.request_id.clone(),
+            verdicts,
+        )
+        .await;
+        execute_request_at(request, Duration::from_secs(20), &directory, false)
+            .await
+            .expect("the genuine approval after the forgeries must approve");
+        peer.await.unwrap();
+        assert_eq!(contacted.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A verified denial after the forgeries still denies, and still beats a
+    /// password (exit 1).
+    #[tokio::test]
+    async fn nats_verified_denial_after_invalid_decisions_still_denies() {
+        let Some((_broker, url)) = h2_broker().await else {
+            return;
+        };
+        let (device, signing) = super::tests::deny_test_device();
+        let directory = h2_dir(
+            "nats-deny",
+            &format!("NATS_URL={url}\n"),
+            vec![device.clone()],
+        );
+        let request = build_synthetic_request();
+        let mut verdicts = h2_forgeries(&request, &device);
+        verdicts.push(h2_json(&DecisionV1::Deny(super::tests::deny_for(
+            &signing,
+            &request.request_id,
+            &device,
+        ))));
+        let peer = h2_nats_peer(
+            &url,
+            format!("oshioki.request.{}", request.host),
+            request.request_id.clone(),
+            verdicts,
+        )
+        .await;
+        let error = execute_request_at(request, Duration::from_secs(20), &directory, false)
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED, "{error:#}");
+        assert!(
+            display_error(&error).contains("explicitly denied"),
+            "{error:#}"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Only forgeries, including an unsigned denial for a pinned browser
+    /// device that the server does not confirm: the request ends unavailable
+    /// at its deadline, never denied. The browser denial is the one case that
+    /// asks the server.
+    #[tokio::test]
+    async fn nats_only_invalid_decisions_end_unavailable() {
+        let Some((_broker, url)) = h2_broker().await else {
+            return;
+        };
+        let (device, _) = super::tests::deny_test_device();
+        let (browser, _) = webauthn_test_device();
+        let directory = h2_dir(
+            "nats-invalid",
+            &format!("NATS_URL={url}\n"),
+            vec![device.clone(), browser.clone()],
+        );
+        let (origin, contacted) = h2_counting_server();
+        h2_server_config(&directory, &origin);
+        let request = build_synthetic_request();
+        let mut verdicts = h2_forgeries(&request, &device);
+        verdicts.push(h2_json(&DecisionV1::Deny(DenyV1 {
+            version: VERSION_V1,
+            request_id: request.request_id.clone(),
+            device_fingerprint: browser.fingerprint.clone(),
+            signature: None,
+        })));
+        let peer = h2_nats_peer(
+            &url,
+            format!("oshioki.request.{}", request.host),
+            request.request_id.clone(),
+            verdicts,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let error = execute_request_at(request, Duration::from_secs(5), &directory, false)
+            .await
+            .unwrap_err();
+        peer.await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(4), "{error:#}");
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        assert!(display_error(&error).contains("were ignored"), "{error:#}");
+        assert_eq!(contacted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The authentication lane on NATS: forged assertions are ignored and the
+    /// genuine one authenticates. Before, each was `PAM_AUTH_ERR`.
+    #[tokio::test]
+    async fn nats_invalid_assertions_do_not_end_authentication() {
+        let Some((_broker, url)) = h2_broker().await else {
+            return;
+        };
+        let (device, signing) = auth_test_device();
+        let impostor = SigningKey::from_bytes((&[79; 32]).into()).unwrap();
+        for genuine in [true, false] {
+            let directory = h2_dir(
+                "nats-auth",
+                &format!("NATS_URL={url}\n"),
+                vec![device.clone()],
+            );
+            let request = auth_request();
+            let raw = request.raw_json().unwrap();
+            let mut verdicts = vec![
+                serde_json::to_vec(&native_decision(
+                    &impostor,
+                    &device,
+                    &request.request_id,
+                    &raw,
+                ))
+                .unwrap(),
+                serde_json::to_vec(&native_decision(
+                    &signing,
+                    &device,
+                    &request.request_id,
+                    &auth_request().raw_json().unwrap(),
+                ))
+                .unwrap(),
+                b"[]".to_vec(),
+            ];
+            if genuine {
+                verdicts.push(
+                    serde_json::to_vec(&native_decision(
+                        &signing,
+                        &device,
+                        &request.request_id,
+                        &raw,
+                    ))
+                    .unwrap(),
+                );
+            }
+            let peer = h2_nats_peer(
+                &url,
+                format!("oshioki.auth.{}", request.trusted.host),
+                request.request_id.clone(),
+                verdicts,
+            )
+            .await;
+            let result =
+                execute_auth_request_at(request, Duration::from_secs(4), &directory, None).await;
+            peer.await.unwrap();
+            if genuine {
+                result.expect("the genuine assertion after the forgeries must authenticate");
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    check_error_exit_code(&error),
+                    CHECK_RC_UNAVAILABLE,
+                    "{error:#}"
+                );
+            }
+            let _ = fs::remove_dir_all(&directory);
+        }
+    }
+
+    /// A socket stub that acknowledges `request_id` (or `ack_id`, when given)
+    /// and then sends `decision` as one frame.
+    async fn h2_socket_stub(
+        listener: tokio::net::UnixListener,
+        ack_id: String,
+        decision: Option<Vec<u8>>,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut prefix = [0u8; oshioki_protocol::socket_v1::FRAME_LEN_BYTES];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let length = oshioki_protocol::socket_v1::decode_frame_len(prefix).unwrap();
+        let mut request = vec![0u8; length];
+        stream.read_exact(&mut request).await.unwrap();
+        let alive = oshioki_protocol::AliveV1::for_request(&ack_id);
+        let frame = oshioki_protocol::socket_v1::encode_frame(&serde_json::to_vec(&alive).unwrap())
+            .unwrap();
+        let _ = stream.write_all(&frame).await;
+        if let Some(decision) = decision {
+            let frame = oshioki_protocol::socket_v1::encode_frame(&decision).unwrap();
+            let _ = stream.write_all(&frame).await;
+        }
+        let _ = stream.flush().await;
+        let mut drain = Vec::new();
+        let _ = stream.read_to_end(&mut drain).await;
+    }
+
+    async fn h2_socket_case(
+        name: &str,
+        devices: Vec<DevicePublicRecordV1>,
+        server_origin: Option<&str>,
+        decision: impl FnOnce(&RequestV1) -> Option<Vec<u8>>,
+        ack_for_another_request: bool,
+    ) -> anyhow::Error {
+        let directory = h2_dir(name, "", devices);
+        let socket = directory.join("agent.sock");
+        fs::write(
+            directory.join("config.env"),
+            format!("OSHIOKI_AGENT_SOCKET={}\n", socket.display()),
+        )
+        .unwrap();
+        if let Some(origin) = server_origin {
+            h2_server_config(&directory, origin);
+        }
+        let request = build_synthetic_request();
+        let ack_id = if ack_for_another_request {
+            Uuid::new_v4().to_string()
+        } else {
+            request.request_id.clone()
+        };
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let serve = tokio::spawn(h2_socket_stub(listener, ack_id, decision(&request)));
+        let error = execute_request_at(request, Duration::from_secs(10), &directory, false)
+            .await
+            .unwrap_err();
+        serve.abort();
+        let _ = fs::remove_dir_all(&directory);
+        error
+    }
+
+    /// An unsigned denial on the socket is not a decision: native agents
+    /// always sign and the server never writes to the socket. It is
+    /// unavailable and the server is never asked to confirm it, even for a
+    /// pinned browser device.
+    #[tokio::test]
+    async fn socket_unsigned_denial_is_unavailable_without_asking_the_server() {
+        let (browser, _) = webauthn_test_device();
+        let (origin, contacted) = h2_counting_server();
+        let fingerprint = browser.fingerprint.clone();
+        let error = h2_socket_case(
+            "socket-unsigned",
+            vec![browser],
+            Some(&origin),
+            |request| {
+                Some(h2_json(&DecisionV1::Deny(DenyV1 {
+                    version: VERSION_V1,
+                    request_id: request.request_id.clone(),
+                    device_fingerprint: fingerprint,
+                    signature: None,
+                })))
+            },
+            false,
+        )
+        .await;
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        assert_eq!(contacted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// On the socket a forged signed denial or approval is unavailable; a
+    /// verified denial still denies.
+    #[tokio::test]
+    async fn socket_forgeries_are_unavailable_and_a_verified_denial_denies() {
+        let (device, signing) = super::tests::deny_test_device();
+        let impostor = SigningKey::from_bytes((&[80; 32]).into()).unwrap();
+        for (name, key, approve) in [
+            ("socket-forged-deny", &impostor, false),
+            ("socket-forged-approve", &impostor, true),
+        ] {
+            let error = h2_socket_case(
+                name,
+                vec![device.clone()],
+                None,
+                |request| {
+                    Some(h2_json(&if approve {
+                        h2_native_approval(key, &device, request)
+                    } else {
+                        DecisionV1::Deny(super::tests::deny_for(key, &request.request_id, &device))
+                    }))
+                },
+                false,
+            )
+            .await;
+            assert_eq!(
+                check_error_exit_code(&error),
+                CHECK_RC_UNAVAILABLE,
+                "{name}: {error:#}"
+            );
+            assert!(
+                display_error(&error).contains("cannot authenticate"),
+                "{error:#}"
+            );
+        }
+        let error = h2_socket_case(
+            "socket-verified-deny",
+            vec![device.clone()],
+            None,
+            |request| {
+                Some(h2_json(&DecisionV1::Deny(super::tests::deny_for(
+                    &signing,
+                    &request.request_id,
+                    &device,
+                ))))
+            },
+            false,
+        )
+        .await;
+        assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED, "{error:#}");
+        assert!(
+            display_error(&error).contains("explicitly denied"),
+            "{error:#}"
+        );
+    }
+
+    /// An acknowledgement for another request, or an authentication decision
+    /// on the command socket, is not evidence about this request: with no
+    /// NATS fallback both are unavailable.
+    #[tokio::test]
+    async fn socket_cross_request_and_cross_lane_messages_are_unavailable() {
+        let (device, _) = super::tests::deny_test_device();
+        let error = h2_socket_case(
+            "socket-other-ack",
+            vec![device.clone()],
+            None,
+            |_| None,
+            true,
+        )
+        .await;
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        assert!(
+            display_error(&error).contains("invalid socket daemon acknowledgement"),
+            "{error:#}"
+        );
+        let (auth_device, auth_signing) = auth_test_device();
+        let auth = auth_request();
+        let cross_lane = serde_json::to_vec(&native_decision(
+            &auth_signing,
+            &auth_device,
+            &auth.request_id,
+            &auth.raw_json().unwrap(),
+        ))
+        .unwrap();
+        let error = h2_socket_case(
+            "socket-cross-lane",
+            vec![device],
+            None,
+            |_| Some(cross_lane),
+            false,
+        )
+        .await;
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+    }
+
+    /// Host faults on the command lane are unavailable, as on the
+    /// authentication lane: no config, a corrupt registry, no active device
+    /// (revoking the last one), and a registry lock held past the budget.
+    #[tokio::test]
+    async fn command_lane_host_faults_are_unavailable() {
+        let (device, _) = super::tests::deny_test_device();
+        let socket_only = "OSHIOKI_AGENT_SOCKET=/nonexistent/oshioki-h2.sock\n";
+
+        let directory = h2_dir("no-config", socket_only, vec![device.clone()]);
+        fs::remove_file(directory.join("config.env")).unwrap();
+        let error = execute_request_at(
+            build_synthetic_request(),
+            Duration::from_secs(5),
+            &directory,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        assert!(
+            display_error(&error).contains("read the transport configuration"),
+            "{error:#}"
+        );
+        let _ = fs::remove_dir_all(&directory);
+
+        let directory = h2_dir("corrupt-registry", socket_only, vec![device.clone()]);
+        fs::write(directory.join("devices.json"), b"{not json").unwrap();
+        let error = execute_request_at(
+            build_synthetic_request(),
+            Duration::from_secs(5),
+            &directory,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        assert!(
+            display_error(&error).contains("read the device registry"),
+            "{error:#}"
+        );
+        let _ = fs::remove_dir_all(&directory);
+
+        let mut revoked = device.clone();
+        revoked.active = false;
+        let directory = h2_dir("no-active", socket_only, vec![revoked]);
+        let error = execute_request_at(
+            build_synthetic_request(),
+            Duration::from_secs(5),
+            &directory,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        assert!(
+            display_error(&error).contains("no active approval devices"),
+            "{error:#}"
+        );
+        let _ = fs::remove_dir_all(&directory);
+
+        let directory = h2_dir("lock-held", socket_only, vec![device]);
+        let held = registry::Transaction::acquire(&directory).unwrap();
+        let started = std::time::Instant::now();
+        let error = execute_request_at(
+            build_synthetic_request(),
+            Duration::from_secs(5),
+            &directory,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() >= registry::DECISION_LOCK_BUDGET,
+            "{error:#}"
+        );
+        assert_eq!(
+            check_error_exit_code(&error),
+            CHECK_RC_UNAVAILABLE,
+            "{error:#}"
+        );
+        drop(held);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A concurrent sudo holding the registry lock briefly is waited for, at
+    /// the snapshot and at final authorization, instead of failing either.
+    #[tokio::test]
+    async fn a_briefly_held_registry_lock_is_waited_for() {
+        let (device, _) = super::tests::deny_test_device();
+        let directory = h2_dir("lock-brief", "", vec![device.clone()]);
+        for phase in ["snapshot", "authorize"] {
+            let (held, release) = std::sync::mpsc::channel();
+            let holder_dir = directory.clone();
+            let holder = std::thread::spawn(move || {
+                let _lock = registry::Transaction::acquire(&holder_dir).unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            });
+            release.recv().unwrap();
+            assert!(registry::Transaction::acquire(&directory).is_err());
+            // The wait must yield: on this single-threaded runtime a task
+            // that needs ~50 ms (a liveness watch, a deadline timer) only
+            // runs if the lock wait is an await point, not a thread sleep.
+            let ticked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let background_task = {
+                let ticked = ticked.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    ticked.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            };
+            match phase {
+                "snapshot" => {
+                    registry::decision_snapshot(&directory).await.unwrap();
+                }
+                _ => {
+                    final_authorization(&directory, &device, 0, now() + 60, None, false)
+                        .await
+                        .unwrap();
+                }
+            }
+            assert!(
+                ticked.load(std::sync::atomic::Ordering::SeqCst),
+                "{phase}: the lock wait blocked the runtime"
+            );
+            background_task.await.unwrap();
+            holder.join().unwrap();
+        }
+        let _ = fs::remove_dir_all(&directory);
     }
 }

@@ -12,6 +12,7 @@ Browser approvals need NATS and the server.
 | First decision wins | The server commits the first accepted action and outbox row together; later actions receive `410`. |
 | Durable publication | The server outbox retries after restart until NATS publication and flush succeed. |
 | Bounded waiting | The hook owns the approval deadline; unavailable transports report the underlying error. |
+| First valid decision wins at the hook | Candidates that do not verify are ignored until the deadline; see [reply subjects](#reply-subjects-on-nats). |
 | Liveness before a human decision | Native `AliveV1` acknowledgement, or browser `DeliveryV1` followed by browser `AliveV1`. Neither authorizes execution. |
 
 Exactly-once commit refers to server state, not exactly-once network delivery.
@@ -23,17 +24,37 @@ With `OSHIOKI_AGENT_SOCKET` configured, the hook tries the socket first.
 
 | Socket outcome | Command approval behavior |
 | --- | --- |
-| Unavailable, closes, or silent before acknowledgement | Try NATS if configured, within the same deadline. |
-| Valid decision | Finish with that result. |
-| Malformed reply or failure after valid acknowledgement | Fail closed; no transport retry. |
+| Unavailable, closes, or silent before acknowledgement; acknowledgement for another request or of the wrong kind | Try NATS if configured, within the same deadline. |
+| Verified decision | Finish with that result. |
+| Malformed reply, decision that does not verify (including any unsigned denial), or failure after valid acknowledgement | Unavailable; password fallback stays eligible; no transport retry. |
+
+Whoever holds the socket path can send any message, so nothing but a verified
+decision ends a request. Native agents always sign, and the server never
+writes to the socket, so an unsigned denial there is never sent to the server
+for confirmation.
 
 Omitting `NATS_URL` makes the hook socket-only. Omitting both transports is
 a configuration error. An agent without NATS settings serves the local socket.
 
-The authentication operation distinguishes an unanswered connection from a
-malformed assertion: a clean hangup can leave password fallback available,
-whereas truncated or invalid decision bytes are a hard failure.
+The authentication operation follows the same rule.
 See [PAM results](../pam/README.md#results-and-cancellation).
+
+## Reply subjects on NATS
+
+`oshioki.ack.<id>`, `oshioki.delivery.<id>`, and `oshioki.verdict.<id>` can be
+written by more than the peer meant to answer, and request IDs travel in the
+clear on the request subject. The hook therefore reads each subject as a
+stream of candidates:
+
+| Message on a reply subject | Hook behavior |
+| --- | --- |
+| Unrecognized kind, undecodable bytes, wrong kind for the subject, or another request's ID | Skipped; keep waiting. |
+| Receipt of the expected kind for this request | Accepted as liveness. |
+| Decision for this request that does not verify | Ignored (audit log); keep waiting. |
+| Unsigned denial | Confirmed against the server's record only for a pinned browser device; otherwise ignored. |
+| First decision that verifies | Final. A verified denial still beats a password. |
+
+Running out the deadline, with or without ignored candidates, is unavailable.
 
 ## Control messages and upgrades
 

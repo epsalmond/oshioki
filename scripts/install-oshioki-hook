@@ -9,6 +9,7 @@ CONFIG_FILE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --prelaunch|--disable-prelaunch|--remove-sudoers-dropin|--prelaunch-status|--standalone-e2e|\
+    --reconcile-plugin-rule|\
     --contextual-pam|--disable-contextual-pam|--contextual-pam-status)
       [ -z "$MODE" ] || { echo "install-oshioki-hook: choose exactly one mode" >&2; exit 2; }
       MODE="${1#--}"
@@ -178,6 +179,118 @@ find_visudo() {
   [ -x /usr/sbin/visudo ] || return 1
   printf '/usr/sbin/visudo\n'
 }
+# The passwordless rule is safe only while sudo actually runs the approval
+# plugin. sudo.conf proves nothing on its own: sudo-rs reads sudoers.d but
+# has no plugin API and ignores sudo.conf, and on classic sudo the plugin
+# line can be lost (conffile prompt, package reinstall, hand edit) while the
+# drop-in survives. Either way the drop-in alone is passwordless root. Root's
+# `sudo -V` opens every approval plugin and prints its show_version line, so
+# the plugin's banner there is positive proof that this sudo loads it.
+PLUGIN_BANNER='Oshioki approval plugin version '
+# Exit status of a run that refused the plugin lane's passwordless rule and
+# left sudo on its own password path. The Debian postinst reports it as a
+# warning rather than failing the package configuration.
+EXIT_PLUGIN_REFUSED=3
+plugin_refused=0
+sudo_version_text() { sudo -V 2>&1; }
+# The first line of `sudo -V`: "Sudo version 1.9.15p5" for classic sudo,
+# "sudo-rs 0.2.8" for sudo-rs. sudo-rs prints it on stderr.
+sudo_is_sudo_rs() {
+  local text
+  text="$(sudo_version_text)" || text=""
+  case "${text%%$'\n'*}" in
+    sudo-rs*|Sudo-rs*) return 0 ;;
+  esac
+  return 1
+}
+sudo_plugin_loaded() {
+  local text
+  # Only the root view counts as proof; the installer always runs as root.
+  [ "$(id -u)" -eq 0 ] || return 1
+  text="$(sudo_version_text)" || return 1
+  grep -Fq "$PLUGIN_BANNER" <<<"$text"
+}
+# Definitely not loaded: root's sudo -V answered (sudo-rs included) and
+# lists no Oshioki plugin. False when sudo -V itself fails.
+sudo_lacks_plugin() {
+  local text
+  [ "$(id -u)" -eq 0 ] || return 1
+  text="$(sudo_version_text)" || return 1
+  ! grep -Fq "$PLUGIN_BANNER" <<<"$text"
+}
+# The proof above is about the `sudo` on PATH. Any other setuid sudo-rs on
+# the host also reads sudoers.d, honours the NOPASSWD rule, and never runs
+# the plugin: Ubuntu 25.10 keeps /usr/lib/cargo/bin/sudo setuid (and
+# /usr/bin/sudo-rs pointing at it) after `update-alternatives` selects
+# classic sudo. So the rule also needs sudo-rs to be absent. Prints the
+# evidence. Only root can create a setuid-root file, so the scan is limited
+# to the system binary directories, to names containing "sudo", and to
+# root-owned setuid files: a setuid file owned by anyone else is never
+# executed as root. Each candidate is asked for its own `-V` banner with no
+# stdin and, where `timeout` exists (not stock macOS), a 5-second limit, so
+# an odd binary cannot hang postinst or the reconcile service.
+# OSHIOKI_SUDO_RS_PATHS and OSHIOKI_SETUID_SCAN_DIRS are test seams for the
+# fixture harness; production callers leave them unset.
+SUDO_RS_PATHS="${OSHIOKI_SUDO_RS_PATHS:-/usr/bin/sudo-rs /usr/lib/cargo/bin/sudo /usr/local/bin/sudo-rs}"
+SETUID_SCAN_DIRS="${OSHIOKI_SETUID_SCAN_DIRS:-/usr/bin /usr/sbin /bin /sbin /usr/local/bin /usr/local/sbin /usr/lib/cargo/bin}"
+probe_version_banner() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5 "$1" -V </dev/null 2>&1
+  else
+    "$1" -V </dev/null 2>&1
+  fi
+}
+sudo_rs_installed() {
+  local path dir text
+  for path in $SUDO_RS_PATHS; do
+    if [ -e "$path" ] || [ -L "$path" ]; then printf '%s\n' "$path"; return 0; fi
+  done
+  if command -v dpkg-query >/dev/null 2>&1; then
+    case "$(dpkg-query -W -f='${Status}' sudo-rs 2>/dev/null || true)" in
+      *" installed") printf 'the sudo-rs package\n'; return 0 ;;
+    esac
+  fi
+  for dir in $SETUID_SCAN_DIRS; do
+    for path in "$dir"/*sudo*; do
+      [ -f "$path" ] && [ -u "$path" ] || continue
+      [ "$(stat_owner "$path" 2>/dev/null || true)" = 0 ] || continue
+      text="$(probe_version_banner "$path")" || true
+      case "${text%%$'\n'*}" in
+        sudo-rs*|Sudo-rs*) printf '%s\n' "$path"; return 0 ;;
+      esac
+    done
+  done
+  return 1
+}
+# Everything the passwordless rule needs, in one place: root, no sudo-rs
+# anywhere, and the plugin banner from the sudo on PATH. On failure the
+# reason is left in nopasswd_refusal for the caller to print.
+nopasswd_refusal=""
+nopasswd_proven() {
+  local evidence
+  nopasswd_refusal=""
+  if evidence="$(sudo_rs_installed)"; then
+    nopasswd_refusal="sudo-rs is installed ($evidence); it reads $SUDOERS_D and would honour the rule without ever running the approval plugin. Remove the sudo-rs package (switching alternatives is not enough)"
+    return 1
+  fi
+  if ! sudo_plugin_loaded; then
+    nopasswd_refusal="root's sudo -V does not list the Oshioki approval plugin, so this sudo is not running it"
+    return 1
+  fi
+  return 0
+}
+# Rollback's question: is restoring the rule provably unsafe? An unanswered
+# sudo -V is not proof either way.
+nopasswd_provably_unsafe() {
+  [ "$(id -u)" -eq 0 ] || return 1
+  sudo_rs_installed >/dev/null || sudo_lacks_plugin
+}
+sudo_rs_refusal() {
+  echo "install-oshioki-hook: refusing the approval plugin lane: this host's sudo is sudo-rs, which has no approval-plugin support and ignores $SUDO_CONF, so its passwordless sudoers rule would allow every sudo without approval. sudo keeps its password path. Remove sudo-rs and use classic sudo 1.9; the contextual PAM lane (install-oshioki-hook --contextual-pam) may work with sudo-rs but has not been validated." >&2
+}
+no_plugin_proof_refusal() {
+  echo "install-oshioki-hook: refusing passwordless sudo: $nopasswd_refusal; $SUDOERS_FILE is not written and sudo keeps asking for passwords" >&2
+}
 write_sudoers_dropin() {
   local user="$1" tmp checker
   safe_directory "$SUDOERS_D"
@@ -208,6 +321,15 @@ install_sudoers_dropin() {
     remove_sudoers_dropin
     return 0
   fi
+  # Runs after the managed block is in sudo.conf, so this asks the sudo that
+  # will run whether it loads the plugin from there. Without that proof the
+  # rule would be a silent allow, so an existing one comes out too.
+  if ! nopasswd_proven; then
+    no_plugin_proof_refusal
+    remove_sudoers_dropin
+    plugin_refused=1
+    return 0
+  fi
   if [ -z "$user" ]; then
     echo "install-oshioki-hook: warning: no laptop user (set OSHIOKI_SUDO_USER); sudo keeps asking for passwords" >&2
     return 0
@@ -231,11 +353,12 @@ plan_sudoers_dropin() {
   if [ -z "$user" ]; then echo "DRY: skip $SUDOERS_FILE (no laptop user named)"; return 0; fi
   valid_sudoers_user "$user" || die "invalid sudoers user: $user"
   if ! sudoers_included; then echo "DRY: skip $SUDOERS_FILE ($MAIN_SUDOERS includes no sudoers.d directory)"; return 0; fi
+  echo "DRY: require root's sudo -V to list the Oshioki approval plugin, else remove $SUDOERS_FILE"
   printf 'DRY: write %s for passwordless sudo by %s\n' "$SUDOERS_FILE" "$user"
 }
 remove_sudoers_dropin() {
   case "$MODE" in
-    prelaunch|disable-prelaunch|remove-sudoers-dropin|contextual-pam) ;;
+    prelaunch|disable-prelaunch|remove-sudoers-dropin|reconcile-plugin-rule|contextual-pam) ;;
     *) return 0 ;;
   esac
   [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ] || return 0
@@ -298,6 +421,19 @@ restore_sudo_backups() {
       return 1
     fi
     pam_trace "pam:rollback:plugin-restored:$SUDO_CONF"
+  fi
+  # A rollback must not bring back a passwordless rule that the restored
+  # sudo provably does not guard with the plugin (sudo-rs, or a lost plugin
+  # line): sudo answers, and lists no Oshioki plugin. An unanswered sudo -V
+  # proves nothing either way and keeps the prior behavior of restoring.
+  if [ -n "$dropin_backup" ] && [ -f "$dropin_backup" ] && nopasswd_provably_unsafe; then
+    echo "install-oshioki-hook: rollback is not restoring $SUDOERS_FILE: sudo does not load the approval plugin or sudo-rs is installed, so sudo keeps its password path" >&2
+    if ! rm -f "$dropin_backup"; then
+      echo "install-oshioki-hook: rollback could not remove its sudoers backup" >&2
+      return 1
+    fi
+    dropin_backup=""
+    dropin_original_present=0
   fi
   # rm first: the drop-in is 0440, so overwriting it in place fails.
   if [ -n "$dropin_backup" ] && [ -f "$dropin_backup" ]; then
@@ -1314,27 +1450,132 @@ if [ "$MODE" = prelaunch-status ]; then
     echo "contextual PAM lane active; the approval plugin is intentionally not enabled (see --contextual-pam-status)"
     exit 0
   fi
-  [ -f "$SUDO_CONF" ] || { echo "disabled"; exit 1; }
-  if [ "$begins" -gt 0 ] && grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then
+  # The same positive proof --prelaunch requires before it writes the
+  # passwordless rule: sudo.conf naming the plugin is not sudo loading it.
+  # Taken as root, like the proof itself.
+  if [ "$(id -u)" -ne 0 ]; then
+    plugin_loaded="unknown (run as root)"
+  elif sudo_is_sudo_rs; then
+    plugin_loaded="no (sudo-rs has no approval-plugin support)"
+  elif sudo_plugin_loaded; then
+    plugin_loaded=yes
+  else
+    plugin_loaded=no
+  fi
+  dropin_present=0
+  if [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ]; then dropin_present=1; fi
+  block_present=0
+  if [ -f "$SUDO_CONF" ] && [ "$begins" -gt 0 ] &&
+     grep -Fq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then
+    block_present=1
+  fi
+  status_exit() { echo "plugin loaded: $plugin_loaded"; exit "$1"; }
+  case "$plugin_loaded" in
+    no*)
+      # A drop-in with no loaded plugin is passwordless root with no approval.
+      if [ "$dropin_present" -eq 1 ]; then
+        echo "FAIL  passwordless sudoers rule without the approval plugin: $SUDOERS_FILE; run install-oshioki-hook --prelaunch to re-check, or --remove-sudoers-dropin"
+        status_exit 1
+      fi
+      ;;
+  esac
+  # A sudo-rs anywhere on the host honours the rule without the plugin, even
+  # when the sudo on PATH is classic sudo.
+  if [ "$dropin_present" -eq 1 ] && [ "$(id -u)" -eq 0 ] &&
+     sudo_rs_evidence="$(sudo_rs_installed)"; then
+    echo "FAIL  passwordless sudoers rule while sudo-rs is installed ($sudo_rs_evidence), which honours it without the approval plugin: $SUDOERS_FILE; remove sudo-rs, then run install-oshioki-hook --prelaunch"
+    status_exit 1
+  fi
+  case "$plugin_loaded" in
+    no\ \(sudo-rs*)
+      echo "unsupported: sudo-rs cannot load the approval plugin; remove sudo-rs and use classic sudo 1.9 (install-oshioki-hook --contextual-pam may work with sudo-rs but has not been validated)"
+      status_exit 1
+      ;;
+  esac
+  if [ "$block_present" -eq 1 ]; then
+    if [ "$plugin_loaded" = no ]; then
+      echo "enabled in $SUDO_CONF, but sudo does not load $PLUGIN_DEST"
+      status_exit 1
+    fi
     # With no named user there is no drop-in to verify, so the plugin block
     # alone reports enabled; laptop-setup always names one, keeping the
     # coupling strict in the owned flow.
     dropin_user="$(sudoers_user)"
     if [ -z "$dropin_user" ] || ! registry_has_active_passwordless_devices; then
-      if [ -n "$dropin_user" ] && { [ -e "$SUDOERS_FILE" ] || [ -L "$SUDOERS_FILE" ]; }; then
+      if [ -n "$dropin_user" ] && [ "$dropin_present" -eq 1 ]; then
         echo "enabled with passwordless sudo but no hardware-backed approval device"
-        exit 1
+        status_exit 1
       fi
       echo "enabled: $PLUGIN_DEST (sudo password required for software-only approvals)"
-      exit 0
+      status_exit 0
     fi
-    if dropin_ok "$dropin_user"; then echo "enabled: $PLUGIN_DEST"; exit 0; fi
+    if dropin_ok "$dropin_user"; then echo "enabled: $PLUGIN_DEST"; status_exit 0; fi
     echo "enabled without passwordless sudo"
-    exit 1
+    status_exit 1
   fi
   # Malformed blocks already died above; anything left here has no block.
+  if [ "$dropin_present" -eq 1 ]; then
+    echo "FAIL  passwordless sudoers rule without the approval plugin: $SUDOERS_FILE; run install-oshioki-hook --prelaunch to re-check, or --remove-sudoers-dropin"
+    status_exit 1
+  fi
   echo "disabled"
-  exit 1
+  status_exit 1
+fi
+
+# Drift check for the passwordless rule between installer runs: sudo.conf
+# losing the plugin line, the sudo alternative switching, sudo-rs arriving.
+# The Debian package's oshioki-sudo-reconcile.path unit runs it whenever
+# those paths change. It removes the rule only on positive evidence that
+# the rule is unguarded: PAM lane, a sudo-rs PATH sudo or installed sudo-rs,
+# the plugin line gone from sudo.conf, or a sudo -V that runs and lists no
+# plugin. It never writes the rule, never edits sudo.conf, and leaves a file
+# it does not own alone. It takes no installer lock: it only removes, and
+# the installer re-proves before every write.
+if [ "$MODE" = reconcile-plugin-rule ]; then
+  [ "$(id -u)" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || die "must run as root"
+  safe_directory "$SUDOERS_D"
+  if [ ! -e "$SUDOERS_FILE" ] && [ ! -L "$SUDOERS_FILE" ]; then
+    echo "install-oshioki-hook: no passwordless sudoers rule at $SUDOERS_FILE; nothing to reconcile"
+    exit 0
+  fi
+  if ! owned_sudoers_dropin_user >/dev/null 2>&1; then
+    echo "install-oshioki-hook: $SUDOERS_FILE is not an Oshioki rule; leaving it alone" >&2
+    exit 0
+  fi
+  reconcile_reason=""
+  if pam_lane_active; then
+    reconcile_reason="this host is on the contextual PAM lane, which has no passwordless rule"
+  elif sudo_is_sudo_rs; then
+    reconcile_reason="the sudo on PATH is sudo-rs, which cannot load the approval plugin"
+  elif [ ! -f "$SUDO_CONF" ] || ! grep -Fxq "Plugin approval_exec $PLUGIN_DEST" "$SUDO_CONF"; then
+    reconcile_reason="$SUDO_CONF no longer names the approval plugin"
+  elif reconcile_evidence="$(sudo_rs_installed)"; then
+    reconcile_reason="sudo-rs is installed ($reconcile_evidence), which honours the rule without the approval plugin; remove the sudo-rs package"
+  else
+    # Only positive evidence removes the rule, as in rollback: sudo -V ran
+    # and listed no Oshioki plugin. A sudo -V that does not run at all (a
+    # mid-upgrade library mismatch, say) proves nothing, and removing the
+    # rule then could lock out an account whose only sudo path it is. Ask
+    # once more after a short pause, then keep the rule and say so.
+    # OSHIOKI_RECONCILE_RETRY_DELAY is a test seam.
+    if ! reconcile_text="$(sudo_version_text)"; then
+      sleep "${OSHIOKI_RECONCILE_RETRY_DELAY:-2}"
+      if ! reconcile_text="$(sudo_version_text)"; then
+        echo "install-oshioki-hook: sudo -V did not run; keeping $SUDOERS_FILE until sudo answers (the next change re-checks)" >&2
+        exit 0
+      fi
+    fi
+    if ! grep -Fq "$PLUGIN_BANNER" <<<"$reconcile_text"; then
+      reconcile_reason="root's sudo -V does not list the Oshioki approval plugin, so this sudo is not running it"
+    fi
+  fi
+  if [ -z "$reconcile_reason" ]; then
+    echo "install-oshioki-hook: the approval plugin is loaded; $SUDOERS_FILE kept"
+    exit 0
+  fi
+  echo "install-oshioki-hook: removing $SUDOERS_FILE: $reconcile_reason; sudo keeps asking for passwords" >&2
+  remove_sudoers_dropin
+  exit 0
 fi
 
 # Package removal uses this mode after dpkg has already lost the rest of the
@@ -2111,6 +2352,36 @@ if pam_lane_active; then
   echo "install-oshioki-hook: $MODE installed; the contextual PAM lane is unchanged"
   exit 0
 fi
+# sudo-rs reads sudoers.d but has no approval-plugin API and ignores
+# sudo.conf, so on such a host the plugin lane would be the blanket NOPASSWD
+# rule with nothing in front of it. Refuse the lane there, whatever the
+# registry says. Like the PAM branch above, the hook binary and config are
+# still refreshed (the contextual PAM lane runs on them) and any stale legacy
+# artifact is removed. sudo is left on its own password path.
+if sudo_is_sudo_rs; then
+  sudo_rs_refusal
+  if [ "$DRY_RUN" -eq 1 ]; then
+    remove_sudoers_dropin
+    if [ -f "$SUDO_CONF" ] && { grep -Fq "$BEGIN_MARK" "$SUDO_CONF" || has_our_plugin; }; then
+      echo "DRY: remove exact managed block from $SUDO_CONF (sudo-rs)"
+    fi
+    echo "DRY: skip enabling $SUDO_CONF (sudo-rs)"
+    exit "$EXIT_PLUGIN_REFUSED"
+  fi
+  capture_dropin_backup
+  [ ! -f "$SUDO_CONF" ] || capture_sudo_conf_backup
+  remove_sudoers_dropin
+  if [ -f "$SUDO_CONF" ] && { grep -Fq "$BEGIN_MARK" "$SUDO_CONF" || has_our_plugin; }; then
+    rewrite_block disable "$SUDO_CONF" "$SUDO_CONF"
+  fi
+  if ! validate_sudo; then
+    restore_sudo_backups
+    die "sudo -V failed; restored prior configuration"
+  fi
+  drop_sudo_backups
+  echo "install-oshioki-hook: $MODE installed the hook and config only; the approval plugin lane is not enabled on sudo-rs" >&2
+  exit "$EXIT_PLUGIN_REFUSED"
+fi
 if [ "$DRY_RUN" -eq 1 ]; then
   if registry_has_active_devices; then
     echo "DRY: enable exact managed block in $SUDO_CONF"
@@ -2152,5 +2423,9 @@ if ! validate_sudo; then
   die "sudo -V failed; restored prior configuration"
 fi
 drop_sudo_backups
+fi
+if [ "$plugin_refused" -eq 1 ]; then
+  echo "install-oshioki-hook: $MODE installed and sudo validated, without passwordless sudo (the approval plugin is not loaded)" >&2
+  exit "$EXIT_PLUGIN_REFUSED"
 fi
 echo "install-oshioki-hook: $MODE installed and sudo validated"

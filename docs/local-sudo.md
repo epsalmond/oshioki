@@ -45,7 +45,7 @@ Oshioki has two sudo modes:
 
 | Mode | What you approve | Password and timestamp behavior |
 | --- | --- | --- |
-| Approval plugin (default, installed by `--prelaunch`) | The exact command and effective environment | Checks each command; hardware-backed devices use the installer's `NOPASSWD` rule. Linux also offers a password fallback. |
+| Approval plugin (default, installed by `--prelaunch`) | The exact command and effective environment | Checks each command; hardware-backed devices use the installer's `NOPASSWD` rule, which is written only when `sudo -V` proves the plugin is loaded. Linux also offers a password fallback. |
 | Contextual PAM (opt-in) | A sudo authentication, with advisory command context | Uses sudo's normal password fallback and timestamp policy; a warm timestamp can skip a new approval. |
 
 PAM command context is not a signed promise of the final executable,

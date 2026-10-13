@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-12
+
+### Security
+
+- Harden privileged sudo helper execution and approval verification.
+- Preserve contextual PAM and Linux sudo-plugin password fallback when an
+  approval path is unavailable.
+- Require a loaded classic sudo approval plugin before enabling the plugin
+  lane's passwordless rule, and reconcile that rule on Debian hosts when
+  sudo configuration or binaries change.
+
 ## [0.4.2] - 2026-10-06
 
 ### Fixed

@@ -191,6 +191,13 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
+# PRELAUNCH_REFUSED models a host whose sudo cannot carry the plugin lane
+# (sudo-rs): the real installer refuses the passwordless rule, leaves sudo on
+# its password path, and exits 3; status then reports it as not enabled.
+if [ "${PRELAUNCH_REFUSED:-0}" = 1 ] && [ "$mode" = --prelaunch ]; then
+  echo "install-oshioki-hook: refusing the approval plugin lane: this host's sudo is sudo-rs" >&2
+  exit 3
+fi
 case "$mode --dry-run=$dry" in
   "--prelaunch --dry-run=1") echo "DRY: plan for $config" ;;
   "--prelaunch --dry-run=0")
@@ -614,7 +621,7 @@ raise SystemExit(os.waitstatus_to_exitcode(status))
     OSHIOKI_AGENT_NATS_URL="${OSHIOKI_AGENT_NATS_URL-$SETUP_NATS_URL}" \
     OSHIOKI_AGENT_NATS_USER="${OSHIOKI_AGENT_NATS_USER-oshioki-agent}" \
     OSHIOKI_AGENT_NATS_PASS="${OSHIOKI_AGENT_NATS_PASS-agent-secret}" \
-    DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
+    DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" PRELAUNCH_REFUSED="${PRELAUNCH_REFUSED:-0}" \
     SEEN_CHECKSUMS="${SEEN_CHECKSUMS:-}" \
     ENROLL_MODE="${ENROLL_MODE:-url}" \
     OSHIOKI_ENROLL_URL_TIMEOUT="${OSHIOKI_ENROLL_URL_TIMEOUT:-60}" \
@@ -648,7 +655,7 @@ run_setup_local() {
     INSTALLED_HOOK="$TEST_ROOT/fake-bin/oshioki" \
     OSHIOKI_INSTALL_ENV="$TEST_ROOT/etc/install.env" \
     OSHIOKI_ORIGIN="${OSHIOKI_ORIGIN:-https://laptop.test}" OSHIOKI_RP_ID="laptop.test" \
-    DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" \
+    DEVICES_ACTIVE="${DEVICES_ACTIVE:-0}" PRELAUNCH_REFUSED="${PRELAUNCH_REFUSED:-0}" \
     "$TEST_ROOT/stage/oshioki-laptop-setup" "$@" </dev/null
 }
 
@@ -724,6 +731,25 @@ grep -Fq 'contextual PAM migration requested' "$TEST_ROOT/ctxpam.log" ||
   fail "--contextual-pam never reached the migration"
 grep -Fq 'OK    pam entries' "$TEST_ROOT/ctxpam.log" ||
   fail "--contextual-pam never ran its own status"
+
+# On a host where the installer refuses the plugin lane (exit 3, sudo-rs),
+# setup warns and still reaches the --contextual-pam migration that the
+# refusal points at, instead of aborting at the prelaunch step.
+rm -f "$TEST_ROOT/pam-lane"
+PRELAUNCH_REFUSED=1 DEVICES_ACTIVE=1 run_setup --yes --contextual-pam >"$TEST_ROOT/refused.log" 2>&1 ||
+  { sed -n '1,40p' "$TEST_ROOT/refused.log" >&2; fail "a refused plugin lane aborted --contextual-pam setup"; }
+grep -Fq 'refused passwordless sudo' "$TEST_ROOT/refused.log" || { sed -n '1,60p' "$TEST_ROOT/refused.log" >&2; fail "a refused plugin lane was not reported"; }
+grep -Fq 'contextual PAM migration requested' "$TEST_ROOT/refused.log" ||
+  fail "a refused plugin lane never reached the migration"
+grep -Fq 'OK    pam entries' "$TEST_ROOT/refused.log" ||
+  fail "a refused plugin lane never ran the PAM status"
+# Without --contextual-pam the refusal is still not an abort: setup finishes
+# with sudo on its password path and says the plugin is not active.
+rm -f "$TEST_ROOT/pam-lane"
+PRELAUNCH_REFUSED=1 DEVICES_ACTIVE=1 run_setup --yes >"$TEST_ROOT/refused-plain.log" 2>&1 ||
+  { sed -n '1,40p' "$TEST_ROOT/refused-plain.log" >&2; fail "a refused plugin lane aborted setup"; }
+grep -Fq 'refused passwordless sudo' "$TEST_ROOT/refused-plain.log" || fail "a plain refused run was not reported"
+: > "$TEST_ROOT/pam-lane"
 
 # One elevation per run. On the contextual PAM lane every sudo authentication
 # is one Touch ID sheet, so a full `--yes --contextual-pam` run must

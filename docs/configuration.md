@@ -8,7 +8,7 @@ For setup commands, use [local sudo](local-sudo.md),
 | File | Owner and purpose |
 | --- | --- |
 | `/etc/oshioki/install.env` | Root-owned, mode 0600; installer inputs |
-| `/etc/oshioki/config.env` | Root-owned hook runtime settings; sudo scrubs the caller's environment |
+| `/etc/oshioki/config.env` | Root-owned hook runtime settings; the sudo lanes never read the caller's environment |
 | `/etc/oshioki/hook.json` | Hook origin, RP ID, and server URL |
 | `/etc/oshioki/devices.json` | Pinned device registry |
 | `~/.config/oshioki/agent.json` | User-owned, mode 0600; native identity |
@@ -78,7 +78,7 @@ environment unless `--reconfigure` is supplied.
 
 | Setting | Meaning |
 | --- | --- |
-| `OSHIOKI_CONFIG_DIR` | Hook state directory, default `/etc/oshioki`. |
+| `OSHIOKI_CONFIG_DIR` | Hook state directory for operator verbs, default `/etc/oshioki`; a user-owned directory keeps the caller's curl config for development. Ignored by the sudo `check` and `authenticate` verbs. |
 | `OSHIOKI_ORIGIN`, `OSHIOKI_RP_ID` | Installer inputs for the browser origin and relying-party hostname. |
 | `OSHIOKI_AGENT_SOCKET` | Socket path in hook `config.env`; tried before NATS. |
 | `OSHIOKI_LOG` | Hook terminal logging, e.g. `info` or `audit=info`; set in `config.env`. |

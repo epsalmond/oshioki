@@ -14,6 +14,20 @@ exec /usr/bin/id "$@"
 SH
 cat > "$TEST_ROOT/fake-bin/deb-systemd-helper" <<'SH'
 #!/usr/bin/env bash
+[ -z "${UNIT_LOG:-}" ] || printf 'deb-systemd-helper %s\n' "$*" >> "$UNIT_LOG"
+exit 0
+SH
+# Real sudo must never run from this harness: `sudo -V` is modelled like
+# the installer test's fake (classic sudo listing the plugin when sudo.conf
+# names it).
+cat > "$TEST_ROOT/fake-bin/sudo" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -V ]; then
+  echo 'Sudo version 1.9.15p5'
+  if [ -f "${SUDO_CONF:-}" ] && grep -q '^Plugin approval_exec ' "$SUDO_CONF"; then
+    echo 'Oshioki approval plugin version 0.0.0-test'
+  fi
+fi
 exit 0
 SH
 cat > "$TEST_ROOT/fake-bin/stat" <<'SH'
@@ -63,6 +77,7 @@ exec /usr/bin/install "${args[@]}"
 SH
 cat > "$TEST_ROOT/fake-bin/systemctl" <<'SH'
 #!/usr/bin/env bash
+[ -z "${UNIT_LOG:-}" ] || printf 'systemctl %s\n' "$*" >> "$UNIT_LOG"
 case "${1:-}" in
   is-active) exit 1 ;;
   *) exit 0 ;;
@@ -116,7 +131,7 @@ make_stub_installer() {
 printf '%s\n' "$*" >> "${STUB_LOG:?}"
 if [ -n "${STUB_FAIL_MODE:-}" ]; then
   case " $* " in
-    *" $STUB_FAIL_MODE "*) exit 1 ;;
+    *" $STUB_FAIL_MODE "*) exit "${STUB_FAIL_STATUS:-1}" ;;
   esac
 fi
 exit 0
@@ -130,7 +145,8 @@ run_postinst() {
     OSHIOKI_INSTALL_ENV="$CASE_ROOT/install.env" \
     OSHIOKI_STATE_DIR="$CASE_ROOT/state" FAKE_STAT_OWNER="${FAKE_STAT_OWNER:-0}" \
     PAM_D="${PAM_D_OVERRIDE:-$CASE_ROOT/pam.d}" \
-    STUB_LOG="$CASE_ROOT/installer.log" \
+    STUB_LOG="$CASE_ROOT/installer.log" STUB_FAIL_MODE="${STUB_FAIL_MODE:-}" \
+    STUB_FAIL_STATUS="${STUB_FAIL_STATUS:-1}" UNIT_LOG="${UNIT_LOG:-}" \
     bash "$SCRIPT_DIR/../packaging/debian/DEBIAN/postinst" configure
 }
 run_prerm() {
@@ -143,7 +159,8 @@ run_prerm() {
     PAM_D="${PAM_D_OVERRIDE:-$CASE_ROOT/pam.d}" \
     PAM_SECURITY_DIR="${PAM_SECURITY_DIR_OVERRIDE:-$CASE_ROOT/security}" \
     OSHIOKI_PAM_MULTIARCH="$CASE_ROOT/pam-multiarch" \
-    INSTALL_TRACE="${INSTALL_TRACE:-}" \
+    INSTALL_TRACE="${INSTALL_TRACE:-}" UNIT_LOG="${UNIT_LOG:-}" \
+    OSHIOKI_SUDO_RS_PATHS="$CASE_ROOT/absent-sudo-rs" OSHIOKI_SETUID_SCAN_DIRS="$CASE_ROOT/absent-bin" \
     bash "$SCRIPT_DIR/../packaging/debian/DEBIAN/prerm" remove
 }
 run_postrm_purge() {
@@ -319,6 +336,61 @@ INSTALLER_OVERRIDE="$CASE_ROOT/stub-installer" STUB_FAIL_MODE=--contextual-pam \
   run_postinst >"$CASE_ROOT/log" 2>&1 || fail "a failed migration failed the whole configure"
 grep -Fq 'did not complete' "$CASE_ROOT/log" || fail "a failed migration was silent"
 grep -Fq -- '--contextual-pam' "$CASE_ROOT/log" || fail "the failure message names no re-run command"
+
+# --prelaunch exits 3 when it refused the plugin lane's passwordless rule
+# (sudo-rs, or a sudo that does not load the plugin) and left sudo on its
+# password path. That must not fail the package configuration, must be
+# reported, and must not skip the contextual PAM step that sudo-rs hosts use.
+new_case postinst-plugin-refused
+new_pam_fixture without-block
+make_stub_installer
+printf 'OSHIOKI_ORIGIN=https://sudo.test\nOSHIOKI_CONTEXTUAL_PAM=1\n' > "$CASE_ROOT/install.env"
+INSTALLER_OVERRIDE="$CASE_ROOT/stub-installer" STUB_FAIL_MODE=--prelaunch STUB_FAIL_STATUS=3 \
+  run_postinst >"$CASE_ROOT/log" 2>&1 || { cat "$CASE_ROOT/log" >&2; fail "a refused plugin lane failed the whole configure"; }
+grep -Fq 'passwordless sudo was not enabled' "$CASE_ROOT/log" || fail "a refused plugin lane was silent"
+grep -q -- '--contextual-pam' "$CASE_ROOT/installer.log" || fail "a refused plugin lane skipped the PAM step"
+
+# Any other --prelaunch failure still fails the configure, as before.
+new_case postinst-prelaunch-fails
+new_pam_fixture without-block
+make_stub_installer
+printf 'OSHIOKI_ORIGIN=https://sudo.test\n' > "$CASE_ROOT/install.env"
+if INSTALLER_OVERRIDE="$CASE_ROOT/stub-installer" STUB_FAIL_MODE=--prelaunch STUB_FAIL_STATUS=1 \
+   run_postinst >"$CASE_ROOT/log" 2>&1; then
+  fail "postinst ignored a failed --prelaunch"
+fi
+
+# The drift watcher ships, only ever runs the remove-only reconcile mode, and
+# is enabled and started by configure whether or not install.env exists: a
+# host can carry the rule from an earlier configure. prerm stops it.
+UNIT_DIR="$SCRIPT_DIR/../packaging/debian/usr/lib/systemd/system"
+[ -f "$UNIT_DIR/oshioki-sudo-reconcile.path" ] || fail "the reconcile path unit is not packaged"
+grep -Fxq 'ExecStart=/usr/share/oshioki/install-oshioki-hook --reconcile-plugin-rule' \
+  "$UNIT_DIR/oshioki-sudo-reconcile.service" || fail "the reconcile service runs something other than the remove-only mode"
+[ "$(grep -c '^ExecStart' "$UNIT_DIR/oshioki-sudo-reconcile.service")" = 1 ] ||
+  fail "the reconcile service runs more than one command"
+for watched in /etc/sudo.conf /etc/alternatives/sudo /usr/bin/sudo-rs /usr/lib/cargo/bin/sudo; do
+  grep -Fxq "PathChanged=$watched" "$UNIT_DIR/oshioki-sudo-reconcile.path" ||
+    fail "the reconcile path unit does not watch $watched"
+done
+grep -Fxq 'Unit=oshioki-sudo-reconcile.service' "$UNIT_DIR/oshioki-sudo-reconcile.path" ||
+  fail "the path unit triggers the wrong service"
+new_case postinst-reconcile-unit
+make_stub_installer
+UNIT_LOG="$CASE_ROOT/units.log" INSTALLER_OVERRIDE="$CASE_ROOT/stub-installer" run_postinst >"$CASE_ROOT/log" 2>&1 ||
+  { cat "$CASE_ROOT/log" >&2; fail "postinst failed while enabling the reconcile unit"; }
+grep -Fxq 'deb-systemd-helper --system enable oshioki-sudo-reconcile.path' "$CASE_ROOT/units.log" ||
+  fail "postinst did not enable the reconcile path unit"
+if [ -d /run/systemd/system ]; then
+  grep -Fxq 'systemctl restart oshioki-sudo-reconcile.path' "$CASE_ROOT/units.log" ||
+    fail "postinst did not start the reconcile path unit"
+fi
+new_case prerm-reconcile-unit
+UNIT_LOG="$CASE_ROOT/units.log" run_prerm >"$CASE_ROOT/log" 2>&1 || { cat "$CASE_ROOT/log" >&2; fail "prerm failed"; }
+if [ -d /run/systemd/system ]; then
+  grep -Fq 'systemctl stop oshioki-sudo-reconcile.path' "$CASE_ROOT/units.log" ||
+    fail "prerm did not stop the reconcile path unit"
+fi
 
 # A migrated host with no install.env still gets its module refreshed, by
 # the branch that calls the installer without --config-file.

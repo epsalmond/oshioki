@@ -14,6 +14,12 @@ PAM_D="${PAM_D:-/etc/pam.d}"
 
 case "$1" in
   remove|purge)
+    # The drift watcher runs this package's installer; stop it before the
+    # installer goes away. It only ever removes the passwordless rule, which
+    # the cleanup below does anyway, so a failure here is not fatal.
+    if [ -d /run/systemd/system ]; then
+      systemctl stop oshioki-sudo-reconcile.path oshioki-sudo-reconcile.service >/dev/null 2>&1 || true
+    fi
     if [ -d /run/systemd/system ] && systemctl is-active -q oshioki-server.service; then
       systemctl stop oshioki-server.service || {
         echo "oshioki: cannot stop oshioki-server; refusing to remove a running server" >&2
