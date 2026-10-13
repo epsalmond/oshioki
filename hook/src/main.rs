@@ -4987,12 +4987,45 @@ mod tests {
         PathBuf::from("/tmp")
     }
 
-    fn socket_test_dir(name: &str) -> PathBuf {
-        let dir =
-            socket_temp_root().join(format!("oshioki-hook-socket-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    pub(super) fn private_socket_test_dir() -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let dir = socket_temp_root().join(format!("oshioki-test-{}", Uuid::new_v4().simple()));
+        // mkdir is atomic and fails on any existing entry, including symlinks.
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         dir
+    }
+
+    fn socket_test_dir(_name: &str) -> PathBuf {
+        private_socket_test_dir()
+    }
+
+    #[test]
+    fn socket_fixtures_are_fresh_private_and_short() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let first = socket_test_dir("private-fixture");
+        std::fs::write(first.join("preserve"), b"first fixture").unwrap();
+        let second = socket_test_dir("private-fixture");
+        assert_ne!(
+            first, second,
+            "a new fixture must not reuse an existing path"
+        );
+        assert_eq!(
+            std::fs::read(first.join("preserve")).unwrap(),
+            b"first fixture"
+        );
+        for directory in [&first, &second] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let socket = directory.join("agent.sock");
+            assert!(socket.as_os_str().as_encoded_bytes().len() < 104);
+            let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+            drop(listener);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     fn socket_test_config(dir: &Path, socket: Option<&Path>) {
@@ -7189,12 +7222,8 @@ mod auth_tests {
     /// A config directory whose only transport is the given socket. No NATS,
     /// so nothing can rescue the socket result and the classification of the
     /// socket event is what the test observes.
-    fn auth_socket_dir(name: &str) -> PathBuf {
-        // A per-user or session `$TMPDIR` may exceed the Unix socket path limit.
-        let directory = super::tests::socket_temp_root()
-            .join(format!("oshioki-auth-{name}-{}", Uuid::new_v4()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
+    fn auth_socket_dir(_name: &str) -> PathBuf {
+        let directory = super::tests::private_socket_test_dir();
         std::fs::write(
             directory.join("config.env"),
             format!(
@@ -7722,14 +7751,8 @@ mod auth_tests {
 
     /// An owner-only config directory with `config` as its `config.env` and
     /// `devices` pinned.
-    fn h2_dir(name: &str, config: &str, devices: Vec<DevicePublicRecordV1>) -> PathBuf {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let directory =
-            super::tests::socket_temp_root().join(format!("oshioki-h2-{name}-{}", Uuid::new_v4()));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .unwrap();
+    fn h2_dir(_name: &str, config: &str, devices: Vec<DevicePublicRecordV1>) -> PathBuf {
+        let directory = super::tests::private_socket_test_dir();
         fs::write(directory.join("config.env"), config).unwrap();
         seed_registry(&directory, devices);
         directory
@@ -7745,9 +7768,7 @@ mod auth_tests {
         verdicts: Vec<Vec<u8>>,
     ) -> tokio::task::JoinHandle<()> {
         use oshioki_transport::ServerTransport as _;
-        let scratch =
-            super::tests::socket_temp_root().join(format!("oshioki-h2-peer-{}", Uuid::new_v4()));
-        fs::create_dir_all(&scratch).unwrap();
+        let scratch = super::tests::private_socket_test_dir();
         fs::write(scratch.join("config.env"), format!("NATS_URL={url}\n")).unwrap();
         let peer = NatsTransport::from_config_dir(&scratch).await.unwrap();
         let _ = fs::remove_dir_all(&scratch);
