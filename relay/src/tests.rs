@@ -240,11 +240,22 @@ fn install_test_executable(path: &Path, contents: impl AsRef<[u8]>) {
         path.file_name().unwrap().to_string_lossy(),
         uuid::Uuid::new_v4()
     ));
-    {
-        let mut file = fs::File::create(&staging).unwrap();
-        file.write_all(contents.as_ref()).unwrap();
-        file.sync_all().unwrap();
-    }
+    // A parallel spawn can inherit an open writer even with O_CLOEXEC and keep
+    // the inode busy until that child execs. Write in a separate process so
+    // sibling test children never inherit a writable fixture descriptor.
+    let mut writer = StdCommand::new("/bin/sh")
+        .args(["-c", "umask 077; cat > \"$1\"", "oshioki-test-fixture"])
+        .arg(&staging)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(contents.as_ref())
+        .unwrap();
+    assert!(writer.wait().unwrap().success());
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
     // Publish the complete, closed fixture atomically so Command cannot resolve
     // its final pathname while that pathname is still being prepared.
@@ -883,7 +894,10 @@ async fn ssh_exit_does_not_wait_for_browser_write_half() {
     .expect("SSH failure must not wait for an open browser socket")
     .expect_err("failed SSH must fail the forward");
     drop(client);
-    assert!(result.to_string().contains("SSH callback forward failed"));
+    assert!(
+        result.to_string().contains("SSH callback forward failed"),
+        "{result:#}"
+    );
 }
 
 #[tokio::test]
@@ -947,7 +961,7 @@ async fn process_group_terminates_launcher_descendants_before_reaping() {
     let mut group = ProcessGroup::spawn(command).unwrap();
     timeout(Duration::from_secs(1), async {
         loop {
-            if marker.exists() && pid_file.exists() {
+            if fs::metadata(&marker).is_ok_and(|metadata| metadata.len() > 0) && pid_file.exists() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -4978,18 +4978,13 @@ mod tests {
 
     /// Base directory for test directories that hold a unix socket.
     ///
-    /// macOS caps `sun_path` at 104 bytes, and its per-user `$TMPDIR`
-    /// (`/var/folders/<22 chars>/<28 chars>/T/`) already spends half of that
-    /// before a uniquely named subdirectory and `agent.sock` are appended, so
-    /// `bind` fails with "path must be shorter than `SUN_LEN`". `/tmp` is short,
-    /// always present on both platforms, and the directory names below it
+    /// Unix socket paths have a small platform limit (104 bytes on macOS,
+    /// 108 on Linux). Per-user or session-specific `$TMPDIR` paths can consume
+    /// most of it before the unique directory and socket name are appended.
+    /// `/tmp` is short and present on both platforms; the directories below it
     /// already carry their own uniqueness.
     pub(super) fn socket_temp_root() -> PathBuf {
-        if cfg!(target_os = "macos") {
-            PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        }
+        PathBuf::from("/tmp")
     }
 
     fn socket_test_dir(name: &str) -> PathBuf {
@@ -7195,8 +7190,7 @@ mod auth_tests {
     /// so nothing can rescue the socket result and the classification of the
     /// socket event is what the test observes.
     fn auth_socket_dir(name: &str) -> PathBuf {
-        // `super::tests::socket_temp_root`: macOS `sun_path` is 104 bytes and
-        // the per-user `$TMPDIR` does not leave room for a socket under it.
+        // A per-user or session `$TMPDIR` may exceed the Unix socket path limit.
         let directory = super::tests::socket_temp_root()
             .join(format!("oshioki-auth-{name}-{}", Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&directory);
