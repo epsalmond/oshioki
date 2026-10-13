@@ -591,7 +591,9 @@ async fn preflight_tool_approval(config: &HookConfigV1) -> Result<()> {
     if url.scheme() != "https" {
         bail!("tool approval capability check requires HTTPS");
     }
-    let response = super::http_get(url.as_str())
+    // Unchanged curl policy: the operator's chosen hook directory decides.
+    let curl = super::CurlConfig::for_directory(&super::config_dir());
+    let response = super::http_get(url.as_str(), curl)
         .await
         .context("server does not advertise browser tool approvals")?;
     let capabilities: ToolCapabilities = serde_json::from_slice(&response)

@@ -44,8 +44,8 @@ pub enum HookProgress {
 }
 
 /// Typed failures that leave the password branch eligible in the sudo
-/// plugin. The hook keeps validation and signed-decision failures as ordinary
-/// errors, so an outer context string cannot turn them into fallback.
+/// plugin. The hook keeps its verified denials as ordinary errors, so an
+/// outer context string cannot turn them into fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookTransportFailure {
     Transport(String),
@@ -55,10 +55,11 @@ pub enum HookTransportFailure {
     /// build recognizes: version skew, a truncated frame, or a bug -- never
     /// evidence that the request was answered. Per issue #68 this is a local
     /// fault like a dropped connection, not a denial, so it leaves the
-    /// password branch eligible exactly as the other variants here do.
-    /// Distinct from an explicit `Deny`, or a verdict that decodes but fails
-    /// shape or signature validation: those remain ordinary errors with no
-    /// `HookTransportFailure` marker and keep failing closed.
+    /// password branch eligible exactly as the other variants here do. The
+    /// sudo command and authentication waits no longer produce it: anyone
+    /// with publish rights on a request's reply subjects could send such a
+    /// message, so those waits skip it instead of ending on it. The browser
+    /// tool-approval lane still does.
     Protocol(String),
 }
 
@@ -80,15 +81,29 @@ impl StdError for HookTransportFailure {}
 /// here, not `impl Future` in the method position.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+/// The candidate decisions for one request, in arrival order.
+///
+/// A transport yields only messages that decode as the expected decision
+/// type for the expected request ID. Everything else on the reply subject is
+/// skipped. The hook still verifies each candidate and keeps reading when
+/// verification fails, so the first *valid* decision wins: an unprivileged
+/// publisher cannot end the request by sending something malformed or
+/// forged. The stream ends with one error when the deadline passes
+/// ([`HookTransportFailure::Expired`]) or the subscription closes
+/// ([`HookTransportFailure::Daemon`]), then yields `None`.
+pub type DecisionStream<T> = Pin<Box<dyn Stream<Item = Result<T>> + Send>>;
+
 /// What the hook needs from a transport: one sudo decision round trip and
 /// the enrollment/revocation lanes. Production hooks run exactly one of
 /// these per process, so the trait is object-safe and the hook holds a
 /// `Box<dyn HookTransport>`.
 pub trait HookTransport: Send + Sync {
-    /// Publishes the sealed request for `host` and waits up to `timeout` for
-    /// one decision on `request_id`, failing when the deadline fires. The
-    /// browser flag comes from the hook's trusted pinned registry and permits
-    /// the server's delivery receipt to extend the short native liveness wait.
+    /// Publishes the sealed request for `host`, waits for its liveness
+    /// receipt, and returns the decisions that arrive for `request_id` until
+    /// `timeout` (measured from the call) fires. The browser flag comes from
+    /// the hook's trusted pinned registry and permits the server's delivery
+    /// receipt to extend the short native liveness wait. See
+    /// [`DecisionStream`] for what the stream yields.
     fn request_decision(
         &self,
         host: &str,
@@ -97,14 +112,14 @@ pub trait HookTransport: Send + Sync {
         timeout: std::time::Duration,
         has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-    ) -> BoxFuture<'_, DecisionV1>;
+    ) -> BoxFuture<'_, DecisionStream<DecisionV1>>;
 
     /// Publishes the sealed contextual sudo authentication envelope for
-    /// `host` on the separate authentication lane and waits up to `timeout`
-    /// for one [`AuthDecisionV1`] on `request_id`. The lane is deliberately
-    /// distinct from `request_decision`: an authentication verdict is never
-    /// a command approval and the two must not share a subject namespace for
-    /// the request itself.
+    /// `host` on the separate authentication lane and returns the
+    /// [`AuthDecisionV1`] candidates for `request_id` until `timeout`. The
+    /// lane is deliberately distinct from `request_decision`: an
+    /// authentication verdict is never a command approval and the two must
+    /// not share a subject namespace for the request itself.
     fn request_authentication(
         &self,
         host: &str,
@@ -113,7 +128,7 @@ pub trait HookTransport: Send + Sync {
         timeout: std::time::Duration,
         has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-    ) -> BoxFuture<'_, AuthDecisionV1>;
+    ) -> BoxFuture<'_, DecisionStream<AuthDecisionV1>>;
 
     /// Publishes one browser-only tool approval request on its isolated lane
     /// and waits for the first terminal signed decision until `timeout`.

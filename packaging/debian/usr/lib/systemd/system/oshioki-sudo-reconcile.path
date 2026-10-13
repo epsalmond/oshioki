@@ -1,0 +1,16 @@
+[Unit]
+Description=Watch sudo for changes that would leave the Oshioki passwordless rule unguarded
+
+[Path]
+# sudo.conf losing the plugin line, the sudo alternative switching, the sudo
+# binary being replaced, and sudo-rs arriving. Each change re-runs the
+# installer's proof, which can only remove the rule.
+PathChanged=/etc/sudo.conf
+PathChanged=/etc/alternatives/sudo
+PathChanged=/usr/bin/sudo
+PathChanged=/usr/bin/sudo-rs
+PathChanged=/usr/lib/cargo/bin/sudo
+Unit=oshioki-sudo-reconcile.service
+
+[Install]
+WantedBy=paths.target

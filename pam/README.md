@@ -87,10 +87,17 @@ Installed controls differ by platform:
   is never authentication success; a subsequent password can authenticate.
 
 There is no remote signed Deny action for this operation. Cancellation,
-dismissal, timeout, or no decision are unavailable. Invalid signatures,
-identity/purpose mismatches, replay, malformed data, and truncated frames are
-failures. A clean connection close after acknowledgement produced no decision
-and leaves fallback possible; receiving invalid decision bytes does not.
+dismissal, timeout, or no decision are unavailable. So is an assertion that
+does not verify: invalid signatures, identity/purpose mismatches, another
+request's ID, malformed data, and truncated frames. Anyone who can publish on
+the NATS verdict subject or hold the agent socket path can send one, and a
+hard failure here is a lockout under `default=die`. Over NATS the helper
+ignores such an assertion and keeps waiting for a valid one until its
+deadline; on the socket it ends the attempt as unavailable. Host faults
+(configuration, registry, registry lock contention past a two-second retry)
+are unavailable too. Hard failures are a verified assertion that arrives after
+the request expired or fails final authorization (a revoked or replaced
+device), plus the protocol and path checks above.
 
 ## Process lifetime
 

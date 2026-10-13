@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Stop the root sudo helper from inheriting the invoking user's environment.
+  The sudo plugin started `oshioki check` with the caller's variables and
+  working directory, so an exported `OSHIOKI_CONFIG_DIR` made the helper run
+  curl without `-q`, and a caller-owned `.curlrc` could then turn a denial
+  confirmation into an arbitrary file write as root. The plugin now starts
+  the helper in `/` with only `PATH=/usr/bin:/bin`; the `check` and
+  `authenticate` verbs re-execute themselves with that environment if given
+  anything else, always use `/etc/oshioki`, and always pass `-q` to curl.
+- Stop forged or malformed approval traffic from locking sudo out. Anyone who
+  could publish on a request's NATS reply subjects, or hold the agent socket
+  path, could end any sudo request as denied by sending a decision that did
+  not verify (wrong request ID, unpinned device, bad signature, unconfirmed
+  unsigned denial); that also cancelled the password prompt, and on a Linux
+  contextual PAM stack became a hard failure. The hook now ignores such
+  decisions on NATS and keeps waiting for a valid one, and treats them as
+  unavailable on the socket, so the password path stays open. A verified
+  denial still denies. Unsigned denials are only confirmed with the server
+  for browser devices arriving over NATS.
+- Keep the password fallback when the hook cannot reach a decision for
+  host-local reasons: missing or broken configuration, an unreadable registry,
+  no active device (for example after revoking the last one), registry lock
+  contention between concurrent sudo invocations (now retried for up to two
+  seconds), or a hook binary that cannot be started or executed.
+- Write the passwordless sudoers rule only after root's `sudo -V` proves that
+  sudo loads the approval plugin, which now reports its version there.
+  Previously, on a sudo without approval-plugin support (sudo-rs, the default
+  on Ubuntu 25.10 and later), or after the plugin line was lost from
+  `/etc/sudo.conf`, activation granted passwordless root with no approval.
+  The installer now refuses the plugin lane on sudo-rs and removes an
+  unproven rule. It also refuses the rule while any sudo-rs is installed,
+  because switching the `sudo` alternative leaves setuid sudo-rs binaries
+  that honour it. A rollback does not restore an unproven rule. Sudo keeps
+  its password path, and the installer exits with status 3. The Debian
+  postinst and `oshioki-laptop-setup` report that status as a warning and
+  continue. `--prelaunch-status` reports `plugin loaded: yes/no` and fails on
+  a rule without a loaded plugin or alongside sudo-rs.
+- Add `install-oshioki-hook --reconcile-plugin-rule`, which repeats that proof
+  and only ever removes the rule. The Debian package runs it from a new
+  `oshioki-sudo-reconcile.path` unit whenever `/etc/sudo.conf`, the `sudo`
+  alternative, or a sudo binary changes.
+
 ## [0.4.2] - 2026-10-06
 
 ### Fixed

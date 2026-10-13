@@ -15,28 +15,76 @@ use async_nats::jetstream::{
 };
 use futures::StreamExt as _;
 use oshioki_protocol::{
-    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, AliveV1, DecisionV1, DeliveryV1, EnrollmentIntentV1,
-    EnrollmentSubmissionV1, TOOL_APPROVAL_SUBJECT, ToolAcknowledgementV1, ToolApprovalDecisionV1,
-    ToolDeliveryV1, allow_plaintext_nats, auth_v1::AuthDecisionV1, check_nats_url, nats_url_is_tls,
+    ALLOW_PLAINTEXT_NATS_ENV, ActivationV1, ControlMessageOutcome, ControlMessageV1, DecisionV1,
+    EnrollmentIntentV1, EnrollmentSubmissionV1, TOOL_APPROVAL_SUBJECT, ToolAcknowledgementV1,
+    ToolApprovalDecisionV1, ToolDeliveryV1, allow_plaintext_nats, auth_v1::AuthDecisionV1,
+    check_nats_url, nats_url_is_tls,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
-    Ack, AckFuture, BoxFuture, HookProgress, HookTransport, HookTransportFailure, InboundMessage,
-    InboundStream, JetStreamMessage, RequestStream, ServerTransport,
+    Ack, AckFuture, BoxFuture, DecisionStream, HookProgress, HookTransport, HookTransportFailure,
+    InboundMessage, InboundStream, JetStreamMessage, RequestStream, ServerTransport,
 };
 
 const DAEMON_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// True when `bytes` name a control-message kind this build does not
-/// recognize. Not evidence of anything -- a newer agent or server may add a
-/// kind this build predates -- so the ack/delivery race and the decision
-/// read both keep waiting instead of treating it as the answer. Issue #66.
-fn is_unrecognized_control_kind(bytes: &[u8]) -> bool {
-    matches!(
-        oshioki_protocol::decode_control_message(bytes),
-        Ok(oshioki_protocol::ControlMessageOutcome::UnknownKind(_))
-    )
+/// Which liveness receipt a message is being read as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiptPosition {
+    /// `AliveV1` on `oshioki.ack.<id>`.
+    Alive,
+    /// `DeliveryV1` on `oshioki.delivery.<id>`.
+    Delivery,
+}
+
+/// True only when `bytes` decode as the receipt `position` expects and that
+/// receipt names `request_id`. Anything else -- a kind this build does not
+/// recognize (issue #66), bytes that do not decode, a receipt for another
+/// request, or a different message kind -- is not this request's receipt and
+/// the wait skips it.
+fn receipt_matches(bytes: &[u8], request_id: &str, position: ReceiptPosition) -> bool {
+    match (oshioki_protocol::decode_control_message(bytes), position) {
+        (
+            Ok(ControlMessageOutcome::Message(ControlMessageV1::Alive(alive))),
+            ReceiptPosition::Alive,
+        ) => alive.validate(request_id).is_ok(),
+        (
+            Ok(ControlMessageOutcome::Message(ControlMessageV1::Delivery(delivery))),
+            ReceiptPosition::Delivery,
+        ) => delivery.validate(request_id).is_ok(),
+        _ => false,
+    }
+}
+
+/// The command decision `bytes` carry for `request_id`, or `None` when the
+/// message is anything else. Shape and signature checks stay in the hook.
+fn command_decision_for(bytes: &[u8], request_id: &str) -> Option<DecisionV1> {
+    let Ok(ControlMessageOutcome::Message(ControlMessageV1::Decision(decision))) =
+        oshioki_protocol::decode_control_message(bytes)
+    else {
+        return None;
+    };
+    let named = match &decision {
+        DecisionV1::Approve(approval) => &approval.request_id,
+        DecisionV1::ApproveNative(approval) => &approval.request_id,
+        DecisionV1::Deny(denial) => &denial.request_id,
+    };
+    (named == request_id).then_some(decision)
+}
+
+/// The authentication decision `bytes` carry for `request_id`, or `None`.
+fn auth_decision_for(bytes: &[u8], request_id: &str) -> Option<AuthDecisionV1> {
+    let Ok(ControlMessageOutcome::Message(ControlMessageV1::AuthDecision(decision))) =
+        oshioki_protocol::decode_control_message(bytes)
+    else {
+        return None;
+    };
+    let named = match &decision {
+        AuthDecisionV1::AuthenticateNative(approval) => &approval.request_id,
+        AuthDecisionV1::AuthenticateWebauthn(approval) => &approval.request_id,
+    };
+    (named == request_id).then_some(decision)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -58,11 +106,6 @@ enum FailureKind {
     /// A message arrived and did not decode as the control message this
     /// point in the exchange expects. See [`HookTransportFailure::Protocol`].
     Protocol,
-}
-
-enum InitialReceipt {
-    Alive(Vec<u8>),
-    Delivery(Vec<u8>),
 }
 
 pub const REQUEST_STREAM: &str = "OSHIOKI";
@@ -367,11 +410,20 @@ fn required_env(name: &str) -> Result<String> {
 
 impl NatsTransport {
     /// The shared request/verdict round trip both hook lanes use. The caller
-    /// picks the request subject and decodes the verdict payload; every
-    /// subscription, receipt, and deadline rule below is identical for
+    /// picks the request subject and how a verdict payload is recognized;
+    /// every subscription, receipt, and deadline rule below is identical for
     /// command approval and contextual authentication.
-    #[allow(clippy::too_many_lines)]
-    fn request_verdict_bytes(
+    ///
+    /// Every reply subject here (`oshioki.ack.<id>`, `oshioki.delivery.<id>`,
+    /// `oshioki.verdict.<id>`) is writable by more than the one peer that is
+    /// supposed to answer, and request IDs travel in the clear on the request
+    /// subject. So nothing that arrives on them is allowed to end the wait by
+    /// being malformed: a message that does not decode as the expected kind
+    /// for this request ID is skipped, exactly like a kind this build does not
+    /// recognize (issue #66). Only the deadline or a closed subscription ends
+    /// a wait without a receipt or decision.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn request_verdicts<T: Send + 'static>(
         &self,
         request_subject: String,
         request_id: &str,
@@ -379,7 +431,8 @@ impl NatsTransport {
         timeout: Duration,
         has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-    ) -> BoxFuture<'_, Vec<u8>> {
+        accept: fn(&[u8], &str) -> Option<T>,
+    ) -> BoxFuture<'_, DecisionStream<T>> {
         let request_id = request_id.to_owned();
         let ack_subject = format!("oshioki.ack.{request_id}");
         let decision_subject = format!("oshioki.verdict.{request_id}");
@@ -430,7 +483,7 @@ impl NatsTransport {
                 Ok::<_, anyhow::Error>((subscription, acknowledgements, deliveries))
             })
             .await;
-            let (mut subscription, mut acknowledgements, mut deliveries) = match setup {
+            let (subscription, mut acknowledgements, mut deliveries) = match setup {
                 Ok(Ok(streams)) => streams,
                 Ok(Err(error)) => {
                     let detail = format!("{error:#}");
@@ -483,39 +536,34 @@ impl NatsTransport {
                 progress(HookProgress::DaemonNotResponding(format!("{error:#}")));
                 return Err(error);
             }
-            // A kind this build does not recognize on either subject is not
-            // evidence of anything -- a newer agent or server may add a
-            // message kind this build predates -- so it is skipped: the loop
-            // reads the next message on the same race instead of treating it
-            // as the receipt. The outer `tokio::time::timeout` above still
-            // bounds the whole loop, so an endless stream of unrecognized
-            // kinds still ends at the deadline rather than waiting forever.
-            // Issue #66.
+            // Anything on either subject that is not this request's receipt
+            // -- an unrecognized kind, bytes that do not decode, a receipt for
+            // another request, or a different message kind -- is skipped and
+            // the race reads on. The `tokio::time::timeout` bounds the whole
+            // loop, so a flood of skipped messages still ends at the short
+            // receipt deadline, which is a daemon outage, not a denial.
             let receipt = tokio::time::timeout(receipt_wait, async {
                 loop {
-                    let next = if let Some(deliveries) = deliveries.as_mut() {
+                    let (position, bytes) = if let Some(deliveries) = deliveries.as_mut() {
                         tokio::select! {
                             message = acknowledgements.next() => message
-                                .map(|message| InitialReceipt::Alive(message.payload.to_vec()))
+                                .map(|message| (ReceiptPosition::Alive, message.payload))
                                 .ok_or_else(|| anyhow::anyhow!("daemon acknowledgement stream closed")),
                             message = deliveries.next() => message
-                                .map(|message| InitialReceipt::Delivery(message.payload.to_vec()))
+                                .map(|message| (ReceiptPosition::Delivery, message.payload))
                                 .ok_or_else(|| anyhow::anyhow!("server delivery receipt stream closed")),
                         }
                     } else {
                         acknowledgements
                             .next()
                             .await
-                            .map(|message| InitialReceipt::Alive(message.payload.to_vec()))
+                            .map(|message| (ReceiptPosition::Alive, message.payload))
                             .ok_or_else(|| anyhow::anyhow!("daemon acknowledgement stream closed"))
                     }?;
-                    let bytes = match &next {
-                        InitialReceipt::Alive(bytes) | InitialReceipt::Delivery(bytes) => bytes,
-                    };
-                    if is_unrecognized_control_kind(bytes) {
-                        continue;
+                    if receipt_matches(&bytes, &request_id, position) {
+                        return Ok::<_, anyhow::Error>(position);
                     }
-                    return Ok::<_, anyhow::Error>(next);
+                    debug!(request_id = %request_id, "skipping a message that is not this request's receipt");
                 }
             })
             .await;
@@ -544,49 +592,8 @@ impl NatsTransport {
                 }
             };
             match receipt {
-                InitialReceipt::Alive(bytes) => {
-                    let acknowledgement: AliveV1 = match serde_json::from_slice(&bytes)
-                        .context("decode daemon acknowledgement; upgrade oshioki-agent before using this hook")
-                    {
-                        Ok(acknowledgement) => acknowledgement,
-                        Err(error) => {
-                            let detail = format!("{error:#}");
-                            progress(HookProgress::ProtocolFailed(detail));
-                            // A decode fault against the host's own local
-                            // agent is a local software fault (version skew,
-                            // a bug), not evidence of a denial. Issue #68.
-                            return Err(failure(FailureKind::Protocol, &error));
-                        }
-                    };
-                    if let Err(error) = acknowledgement
-                        .validate(&request_id)
-                        .context("invalid daemon acknowledgement; upgrade oshioki-agent before using this hook")
-                    {
-                        let detail = format!("{error:#}");
-                        progress(HookProgress::ProtocolFailed(detail));
-                        return Err(error);
-                    }
-                    progress(HookProgress::WaitingForApproval);
-                }
-                InitialReceipt::Delivery(bytes) => {
-                    let delivery: DeliveryV1 = match serde_json::from_slice(&bytes)
-                        .context("decode server delivery receipt; upgrade oshioki-server before using this hook")
-                    {
-                        Ok(delivery) => delivery,
-                        Err(error) => {
-                            let detail = format!("{error:#}");
-                            progress(HookProgress::ProtocolFailed(detail));
-                            return Err(failure(FailureKind::Protocol, &error));
-                        }
-                    };
-                    if let Err(error) = delivery
-                        .validate(&request_id)
-                        .context("invalid server delivery receipt; upgrade oshioki-server before using this hook")
-                    {
-                        let detail = format!("{error:#}");
-                        progress(HookProgress::ProtocolFailed(detail));
-                        return Err(error);
-                    }
+                ReceiptPosition::Alive => progress(HookProgress::WaitingForApproval),
+                ReceiptPosition::Delivery => {
                     progress(HookProgress::RequestDelivered);
                     stage = "waiting for browser or daemon acknowledgement";
                     let remaining = timeout
@@ -597,81 +604,92 @@ impl NatsTransport {
                             anyhow::anyhow!("sudo decision deadline exceeded while {stage}");
                         return Err(failure(FailureKind::Expired, &detail));
                     }
-                    let bytes = match tokio::time::timeout(remaining, acknowledgements.next()).await
-                    {
-                        Ok(Some(message)) => message.payload,
-                        Ok(None) => {
-                            let detail = anyhow::anyhow!("daemon acknowledgement stream closed");
-                            return Err(failure(FailureKind::Expired, &detail));
+                    let acknowledged = tokio::time::timeout(remaining, async {
+                        loop {
+                            let message = acknowledgements.next().await.ok_or_else(|| {
+                                anyhow::anyhow!("daemon acknowledgement stream closed")
+                            })?;
+                            if receipt_matches(&message.payload, &request_id, ReceiptPosition::Alive)
+                            {
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                            debug!(request_id = %request_id, "skipping a message that is not this request's acknowledgement");
                         }
+                    })
+                    .await;
+                    match acknowledged {
+                        Ok(Ok(())) => progress(HookProgress::WaitingForApproval),
+                        Ok(Err(detail)) => return Err(failure(FailureKind::Expired, &detail)),
                         Err(_) => {
                             let detail =
                                 anyhow::anyhow!("sudo decision deadline exceeded while {stage}");
                             return Err(failure(FailureKind::Expired, &detail));
                         }
-                    };
-                    let acknowledgement: AliveV1 = match serde_json::from_slice(&bytes)
-                        .context("decode browser acknowledgement; upgrade oshioki-server before using browser approvals")
-                    {
-                        Ok(acknowledgement) => acknowledgement,
-                        Err(error) => {
-                            let detail = format!("{error:#}");
-                            progress(HookProgress::ProtocolFailed(detail));
-                            return Err(failure(FailureKind::Protocol, &error));
-                        }
-                    };
-                    if let Err(error) = acknowledgement
-                        .validate(&request_id)
-                        .context("invalid browser acknowledgement; upgrade oshioki-server before using browser approvals")
-                    {
-                        let detail = format!("{error:#}");
-                        progress(HookProgress::ProtocolFailed(detail));
-                        return Err(error);
                     }
-                    progress(HookProgress::WaitingForApproval);
                 }
             }
-            let remaining = timeout
-                .checked_sub(started.elapsed())
-                .unwrap_or(Duration::ZERO);
-            if remaining.is_zero() {
+            let deadline = started + timeout;
+            if deadline <= tokio::time::Instant::now() {
                 let detail = anyhow::anyhow!(
                     "sudo decision deadline exceeded after {}ms while waiting for decision",
                     timeout.as_millis()
                 );
                 return Err(failure(FailureKind::Expired, &detail));
             }
-            // Skip an unrecognized kind on the decision subject the same way
-            // as the ack/delivery race above: it is not evidence the request
-            // was answered, so the loop keeps waiting for the next message,
-            // bounded by the same outer timeout. Issue #66.
-            let result = tokio::time::timeout(remaining, async {
-                loop {
-                    let message = subscription.next().await.ok_or_else(|| {
-                        let error = anyhow::anyhow!("decision stream closed");
-                        failure(FailureKind::Daemon, &error)
-                    })?;
-                    let bytes = message.payload.to_vec();
-                    if is_unrecognized_control_kind(&bytes) {
-                        continue;
-                    }
-                    return Ok::<_, anyhow::Error>(bytes);
-                }
-            })
-            .await;
-            match result {
-                Ok(Ok(verdict)) => Ok(verdict),
-                Ok(Err(error)) => Err(error),
-                Err(_) => {
-                    let detail = anyhow::anyhow!(
-                        "sudo decision deadline exceeded after {}ms while waiting for decision",
-                        timeout.as_millis()
-                    );
-                    let error = failure(FailureKind::Expired, &detail);
-                    Err(error)
-                }
-            }
+            let wait = VerdictWait {
+                subscription,
+                request_id,
+                accept,
+                deadline,
+                timeout,
+                finished: false,
+            };
+            Ok(Box::pin(futures::stream::unfold(wait, next_verdict)) as DecisionStream<T>)
         })
+    }
+}
+
+/// The decision subscription for one request, read lazily by the hook.
+struct VerdictWait<T> {
+    subscription: async_nats::Subscriber,
+    request_id: String,
+    accept: fn(&[u8], &str) -> Option<T>,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+    finished: bool,
+}
+
+/// Reads the next message on the decision subject that `accept` recognizes
+/// for this request, skipping everything else until the deadline. Ends the
+/// stream after one terminal error.
+async fn next_verdict<T>(mut wait: VerdictWait<T>) -> Option<(Result<T>, VerdictWait<T>)> {
+    if wait.finished {
+        return None;
+    }
+    loop {
+        let message = match tokio::time::timeout_at(wait.deadline, wait.subscription.next()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                wait.finished = true;
+                let error = failure(
+                    FailureKind::Daemon,
+                    &anyhow::anyhow!("decision stream closed"),
+                );
+                return Some((Err(error), wait));
+            }
+            Err(_) => {
+                wait.finished = true;
+                let detail = anyhow::anyhow!(
+                    "sudo decision deadline exceeded after {}ms while waiting for decision",
+                    wait.timeout.as_millis()
+                );
+                return Some((Err(failure(FailureKind::Expired, &detail)), wait));
+            }
+        };
+        if let Some(decision) = (wait.accept)(&message.payload, &wait.request_id) {
+            return Some((Ok(decision), wait));
+        }
+        debug!(request_id = %wait.request_id, "skipping a message that is not a decision for this request");
     }
 }
 
@@ -684,28 +702,16 @@ impl HookTransport for NatsTransport {
         timeout: Duration,
         has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-    ) -> BoxFuture<'_, DecisionV1> {
-        let verdict = self.request_verdict_bytes(
+    ) -> BoxFuture<'_, DecisionStream<DecisionV1>> {
+        self.request_verdicts(
             format!("oshioki.request.{host}"),
             request_id,
             payload,
             timeout,
             has_browser_recipient,
             progress,
-        );
-        Box::pin(async move {
-            let bytes = verdict.await?;
-            serde_json::from_slice(&bytes).map_err(|error| {
-                // A decode fault here is version skew or a bug, not evidence
-                // of a denial: issue #68. An explicit `Deny` and a verdict
-                // that decodes but fails shape or signature validation are
-                // unaffected -- those happen after this call returns.
-                failure(
-                    FailureKind::Protocol,
-                    &anyhow::Error::new(error).context("decode decision"),
-                )
-            })
-        })
+            command_decision_for,
+        )
     }
 
     fn request_authentication(
@@ -716,28 +722,16 @@ impl HookTransport for NatsTransport {
         timeout: Duration,
         has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-    ) -> BoxFuture<'_, AuthDecisionV1> {
-        let verdict = self.request_verdict_bytes(
+    ) -> BoxFuture<'_, DecisionStream<AuthDecisionV1>> {
+        self.request_verdicts(
             format!("oshioki.auth.{host}"),
             request_id,
             payload,
             timeout,
             has_browser_recipient,
             progress,
-        );
-        Box::pin(async move {
-            let bytes = verdict.await?;
-            serde_json::from_slice(&bytes).map_err(|error| {
-                // See `request_decision`: a decode fault is a local software
-                // fault, not a denial. The auth lane has no explicit `Deny`
-                // at all (see `AuthDecisionV1`), so a decode failure is the
-                // only way this call can end without an approval.
-                failure(
-                    FailureKind::Protocol,
-                    &anyhow::Error::new(error).context("decode authentication decision"),
-                )
-            })
-        })
+            auth_decision_for,
+        )
     }
 
     fn request_tool_approval(
@@ -984,44 +978,99 @@ impl ServerTransport for NatsTransport {
 mod tests {
     use super::*;
 
-    /// `is_unrecognized_control_kind` is the exact check the ack/delivery
-    /// race and the decision read use to decide "skip and keep waiting" vs.
-    /// "this is the answer". No live NATS connection is needed to exercise
-    /// it: `request_verdict_bytes` itself is not unit-testable without a
-    /// broker, but this is the whole of the kind-sniffing logic it adds.
-    #[test]
-    fn a_future_kind_on_either_subject_is_skipped() {
-        let future_kind = br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#;
-        assert!(is_unrecognized_control_kind(future_kind));
-    }
-
-    #[test]
-    fn a_recognized_alive_message_is_not_skipped() {
-        let alive = oshioki_protocol::AliveV1::for_request("req-1");
-        let bytes = serde_json::to_vec(&alive).unwrap();
-        assert!(!is_unrecognized_control_kind(&bytes));
-    }
-
-    #[test]
-    fn a_recognized_decision_message_is_not_skipped() {
-        let decision = DecisionV1::Deny(oshioki_protocol::DenyV1 {
+    fn deny(request_id: &str) -> DecisionV1 {
+        DecisionV1::Deny(oshioki_protocol::DenyV1 {
             version: oshioki_protocol::VERSION_V1,
-            request_id: "req-1".into(),
+            request_id: request_id.into(),
             device_fingerprint: "fp".into(),
             signature: None,
-        });
-        let bytes = serde_json::to_vec(&decision).unwrap();
-        assert!(!is_unrecognized_control_kind(&bytes));
+        })
     }
 
-    /// A genuine decode fault (garbage, not merely an unfamiliar kind) is
-    /// not treated as "skip and keep waiting": it stays a fault the caller
-    /// maps to `HookTransportFailure::Protocol` downstream. Confirms the two
-    /// are not conflated by this check.
+    fn auth_decision(request_id: &str) -> AuthDecisionV1 {
+        AuthDecisionV1::AuthenticateNative(oshioki_protocol::auth_v1::AuthApproveNativeV1 {
+            version: oshioki_protocol::auth_v1::AUTH_WIRE_VERSION,
+            request_id: request_id.into(),
+            device_fingerprint: "fp".into(),
+            signature: "c2ln".into(),
+        })
+    }
+
+    /// The receipt race returns only this request's receipt of the kind its
+    /// subject carries. A future kind (issue #66), garbage, a receipt for
+    /// another request, and a valid message of another kind are all skipped:
+    /// any publisher on the subject could send them.
     #[test]
-    fn garbage_bytes_are_not_treated_as_an_unrecognized_kind() {
-        assert!(!is_unrecognized_control_kind(b"not json"));
-        assert!(!is_unrecognized_control_kind(b""));
+    fn only_this_requests_receipt_ends_the_receipt_wait() {
+        let alive = serde_json::to_vec(&oshioki_protocol::AliveV1::for_request("req-1")).unwrap();
+        let delivery =
+            serde_json::to_vec(&oshioki_protocol::DeliveryV1::for_request("req-1")).unwrap();
+        assert!(receipt_matches(&alive, "req-1", ReceiptPosition::Alive));
+        assert!(receipt_matches(
+            &delivery,
+            "req-1",
+            ReceiptPosition::Delivery
+        ));
+        let other_alive =
+            serde_json::to_vec(&oshioki_protocol::AliveV1::for_request("req-2")).unwrap();
+        let other_delivery =
+            serde_json::to_vec(&oshioki_protocol::DeliveryV1::for_request("req-2")).unwrap();
+        let future_kind = br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#.to_vec();
+        let decision = serde_json::to_vec(&deny("req-1")).unwrap();
+        for position in [ReceiptPosition::Alive, ReceiptPosition::Delivery] {
+            for skipped in [
+                &other_alive,
+                &other_delivery,
+                &future_kind,
+                &decision,
+                &b"not json".to_vec(),
+                &Vec::new(),
+            ] {
+                assert!(!receipt_matches(skipped, "req-1", position), "{position:?}");
+            }
+        }
+        assert!(!receipt_matches(&delivery, "req-1", ReceiptPosition::Alive));
+        assert!(!receipt_matches(&alive, "req-1", ReceiptPosition::Delivery));
+    }
+
+    /// The decision wait yields only a decoded command decision naming this
+    /// request. Everything else on the verdict subject is skipped rather than
+    /// returned for the hook to fail on.
+    #[test]
+    fn only_this_requests_command_decision_is_a_candidate() {
+        let ours = serde_json::to_vec(&deny("req-1")).unwrap();
+        assert_eq!(command_decision_for(&ours, "req-1"), Some(deny("req-1")));
+        for skipped in [
+            serde_json::to_vec(&deny("req-2")).unwrap(),
+            serde_json::to_vec(&auth_decision("req-1")).unwrap(),
+            serde_json::to_vec(&oshioki_protocol::AliveV1::for_request("req-1")).unwrap(),
+            br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#.to_vec(),
+            br#"{"action":"deny","request_id":"req-1"}"#.to_vec(),
+            br#"{"action":"explode","request_id":"req-1"}"#.to_vec(),
+            b"not json".to_vec(),
+        ] {
+            assert_eq!(command_decision_for(&skipped, "req-1"), None);
+        }
+    }
+
+    /// The same filter on the authentication lane: a command decision is not
+    /// an authentication candidate, and neither is another request's answer.
+    #[test]
+    fn only_this_requests_authentication_decision_is_a_candidate() {
+        let ours = serde_json::to_vec(&auth_decision("req-1")).unwrap();
+        assert_eq!(
+            auth_decision_for(&ours, "req-1"),
+            Some(auth_decision("req-1"))
+        );
+        for skipped in [
+            serde_json::to_vec(&auth_decision("req-2")).unwrap(),
+            serde_json::to_vec(&deny("req-1")).unwrap(),
+            br#"{"type":"future_kind","version":1,"request_id":"req-1"}"#.to_vec(),
+            br#"{"type":"sudo_authentication_native","request_id":"req-1"}"#.to_vec(),
+            b"not json".to_vec(),
+        ] {
+            assert_eq!(auth_decision_for(&skipped, "req-1"), None);
+        }
     }
 
     #[test]

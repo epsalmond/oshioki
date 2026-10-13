@@ -72,7 +72,24 @@ case "$1" in
       # opt-in read at the end of this script relies on. On a host already
       # on the contextual PAM lane it refreshes those artifacts without
       # re-enabling the approval plugin or the blanket sudoers rule.
-      installer_hook --prelaunch --config-file "$INSTALL_ENV"
+      #
+      # Exit 3 means the installer refused the passwordless sudoers rule
+      # because this host's sudo does not load the approval plugin (sudo-rs,
+      # or a classic sudo whose `sudo -V` does not list it), removed any
+      # existing rule, and left sudo on its password path. That is a safe,
+      # complete state, so it is a warning rather than a failed configure,
+      # and the contextual PAM step below still runs.
+      prelaunch_status=0
+      installer_hook --prelaunch --config-file "$INSTALL_ENV" || prelaunch_status=$?
+      case "$prelaunch_status" in
+        0) ;;
+        3)
+          echo "oshioki: this host's sudo does not run the approval plugin, or sudo-rs is installed; passwordless sudo was not enabled and sudo keeps its password path." >&2
+          echo "oshioki: remove sudo-rs and use classic sudo 1.9, then re-run: $INSTALLER --prelaunch --config-file $INSTALL_ENV" >&2
+          echo "oshioki: the contextual PAM lane ($INSTALLER --contextual-pam) may work with sudo-rs but has not been validated." >&2
+          ;;
+        *) exit "$prelaunch_status" ;;
+      esac
     else
       echo "oshioki: hook not enabled (no $INSTALL_ENV)." >&2
       echo "oshioki: pre-seed that file (0600, root-owned) before installing," >&2
@@ -84,8 +101,17 @@ case "$1" in
     # can remove the symlinks after dpkg has deleted the unit file.
     deb-systemd-helper unmask oshioki-server.service >/dev/null || true
     deb-systemd-helper --system enable oshioki-server.service >/dev/null
+    # The drift watcher for the passwordless rule. It only ever removes the
+    # rule (install-oshioki-hook --reconcile-plugin-rule), so it is enabled
+    # unconditionally, and a failure to enable or start it is reported
+    # without failing the configure: the installer re-proves on every run.
+    deb-systemd-helper unmask oshioki-sudo-reconcile.path >/dev/null || true
+    deb-systemd-helper --system enable oshioki-sudo-reconcile.path >/dev/null ||
+      echo "oshioki: warning: could not enable oshioki-sudo-reconcile.path" >&2
     if [ -d /run/systemd/system ]; then
       systemctl daemon-reload
+      systemctl restart oshioki-sudo-reconcile.path ||
+        echo "oshioki: warning: could not start oshioki-sudo-reconcile.path; inspect systemctl status oshioki-sudo-reconcile.path" >&2
       if [ -n "${2:-}" ]; then
         systemctl try-restart oshioki-server.service || {
           echo "oshioki: upgraded but failed to restart oshioki-server; inspect systemctl status oshioki-server.service" >&2

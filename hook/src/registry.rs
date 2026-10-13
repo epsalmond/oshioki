@@ -7,6 +7,7 @@ use std::{
     fs, io,
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::Path,
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,12 +97,40 @@ pub(super) struct Transaction<'a> {
     directory: &'a Path,
     _lock: Flock<fs::File>,
 }
+/// How long a sudo decision waits for another process's registry
+/// transaction before calling the registry unavailable. Writers hold the lock
+/// only for a load and an atomic rename, never across network I/O, so this
+/// is contention between concurrent sudo invocations, not a stuck writer.
+pub(super) const DECISION_LOCK_BUDGET: Duration = Duration::from_secs(2);
+const DECISION_LOCK_RETRY: Duration = Duration::from_millis(25);
+
 impl<'a> Transaction<'a> {
     pub fn acquire(directory: &'a Path) -> Result<Self> {
         Ok(Self {
             directory,
             _lock: lock(directory, ".devices.lock")?,
         })
+    }
+    /// [`Self::acquire`] for the sudo decision paths, retrying only [`Busy`]
+    /// until [`DECISION_LOCK_BUDGET`] runs out, so two concurrent invocations
+    /// do not turn lock contention into a failure. The wait is an async sleep:
+    /// the PAM liveness watch and the decision deadline keep running while it
+    /// waits. Every other error returns at once, and the caller still loads
+    /// and checks the state it finds under the lock, so waiting never skips a
+    /// revocation that committed first.
+    pub async fn acquire_for_decision(directory: &'a Path) -> Result<Self> {
+        let give_up = tokio::time::Instant::now() + DECISION_LOCK_BUDGET;
+        loop {
+            match Self::acquire(directory) {
+                Err(error)
+                    if error.downcast_ref::<Busy>().is_some()
+                        && tokio::time::Instant::now() < give_up =>
+                {
+                    tokio::time::sleep(DECISION_LOCK_RETRY).await;
+                }
+                result => return result,
+            }
+        }
     }
     pub fn load(&self) -> Result<LocalRegistry> {
         let file = match fs::OpenOptions::new()
@@ -141,6 +170,12 @@ pub(super) fn persist(transaction: &Transaction<'_>, state: &LocalRegistry) -> R
 
 pub(super) fn snapshot(directory: &Path) -> Result<LocalRegistry> {
     Transaction::acquire(directory)?.load()
+}
+
+/// The recipient snapshot a sudo decision starts from, waiting briefly for a
+/// concurrent registry transaction instead of failing on it.
+pub(super) async fn decision_snapshot(directory: &Path) -> Result<LocalRegistry> {
+    Transaction::acquire_for_decision(directory).await?.load()
 }
 
 fn same_credential(a: &DevicePublicRecordV1, b: &DevicePublicRecordV1) -> bool {
@@ -197,7 +232,7 @@ pub(super) enum GateError {
     Denied(&'static str),
 }
 
-pub(super) fn authorize(
+pub(super) async fn authorize(
     directory: &Path,
     device: &DevicePublicRecordV1,
     epoch: u64,
@@ -205,8 +240,11 @@ pub(super) fn authorize(
     observed: Option<u32>,
     warning_only: bool,
 ) -> std::result::Result<(), GateError> {
-    authorize_with(
-        directory,
+    let transaction = Transaction::acquire_for_decision(directory)
+        .await
+        .map_err(GateError::Host)?;
+    authorize_in(
+        &transaction,
         device,
         epoch,
         expires_at,
@@ -217,6 +255,8 @@ pub(super) fn authorize(
     )
 }
 
+/// The gate with an injected clock and writer, acquiring without waiting.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn authorize_with(
     directory: &Path,
@@ -229,6 +269,30 @@ pub(super) fn authorize_with(
     write: impl FnOnce(&Transaction<'_>, &LocalRegistry) -> Result<()>,
 ) -> std::result::Result<(), GateError> {
     let transaction = Transaction::acquire(directory).map_err(GateError::Host)?;
+    authorize_in(
+        &transaction,
+        device,
+        epoch,
+        expires_at,
+        observed,
+        warning_only,
+        clock,
+        write,
+    )
+}
+
+/// The final-authorization checks, under a registry lock the caller holds.
+#[allow(clippy::too_many_arguments)]
+fn authorize_in(
+    transaction: &Transaction<'_>,
+    device: &DevicePublicRecordV1,
+    epoch: u64,
+    expires_at: i64,
+    observed: Option<u32>,
+    warning_only: bool,
+    clock: impl FnOnce() -> i64,
+    write: impl FnOnce(&Transaction<'_>, &LocalRegistry) -> Result<()>,
+) -> std::result::Result<(), GateError> {
     let mut state = transaction.load().map_err(GateError::Host)?;
     if epoch != state.revocation_epoch {
         return Err(GateError::Denied(
@@ -254,7 +318,7 @@ pub(super) fn authorize_with(
         }
         if observed > stored.sign_count {
             stored.sign_count = observed;
-            if let Err(error) = write(&transaction, &state) {
+            if let Err(error) = write(transaction, &state) {
                 if !warning_only {
                     return Err(GateError::Host(error));
                 }

@@ -1,0 +1,10 @@
+[Unit]
+Description=Remove the Oshioki passwordless sudo rule if sudo no longer runs the approval plugin
+ConditionPathExists=/usr/share/oshioki/install-oshioki-hook
+
+[Service]
+Type=oneshot
+# Fail-safe: this mode re-checks that sudo loads the approval plugin and that
+# no sudo-rs is installed, and removes /etc/sudoers.d/oshioki when either
+# fails. It never writes the rule and never edits sudo.conf.
+ExecStart=/usr/share/oshioki/install-oshioki-hook --reconcile-plugin-rule

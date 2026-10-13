@@ -39,6 +39,10 @@ investigating.
   only.
 - The server stores routing data and opaque ciphertext; it must never be able
   to produce an approval the hook accepts.
+- The sudo lanes (`oshioki check`, `oshioki authenticate`) never consult the
+  caller's environment or working directory for configuration, transport, or
+  helper execution: they restart in `/` with only a fixed `PATH`, read only
+  `/etc/oshioki`, and run curl with `-q`.
 - Release agent builds must offer no prompt bypass: `run --auto` exists only
   under the `unattended` cargo feature.
 - `unsafe` is confined to the macOS `enclave` crate and the existing sudo

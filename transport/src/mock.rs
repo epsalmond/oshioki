@@ -15,8 +15,8 @@ use oshioki_protocol::{
 };
 
 use crate::{
-    Ack, AckFuture, BoxFuture, HookProgress, HookTransport, InboundMessage, InboundStream,
-    JetStreamMessage, RequestStream, ServerTransport,
+    Ack, AckFuture, BoxFuture, DecisionStream, HookProgress, HookTransport, InboundMessage,
+    InboundStream, JetStreamMessage, RequestStream, ServerTransport,
 };
 
 /// The subject the hook's enrollment intent goes out on, mirrored from the
@@ -63,7 +63,8 @@ impl MockTransport {
         Self::default()
     }
 
-    /// Queues one verdict for the next `request_decision` call.
+    /// Queues one verdict for the next `request_decision` call. Every
+    /// verdict queued before that call becomes one of its candidates.
     pub fn push_verdict(&self, decision: DecisionV1) {
         self.lock().hook_verdicts.push_back(Ok(decision));
     }
@@ -109,6 +110,22 @@ impl MockTransport {
     }
 }
 
+/// Every verdict queued so far, in order, as one request's candidate stream.
+/// Like the real transport the stream ends with one error: the first queued
+/// error, or a timeout once the queue runs out.
+fn queued_candidates<T>(queue: &mut VecDeque<Result<T>>) -> Vec<Result<T>> {
+    let mut outcomes = Vec::new();
+    while let Some(outcome) = queue.pop_front() {
+        let failed = outcome.is_err();
+        outcomes.push(outcome);
+        if failed {
+            return outcomes;
+        }
+    }
+    outcomes.push(Err(anyhow!("mock transport timed out: no queued verdict")));
+    outcomes
+}
+
 impl HookTransport for MockTransport {
     fn request_decision(
         &self,
@@ -118,15 +135,11 @@ impl HookTransport for MockTransport {
         _timeout: std::time::Duration,
         _has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-    ) -> BoxFuture<'_, DecisionV1> {
-        let outcome = self
-            .lock()
-            .hook_verdicts
-            .pop_front()
-            .unwrap_or_else(|| Err(anyhow!("mock transport timed out: no queued verdict")));
+    ) -> BoxFuture<'_, DecisionStream<DecisionV1>> {
+        let outcomes = queued_candidates(&mut self.lock().hook_verdicts);
         Box::pin(async move {
             progress(HookProgress::WaitingForApproval);
-            outcome
+            Ok(Box::pin(futures::stream::iter(outcomes)) as DecisionStream<DecisionV1>)
         })
     }
 
@@ -138,22 +151,19 @@ impl HookTransport for MockTransport {
         _timeout: std::time::Duration,
         _has_browser_recipient: bool,
         progress: std::sync::Arc<dyn Fn(HookProgress) + Send + Sync>,
-    ) -> BoxFuture<'_, AuthDecisionV1> {
-        let outcome = {
+    ) -> BoxFuture<'_, DecisionStream<AuthDecisionV1>> {
+        let outcomes = {
             let mut state = self.lock();
             // Recorded on the real subject so a test can assert the hook
             // published on the authentication lane, not the command lane.
             state
                 .published
                 .push((format!("oshioki.auth.{host}"), payload));
-            state
-                .hook_auth_verdicts
-                .pop_front()
-                .unwrap_or_else(|| Err(anyhow!("mock transport timed out: no queued verdict")))
+            queued_candidates(&mut state.hook_auth_verdicts)
         };
         Box::pin(async move {
             progress(HookProgress::WaitingForApproval);
-            outcome
+            Ok(Box::pin(futures::stream::iter(outcomes)) as DecisionStream<AuthDecisionV1>)
         })
     }
 
@@ -294,6 +304,7 @@ impl ServerTransport for MockTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
     use oshioki_protocol::VERSION_V1;
 
     /// The accessors capture what the operations record: revocation
@@ -343,7 +354,7 @@ mod tests {
             signature: "c2ln".into(),
         };
         transport.push_auth_verdict(AuthDecisionV1::AuthenticateNative(approval.clone()));
-        let decision = transport
+        let mut decisions = transport
             .request_authentication(
                 "host-1",
                 &approval.request_id,
@@ -354,7 +365,10 @@ mod tests {
             )
             .await
             .unwrap();
+        let decision = decisions.next().await.unwrap().unwrap();
         assert_eq!(decision, AuthDecisionV1::AuthenticateNative(approval));
+        assert!(decisions.next().await.unwrap().is_err());
+        assert!(decisions.next().await.is_none());
         assert_eq!(
             transport.published(),
             [("oshioki.auth.host-1".to_string(), b"sealed".to_vec())]
@@ -372,19 +386,18 @@ mod tests {
             device_fingerprint: "fp-1".into(),
             signature: None,
         }));
-        assert!(
-            transport
-                .request_authentication(
-                    "host-1",
-                    "req-1",
-                    Vec::new(),
-                    std::time::Duration::from_secs(1),
-                    false,
-                    std::sync::Arc::new(|_| {}),
-                )
-                .await
-                .is_err()
-        );
+        let mut decisions = transport
+            .request_authentication(
+                "host-1",
+                "req-1",
+                Vec::new(),
+                std::time::Duration::from_secs(1),
+                false,
+                std::sync::Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        assert!(decisions.next().await.unwrap().is_err());
     }
 
     /// The enrollment round trip records the intent on the real subject and

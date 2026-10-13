@@ -18,6 +18,12 @@ Provide:
   `OSHIOKI_RP_ID=sudo.example.com`.
 - Service supervision, backups, health monitoring, and a previous release for restore.
 
+Each sudo host on the approval plugin lane needs Todd Miller's sudo 1.9 or
+newer with approval-plugin support. sudo-rs, the default on Ubuntu 25.10
+and later, cannot load the plugin. The installer refuses that lane there, and
+refuses the passwordless rule while the `sudo-rs` package is installed at all.
+See [supported sudo](install.md#supported-sudo).
+
 The Debian package includes `oshioki-server.service`, running as user
 `oshioki` with `/etc/oshioki/server.env`. Start it after provisioning its
 environment and broker. A fresh package install enables the unit but does not

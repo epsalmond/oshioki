@@ -266,8 +266,8 @@ if ! command -v sudo >/dev/null 2>&1 || ! command -v file >/dev/null 2>&1; then
   apt-get install -y -qq sudo file >/dev/null
 fi
 
-install -d -m 0750 -o root -g root /etc/oshioki
-cp "$SHARE_DIR/devices.json" /etc/oshioki/devices.json
+install -d -m 0700 -o root -g root /etc/oshioki
+install -m 0600 -o root -g root "$SHARE_DIR/devices.json" /etc/oshioki/devices.json
 echo "[inner] devices.json planted"
 
 # The installer enables the hook only when a device is already active, so
@@ -275,6 +275,15 @@ echo "[inner] devices.json planted"
 # the hook never publishes the request over NATS.
 "$SERVICE_DIR/scripts/install-oshioki-hook" --standalone-e2e
 echo "[inner] install-oshioki-hook OK"
+
+# The installer's proof that sudo loads the plugin, against real sudo: root's
+# `sudo -V` must print the plugin's show_version banner.
+sudo_version="$(sudo -V)"
+printf '%s\n' "$sudo_version"
+if ! grep -Fq 'Oshioki approval plugin version ' <<<"$sudo_version"; then
+  echo "[inner] FAIL: root's sudo -V does not list the Oshioki approval plugin" >&2
+  exit 1
+fi
 
 cleanup_e2e_sudoers() {
   rm -f /etc/sudoers.d/oshioki-e2e

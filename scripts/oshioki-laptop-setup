@@ -549,6 +549,27 @@ run_installer() {
   fi
 }
 
+# `install-oshioki-hook --prelaunch` exits 3 when it refused the plugin
+# lane's passwordless rule (sudo-rs on the host, or a sudo that does not load
+# the plugin) and left sudo on its password path. That is a finished, safe
+# state rather than a failed install: warn and carry on, so that a
+# --contextual-pam run still reaches its migration. Any other failure stays
+# fatal.
+PLUGIN_REFUSED=0
+run_prelaunch() {
+  local status=0
+  run_installer --prelaunch "$@" || status=$?
+  case "$status" in
+    0) return 0 ;;
+    3)
+      PLUGIN_REFUSED=1
+      info "warning: the installer refused passwordless sudo on this host (reason above); sudo keeps its password path"
+      return 0
+      ;;
+    *) return "$status" ;;
+  esac
+}
+
 # True when a unix socket at $1 accepts a connection. The socket file
 # outlives its listener across agent restarts, so presence proves nothing.
 socket_live() {
@@ -746,13 +767,13 @@ privileged_phase_local() {
     chmod 0600 "$INSTALL_ENV"
     PHASE_REUSED=0
   fi
-  SUDO="" run_installer --prelaunch --dry-run >&2
+  SUDO="" run_prelaunch --dry-run >&2
   if [ "$YES" -eq 0 ]; then
     printf 'Apply the plan above? [y/N]: ' >&2
     IFS= read -r answer || true
     [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "aborted; re-run when ready"
   fi
-  SUDO="" run_installer --prelaunch >&2
+  SUDO="" run_prelaunch >&2
   [ -x "$INSTALLED_HOOK" ] || die "installed hook not found: $INSTALLED_HOOK (set INSTALLED_HOOK)"
   # The outer run exported the record and answers the confirmation itself,
   # so pinning never types the fingerprint.
@@ -761,9 +782,16 @@ privileged_phase_local() {
   info "device paired locally"
   if ! SUDO="" run_installer --prelaunch-status >&2; then
     info "enabling the sudo plugin now that a device is active"
-    SUDO="" run_installer --prelaunch >&2
+    SUDO="" run_prelaunch >&2
   fi
-  SUDO="" run_installer --prelaunch-status >&2 || die "plugin is not enabled after install"
+  # A refused passwordless rule is reported by status as not enabled; the
+  # refusal already explained why, and sudo kept its password path.
+  if [ "$PLUGIN_REFUSED" -eq 1 ]; then
+    SUDO="" run_installer --prelaunch-status >&2 ||
+      info "warning: sudo approval is not active through the plugin on this host"
+  else
+    SUDO="" run_installer --prelaunch-status >&2 || die "plugin is not enabled after install"
+  fi
   printf '%s\n' 'OSHIOKI_SETUP_VALUES_BEGIN'
   printf 'OSHIOKI_ORIGIN=%s\n' "$PHASE_ORIGIN"
   printf 'OSHIOKI_RP_ID=%s\n' "${PHASE_RP_ID:-localhost}"
@@ -970,13 +998,13 @@ if [ "$LOCAL" -eq 1 ]; then
   check_config
 else
 info "step 2/$TOTAL_STEPS: prelaunch install"
-run_installer --prelaunch --dry-run
+run_prelaunch --dry-run
 if [ "$YES" -eq 0 ]; then
   printf 'Apply the plan above? [y/N]: ' >&2
   IFS= read -r answer || true
   [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "aborted; re-run when ready"
 fi
-run_installer --prelaunch
+run_prelaunch
 fi
 
 if [ "$LOCAL" -eq 0 ]; then
@@ -1056,7 +1084,7 @@ fi
 if [ "$LOCAL" -eq 0 ]; then
 if ! run_installer --prelaunch-status >/dev/null 2>&1; then
   info "enabling the sudo plugin now that a device is active"
-  run_installer --prelaunch
+  run_prelaunch
 fi
 fi
 
@@ -1280,6 +1308,9 @@ if [ "$LOCAL" -eq 0 ]; then
   if [ "$CONTEXTUAL_PAM" -eq 1 ]; then
     run_installer --prelaunch-status ||
       info "the contextual PAM migration below is what repairs this"
+  elif [ "$PLUGIN_REFUSED" -eq 1 ]; then
+    run_installer --prelaunch-status ||
+      info "warning: sudo approval is not active through the plugin on this host"
   else
     run_installer --prelaunch-status
   fi

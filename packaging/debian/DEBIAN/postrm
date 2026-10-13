@@ -104,10 +104,13 @@ case "$1" in
     # mask (a symlink to /dev/null, no unit resolution) can neutralize
     # the dangling wants/ symlink. Reinstall unmasks and re-enables.
     deb-systemd-helper mask oshioki-server.service >/dev/null || true
+    deb-systemd-helper mask oshioki-sudo-reconcile.path >/dev/null || true
     ;;
   purge)
     deb-systemd-helper purge oshioki-server.service >/dev/null || true
     deb-systemd-helper unmask oshioki-server.service >/dev/null || true
+    deb-systemd-helper purge oshioki-sudo-reconcile.path >/dev/null || true
+    deb-systemd-helper unmask oshioki-sudo-reconcile.path >/dev/null || true
     # prerm normally removes this first, but purge is the last opportunity
     # after a partial or interrupted removal. This verifier is self-contained
     # because the packaged installer may already have been deleted.
