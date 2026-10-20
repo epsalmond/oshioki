@@ -160,6 +160,9 @@ valid_sudoers_user() {
   esac
   return 0
 }
+contextual_pam_noninteractive_note() {
+  echo "install-oshioki-hook: note: sudo -n stops before PAM by default. On classic sudo 1.9.10+, configure the account that runs agents with the scoped setting 'Defaults:<agent-user> noninteractive_auth' in a dotless /etc/sudoers.d file, then run 'sudo visudo -c'. Password fallback remains unavailable under -n." >&2
+}
 # `ALL` would imply SETENV; explicitly deny it so the approved environment is
 # exactly the one the plugin authenticated in its RequestV1.
 sudoers_line() { printf '%s ALL=(ALL) NOSETENV: NOPASSWD: ALL\n' "$1"; }
@@ -1940,6 +1943,7 @@ if [ "$MODE" = contextual-pam ]; then
     pam_previous=""
     pam_trace "pam:refresh:committed"
     echo "install-oshioki-hook: contextual PAM module refreshed at $module_dest"
+    contextual_pam_noninteractive_note
     exit 0
   fi
 
@@ -2124,6 +2128,7 @@ if [ "$MODE" = contextual-pam ]; then
     echo "install-oshioki-hook: ${pam_services_inherited% } inherits the edit via @include sudo"
   [ -z "$pam_services_absent" ] ||
     echo "install-oshioki-hook: ${pam_services_absent% } does not exist on this host and was skipped"
+  contextual_pam_noninteractive_note
   exit 0
 fi
 

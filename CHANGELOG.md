@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Document that contextual PAM needs sudo 1.9.10's scoped
+  `noninteractive_auth` setting before `sudo -n` can reach Oshioki, and print
+  the setting after successful contextual PAM installation or refresh.
+
 ## [0.4.3] - 2026-10-12
 
 ### Security
