@@ -5,6 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TEST_ROOT="$(mktemp -d -t oshioki-hook-install-test.XXXXXX)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 fail() { echo "test-install-oshioki-hook: $*" >&2; exit 1; }
+assert_contextual_pam_noninteractive_note() {
+  local log="$1"
+  grep -Fq 'sudo -n stops before PAM by default' "$log" ||
+    fail "contextual PAM output omitted the sudo -n explanation"
+  grep -Fq 'Defaults:<agent-user> noninteractive_auth' "$log" ||
+    fail "contextual PAM output omitted the scoped noninteractive_auth setting"
+  grep -Fq "sudo visudo -c" "$log" ||
+    fail "contextual PAM output omitted the visudo validation step"
+}
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -1152,9 +1161,13 @@ IDEMPOTENT="$TEST_ROOT/pam-idempotent"
 setup_legacy_host "$IDEMPOTENT" ubuntu-24.04
 run_installer --sudo-user testuser "$IDEMPOTENT" --contextual-pam >"$IDEMPOTENT/first.log" 2>&1 ||
   fail "idempotency setup failed"
+assert_contextual_pam_noninteractive_note "$IDEMPOTENT/first.log"
 cp "$IDEMPOTENT/pam.d/sudo" "$IDEMPOTENT/after-first"
 run_installer --sudo-user testuser "$IDEMPOTENT" --contextual-pam >"$IDEMPOTENT/second.log" 2>&1 ||
   fail "a re-run of --contextual-pam failed"
+if grep -Fq 'sudo -n stops before PAM by default' "$IDEMPOTENT/second.log"; then
+  fail "already-current contextual PAM install repeated the sudo -n note"
+fi
 cmp -s "$IDEMPOTENT/after-first" "$IDEMPOTENT/pam.d/sudo" || fail "a re-run changed /etc/pam.d/sudo"
 [ "$(grep -c '^# BEGIN oshioki pam$' "$IDEMPOTENT/pam.d/sudo")" -eq 1 ] || fail "a re-run duplicated the block"
 
@@ -1645,6 +1658,7 @@ OSHIOKI_CHECKSUMS="$REFRESH/v2/SHA256SUMS" PAM_MODULE_BIN="$REFRESH/v2/$PAM_MODU
   run_installer --sudo-user testuser "$REFRESH" --contextual-pam >"$REFRESH/refresh.log" 2>&1 ||
   { sed -n '1,40p' "$REFRESH/refresh.log" >&2; fail "the module refresh failed"; }
 grep -Fq 'contextual PAM module refreshed' "$REFRESH/refresh.log" || fail "the refresh did not report itself"
+assert_contextual_pam_noninteractive_note "$REFRESH/refresh.log"
 cmp -s "$REFRESH/v2/$PAM_MODULE_ARTIFACT" "$refresh_module" || fail "the refresh did not replace the module"
 for service in sudo sudo-i; do
   cmp -s "$REFRESH/migrated/$service" "$REFRESH/pam.d/$service" || fail "the refresh changed $service"

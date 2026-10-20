@@ -73,3 +73,43 @@ See the [PAM contract](../pam/README.md) for those distinctions and support limi
 
 Restore ordinary sudo with the relevant
 [disable command](../RUNBOOK.md#restore-ordinary-sudo).
+
+### Non-interactive sudo
+
+Sudo normally refuses `sudo -n` before starting PAM when a cold authentication
+is required. In that default configuration Oshioki cannot receive an approval
+request. Classic sudo 1.9.10 and newer provide `noninteractive_auth` for
+authentication methods such as Oshioki that do not read from the PAM
+conversation. Confirm the implementation and version first with `sudo -V`.
+
+Enable it for the account that runs agents with a scoped sudoers entry,
+replacing `alice` with that account:
+
+```sudoers
+Defaults:alice noninteractive_auth
+```
+
+Create or edit `/etc/sudoers.d/oshioki-noninteractive-auth` with
+`sudo visudo -f /etc/sudoers.d/oshioki-noninteractive-auth`. `visudo` validates
+the setting before installing the root-owned file. Keep its mode at `0440` and
+use a name with no dots that does not end in `~`; sudo ignores other names in
+that directory. Run `sudo visudo -c` and confirm its output lists the new file.
+If it does not, the main sudoers policy does not include `/etc/sudoers.d`.
+
+From a login shell for the same account named in `Defaults:`, run a cold
+acceptance check:
+
+```sh
+sudo -k
+sudo -n true
+```
+
+The cold check must produce an Oshioki approval and exit successfully after it
+is approved. The setting does not grant sudo access or bypass authentication.
+If Oshioki is unavailable or authentication does not complete, `sudo -n` fails
+because its password fallback cannot prompt. Warm sudo timestamps retain their
+normal behavior and can skip PAM entirely.
+
+This setting also lets any non-TTY process running as that account send an
+Oshioki request for a cold `sudo -n` command. Check the command and context in
+each request, and do not approve unexpected or repeated requests.

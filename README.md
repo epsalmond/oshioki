@@ -52,6 +52,13 @@ See [installation](docs/install.md) for source builds and host activation.
 | Build, change, or test Oshioki | [Contributing](CONTRIBUTING.md) |
 | Diagnose an approval or recover sudo | [Runbook](RUNBOOK.md) |
 
+Contextual PAM follows sudo's own non-interactive policy. If you choose that
+lane, `sudo -n` exits before PAM by default when authentication is required.
+Classic sudo 1.9.10 and newer can opt the agent account into Oshioki-backed
+non-interactive authentication with `Defaults:<agent-user> noninteractive_auth`.
+See [non-interactive sudo](docs/local-sudo.md#non-interactive-sudo) for the
+scoped configuration, validation, and failure behavior.
+
 An opt-in setup helper can route the exact `gcloud auth login` command through
 the browser relay; other gcloud commands and login forms with flags pass
 through unchanged. Vercel login is not supported yet. See the
