@@ -106,6 +106,7 @@ struct VapidClaims {
 
 #[derive(Debug, Deserialize)]
 struct PushSubscriptionRequest {
+    installation_token: Option<String>,
     version: u8,
     endpoint: String,
     expiration_time: Option<i64>,
@@ -827,7 +828,7 @@ async fn push_worker(state: AppState) {
             }
             Ok(PushDeliveryResult::Gone) => state.store.disable_push_for_claim(
                 item.id,
-                &item.subscription_id,
+                &item.endpoint_id,
                 &item.claim_token,
                 current,
                 "endpoint_gone",
@@ -1139,6 +1140,7 @@ async fn push_config(State(state): State<AppState>) -> Json<serde_json::Value> {
         "version": 1,
         "enabled": true,
         "vapid_public_key": state.vapid.public_key,
+        "multi_enrollment": true,
     }))
 }
 
@@ -1188,19 +1190,21 @@ async fn register_push_subscription(
     });
     let id = state
         .store
-        .register_push_subscription(
+        .register_push_membership(
             token.as_bytes(),
             &input.endpoint,
             &p256dh,
             &auth,
             expiration_time,
+            input.installation_token.as_deref(),
             now(),
         )
         .map_err(|error| {
             let message = error.to_string();
             if message.contains("active WebAuthn") {
                 ApiError(StatusCode::UNAUTHORIZED)
-            } else if message.contains("another active") {
+            } else if message.contains("another active") || message.contains("capability conflict")
+            {
                 ApiError(StatusCode::CONFLICT)
             } else {
                 ApiError(StatusCode::BAD_REQUEST)
@@ -2001,7 +2005,7 @@ mod tests {
         p256dh.extend_from_slice(point.y().unwrap());
         db::PushItem {
             id: 1,
-            subscription_id: "ps_test".into(),
+            endpoint_id: "pe_test".into(),
             endpoint: "https://push.example.test/send".into(),
             p256dh,
             auth: vec![9; db::PUSH_AUTH_BYTES],
@@ -2131,6 +2135,166 @@ mod tests {
         assert!(worker.contains("\"tool\""));
     }
 
+    fn multi_push_api_state(name: &str) -> (PathBuf, AppState, [HeaderMap; 2], String) {
+        let (dir, state) = health_state(name, 0, 0);
+        let tokens = [
+            "first-browser-token-012345678901234567890",
+            "second-browser-token-012345678901234567890",
+        ];
+        let mut devices = [test_device(), test_device()];
+        let second_credential = vec![2; 16];
+        devices[1].credential_id = oshioki_protocol::encode_base64url(&second_credential);
+        devices[1].fingerprint = oshioki_protocol::device_fingerprint(
+            &second_credential,
+            &oshioki_protocol::decode_base64url(&devices[1].credential_public_key).unwrap(),
+            &oshioki_protocol::decode_base64url(&devices[1].box_public_key).unwrap(),
+        );
+        for (device, token) in devices.iter_mut().zip(tokens) {
+            device.api_token_hash =
+                oshioki_protocol::encode_base64url(&sha2::Sha256::digest(token.as_bytes()));
+            state.store.put_device(device).unwrap();
+        }
+        let headers = tokens.map(|token| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            h
+        });
+        (dir, state, headers, devices[0].fingerprint.clone())
+    }
+
+    fn multi_push_input(
+        material: &db::PushItem,
+        installation_token: Option<&str>,
+    ) -> PushSubscriptionRequest {
+        serde_json::from_value::<PushSubscriptionRequest>(json!({
+            "version":1,"endpoint":material.endpoint,"expiration_time":null,
+            "installation_token":installation_token,
+            "keys":{"p256dh":oshioki_protocol::encode_base64url(&material.p256dh),"auth":oshioki_protocol::encode_base64url(&material.auth)}
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn push_api_advertises_and_enforces_multi_enrollment_capability() {
+        let (dir, state, headers, first_fingerprint) = multi_push_api_state("push-api-multi");
+        let capability = oshioki_protocol::encode_base64url(&[42; 32]);
+        let material = test_push_item();
+        let input = |capability: Option<&str>| multi_push_input(&material, capability);
+        let Json(config) = push_config(State(state.clone())).await;
+        assert_eq!(config["multi_enrollment"], true);
+        let Json(first) = register_push_subscription(
+            State(state.clone()),
+            headers[0].clone(),
+            Json(input(Some(&capability))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            register_push_subscription(State(state.clone()), headers[1].clone(), Json(input(None)))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            register_push_subscription(
+                State(state.clone()),
+                headers[0].clone(),
+                Json(input(Some(&oshioki_protocol::encode_base64url(&[43; 32]))))
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        let Json(second) = register_push_subscription(
+            State(state.clone()),
+            headers[1].clone(),
+            Json(input(Some(&capability))),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first.subscription_id, second.subscription_id);
+        let Json(retry) = register_push_subscription(
+            State(state.clone()),
+            headers[1].clone(),
+            Json(input(Some(&capability))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.subscription_id, second.subscription_id);
+        assert_eq!(
+            delete_push_subscription(
+                State(state.clone()),
+                Path(first.subscription_id.clone()),
+                headers[1].clone()
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            delete_push_subscription(
+                State(state.clone()),
+                Path(first.subscription_id),
+                headers[0].clone()
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            push_status(State(state.clone()), headers[1].clone())
+                .await
+                .unwrap()
+                .0
+                .count,
+            1
+        );
+        state
+            .store
+            .set_device_active(&first_fingerprint, false)
+            .unwrap();
+        assert_eq!(
+            register_push_subscription(
+                State(state.clone()),
+                headers[0].clone(),
+                Json(input(Some(&capability)))
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn push_api_rejects_noncanonical_installation_tokens() {
+        let (dir, state, headers, _) = multi_push_api_state("push-api-malformed");
+        let material = test_push_item();
+        let input = |token: Option<&str>| multi_push_input(&material, token);
+        for malformed in ["bad".to_string(), format!("{}B", "A".repeat(42))] {
+            assert_eq!(
+                register_push_subscription(
+                    State(state.clone()),
+                    headers[0].clone(),
+                    Json(input(Some(&malformed)))
+                )
+                .await
+                .unwrap_err()
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn push_handlers_reject_unknown_bearers_and_unbounded_keys() {
         let (dir, state) = health_state("push-api-rejections", 0, 0);
@@ -2149,6 +2313,7 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         let oversized_key = PushSubscriptionRequest {
+            installation_token: None,
             version: 1,
             endpoint: "https://push.example.test/send".into(),
             expiration_time: None,

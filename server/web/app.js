@@ -85,19 +85,62 @@ async function setSetting(key, value) {
   });
   db.close();
 }
-async function deleteSetting(key) {
+// The binding's capability is created atomically before its first POST. Two
+// tabs must never persist different candidates for the same browser endpoint.
+const PUSH_BINDING_KEY = "pushBinding";
+async function changePushBinding(change) {
   const db = await openDb();
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction("settings", "readwrite"); tx.objectStore("settings").delete(key);
-    tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || new Error("settings transaction aborted"));
-  });
-  db.close();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction("settings", "readwrite");
+      const store = tx.objectStore("settings");
+      const request = store.get(PUSH_BINDING_KEY);
+      let result;
+      request.onsuccess = () => {
+        try {
+          result = change(request.result?.value, store);
+          if (result !== undefined) store.put({ key: PUSH_BINDING_KEY, value: result });
+        } catch (error) { tx.abort(); reject(error); }
+      };
+      tx.oncomplete = () => resolve(result);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("notification settings transaction aborted"));
+    });
+  } finally { db.close(); }
 }
-async function pushSettings() {
-  return {
-    pushOwnerFingerprint: await getSetting("pushOwnerFingerprint"),
-    pushSubscriptionId: await getSetting("pushSubscriptionId"),
+async function createPushBinding(endpoint, bootstrapFingerprint) {
+  const candidate = {
+    version: 1, endpoint,
+    installation_token: bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32))),
+    bootstrap_fingerprint: bootstrapFingerprint, state: "pending", registrations: {},
   };
+  return changePushBinding(current => current?.endpoint === endpoint ? current : candidate);
+}
+function samePushBinding(current, expected) {
+  return current?.endpoint === expected.endpoint && current?.installation_token === expected.installation_token;
+}
+async function savePushRegistration(binding, fingerprint, subscriptionId) {
+  let saved = false;
+  await changePushBinding((current, store) => {
+    if (!samePushBinding(current, binding)) return undefined;
+    saved = true;
+    const registrations = { ...current.registrations };
+    if (subscriptionId === null) delete registrations[fingerprint];
+    else registrations[fingerprint] = subscriptionId;
+    if (subscriptionId && fingerprint === current.bootstrap_fingerprint) {
+      store.delete("pushOwnerFingerprint");
+      store.delete("pushSubscriptionId");
+    }
+    return { ...current, registrations,
+      state: subscriptionId && fingerprint === current.bootstrap_fingerprint ? "bound" : current.state };
+  });
+  return saved;
+}
+function withPushLifecycle(action) {
+  if (!navigator.locks?.request) {
+    throw new Error("Notification setup needs a browser with Web Locks support. Existing notifications were preserved.");
+  }
+  return navigator.locks.request("oshioki-push-lifecycle-v1", { mode: "exclusive" }, action);
 }
 
 const PUSH_VERSION = 1;
@@ -164,109 +207,155 @@ async function pushSubscriptionRequest(subscription) {
 async function pushConfig() {
   const response = await fetch("/api/v1/push/config", { cache: "no-store" });
   if (!response.ok) throw new Error(`push configuration failed ${response.status}`);
-  const config = await response.json();
+  const config = await response.json().catch(() => { throw new Error("invalid push configuration"); });
   if (config.version !== PUSH_VERSION || typeof config.enabled !== "boolean") throw new Error("invalid push configuration");
   return config;
 }
-async function pushStatusForDevice(device) {
-  const response = await fetch("/api/v1/push/status", { cache: "no-store", headers: { authorization: `Bearer ${device.apiToken}` } });
-  if (!response.ok) throw new Error(`push status failed ${response.status}`);
-  const status = await response.json();
-  if (status.version !== PUSH_VERSION || typeof status.registered !== "boolean" || !Number.isInteger(status.count)) throw new Error("invalid push status");
-  return status;
+function pushRecoveryError() {
+  const error = new Error("Notification ownership is unavailable. Use Replace notification subscription to create a fresh endpoint for all saved enrollments.");
+  error.pushRecovery = true;
+  return error;
 }
-async function postPushSubscription(device, subscription) {
+async function postPushSubscription(device, subscription, installationToken) {
   const response = await fetch("/api/v1/push/subscriptions", {
     method: "POST", cache: "no-store",
     headers: { authorization: `Bearer ${device.apiToken}`, "content-type": "application/json" },
-    body: JSON.stringify(await pushSubscriptionRequest(subscription)),
+    body: JSON.stringify({ ...await pushSubscriptionRequest(subscription), installation_token: installationToken }),
   });
-  if (!response.ok) throw new Error(`push registration failed ${response.status}`);
-  const result = await response.json();
+  if (response.status === 409) throw pushRecoveryError();
+  if (!response.ok) {
+    const error = new Error(response.status === 401
+      ? "A saved enrollment is unavailable or revoked. Other enrollments keep their notifications."
+      : `Notification registration failed (${response.status}). Retry Enable notifications.`);
+    error.status = response.status;
+    throw error;
+  }
+  const result = await response.json().catch(() => { throw new Error("invalid push registration response"); });
   if (result.version !== PUSH_VERSION || typeof result.subscription_id !== "string" || !result.subscription_id) throw new Error("invalid push registration response");
   return result.subscription_id;
 }
-async function deletePushSubscription(device, subscriptionId) {
-  const response = await fetch(`/api/v1/push/subscriptions/${encodeURIComponent(subscriptionId)}`, {
-    method: "DELETE", cache: "no-store", headers: { authorization: `Bearer ${device.apiToken}` },
-  });
-  if (response.status === 401) return "unauthorized";
-  if (response.status === 404) return "missing";
-  if (!response.ok) throw new Error(`push removal failed ${response.status}`);
-  return "deleted";
+async function multiEnrollmentPushConfig() {
+  const config = await pushConfig();
+  if (config.multi_enrollment !== true) {
+    throw new Error("The server needs an update for notifications across saved enrollments. Existing notification settings were preserved.");
+  }
+  if (!config.enabled || typeof config.vapid_public_key !== "string") throw new Error("Server notifications are not configured.");
+  return config;
 }
-async function clearPushOwner() {
-  await deleteSetting("pushOwnerFingerprint");
-  await deleteSetting("pushSubscriptionId");
+function eligiblePushDevices(devices) {
+  return devices.filter(device => typeof device.fingerprint === "string" && device.fingerprint && typeof device.apiToken === "string" && device.apiToken);
 }
-async function setPushOwner(fingerprint, subscriptionId) {
-  await setSetting("pushOwnerFingerprint", fingerprint);
-  await setSetting("pushSubscriptionId", subscriptionId);
+async function activePushBootstrap(devices) {
+  for (const device of devices) {
+    // Check bearer validity without attempting to claim an endpoint. Only a
+    // confirmed revoked/unavailable credential permits trying the next one.
+    const response = await fetch("/api/v1/push/status", {
+      cache: "no-store", headers: { authorization: `Bearer ${device.apiToken}` },
+    });
+    if (response.status === 401) continue;
+    if (!response.ok) throw new Error(`Notification enrollment check failed (${response.status}). Retry Enable notifications.`);
+    const status = await response.json().catch(() => { throw new Error("invalid push status response"); });
+    if (status.version !== PUSH_VERSION || typeof status.enabled !== "boolean" || typeof status.registered !== "boolean"
+      || !Number.isSafeInteger(status.count) || status.count < 0) throw new Error("invalid push status response");
+    return device;
+  }
+  throw new Error("No active saved enrollment is available. Save an enrollment before enabling notifications.");
+}
+async function reconcilePushSubscription(subscription, devices, { freshBootstrap = null } = {}) {
+  let binding = await getSetting(PUSH_BINDING_KEY);
+  if (binding?.endpoint !== subscription.endpoint) {
+    // Read legacy ownership before changing any settings. Claim with that
+    // credential first, even when the page is showing a different enrollment.
+    const legacyOwner = await getSetting("pushOwnerFingerprint");
+    const legacyId = await getSetting("pushSubscriptionId");
+    const bootstrap = freshBootstrap || (legacyOwner
+      ? devices.find(device => device.fingerprint === legacyOwner)
+      : (binding ? await activePushBootstrap(devices) : null));
+    if (!bootstrap || (!freshBootstrap && legacyOwner && !legacyId)) throw pushRecoveryError();
+    binding = await createPushBinding(subscription.endpoint, bootstrap.fingerprint);
+  }
+  const failures = [];
+  const register = async device => {
+    try {
+      const id = await postPushSubscription(device, subscription, binding.installation_token);
+      if (!await savePushRegistration(binding, device.fingerprint, id)) throw new Error("Notification subscription changed; retry notification setup.");
+    } catch (error) {
+      if (error.status === 401) await savePushRegistration(binding, device.fingerprint, null);
+      throw error;
+    }
+  };
+  let bootstrapped = false;
+  if (binding.state === "pending") {
+    const bootstrap = devices.find(device => device.fingerprint === binding.bootstrap_fingerprint);
+    if (!bootstrap) throw pushRecoveryError();
+    // A persisted candidate alone proves nothing. Do not try another bearer
+    // until the bootstrap POST has succeeded and bound state is committed.
+    try { await register(bootstrap); }
+    catch (error) { if (error.status === 401) throw pushRecoveryError(); throw error; }
+    const current = await getSetting(PUSH_BINDING_KEY);
+    if (!samePushBinding(current, binding)) throw new Error("Notification subscription changed; retry notification setup.");
+    binding = current;
+    bootstrapped = true;
+  }
+  for (const device of devices) {
+    if (bootstrapped && device.fingerprint === binding.bootstrap_fingerprint) continue;
+    try { await register(device); } catch (error) { failures.push(error); }
+  }
+  const current = await getSetting(PUSH_BINDING_KEY);
+  if (!samePushBinding(current, binding)) throw new Error("Notification subscription changed; retry notification setup.");
+  return { registered: Object.keys(current.registrations).length, total: devices.length, failures };
 }
 async function syncOwnedPushSubscription() {
   const support = pushSupport();
   if (!support.supported || Notification.permission !== "granted") return null;
-  const registration = await registerPushWorker();
-  const subscription = await registration.pushManager.getSubscription();
-  const settings = await pushSettings();
-  if (!settings.pushOwnerFingerprint) {
-    if (subscription) throw new Error("this browser has an unowned notification subscription; revoke the old device before re-enrolling");
-    return null;
-  }
-  const device = await deviceByFingerprint(settings.pushOwnerFingerprint);
-  if (!device) throw new Error("notification ownership is unavailable; revoke the old device before re-enrolling");
-  if (!subscription) return null;
-  const subscriptionId = await postPushSubscription(device, subscription);
-  await setPushOwner(device.fingerprint, subscriptionId);
-  return { device, status: await pushStatusForDevice(device) };
+  return withPushLifecycle(async () => {
+    await multiEnrollmentPushConfig();
+    const registration = await registerPushWorker();
+    const subscription = await registration.pushManager.getSubscription();
+    if (!subscription) return null;
+    return reconcilePushSubscription(subscription, eligiblePushDevices(await allDevices()));
+  });
 }
 
-async function enablePushForDevice(device) {
+async function enablePushForDevice(_device, { replace = false } = {}) {
   const support = pushSupport();
   if (!support.supported) throw new Error("This browser cannot enable Web Push; enrollment remains available without notifications");
-  // Keep this as the first asynchronous operation in the click handler. iOS
-  // requires the permission prompt to be caused by a direct user gesture.
-  const permission = await Notification.requestPermission();
+  // Permission is requested directly in the click handler, before locking,
+  // storage or network I/O. Reconciliation of saved enrollments never prompts.
+  const permission = Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
   if (permission !== "granted") throw new Error(permission === "denied"
-    ? "Notifications are blocked. Allow them in browser settings, then use Re-enable notifications."
+    ? "Notifications are blocked. Allow them in browser settings, then use Enable notifications."
     : "Notification permission was not granted");
-  const config = await pushConfig();
-  if (!config.enabled || typeof config.vapid_public_key !== "string") throw new Error("server notifications are not configured");
-  const settings = await pushSettings();
-  const registration = await registerPushWorker();
-  let subscription = await registration.pushManager.getSubscription();
-  let retiredEndpoint;
-  if (settings.pushOwnerFingerprint && settings.pushOwnerFingerprint !== device.fingerprint) {
-    const oldDevice = await deviceByFingerprint(settings.pushOwnerFingerprint);
-    if (!oldDevice || !settings.pushSubscriptionId) {
-      throw new Error("notification ownership is unavailable; revoke the old device before re-enrolling");
+  return withPushLifecycle(async () => {
+    const config = await multiEnrollmentPushConfig();
+    const devices = eligiblePushDevices(await allDevices());
+    if (!devices.length) throw new Error("Save an enrollment before enabling notifications.");
+    const registration = await registerPushWorker();
+    let subscription = await registration.pushManager.getSubscription();
+    // Validate a bootstrap before creating an endpoint or retiring the old
+    // one. A failed preflight must leave ordinary retry and notifications usable.
+    const freshBootstrap = replace || !subscription ? await activePushBootstrap(devices) : null;
+    let retiredEndpoint;
+    if (replace && subscription) {
+      retiredEndpoint = subscription.endpoint;
+      if (!await subscription.unsubscribe()) throw new Error("Could not remove the old browser subscription.");
+      subscription = null;
     }
-    // Do not reuse the old endpoint; the new bearer needs a fresh subscription.
-    retiredEndpoint = subscription?.endpoint;
-    await deletePushSubscription(oldDevice, settings.pushSubscriptionId);
-    if (subscription && !(await subscription.unsubscribe())) throw new Error("could not remove the old browser subscription");
-    subscription = null;
-    await clearPushOwner();
-  } else if (!settings.pushOwnerFingerprint && subscription) {
-    // A subscription with no recorded owner could belong to another device
-    // from a lost browser profile. Never attempt an endpoint takeover.
-    throw new Error("this browser has an unowned notification subscription; revoke the old device before re-enrolling");
-  }
-  if (!subscription) {
-    subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlToBytes(config.vapid_public_key) });
-  }
-  if (retiredEndpoint && subscription.endpoint === retiredEndpoint) {
-    await subscription.unsubscribe();
-    throw new Error("browser did not create a fresh notification subscription for the new owner");
-  }
-  const subscriptionId = await postPushSubscription(device, subscription);
-  await setPushOwner(device.fingerprint, subscriptionId);
-  return { device, status: await pushStatusForDevice(device) };
+    if (!subscription) {
+      subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlToBytes(config.vapid_public_key) });
+    }
+    if (retiredEndpoint && subscription.endpoint === retiredEndpoint) {
+      await subscription.unsubscribe();
+      throw pushRecoveryError();
+    }
+    return reconcilePushSubscription(subscription, devices, { freshBootstrap });
+  });
 }
 
 function pushStatusText(status) {
-  if (!status) return "Server registration has not been checked.";
-  return status.registered ? `Server registration active (${status.count} subscription${status.count === 1 ? "" : "s"}).` : "Browser permission is ready, but this device is not registered on the server.";
+  if (!status) return "Notification registration has not been checked.";
+  const active = `Notifications registered for ${status.registered} of ${status.total} saved enrollments.`;
+  return status.failures.length ? `${active} Some enrollments need attention. ${status.failures[0].message}` : active;
 }
 function setPushText(id, value) {
   const element = typeof document !== "undefined" ? document.getElementById(id) : null;
@@ -281,30 +370,40 @@ async function updatePushUi(device) {
   }
   setPushText("push-support", Notification.permission === "granted" ? "Browser notification permission is granted." : "Notifications are separate from passkey enrollment and require a button tap.");
   const button = document.getElementById("enable-notifications"); if (button) button.hidden = false;
-  try {
-    const settings = await pushSettings();
-    if (settings.pushOwnerFingerprint && settings.pushOwnerFingerprint !== device.fingerprint) {
-      setPushText("push-server", "Another enrolled device owns browser notifications. Enable notifications here to transfer ownership safely.");
-    } else {
-      const result = await syncOwnedPushSubscription();
-      if (result) setPushText("push-server", pushStatusText(result.status));
-      else if (Notification.permission === "granted") setPushText("push-server", "Browser permission is granted; tap Enable notifications to register this device.");
+  const showError = error => {
+    setPushText("push-server", error.message || "Notification registration needs attention.");
+    if (button && error.pushRecovery) {
+      button.textContent = "Replace notification subscription";
+      button.dataset.pushReplace = "true";
     }
-  } catch (error) {
-    console.error(error); setPushText("push-server", error.message || "Notification registration needs attention.");
-  }
+  };
+  const showResult = result => {
+    setPushText("push-server", pushStatusText(result));
+    const recovery = result?.failures.find(error => error.pushRecovery);
+    if (recovery && button) {
+      button.textContent = "Replace notification subscription";
+      button.dataset.pushReplace = "true";
+    } else if (button) {
+      button.textContent = "Enable notifications";
+      delete button.dataset.pushReplace;
+    }
+  };
+  try {
+    const result = await syncOwnedPushSubscription();
+    if (result) showResult(result);
+    else if (Notification.permission === "granted") setPushText("push-server", "Tap Enable notifications to register all saved enrollments.");
+  } catch (error) { showError(error); }
   if (button && !button.dataset.pushBound) {
     button.dataset.pushBound = "true";
     button.addEventListener("click", async () => {
       button.disabled = true;
       try {
-        const result = await enablePushForDevice(device);
+        const result = await enablePushForDevice(device, { replace: button.dataset.pushReplace === "true" });
         setPushText("push-support", "Browser notification permission is granted.");
-        setPushText("push-server", pushStatusText(result.status));
-        setPushText("push-help", "Notifications can be re-enabled here after browser settings change.");
-      } catch (error) {
-        console.error(error); setPushText("push-server", error.message || "Notification registration failed.");
-      } finally { button.disabled = false; }
+        showResult(result);
+        setPushText("push-help", "Notifications cover saved enrollments in this browser app. Each enrollment keeps its own approval key.");
+      } catch (error) { showError(error); }
+      finally { button.disabled = false; }
     });
   }
 }
@@ -707,7 +806,7 @@ if (typeof globalThis !== "undefined") {
   globalThis.OshiokiApprovalReview = { formatEnvironment, quoteReviewString, formatInvocation };
   globalThis.OshiokiPush = {
     parseEnrollmentUrl, pushSupport, pushSubscriptionRequest, pushStatusText,
-    deviceByFingerprint, getSetting, setSetting, syncOwnedPushSubscription, enablePushForDevice,
+    deviceByFingerprint, getSetting, setSetting, createPushBinding, savePushRegistration, syncOwnedPushSubscription, enablePushForDevice,
   };
 }
 if (typeof document !== "undefined" && document.body) {

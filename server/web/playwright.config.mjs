@@ -28,6 +28,6 @@ export default defineConfig({
     launchOptions: {
       args: launchArgs,
     },
-    trace: "retain-on-failure",
+    trace: { mode: "retain-on-failure", screenshots: false },
   },
 });

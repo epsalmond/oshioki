@@ -96,11 +96,12 @@ async function waitForMatch(processHandle, pattern, timeoutMs = 15_000) {
   throw new Error(`timed out waiting for hook output ${pattern}: ${processHandle.output()}`);
 }
 
-async function virtualProfile(browser, consoleErrors) {
+async function virtualProfile(browser, consoleErrors, { consoleLocations = false } = {}) {
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
   const page = await context.newPage();
   page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(message.text());
+    if (message.type() === "error") consoleErrors.push(consoleLocations
+      ? { text: message.text(), url: message.location().url } : message.text());
   });
   page.on("pageerror", (error) => consoleErrors.push(error.message));
   const cdp = await context.newCDPSession(page);
@@ -119,8 +120,8 @@ async function virtualProfile(browser, consoleErrors) {
   return { context, page, cdp, authenticatorId };
 }
 
-async function enrolledDevice(page) {
-  return page.evaluate(async () => {
+async function enrolledDevice(page, fingerprint = null) {
+  return page.evaluate(async fingerprint => {
     const database = await new Promise((resolve, reject) => {
       const request = indexedDB.open("oshioki", 2);
       request.onsuccess = () => resolve(request.result);
@@ -132,8 +133,8 @@ async function enrolledDevice(page) {
       request.onerror = () => reject(request.error);
     });
     database.close();
-    return devices.at(0);
-  });
+    return fingerprint ? devices.find(device => device.fingerprint === fingerprint) : devices.at(0);
+  }, fingerprint);
 }
 
 async function enrollmentUrl(processHandle) {
@@ -157,7 +158,8 @@ async function completeEnrollment(profile, processHandle, url) {
   await profile.page.getByRole("button", { name: "Continue" }).click();
   await expect(profile.page.locator("#status")).toContainText("Enrolled as");
   const result = await processHandle.exited;
-  const device = await enrolledDevice(profile.page);
+  const fingerprint = (await profile.page.locator("#status").textContent()).match(/^Enrolled as (\S+)\. Passkey/)[1];
+  const device = await enrolledDevice(profile.page, fingerprint);
   if (device?.fingerprint) enrolledFingerprints.add(device.fingerprint);
   expect(result.code, result.stderr).toBe(0);
   expect(device).toBeTruthy();
@@ -478,6 +480,146 @@ test("two browser profiles enroll independently and own their approvals", async 
   await second.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: second.authenticatorId });
   await first.context.close();
   await second.context.close();
+});
+
+test("two enrollments share one browser endpoint and the remaining enrollment approves after revoke", async ({ browser }) => {
+  const consoleErrors = [];
+  const profile = await virtualProfile(browser, consoleErrors, { consoleLocations: true });
+  const networkErrors = [], enrollmentSubmissions = [];
+  profile.page.on("requestfailed", request => networkErrors.push(request));
+  profile.page.on("request", request => {
+    if (request.frame() !== profile.page.mainFrame()) return;
+    const enrollment = new URL(request.frame().url()).pathname.match(/^\/enroll\/([0-9a-f-]+)$/);
+    if (enrollment && request.method() === "POST" && request.url() === `${origin}/api/v1/enrollments/${enrollment[1]}/submission`) {
+      enrollmentSubmissions.push(request.url());
+    }
+  });
+  const enrolled = [await enroll(profile), await enroll(profile)];
+  expect(enrollmentSubmissions).toHaveLength(2);
+  expect(new Set(enrollmentSubmissions).size).toBe(2);
+  // IndexedDB enumerates fingerprints in key order. Revoke the first one so
+  // the later request must scan past its stale local credential.
+  const [first, second] = enrolled.sort((a, b) => a.fingerprint < b.fingerprint ? -1 : 1);
+  expect(first.fingerprint).not.toBe(second.fingerprint);
+  const endpoint = `https://push.example/browser-${crypto.randomUUID()}`;
+  await profile.page.evaluate(async ({ endpoint, fingerprint }) => {
+    await OshiokiPush.createPushBinding(endpoint, fingerprint);
+  }, { endpoint, fingerprint: first.fingerprint });
+  await profile.context.addInitScript(({ endpoint }) => {
+    const bytes = value => {
+      let binary = "";
+      for (const byte of value) binary += String.fromCharCode(byte);
+      return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    };
+    // Stub only the platform PushSubscription. Membership registration,
+    // revocation, request decryption and WebAuthn approval use the real server.
+    const subscription = {
+      endpoint, expirationTime: null,
+      unsubscribe: async () => { window.__sharedPushUnsubscribed++; return true; },
+    };
+    // Keep transport keys stable across calls and page reloads. This is a
+    // valid uncompressed P-256 generator point, never an enrollment secret.
+    const publicKey = Uint8Array.from(atob("BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU="), c => c.charCodeAt(0));
+    subscription.toJSON = () => ({ keys: { p256dh: bytes(publicKey), auth: bytes(new Uint8Array(16).fill(7)) } });
+    window.__sharedPushUnsubscribed = 0;
+    Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: { register: async () => ({ pushManager: { getSubscription: async () => subscription } }) } });
+    Object.defineProperty(window, "PushManager", { configurable: true, value: function PushManager() {} });
+    Object.defineProperty(window, "Notification", { configurable: true, value: { permission: "granted", requestPermission: async () => { throw new Error("unexpected notification prompt"); } } });
+  }, { endpoint });
+  await navigate(profile.page, `${origin}/setup`);
+  const shared = await profile.page.evaluate(async () => {
+    const result = await OshiokiPush.syncOwnedPushSubscription();
+    return { registered: result.registered, binding: await OshiokiPush.getSetting("pushBinding") };
+  });
+  expect(shared.registered).toBe(2);
+  expect(shared.binding.endpoint).toBe(endpoint);
+  expect(Object.keys(shared.binding.registrations).sort()).toEqual([first.fingerprint, second.fingerprint].sort());
+  expect(new Set(Object.values(shared.binding.registrations)).size).toBe(2);
+
+  // Explicit membership removal is bearer scoped and preserves the second.
+  const removed = await profile.page.evaluate(async ({ first, second, id }) => {
+    const response = await fetch(`/api/v1/push/subscriptions/${encodeURIComponent(id)}`, { method: "DELETE", headers: { authorization: `Bearer ${first.apiToken}` } });
+    const remaining = await fetch("/api/v1/push/status", { headers: { authorization: `Bearer ${second.apiToken}` } });
+    return { removed: response.status, remaining: await remaining.json() };
+  }, { first, second, id: shared.binding.registrations[first.fingerprint] });
+  expect(removed.removed).toBe(204);
+  expect(removed.remaining.registered).toBe(true);
+  expect(removed.remaining.count).toBe(1);
+
+  const revocation = hook(["revoke", first.fingerprint]);
+  const revokedResult = await revocation.exited;
+  expect(revokedResult.code, revokedResult.stderr).toBe(0);
+  enrolledFingerprints.delete(first.fingerprint);
+  expect(consoleErrors).toEqual([]);
+  const rejected = [];
+  let rejectionContext = "explicit push reconciliation";
+  profile.page.on("response", response => {
+    if (response.status() < 400) return;
+    const request = response.request();
+    rejected.push({ context: rejectionContext, method: request.method(), url: response.url(), status: response.status(),
+      revokedBearer: request.headers().authorization === `Bearer ${first.apiToken}` });
+  });
+  const afterRevoke = await profile.page.evaluate(async () => {
+    const result = await OshiokiPush.syncOwnedPushSubscription();
+    return { registered: result.registered, failures: result.failures.length, binding: await OshiokiPush.getSetting("pushBinding"), unsubscribed: window.__sharedPushUnsubscribed };
+  });
+  expect(afterRevoke.registered).toBe(1);
+  expect(afterRevoke.failures).toBe(1);
+  expect(afterRevoke.binding.registrations[first.fingerprint]).toBeUndefined();
+  expect(afterRevoke.binding.registrations[second.fingerprint]).toBe(shared.binding.registrations[second.fingerprint]);
+  expect(afterRevoke.binding.installation_token).toBe(shared.binding.installation_token);
+  expect(afterRevoke.unsubscribed).toBe(0);
+
+  const reads = [], approvals = [];
+  profile.page.on("request", request => {
+    if (/\/api\/v1\/requests\/[^/]+$/.test(request.url())) reads.push(request.headers().authorization);
+    if (request.url().endsWith("/approve")) approvals.push({ url: request.url(), bearer: request.headers().authorization, body: request.postDataJSON() });
+  });
+  rejectionContext = "remaining enrollment approval";
+  await requestWith(profile, second, "approve");
+  expect(reads).toContain(`Bearer ${first.apiToken}`);
+  expect(reads).toContain(`Bearer ${second.apiToken}`);
+  expect(approvals).toHaveLength(1);
+  expect(approvals[0].bearer).toBe(`Bearer ${second.apiToken}`);
+  expect(approvals[0].body.device_fingerprint).toBe(second.fingerprint);
+  expect(approvals[0].body.credential_id).toBe(second.credentialId);
+  // A revoked credential remains saved locally: explicit reconciliation and
+  // approval-page startup each reject its push POST, and the request scan
+  // rejects its GET before using the remaining enrollment. Match the exact
+  // responses and their browser resource errors; all other errors still fail.
+  expect(rejected).toEqual(expect.arrayContaining([
+    { context: "explicit push reconciliation", method: "POST", url: `${origin}/api/v1/push/subscriptions`, status: 401, revokedBearer: true },
+    { context: "remaining enrollment approval", method: "GET", url: approvals[0].url.replace(/\/approve$/, ""), status: 401, revokedBearer: true },
+    { context: "remaining enrollment approval", method: "POST", url: `${origin}/api/v1/push/subscriptions`, status: 401, revokedBearer: true },
+  ]));
+  expect(rejected).toHaveLength(3);
+  const resourceErrors = rejected.map(({ url }) => ({ url,
+    text: "Failed to load resource: the server responded with a status of 401 (Unauthorized)" }));
+  const byUrl = (a, b) => String(a.url).localeCompare(String(b.url));
+  expect(consoleErrors.sort(byUrl)).toEqual(resourceErrors.sort(byUrl));
+  // Chromium can report ERR_ABORTED for these requests after exposing their
+  // successful HTTP response. Each operation's result is asserted above;
+  // accept only its exact route/status, at most once. This is not evidence
+  // that navigation caused the cancellation (ack/approve do not navigate).
+  const acceptedResponses = new Map([
+    ...enrollmentSubmissions.map(url => [`POST ${url}`, 202]),
+    [`DELETE ${origin}/api/v1/push/subscriptions/${encodeURIComponent(shared.binding.registrations[first.fingerprint])}`, 204],
+    [`POST ${approvals[0].url.replace(/\/approve$/, "/ack")}`, 202],
+    [`POST ${approvals[0].url}`, 202],
+  ]);
+  for (const request of networkErrors) {
+    const operation = `${request.method()} ${request.url()}`;
+    expect(request.failure()?.errorText, operation).toBe("net::ERR_ABORTED");
+    expect(request.resourceType(), operation).toBe("fetch");
+    expect(request.isNavigationRequest(), operation).toBe(false);
+    expect(request.frame(), operation).toBe(profile.page.mainFrame());
+    expect(acceptedResponses.has(operation), operation).toBe(true);
+    const response = await request.response();
+    expect(response?.status(), operation).toBe(acceptedResponses.get(operation));
+    acceptedResponses.delete(operation);
+  }
+  await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
+  await profile.context.close();
 });
 
 test("server delivery receipt permits a delayed browser open and approval", async ({ browser }) => {
