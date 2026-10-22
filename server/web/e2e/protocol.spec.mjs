@@ -96,11 +96,12 @@ async function waitForMatch(processHandle, pattern, timeoutMs = 15_000) {
   throw new Error(`timed out waiting for hook output ${pattern}: ${processHandle.output()}`);
 }
 
-async function virtualProfile(browser, consoleErrors) {
+async function virtualProfile(browser, consoleErrors, { consoleLocations = false } = {}) {
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
   const page = await context.newPage();
   page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(message.text());
+    if (message.type() === "error") consoleErrors.push(consoleLocations
+      ? { text: message.text(), url: message.location().url } : message.text());
   });
   page.on("pageerror", (error) => consoleErrors.push(error.message));
   const cdp = await context.newCDPSession(page);
@@ -483,7 +484,9 @@ test("two browser profiles enroll independently and own their approvals", async 
 
 test("two enrollments share one browser endpoint and the remaining enrollment approves after revoke", async ({ browser }) => {
   const consoleErrors = [];
-  const profile = await virtualProfile(browser, consoleErrors);
+  const profile = await virtualProfile(browser, consoleErrors, { consoleLocations: true });
+  const networkErrors = [];
+  profile.page.on("requestfailed", request => networkErrors.push({ method: request.method(), url: request.url(), error: request.failure()?.errorText }));
   const enrolled = [await enroll(profile), await enroll(profile)];
   // IndexedDB enumerates fingerprints in key order. Revoke the first one so
   // the later request must scan past its stale local credential.
@@ -538,6 +541,15 @@ test("two enrollments share one browser endpoint and the remaining enrollment ap
   const revokedResult = await revocation.exited;
   expect(revokedResult.code, revokedResult.stderr).toBe(0);
   enrolledFingerprints.delete(first.fingerprint);
+  expect(consoleErrors).toEqual([]);
+  const rejected = [];
+  let rejectionContext = "explicit push reconciliation";
+  profile.page.on("response", response => {
+    if (response.status() < 400) return;
+    const request = response.request();
+    rejected.push({ context: rejectionContext, method: request.method(), url: response.url(), status: response.status(),
+      revokedBearer: request.headers().authorization === `Bearer ${first.apiToken}` });
+  });
   const afterRevoke = await profile.page.evaluate(async () => {
     const result = await OshiokiPush.syncOwnedPushSubscription();
     return { registered: result.registered, failures: result.failures.length, binding: await OshiokiPush.getSetting("pushBinding"), unsubscribed: window.__sharedPushUnsubscribed };
@@ -552,8 +564,9 @@ test("two enrollments share one browser endpoint and the remaining enrollment ap
   const reads = [], approvals = [];
   profile.page.on("request", request => {
     if (/\/api\/v1\/requests\/[^/]+$/.test(request.url())) reads.push(request.headers().authorization);
-    if (request.url().endsWith("/approve")) approvals.push({ bearer: request.headers().authorization, body: request.postDataJSON() });
+    if (request.url().endsWith("/approve")) approvals.push({ url: request.url(), bearer: request.headers().authorization, body: request.postDataJSON() });
   });
+  rejectionContext = "remaining enrollment approval";
   await requestWith(profile, second, "approve");
   expect(reads).toContain(`Bearer ${first.apiToken}`);
   expect(reads).toContain(`Bearer ${second.apiToken}`);
@@ -561,7 +574,21 @@ test("two enrollments share one browser endpoint and the remaining enrollment ap
   expect(approvals[0].bearer).toBe(`Bearer ${second.apiToken}`);
   expect(approvals[0].body.device_fingerprint).toBe(second.fingerprint);
   expect(approvals[0].body.credential_id).toBe(second.credentialId);
-  expect(consoleErrors).toEqual([]);
+  // A revoked credential remains saved locally: explicit reconciliation and
+  // approval-page startup each reject its push POST, and the request scan
+  // rejects its GET before using the remaining enrollment. Match the exact
+  // responses and their browser resource errors; all other errors still fail.
+  expect(rejected).toEqual(expect.arrayContaining([
+    { context: "explicit push reconciliation", method: "POST", url: `${origin}/api/v1/push/subscriptions`, status: 401, revokedBearer: true },
+    { context: "remaining enrollment approval", method: "GET", url: approvals[0].url.replace(/\/approve$/, ""), status: 401, revokedBearer: true },
+    { context: "remaining enrollment approval", method: "POST", url: `${origin}/api/v1/push/subscriptions`, status: 401, revokedBearer: true },
+  ]));
+  expect(rejected).toHaveLength(3);
+  const resourceErrors = rejected.map(({ url }) => ({ url,
+    text: "Failed to load resource: the server responded with a status of 401 (Unauthorized)" }));
+  const byUrl = (a, b) => String(a.url).localeCompare(String(b.url));
+  expect(consoleErrors.sort(byUrl)).toEqual(resourceErrors.sort(byUrl));
+  expect(networkErrors).toEqual([]);
   await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
   await profile.context.close();
 });

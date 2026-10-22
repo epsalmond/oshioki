@@ -245,6 +245,22 @@ async function multiEnrollmentPushConfig() {
 function eligiblePushDevices(devices) {
   return devices.filter(device => typeof device.fingerprint === "string" && device.fingerprint && typeof device.apiToken === "string" && device.apiToken);
 }
+async function activePushBootstrap(devices) {
+  for (const device of devices) {
+    // Check bearer validity without attempting to claim an endpoint. Only a
+    // confirmed revoked/unavailable credential permits trying the next one.
+    const response = await fetch("/api/v1/push/status", {
+      cache: "no-store", headers: { authorization: `Bearer ${device.apiToken}` },
+    });
+    if (response.status === 401) continue;
+    if (!response.ok) throw new Error(`Notification enrollment check failed (${response.status}). Retry Enable notifications.`);
+    const status = await response.json().catch(() => { throw new Error("invalid push status response"); });
+    if (status.version !== PUSH_VERSION || typeof status.enabled !== "boolean" || typeof status.registered !== "boolean"
+      || !Number.isSafeInteger(status.count) || status.count < 0) throw new Error("invalid push status response");
+    return device;
+  }
+  throw new Error("No active saved enrollment is available. Save an enrollment before enabling notifications.");
+}
 async function reconcilePushSubscription(subscription, devices, { fresh = false } = {}) {
   let binding = await getSetting(PUSH_BINDING_KEY);
   if (binding?.endpoint !== subscription.endpoint) {
@@ -254,7 +270,7 @@ async function reconcilePushSubscription(subscription, devices, { fresh = false 
     const legacyId = await getSetting("pushSubscriptionId");
     const bootstrap = !fresh && legacyOwner
       ? devices.find(device => device.fingerprint === legacyOwner)
-      : (fresh || binding ? devices[0] : null);
+      : (fresh || binding ? await activePushBootstrap(devices) : null);
     if (!bootstrap || (!fresh && legacyOwner && !legacyId)) throw pushRecoveryError();
     binding = await createPushBinding(subscription.endpoint, bootstrap.fingerprint);
   }

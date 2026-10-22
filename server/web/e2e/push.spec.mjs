@@ -35,16 +35,17 @@ test("setup accepts only same-origin enrollment URLs and clears the fragment", a
   expect(await page.evaluate(() => localStorage.length)).toBe(0);
 });
 
-async function mockedPushBrowser(page) {
-  await page.addInitScript(() => {
-    const subscription = {
-      endpoint: "https://push.example/browser", expirationTime: null,
+async function mockedPushBrowser(page, { fresh = false } = {}) {
+  await page.addInitScript(({ fresh }) => {
+    const makeSubscription = endpoint => ({
+      endpoint, expirationTime: null,
       toJSON: () => ({ keys: { p256dh: "p256dh", auth: "auth" } }),
-      unsubscribe: async () => { window.__pushUnsubscribed++; return true; },
-    };
+      unsubscribe: async () => { window.__pushUnsubscribed++; subscription = null; return true; },
+    });
+    let subscription = fresh ? null : makeSubscription("https://push.example/browser");
     const registration = { pushManager: {
       getSubscription: async () => subscription,
-      subscribe: async () => { window.__pushSubscribed++; return subscription; },
+      subscribe: async () => { window.__pushSubscribed++; subscription = makeSubscription("https://push.example/fresh"); return subscription; },
     } };
     Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: { register: async () => registration } });
     Object.defineProperty(window, "PushManager", { configurable: true, writable: true, value: function PushManager() {} });
@@ -53,6 +54,7 @@ async function mockedPushBrowser(page) {
       permission: "default", requestPermission: async () => { window.__pushPermissionRequests++; Notification.permission = "granted"; return "granted"; },
     } });
     window.__pushCalls = [];
+    window.__pushStatusCalls = [];
     window.__pushUnsubscribed = 0;
     window.__pushSubscribed = 0;
     window.__pushPermissionRequests = 0;
@@ -80,18 +82,87 @@ async function mockedPushBrowser(page) {
       if (url.endsWith("/api/v1/push/config")) return new Response(JSON.stringify({
         version: 1, enabled: true, multi_enrollment: true, vapid_public_key: "B".repeat(87),
       }), { status: 200 });
+      if (url.endsWith("/api/v1/push/status")) {
+        window.__pushStatusCalls.push(init.headers.authorization);
+        if (window.__pushRejectBearer === init.headers.authorization) return new Response("{}", { status: 401 });
+        return new Response(JSON.stringify({ version: 1, enabled: true, registered: false, count: 0 }), { status: 200 });
+      }
       if (url.endsWith("/api/v1/push/subscriptions")) {
         window.__pushCalls.push({ url, headers: init.headers, body: JSON.parse(init.body) });
         if (window.__pushHold) await window.__pushHold;
         if (window.__pushRejectBearer === init.headers.authorization) return new Response("{}", { status: 401 });
+        if (window.__pushUnavailableBearer === init.headers.authorization) return new Response("{}", { status: 503 });
         return new Response(JSON.stringify({ version: 1, subscription_id: `${init.headers.authorization.slice(7)}-membership` }), { status: 200 });
       }
       return originalFetch(input, init);
     };
-  });
+  }, { fresh });
   await navigate(page, `${origin}/setup`);
   await page.evaluate(async () => { await window.__pushDatabaseReady; Notification.permission = "granted"; });
 }
+
+for (const replace of [false, true]) {
+  test(`fresh bootstrap skips a previously revoked enrollment on ${replace ? "replacement" : "first enable"}`, async ({ page }) => {
+    await mockedPushBrowser(page, { fresh: !replace });
+    const result = await page.evaluate(async replace => {
+      window.__pushRejectBearer = "Bearer first-token";
+      const status = await OshiokiPush.enablePushForDevice(null, { replace });
+      return { registered: status.registered, text: OshiokiPush.pushStatusText(status),
+        statuses: window.__pushStatusCalls, calls: window.__pushCalls, binding: await OshiokiPush.getSetting("pushBinding") };
+    }, replace);
+    expect(result.registered).toBe(1);
+    expect(result.text).toContain("1 of 2");
+    expect(result.text).toContain("unavailable or revoked");
+    expect(result.statuses).toEqual(["Bearer first-token", "Bearer second-token"]);
+    expect(result.calls.map(call => call.headers.authorization)).toEqual(["Bearer second-token", "Bearer first-token"]);
+    expect(result.binding.bootstrap_fingerprint).toBe("second");
+    expect(result.binding.state).toBe("bound");
+    expect(result.binding.registrations).toEqual({ second: "second-token-membership" });
+    const retried = await page.evaluate(async () => {
+      await OshiokiPush.syncOwnedPushSubscription();
+      return { binding: await OshiokiPush.getSetting("pushBinding"), statuses: window.__pushStatusCalls,
+        unsubscribed: window.__pushUnsubscribed, subscribed: window.__pushSubscribed, prompts: window.__pushPermissionRequests };
+    });
+    expect(retried.binding).toEqual(result.binding);
+    expect(retried.statuses).toEqual(result.statuses);
+    expect(retried.unsubscribed).toBe(Number(replace));
+    expect(retried.subscribed).toBe(1);
+    expect(retried.prompts).toBe(0);
+  });
+}
+
+test("a failed fresh bootstrap retries only its persisted active enrollment and capability", async ({ page }) => {
+  await mockedPushBrowser(page, { fresh: true });
+  const pending = await page.evaluate(async () => {
+    window.__pushRejectBearer = "Bearer first-token";
+    window.__pushUnavailableBearer = "Bearer second-token";
+    let message;
+    try { await OshiokiPush.enablePushForDevice(null); } catch (error) { message = error.message; }
+    return { message, binding: await OshiokiPush.getSetting("pushBinding"), calls: window.__pushCalls };
+  });
+  expect(pending.message).toContain("registration failed (503)");
+  expect(pending.binding.state).toBe("pending");
+  expect(pending.binding.bootstrap_fingerprint).toBe("second");
+  expect(pending.calls.map(call => call.headers.authorization)).toEqual(["Bearer second-token"]);
+  const retried = await page.evaluate(async () => {
+    window.__pushUnavailableBearer = null;
+    const result = await OshiokiPush.syncOwnedPushSubscription();
+    return { registered: result.registered, failures: result.failures.length, binding: await OshiokiPush.getSetting("pushBinding"),
+      calls: window.__pushCalls, statuses: window.__pushStatusCalls, unsubscribed: window.__pushUnsubscribed,
+      subscribed: window.__pushSubscribed, prompts: window.__pushPermissionRequests };
+  });
+  expect(retried.registered).toBe(1);
+  expect(retried.failures).toBe(1);
+  expect(retried.binding.state).toBe("bound");
+  expect(retried.binding.bootstrap_fingerprint).toBe("second");
+  expect(retried.binding.installation_token).toBe(pending.binding.installation_token);
+  expect(retried.calls.map(call => call.headers.authorization)).toEqual(["Bearer second-token", "Bearer second-token", "Bearer first-token"]);
+  expect(retried.statuses).toEqual(["Bearer first-token", "Bearer second-token"]);
+  expect(new Set(retried.calls.map(call => call.body.installation_token)).size).toBe(1);
+  expect(retried.unsubscribed).toBe(0);
+  expect(retried.subscribed).toBe(1);
+  expect(retried.prompts).toBe(0);
+});
 
 test("shared browser claims its legacy owner first and preserves other memberships after revocation", async ({ page }) => {
   await mockedPushBrowser(page);

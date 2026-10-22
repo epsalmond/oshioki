@@ -138,6 +138,7 @@ function pushHarness({ legacy = false, subscription = true } = {}) {
   let multiEnrollment = true;
   let nextEndpoint = "https://push.example/fresh";
   let post = async (_body, bearer) => ({ ok: true, status: 200, json: async () => ({ version: 1, subscription_id: `${bearer.slice(7)}-id` }) });
+  let status = async () => ({ ok: true, status: 200, json: async () => ({ version: 1, enabled: true, registered: false, count: 0 }) });
   let lockQueue = Promise.resolve();
   const locks = { request(_name, _options, action) {
     events.push("lock");
@@ -155,6 +156,7 @@ function pushHarness({ legacy = false, subscription = true } = {}) {
       fetch: async (url, options = {}) => {
         calls.push({ url, options });
         if (url.endsWith("/push/config")) return { ok: true, status: 200, json: async () => ({ version: 1, enabled: true, multi_enrollment: multiEnrollment, vapid_public_key: "B".repeat(87) }) };
+        if (url.endsWith("/push/status")) return status(options.headers.authorization);
         if (url.endsWith("/push/subscriptions") && options.method === "POST") return post(JSON.parse(options.body), options.headers.authorization);
         throw new Error(`unexpected fetch ${url}`);
       },
@@ -167,7 +169,7 @@ function pushHarness({ legacy = false, subscription = true } = {}) {
   const sandbox = context();
   return { stores, calls, events, sandbox, push: sandbox.OshiokiPush, context,
     posts: () => calls.filter(call => call.options.method === "POST"),
-    setPost(value) { post = value; }, setMultiEnrollment(value) { multiEnrollment = value; }, setNextEndpoint(value) { nextEndpoint = value; },
+    setPost(value) { post = value; }, setStatus(value) { status = value; }, setMultiEnrollment(value) { multiEnrollment = value; }, setNextEndpoint(value) { nextEndpoint = value; },
     counters: () => ({ unsubscribed, subscribed, permissionRequests }),
   };
 }
@@ -268,6 +270,101 @@ async function testPartialAndRevokedEnrollment() {
   assert.equal(binding.registrations.second, "second-id");
   assert.equal(binding.installation_token, token);
   assert.equal(h.counters().unsubscribed, 0);
+}
+function revokeFirstEnrollment(h) {
+  h.setStatus(async bearer => bearer === "Bearer first-token"
+    ? { ok: false, status: 401, json: async () => { throw new Error("private error body"); } }
+    : { ok: true, status: 200, json: async () => ({ version: 1, enabled: true, registered: false, count: 0 }) });
+  h.setPost(async (_body, bearer) => bearer === "Bearer first-token"
+    ? { ok: false, status: 401 }
+    : { ok: true, status: 200, json: async () => ({ version: 1, subscription_id: "second-id" }) });
+}
+async function testFreshBootstrapSkipsRevokedEnrollment() {
+  for (const replace of [false, true]) {
+    const h = pushHarness({ subscription: replace });
+    revokeFirstEnrollment(h);
+    const result = await h.push.enablePushForDevice(h.stores.devices.get("first"), { replace });
+    const binding = await h.push.getSetting("pushBinding");
+    assert.equal(binding.bootstrap_fingerprint, "second");
+    assert.equal(binding.state, "bound");
+    assert.deepEqual(json(binding.registrations), { second: "second-id" });
+    assert.equal(result.registered, 1);
+    assert.equal(result.total, 2);
+    assert.equal(result.failures[0].status, 401);
+    assert.match(h.push.pushStatusText(result), /1 of 2.*unavailable or revoked/);
+    assert.deepEqual(h.calls.filter(call => call.url.endsWith("/push/status")).map(call => call.options.headers.authorization),
+      ["Bearer first-token", "Bearer second-token"]);
+    assert.deepEqual(h.posts().map(call => call.options.headers.authorization), ["Bearer second-token", "Bearer first-token"]);
+    await h.push.syncOwnedPushSubscription();
+    assert.deepEqual(json(await h.push.getSetting("pushBinding")), json(binding));
+    assert.equal(h.calls.filter(call => call.url.endsWith("/push/status")).length, 2);
+    assert.deepEqual(h.counters(), { unsubscribed: Number(replace), subscribed: 1, permissionRequests: 0 });
+  }
+
+  // Automatic renewal has a previous binding, but no local claim for the new
+  // endpoint. It must validate the new bootstrap just like explicit enable.
+  const renewed = pushHarness();
+  await renewed.push.createPushBinding("https://push.example/previous", "first");
+  revokeFirstEnrollment(renewed);
+  assert.equal((await renewed.push.syncOwnedPushSubscription()).registered, 1);
+  assert.equal((await renewed.push.getSetting("pushBinding")).bootstrap_fingerprint, "second");
+}
+async function testFreshBootstrapRetryIsImmutable() {
+  const h = pushHarness({ subscription: false });
+  revokeFirstEnrollment(h);
+  h.setPost(async (_body, bearer) => {
+    assert.equal(bearer, "Bearer second-token");
+    const binding = await h.push.getSetting("pushBinding");
+    assert.equal(binding.state, "pending");
+    assert.equal(binding.bootstrap_fingerprint, "second");
+    return { ok: false, status: 503 };
+  });
+  await assert.rejects(h.push.enablePushForDevice(null), /registration failed \(503\)/);
+  const pending = json(await h.push.getSetting("pushBinding"));
+  assert.deepEqual(pending.registrations, {});
+  h.setStatus(async () => { throw new Error("pending bootstrap must not reselect any identity"); });
+  h.setPost(async () => ({ ok: false, status: 401 }));
+  await assert.rejects(h.push.syncOwnedPushSubscription(), /Replace notification subscription/);
+  assert.deepEqual(json(await h.push.getSetting("pushBinding")), pending);
+  h.setPost(async (_body, bearer) => bearer === "Bearer first-token"
+    ? { ok: false, status: 401 }
+    : { ok: true, status: 200, json: async () => ({ version: 1, subscription_id: "second-id" }) });
+  const result = await h.push.enablePushForDevice(h.stores.devices.get("first"));
+  const bound = await h.push.getSetting("pushBinding");
+  assert.equal(result.registered, 1);
+  assert.equal(result.failures[0].status, 401);
+  assert.equal(bound.state, "bound");
+  assert.equal(bound.bootstrap_fingerprint, "second");
+  assert.equal(bound.installation_token, pending.installation_token);
+  assert.deepEqual(h.posts().map(call => call.options.headers.authorization),
+    ["Bearer second-token", "Bearer second-token", "Bearer second-token", "Bearer first-token"]);
+  assert.ok(h.posts().every(call => JSON.parse(call.options.body).installation_token === pending.installation_token));
+  assert.deepEqual(h.counters(), { unsubscribed: 0, subscribed: 1, permissionRequests: 0 });
+}
+async function testBootstrapValidationFailsSafely() {
+  for (const status of [403, 503]) {
+    const h = pushHarness({ subscription: false });
+    h.setStatus(async () => ({ ok: false, status, json: async () => { throw new Error("private error body"); } }));
+    await assert.rejects(h.push.enablePushForDevice(null), new RegExp(`enrollment check failed \\(${status}\\)`));
+    assert.equal(h.calls.filter(call => call.url.endsWith("/push/status")).length, 1);
+    assert.equal(h.posts().length, 0);
+    assert.equal(await h.push.getSetting("pushBinding"), undefined);
+  }
+  const malformed = pushHarness({ subscription: false });
+  malformed.setStatus(async () => ({ ok: true, status: 200, json: async () => ({ version: 1 }) }));
+  await assert.rejects(malformed.push.enablePushForDevice(null), /invalid push status response/);
+  assert.equal(malformed.posts().length, 0);
+  assert.equal(await malformed.push.getSetting("pushBinding"), undefined);
+  const unavailable = pushHarness({ subscription: false });
+  unavailable.setStatus(async () => ({ ok: false, status: 401 }));
+  await assert.rejects(unavailable.push.enablePushForDevice(null), /No active saved enrollment/);
+  assert.equal(unavailable.posts().length, 0);
+  assert.equal(await unavailable.push.getSetting("pushBinding"), undefined);
+  const legacy = pushHarness({ legacy: true });
+  revokeFirstEnrollment(legacy);
+  legacy.setStatus(async () => { throw new Error("legacy ownership must not be reselected"); });
+  assert.equal((await legacy.push.syncOwnedPushSubscription()).registered, 1);
+  assert.equal(legacy.posts()[0].options.headers.authorization, "Bearer second-token");
 }
 async function testAtomicBootstrapAndStaleSuccess() {
   const h = pushHarness({ legacy: true });
@@ -376,6 +473,9 @@ async function testApprovalUsesAuthorizedEnrollment() {
   await testPendingRetryAndClaimFailure();
   await testExplicitRecovery();
   await testPartialAndRevokedEnrollment();
+  await testFreshBootstrapSkipsRevokedEnrollment();
+  await testFreshBootstrapRetryIsImmutable();
+  await testBootstrapValidationFailsSafely();
   await testAtomicBootstrapAndStaleSuccess();
   await testCompatibilityAndPermission();
   await testApprovalUsesAuthorizedEnrollment();
