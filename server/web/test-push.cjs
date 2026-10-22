@@ -366,6 +366,52 @@ async function testBootstrapValidationFailsSafely() {
   assert.equal((await legacy.push.syncOwnedPushSubscription()).registered, 1);
   assert.equal(legacy.posts()[0].options.headers.authorization, "Bearer second-token");
 }
+async function testBootstrapPreflightRetry() {
+  const failures = [
+    { response: async () => ({ ok: false, status: 403 }), message: /enrollment check failed \(403\)/ },
+    { response: async () => ({ ok: false, status: 503 }), message: /enrollment check failed \(503\)/ },
+    { response: async () => { throw new TypeError("network unavailable"); }, message: /network unavailable/ },
+    { response: async () => ({ ok: true, status: 200, json: async () => ({ version: 1 }) }), message: /invalid push status response/ },
+    { response: async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("invalid JSON"); } }), message: /invalid push status response/ },
+    { response: async () => ({ ok: false, status: 401 }), message: /No active saved enrollment/, checks: 2 },
+  ];
+  for (const replace of [false, true]) {
+    for (const failure of failures) {
+      const h = pushHarness({ legacy: replace, subscription: replace });
+      if (replace) await h.push.syncOwnedPushSubscription();
+      const previous = replace ? json(await h.push.getSetting("pushBinding")) : undefined;
+      h.calls.length = 0;
+      h.setStatus(failure.response);
+      await assert.rejects(h.push.enablePushForDevice(null, { replace }), failure.message);
+      assert.equal(h.calls.filter(call => call.url.endsWith("/push/status")).length, failure.checks || 1);
+      assert.equal(h.posts().length, 0);
+      assert.deepEqual(h.counters(), { unsubscribed: 0, subscribed: 0, permissionRequests: 0 });
+      const registration = await h.sandbox.navigator.serviceWorker.register();
+      assert.equal((await registration.pushManager.getSubscription())?.endpoint, previous?.endpoint);
+      if (replace) {
+        assert.deepEqual(json(await h.push.getSetting("pushBinding")), previous);
+        // The old endpoint stays usable even while candidate checks fail.
+        assert.equal((await h.push.syncOwnedPushSubscription()).registered, 2);
+        assert.deepEqual(json(await h.push.getSetting("pushBinding")), previous);
+        assert.ok(h.posts().every(call => {
+          const body = JSON.parse(call.options.body);
+          return body.endpoint === previous.endpoint && body.installation_token === previous.installation_token;
+        }));
+        assert.equal(h.calls.filter(call => call.url.endsWith("/push/status")).length, failure.checks || 1);
+      } else {
+        assert.equal(await h.push.getSetting("pushBinding"), undefined);
+      }
+      h.calls.length = 0;
+      h.setStatus(async () => ({ ok: true, status: 200, json: async () => ({ version: 1, enabled: true, registered: false, count: 0 }) }));
+      const result = await h.push.enablePushForDevice(null, { replace });
+      assert.equal(result.registered, 2);
+      assert.equal(result.failures.length, 0);
+      assert.equal(h.calls.filter(call => call.url.endsWith("/push/status")).length, 1);
+      assert.deepEqual(h.counters(), { unsubscribed: Number(replace), subscribed: 1, permissionRequests: 0 });
+      assert.equal((await h.push.getSetting("pushBinding")).endpoint, "https://push.example/fresh");
+    }
+  }
+}
 async function testAtomicBootstrapAndStaleSuccess() {
   const h = pushHarness({ legacy: true });
   const other = h.context().OshiokiPush;
@@ -476,6 +522,7 @@ async function testApprovalUsesAuthorizedEnrollment() {
   await testFreshBootstrapSkipsRevokedEnrollment();
   await testFreshBootstrapRetryIsImmutable();
   await testBootstrapValidationFailsSafely();
+  await testBootstrapPreflightRetry();
   await testAtomicBootstrapAndStaleSuccess();
   await testCompatibilityAndPermission();
   await testApprovalUsesAuthorizedEnrollment();

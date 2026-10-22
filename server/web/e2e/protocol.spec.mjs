@@ -485,9 +485,18 @@ test("two browser profiles enroll independently and own their approvals", async 
 test("two enrollments share one browser endpoint and the remaining enrollment approves after revoke", async ({ browser }) => {
   const consoleErrors = [];
   const profile = await virtualProfile(browser, consoleErrors, { consoleLocations: true });
-  const networkErrors = [];
-  profile.page.on("requestfailed", request => networkErrors.push({ method: request.method(), url: request.url(), error: request.failure()?.errorText }));
+  const networkErrors = [], enrollmentSubmissions = [];
+  profile.page.on("requestfailed", request => networkErrors.push(request));
+  profile.page.on("request", request => {
+    if (request.frame() !== profile.page.mainFrame()) return;
+    const enrollment = new URL(request.frame().url()).pathname.match(/^\/enroll\/([0-9a-f-]+)$/);
+    if (enrollment && request.method() === "POST" && request.url() === `${origin}/api/v1/enrollments/${enrollment[1]}/submission`) {
+      enrollmentSubmissions.push(request.url());
+    }
+  });
   const enrolled = [await enroll(profile), await enroll(profile)];
+  expect(enrollmentSubmissions).toHaveLength(2);
+  expect(new Set(enrollmentSubmissions).size).toBe(2);
   // IndexedDB enumerates fingerprints in key order. Revoke the first one so
   // the later request must scan past its stale local credential.
   const [first, second] = enrolled.sort((a, b) => a.fingerprint < b.fingerprint ? -1 : 1);
@@ -588,7 +597,27 @@ test("two enrollments share one browser endpoint and the remaining enrollment ap
     text: "Failed to load resource: the server responded with a status of 401 (Unauthorized)" }));
   const byUrl = (a, b) => String(a.url).localeCompare(String(b.url));
   expect(consoleErrors.sort(byUrl)).toEqual(resourceErrors.sort(byUrl));
-  expect(networkErrors).toEqual([]);
+  // Chromium can report ERR_ABORTED for these requests after exposing their
+  // successful HTTP response. Each operation's result is asserted above;
+  // accept only its exact route/status, at most once. This is not evidence
+  // that navigation caused the cancellation (ack/approve do not navigate).
+  const acceptedResponses = new Map([
+    ...enrollmentSubmissions.map(url => [`POST ${url}`, 202]),
+    [`DELETE ${origin}/api/v1/push/subscriptions/${encodeURIComponent(shared.binding.registrations[first.fingerprint])}`, 204],
+    [`POST ${approvals[0].url.replace(/\/approve$/, "/ack")}`, 202],
+    [`POST ${approvals[0].url}`, 202],
+  ]);
+  for (const request of networkErrors) {
+    const operation = `${request.method()} ${request.url()}`;
+    expect(request.failure()?.errorText, operation).toBe("net::ERR_ABORTED");
+    expect(request.resourceType(), operation).toBe("fetch");
+    expect(request.isNavigationRequest(), operation).toBe(false);
+    expect(request.frame(), operation).toBe(profile.page.mainFrame());
+    expect(acceptedResponses.has(operation), operation).toBe(true);
+    const response = await request.response();
+    expect(response?.status(), operation).toBe(acceptedResponses.get(operation));
+    acceptedResponses.delete(operation);
+  }
   await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
   await profile.context.close();
 });

@@ -261,17 +261,17 @@ async function activePushBootstrap(devices) {
   }
   throw new Error("No active saved enrollment is available. Save an enrollment before enabling notifications.");
 }
-async function reconcilePushSubscription(subscription, devices, { fresh = false } = {}) {
+async function reconcilePushSubscription(subscription, devices, { freshBootstrap = null } = {}) {
   let binding = await getSetting(PUSH_BINDING_KEY);
   if (binding?.endpoint !== subscription.endpoint) {
     // Read legacy ownership before changing any settings. Claim with that
     // credential first, even when the page is showing a different enrollment.
     const legacyOwner = await getSetting("pushOwnerFingerprint");
     const legacyId = await getSetting("pushSubscriptionId");
-    const bootstrap = !fresh && legacyOwner
+    const bootstrap = freshBootstrap || (legacyOwner
       ? devices.find(device => device.fingerprint === legacyOwner)
-      : (fresh || binding ? await activePushBootstrap(devices) : null);
-    if (!bootstrap || (!fresh && legacyOwner && !legacyId)) throw pushRecoveryError();
+      : (binding ? await activePushBootstrap(devices) : null));
+    if (!bootstrap || (!freshBootstrap && legacyOwner && !legacyId)) throw pushRecoveryError();
     binding = await createPushBinding(subscription.endpoint, bootstrap.fingerprint);
   }
   const failures = [];
@@ -332,13 +332,15 @@ async function enablePushForDevice(_device, { replace = false } = {}) {
     if (!devices.length) throw new Error("Save an enrollment before enabling notifications.");
     const registration = await registerPushWorker();
     let subscription = await registration.pushManager.getSubscription();
+    // Validate a bootstrap before creating an endpoint or retiring the old
+    // one. A failed preflight must leave ordinary retry and notifications usable.
+    const freshBootstrap = replace || !subscription ? await activePushBootstrap(devices) : null;
     let retiredEndpoint;
     if (replace && subscription) {
       retiredEndpoint = subscription.endpoint;
       if (!await subscription.unsubscribe()) throw new Error("Could not remove the old browser subscription.");
       subscription = null;
     }
-    const fresh = !subscription;
     if (!subscription) {
       subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlToBytes(config.vapid_public_key) });
     }
@@ -346,7 +348,7 @@ async function enablePushForDevice(_device, { replace = false } = {}) {
       await subscription.unsubscribe();
       throw pushRecoveryError();
     }
-    return reconcilePushSubscription(subscription, devices, { fresh });
+    return reconcilePushSubscription(subscription, devices, { freshBootstrap });
   });
 }
 

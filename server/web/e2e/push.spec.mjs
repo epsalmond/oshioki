@@ -58,6 +58,7 @@ async function mockedPushBrowser(page, { fresh = false } = {}) {
     window.__pushUnsubscribed = 0;
     window.__pushSubscribed = 0;
     window.__pushPermissionRequests = 0;
+    Object.defineProperty(window, "__pushSubscriptionEndpoint", { get: () => subscription?.endpoint });
     window.__pushDatabaseReady = new Promise((resolve, reject) => {
       const request = indexedDB.open("oshioki", 2);
       request.onupgradeneeded = () => {
@@ -84,6 +85,10 @@ async function mockedPushBrowser(page, { fresh = false } = {}) {
       }), { status: 200 });
       if (url.endsWith("/api/v1/push/status")) {
         window.__pushStatusCalls.push(init.headers.authorization);
+        if (window.__pushStatusFailure === "503") return new Response("{}", { status: 503 });
+        if (window.__pushStatusFailure === "network") throw new TypeError("network unavailable");
+        if (window.__pushStatusFailure === "malformed") return new Response("{}", { status: 200 });
+        if (window.__pushStatusFailure === "all401") return new Response("{}", { status: 401 });
         if (window.__pushRejectBearer === init.headers.authorization) return new Response("{}", { status: 401 });
         return new Response(JSON.stringify({ version: 1, enabled: true, registered: false, count: 0 }), { status: 200 });
       }
@@ -163,6 +168,65 @@ test("a failed fresh bootstrap retries only its persisted active enrollment and 
   expect(retried.subscribed).toBe(1);
   expect(retried.prompts).toBe(0);
 });
+
+for (const replace of [false, true]) {
+  for (const failure of ["503", "network", "malformed", "all401"]) {
+    test(`${replace ? "replacement" : "first enable"} preserves subscription state after ${failure} preflight and retries`, async ({ page }) => {
+      await mockedPushBrowser(page, { fresh: !replace });
+      const failed = await page.evaluate(async ({ replace, failure }) => {
+        if (replace) await OshiokiPush.syncOwnedPushSubscription();
+        const previous = await OshiokiPush.getSetting("pushBinding");
+        window.__pushCalls = [];
+        window.__pushStatusCalls = [];
+        window.__pushStatusFailure = failure;
+        let message;
+        try { await OshiokiPush.enablePushForDevice(null, { replace }); } catch (error) { message = error.message; }
+        return { message, previous, binding: await OshiokiPush.getSetting("pushBinding"), calls: window.__pushCalls,
+          statuses: window.__pushStatusCalls, endpoint: window.__pushSubscriptionEndpoint,
+          subscribed: window.__pushSubscribed, unsubscribed: window.__pushUnsubscribed };
+      }, { replace, failure });
+      expect(failed.message).toContain({ "503": "enrollment check failed (503)", network: "network unavailable",
+        malformed: "invalid push status response", all401: "No active saved enrollment" }[failure]);
+      expect(failed.statuses).toEqual(failure === "all401" ? ["Bearer first-token", "Bearer second-token"] : ["Bearer first-token"]);
+      expect(failed.binding).toEqual(failed.previous);
+      expect(failed.endpoint).toBe(replace ? "https://push.example/browser" : undefined);
+      expect(failed.calls).toEqual([]);
+      expect(failed.subscribed).toBe(0);
+      expect(failed.unsubscribed).toBe(0);
+      if (replace) {
+        const preserved = await page.evaluate(async () => {
+          const result = await OshiokiPush.syncOwnedPushSubscription();
+          return { registered: result.registered, binding: await OshiokiPush.getSetting("pushBinding"),
+            calls: window.__pushCalls, statuses: window.__pushStatusCalls };
+        });
+        expect(preserved.registered).toBe(2);
+        expect(preserved.binding).toEqual(failed.previous);
+        expect(preserved.statuses).toEqual(failed.statuses);
+        expect(preserved.calls).toHaveLength(2);
+        for (const call of preserved.calls) {
+          expect(call.body.endpoint).toBe(failed.previous.endpoint);
+          expect(call.body.installation_token).toBe(failed.previous.installation_token);
+        }
+      }
+      const retried = await page.evaluate(async replace => {
+        window.__pushStatusFailure = null;
+        window.__pushStatusCalls = [];
+        const status = await OshiokiPush.enablePushForDevice(null, { replace });
+        return { registered: status.registered, failures: status.failures.length, binding: await OshiokiPush.getSetting("pushBinding"),
+          statuses: window.__pushStatusCalls, subscribed: window.__pushSubscribed,
+          unsubscribed: window.__pushUnsubscribed, prompts: window.__pushPermissionRequests };
+      }, replace);
+      expect(retried.registered).toBe(2);
+      expect(retried.failures).toBe(0);
+      expect(retried.binding.state).toBe("bound");
+      expect(retried.binding.endpoint).toBe("https://push.example/fresh");
+      expect(retried.statuses).toEqual(["Bearer first-token"]);
+      expect(retried.subscribed).toBe(1);
+      expect(retried.unsubscribed).toBe(Number(replace));
+      expect(retried.prompts).toBe(0);
+    });
+  }
+}
 
 test("shared browser claims its legacy owner first and preserves other memberships after revocation", async ({ page }) => {
   await mockedPushBrowser(page);
