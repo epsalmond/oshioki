@@ -119,8 +119,8 @@ async function virtualProfile(browser, consoleErrors) {
   return { context, page, cdp, authenticatorId };
 }
 
-async function enrolledDevice(page) {
-  return page.evaluate(async () => {
+async function enrolledDevice(page, fingerprint = null) {
+  return page.evaluate(async fingerprint => {
     const database = await new Promise((resolve, reject) => {
       const request = indexedDB.open("oshioki", 2);
       request.onsuccess = () => resolve(request.result);
@@ -132,8 +132,8 @@ async function enrolledDevice(page) {
       request.onerror = () => reject(request.error);
     });
     database.close();
-    return devices.at(0);
-  });
+    return fingerprint ? devices.find(device => device.fingerprint === fingerprint) : devices.at(0);
+  }, fingerprint);
 }
 
 async function enrollmentUrl(processHandle) {
@@ -157,7 +157,8 @@ async function completeEnrollment(profile, processHandle, url) {
   await profile.page.getByRole("button", { name: "Continue" }).click();
   await expect(profile.page.locator("#status")).toContainText("Enrolled as");
   const result = await processHandle.exited;
-  const device = await enrolledDevice(profile.page);
+  const fingerprint = (await profile.page.locator("#status").textContent()).match(/^Enrolled as (\S+)\. Passkey/)[1];
+  const device = await enrolledDevice(profile.page, fingerprint);
   if (device?.fingerprint) enrolledFingerprints.add(device.fingerprint);
   expect(result.code, result.stderr).toBe(0);
   expect(device).toBeTruthy();
@@ -478,6 +479,91 @@ test("two browser profiles enroll independently and own their approvals", async 
   await second.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: second.authenticatorId });
   await first.context.close();
   await second.context.close();
+});
+
+test("two enrollments share one browser endpoint and the remaining enrollment approves after revoke", async ({ browser }) => {
+  const consoleErrors = [];
+  const profile = await virtualProfile(browser, consoleErrors);
+  const enrolled = [await enroll(profile), await enroll(profile)];
+  // IndexedDB enumerates fingerprints in key order. Revoke the first one so
+  // the later request must scan past its stale local credential.
+  const [first, second] = enrolled.sort((a, b) => a.fingerprint < b.fingerprint ? -1 : 1);
+  expect(first.fingerprint).not.toBe(second.fingerprint);
+  const endpoint = `https://push.example/browser-${crypto.randomUUID()}`;
+  await profile.page.evaluate(async ({ endpoint, fingerprint }) => {
+    await OshiokiPush.createPushBinding(endpoint, fingerprint);
+  }, { endpoint, fingerprint: first.fingerprint });
+  await profile.context.addInitScript(({ endpoint }) => {
+    const bytes = value => {
+      let binary = "";
+      for (const byte of value) binary += String.fromCharCode(byte);
+      return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    };
+    // Stub only the platform PushSubscription. Membership registration,
+    // revocation, request decryption and WebAuthn approval use the real server.
+    const subscription = {
+      endpoint, expirationTime: null,
+      unsubscribe: async () => { window.__sharedPushUnsubscribed++; return true; },
+    };
+    // Keep transport keys stable across calls and page reloads. This is a
+    // valid uncompressed P-256 generator point, never an enrollment secret.
+    const publicKey = Uint8Array.from(atob("BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU="), c => c.charCodeAt(0));
+    subscription.toJSON = () => ({ keys: { p256dh: bytes(publicKey), auth: bytes(new Uint8Array(16).fill(7)) } });
+    window.__sharedPushUnsubscribed = 0;
+    Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: { register: async () => ({ pushManager: { getSubscription: async () => subscription } }) } });
+    Object.defineProperty(window, "PushManager", { configurable: true, value: function PushManager() {} });
+    Object.defineProperty(window, "Notification", { configurable: true, value: { permission: "granted", requestPermission: async () => { throw new Error("unexpected notification prompt"); } } });
+  }, { endpoint });
+  await navigate(profile.page, `${origin}/setup`);
+  const shared = await profile.page.evaluate(async () => {
+    const result = await OshiokiPush.syncOwnedPushSubscription();
+    return { registered: result.registered, binding: await OshiokiPush.getSetting("pushBinding") };
+  });
+  expect(shared.registered).toBe(2);
+  expect(shared.binding.endpoint).toBe(endpoint);
+  expect(Object.keys(shared.binding.registrations).sort()).toEqual([first.fingerprint, second.fingerprint].sort());
+  expect(new Set(Object.values(shared.binding.registrations)).size).toBe(2);
+
+  // Explicit membership removal is bearer scoped and preserves the second.
+  const removed = await profile.page.evaluate(async ({ first, second, id }) => {
+    const response = await fetch(`/api/v1/push/subscriptions/${encodeURIComponent(id)}`, { method: "DELETE", headers: { authorization: `Bearer ${first.apiToken}` } });
+    const remaining = await fetch("/api/v1/push/status", { headers: { authorization: `Bearer ${second.apiToken}` } });
+    return { removed: response.status, remaining: await remaining.json() };
+  }, { first, second, id: shared.binding.registrations[first.fingerprint] });
+  expect(removed.removed).toBe(204);
+  expect(removed.remaining.registered).toBe(true);
+  expect(removed.remaining.count).toBe(1);
+
+  const revocation = hook(["revoke", first.fingerprint]);
+  const revokedResult = await revocation.exited;
+  expect(revokedResult.code, revokedResult.stderr).toBe(0);
+  enrolledFingerprints.delete(first.fingerprint);
+  const afterRevoke = await profile.page.evaluate(async () => {
+    const result = await OshiokiPush.syncOwnedPushSubscription();
+    return { registered: result.registered, failures: result.failures.length, binding: await OshiokiPush.getSetting("pushBinding"), unsubscribed: window.__sharedPushUnsubscribed };
+  });
+  expect(afterRevoke.registered).toBe(1);
+  expect(afterRevoke.failures).toBe(1);
+  expect(afterRevoke.binding.registrations[first.fingerprint]).toBeUndefined();
+  expect(afterRevoke.binding.registrations[second.fingerprint]).toBe(shared.binding.registrations[second.fingerprint]);
+  expect(afterRevoke.binding.installation_token).toBe(shared.binding.installation_token);
+  expect(afterRevoke.unsubscribed).toBe(0);
+
+  const reads = [], approvals = [];
+  profile.page.on("request", request => {
+    if (/\/api\/v1\/requests\/[^/]+$/.test(request.url())) reads.push(request.headers().authorization);
+    if (request.url().endsWith("/approve")) approvals.push({ bearer: request.headers().authorization, body: request.postDataJSON() });
+  });
+  await requestWith(profile, second, "approve");
+  expect(reads).toContain(`Bearer ${first.apiToken}`);
+  expect(reads).toContain(`Bearer ${second.apiToken}`);
+  expect(approvals).toHaveLength(1);
+  expect(approvals[0].bearer).toBe(`Bearer ${second.apiToken}`);
+  expect(approvals[0].body.device_fingerprint).toBe(second.fingerprint);
+  expect(approvals[0].body.credential_id).toBe(second.credentialId);
+  expect(consoleErrors).toEqual([]);
+  await profile.cdp.send("WebAuthn.removeVirtualAuthenticator", { authenticatorId: profile.authenticatorId });
+  await profile.context.close();
 });
 
 test("server delivery receipt permits a delayed browser open and approval", async ({ browser }) => {

@@ -27,7 +27,7 @@ pub const PUSH_LEASE_SECS: i64 = 30;
 pub const PUSH_DISABLED_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 /// Schema version this binary writes after migrate. Older files snapshot,
 /// then move forward; newer files refuse to open. See `docs/compatibility.md`.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub struct Store {
     connection: Mutex<Connection>,
@@ -70,7 +70,7 @@ pub struct PushStatus {
 #[derive(Debug, Clone)]
 pub struct PushItem {
     pub id: i64,
-    pub subscription_id: String,
+    pub endpoint_id: String,
     pub endpoint: String,
     pub p256dh: Vec<u8>,
     pub auth: Vec<u8>,
@@ -81,6 +81,8 @@ pub struct PushItem {
     pub claim_token: String,
     pub attempts: i64,
 }
+
+type ExistingEndpoint = (String, Option<Vec<u8>>, Vec<u8>, Vec<u8>);
 
 type PushClaimRow = (
     i64,
@@ -120,27 +122,21 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         match version {
-            0..=3 => {
+            0..=4 => {
                 create_verified_restore_snapshot(&connection, path, version)?;
-                match version {
-                    0 => {
-                        connection.execute_batch(MIGRATION_V1)?;
-                        connection.execute_batch(MIGRATION_V2)?;
-                        connection.execute_batch(MIGRATION_V3)?;
-                        connection.execute_batch(MIGRATION_V4)?;
-                    }
-                    1 => {
-                        connection.execute_batch(MIGRATION_V2)?;
-                        connection.execute_batch(MIGRATION_V3)?;
-                        connection.execute_batch(MIGRATION_V4)?;
-                    }
-                    2 => {
-                        connection.execute_batch(MIGRATION_V3)?;
-                        connection.execute_batch(MIGRATION_V4)?;
-                    }
-                    3 => connection.execute_batch(MIGRATION_V4)?,
-                    _ => unreachable!("matched 0|1|2|3"),
+                if version < 1 {
+                    connection.execute_batch(MIGRATION_V1)?;
                 }
+                if version < 2 {
+                    connection.execute_batch(MIGRATION_V2)?;
+                }
+                if version < 3 {
+                    connection.execute_batch(MIGRATION_V3)?;
+                }
+                if version < 4 {
+                    connection.execute_batch(MIGRATION_V4)?;
+                }
+                migrate_v5(&connection)?;
             }
             SCHEMA_VERSION => {}
             newer => bail!("unsupported database schema version {newer}"),
@@ -158,6 +154,7 @@ impl Store {
         connection.execute_batch(MIGRATION_V2)?;
         connection.execute_batch(MIGRATION_V3)?;
         connection.execute_batch(MIGRATION_V4)?;
+        migrate_v5(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -214,18 +211,14 @@ impl Store {
                  WHERE device_fingerprint=?1 AND disabled_at IS NULL",
                 [fingerprint],
             )?;
-            transaction.execute(
-                "UPDATE push_outbox SET abandoned_at=unixepoch(), claim_token=NULL, claimed_until=NULL
-                 WHERE subscription_id IN (SELECT id FROM push_subscriptions WHERE device_fingerprint=?1)
-                   AND sent_at IS NULL AND abandoned_at IS NULL",
-                [fingerprint],
-            )?;
+            abandon_ineligible_pushes(&transaction, unix_now())?;
         }
         transaction.commit()?;
         Ok(changed == 1)
     }
 
-    pub fn register_push_subscription(
+    #[cfg(test)]
+    fn register_push_subscription(
         &self,
         token: &[u8],
         endpoint: &str,
@@ -234,63 +227,120 @@ impl Store {
         expiration_at: Option<i64>,
         now: i64,
     ) -> Result<String> {
-        validate_push_endpoint(endpoint)?;
-        if p256dh.len() != PUSH_P256DH_BYTES || p256dh.first() != Some(&4) {
-            bail!("invalid p256dh key");
-        }
-        if p256::PublicKey::from_sec1_bytes(p256dh).is_err() {
-            bail!("invalid p256dh key");
-        }
-        if auth.len() != PUSH_AUTH_BYTES {
-            bail!("invalid auth secret");
-        }
-        if let Some(expiration_at) = expiration_at {
-            if expiration_at <= now {
-                bail!("expired subscription");
-            }
-        }
+        self.register_push_membership(token, endpoint, p256dh, auth, expiration_at, None, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_push_membership(
+        &self,
+        token: &[u8],
+        endpoint: &str,
+        p256dh: &[u8],
+        auth: &[u8],
+        expiration_at: Option<i64>,
+        installation_token: Option<&str>,
+        now: i64,
+    ) -> Result<String> {
         let token_hash = Sha256::digest(token).to_vec();
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let fingerprint: String = transaction
             .query_row(
                 "SELECT fingerprint FROM devices WHERE api_token_hash=?1 AND active=1
-                 AND COALESCE(json_extract(public_record_json, '$.kind'), 'webauthn')='webauthn'",
+             AND COALESCE(json_extract(public_record_json, '$.kind'), 'webauthn')='webauthn'",
                 [&token_hash],
                 |row| row.get(0),
             )
             .optional()?
             .context("active WebAuthn device not found")?;
-        let existing: Option<(String, String, Option<i64>, bool)> = transaction
-            .query_row(
-                "SELECT p.id, p.device_fingerprint, p.disabled_at, COALESCE(d.active, 0)
-                 FROM push_subscriptions p LEFT JOIN devices d ON d.fingerprint=p.device_fingerprint
-                 WHERE p.endpoint=?1",
-                [endpoint],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        let id = if let Some((id, owner, disabled_at, owner_active)) = existing {
-            if owner != fingerprint && disabled_at.is_none() && owner_active {
-                bail!("push endpoint belongs to another active device");
+        validate_push_endpoint(endpoint)?;
+        if p256dh.len() != PUSH_P256DH_BYTES
+            || p256dh.first() != Some(&4)
+            || p256::PublicKey::from_sec1_bytes(p256dh).is_err()
+        {
+            bail!("invalid p256dh key");
+        }
+        if auth.len() != PUSH_AUTH_BYTES {
+            bail!("invalid auth secret");
+        }
+        if expiration_at.is_some_and(|expiry| expiry <= now) {
+            bail!("expired subscription");
+        }
+        let supplied_hash = installation_token
+            .map(installation_token_hash)
+            .transpose()?;
+        let existing: Option<ExistingEndpoint> = transaction.query_row(
+            "SELECT id, installation_token_hash, p256dh, auth FROM push_endpoints WHERE endpoint=?1",
+            [endpoint], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        let endpoint_id = if let Some((id, stored_hash, stored_key, stored_auth)) = existing {
+            let active_member: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM push_subscriptions s JOIN devices d ON d.fingerprint=s.device_fingerprint
+                 WHERE s.endpoint_id=?1 AND s.device_fingerprint=?2 AND s.disabled_at IS NULL AND d.active=1)",
+                params![id, fingerprint], |row| row.get(0),
+            )?;
+            if let Some(stored_hash) = stored_hash {
+                match supplied_hash.as_ref() {
+                    Some(hash) if hash == &stored_hash => {}
+                    None if active_member && stored_key == p256dh && stored_auth == auth => {
+                        // Safe old-client refresh cannot reactivate a dead physical endpoint.
+                        let active: bool = transaction.query_row(
+                            "SELECT disabled_at IS NULL FROM push_endpoints WHERE id=?1",
+                            [&id],
+                            |row| row.get(0),
+                        )?;
+                        if !active {
+                            bail!(
+                                "push endpoint capability conflict; replace browser subscription"
+                            );
+                        }
+                    }
+                    _ => bail!("push endpoint capability conflict; replace browser subscription"),
+                }
+            } else if !active_member {
+                let owned: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM push_subscriptions s JOIN devices d ON d.fingerprint=s.device_fingerprint
+                     WHERE s.endpoint_id=?1 AND s.disabled_at IS NULL AND d.active=1
+                       AND EXISTS (SELECT 1 FROM push_endpoints e WHERE e.id=s.endpoint_id AND e.disabled_at IS NULL))", [&id], |row| row.get(0),
+                )?;
+                if owned {
+                    bail!("push endpoint belongs to another active device");
+                }
+                transaction.execute(
+                    "UPDATE push_subscriptions SET disabled_at=COALESCE(disabled_at,?2), updated_at=?2 WHERE endpoint_id=?1",
+                    params![id, now],
+                )?;
             }
             transaction.execute(
-                "UPDATE push_subscriptions SET device_fingerprint=?2, p256dh=?3, auth=?4,
-                 expiration_at=?5, updated_at=?6, disabled_at=NULL, last_error=NULL
-                 WHERE id=?1",
-                params![id, fingerprint, p256dh, auth, expiration_at, now],
+                "UPDATE push_endpoints SET p256dh=?2, auth=?3, expiration_at=?4,
+                 installation_token_hash=COALESCE(installation_token_hash,?5), updated_at=?6,
+                 disabled_at=NULL, last_error=NULL WHERE id=?1",
+                params![id, p256dh, auth, expiration_at, supplied_hash, now],
             )?;
             id
         } else {
-            let id = format!("ps_{}", uuid::Uuid::new_v4().simple());
+            let id = format!("pe_{}", uuid::Uuid::new_v4().simple());
             transaction.execute(
-                "INSERT INTO push_subscriptions
-                 (id, device_fingerprint, endpoint, p256dh, auth, expiration_at, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-                params![id, fingerprint, endpoint, p256dh, auth, expiration_at, now],
+                "INSERT INTO push_endpoints(id, endpoint, p256dh, auth, expiration_at, installation_token_hash, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?7)",
+                params![id, endpoint, p256dh, auth, expiration_at, supplied_hash, now],
             )?;
             id
         };
+        let candidate = format!("ps_{}", uuid::Uuid::new_v4().simple());
+        transaction.execute(
+            "INSERT INTO push_subscriptions(id, endpoint_id, device_fingerprint, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?4) ON CONFLICT(endpoint_id,device_fingerprint)
+             DO UPDATE SET updated_at=excluded.updated_at, disabled_at=NULL",
+            params![candidate, endpoint_id, fingerprint, now],
+        )?;
+        let id = transaction.query_row(
+            "SELECT id FROM push_subscriptions WHERE endpoint_id=?1 AND device_fingerprint=?2",
+            params![endpoint_id, fingerprint],
+            |row| row.get(0),
+        )?;
+        // A legacy reclaim must not revive or preserve work for a previous owner.
+        abandon_ineligible_pushes(&transaction, now)?;
         transaction.commit()?;
         Ok(id)
     }
@@ -311,8 +361,9 @@ impl Store {
         };
         let count: usize = connection
             .query_row(
-                "SELECT COUNT(*) FROM push_subscriptions
-                 WHERE device_fingerprint=?1 AND disabled_at IS NULL",
+                "SELECT COUNT(*) FROM push_subscriptions s JOIN push_endpoints e ON e.id=s.endpoint_id
+                 WHERE s.device_fingerprint=?1 AND s.disabled_at IS NULL AND e.disabled_at IS NULL
+                   AND (e.expiration_at IS NULL OR e.expiration_at>unixepoch())",
                 [owner],
                 |row| row.get::<_, i64>(0),
             )?
@@ -346,11 +397,7 @@ impl Store {
             params![id, token_hash, now],
         )?;
         if changed != 0 {
-            transaction.execute(
-                "UPDATE push_outbox SET abandoned_at=?2, claim_token=NULL, claimed_until=NULL
-                 WHERE subscription_id=?1 AND sent_at IS NULL AND abandoned_at IS NULL",
-                params![id, now],
-            )?;
+            abandon_ineligible_pushes(&transaction, now)?;
         }
         transaction.commit()?;
         Ok(changed == 1)
@@ -523,6 +570,57 @@ impl Store {
     }
 }
 
+// The candidate row alias p always carries the exact lane, request and physical endpoint.
+// This single predicate is used at enqueue, claim, delete and device revoke.
+const PUSH_ELIGIBLE: &str = "EXISTS (
+    SELECT 1 FROM push_endpoints e
+    JOIN push_subscriptions s ON s.endpoint_id=e.id
+    JOIN devices d ON d.fingerprint=s.device_fingerprint
+    WHERE e.id=p.endpoint_id AND e.disabled_at IS NULL
+      AND (e.expiration_at IS NULL OR e.expiration_at>?1)
+      AND s.disabled_at IS NULL AND d.active=1
+      AND ((p.request_kind='request' AND EXISTS
+             (SELECT 1 FROM sealed_bodies b WHERE b.request_id=p.request_id AND b.fingerprint=d.fingerprint))
+        OR (p.request_kind='auth' AND EXISTS
+             (SELECT 1 FROM auth_sealed_bodies b WHERE b.request_id=p.request_id AND b.fingerprint=d.fingerprint))
+        OR (p.request_kind='tool' AND EXISTS
+             (SELECT 1 FROM tool_sealed_bodies b WHERE b.request_id=p.request_id AND b.fingerprint=d.fingerprint)))
+)";
+
+fn enqueue_push(
+    transaction: &Transaction<'_>,
+    lane: &str,
+    id: &str,
+    payload: &[u8],
+    now: i64,
+) -> Result<()> {
+    transaction.execute(&format!(
+        "INSERT OR IGNORE INTO push_outbox(request_kind,request_id,endpoint_id,payload,created_at,available_at)
+         SELECT ?2,?3,p.endpoint_id,?4,?1,?1
+         FROM (SELECT id AS endpoint_id, ?2 AS request_kind, ?3 AS request_id FROM push_endpoints) p
+         WHERE {PUSH_ELIGIBLE}"), params![now, lane, id, payload])?;
+    Ok(())
+}
+
+fn unix_now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+fn installation_token_hash(token: &str) -> Result<Vec<u8>> {
+    if token.len() != 43
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("invalid installation token");
+    }
+    let bytes = oshioki_protocol::decode_base64url(token).context("invalid installation token")?;
+    if bytes.len() != 32 || oshioki_protocol::encode_base64url(&bytes) != token {
+        bail!("invalid installation token");
+    }
+    Ok(Sha256::digest(&bytes).to_vec())
+}
+
 fn abandon_ineligible_pushes(transaction: &Transaction<'_>, now: i64) -> Result<()> {
     transaction.execute(
         "UPDATE push_outbox SET abandoned_at=?1, claim_token=NULL, claimed_until=NULL,
@@ -530,19 +628,16 @@ fn abandon_ineligible_pushes(transaction: &Transaction<'_>, now: i64) -> Result<
          AND attempts>=?2 AND (claimed_until IS NULL OR claimed_until<=?1)",
         params![now, PUSH_MAX_ATTEMPTS],
     )?;
-    transaction.execute(
-        "UPDATE push_outbox SET abandoned_at=?1 WHERE sent_at IS NULL AND abandoned_at IS NULL
+    transaction.execute(&format!(
+        "UPDATE push_outbox AS p SET abandoned_at=?1, claim_token=NULL, claimed_until=NULL
+         WHERE sent_at IS NULL AND abandoned_at IS NULL
          AND ((request_kind='request' AND NOT EXISTS
-              (SELECT 1 FROM requests r WHERE r.id=push_outbox.request_id AND r.state='pending' AND r.expires_at>?1))
+              (SELECT 1 FROM requests r WHERE r.id=p.request_id AND r.state='pending' AND r.expires_at>?1))
            OR (request_kind='auth' AND NOT EXISTS
-              (SELECT 1 FROM auth_requests a WHERE a.id=push_outbox.request_id AND a.state='pending' AND a.expires_at>?1))
+              (SELECT 1 FROM auth_requests a WHERE a.id=p.request_id AND a.state='pending' AND a.expires_at>?1))
            OR (request_kind='tool' AND NOT EXISTS
-              (SELECT 1 FROM tool_requests t WHERE t.id=push_outbox.request_id AND t.state='pending' AND t.expires_at>?1))
-           OR NOT EXISTS (SELECT 1 FROM devices d JOIN push_subscriptions s ON s.device_fingerprint=d.fingerprint
-                          WHERE s.id=push_outbox.subscription_id AND d.active=1 AND s.disabled_at IS NULL
-                            AND (s.expiration_at IS NULL OR s.expiration_at>?1)))",
-        [now],
-    )?;
+              (SELECT 1 FROM tool_requests t WHERE t.id=p.request_id AND t.state='pending' AND t.expires_at>?1))
+           OR NOT ({PUSH_ELIGIBLE}))"), [now])?;
     Ok(())
 }
 
@@ -703,16 +798,12 @@ impl Store {
             "lane": "request",
             "request_id": envelope.request_id,
         }))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO push_outbox
-             (request_kind, request_id, subscription_id, payload, created_at, available_at)
-             SELECT 'request', ?1, p.id, ?2, ?3, ?3
-             FROM push_subscriptions p
-             JOIN devices d ON d.fingerprint=p.device_fingerprint
-             JOIN sealed_bodies b ON b.fingerprint=d.fingerprint AND b.request_id=?1
-             WHERE d.active=1 AND p.disabled_at IS NULL
-               AND (p.expiration_at IS NULL OR p.expiration_at>?3)",
-            params![envelope.request_id, push_payload, now],
+        enqueue_push(
+            &transaction,
+            "request",
+            &envelope.request_id,
+            &push_payload,
+            now,
         )?;
         // Routing is part of the same durable transaction as the request:
         // only an active device record already bound to one of the sealed
@@ -809,17 +900,12 @@ impl Store {
             "lane": "tool",
             "request_id": envelope.request_id,
         }))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO push_outbox
-             (request_kind, request_id, subscription_id, payload, created_at, available_at)
-             SELECT 'tool', ?1, p.id, ?2, ?3, ?3
-             FROM push_subscriptions p
-             JOIN devices d ON d.fingerprint=p.device_fingerprint
-             JOIN tool_sealed_bodies b ON b.fingerprint=d.fingerprint AND b.request_id=?1
-             WHERE d.active=1 AND p.disabled_at IS NULL
-               AND COALESCE(json_extract(d.public_record_json, '$.kind'), 'webauthn')='webauthn'
-               AND (p.expiration_at IS NULL OR p.expiration_at>?3)",
-            params![envelope.request_id, push_payload, now],
+        enqueue_push(
+            &transaction,
+            "tool",
+            &envelope.request_id,
+            &push_payload,
+            now,
         )?;
         let delivery = serde_json::to_vec(&ToolDeliveryV1::for_request(&envelope.request_id))?;
         transaction.execute(
@@ -1035,16 +1121,12 @@ impl Store {
             "lane": "auth",
             "request_id": envelope.request_id,
         }))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO push_outbox
-             (request_kind, request_id, subscription_id, payload, created_at, available_at)
-             SELECT 'auth', ?1, p.id, ?2, ?3, ?3
-             FROM push_subscriptions p
-             JOIN devices d ON d.fingerprint=p.device_fingerprint
-             JOIN auth_sealed_bodies b ON b.fingerprint=d.fingerprint AND b.request_id=?1
-             WHERE d.active=1 AND p.disabled_at IS NULL
-               AND (p.expiration_at IS NULL OR p.expiration_at>?3)",
-            params![envelope.request_id, push_payload, now],
+        enqueue_push(
+            &transaction,
+            "auth",
+            &envelope.request_id,
+            &push_payload,
+            now,
         )?;
         // Same rule as the command lane: a delivery receipt is a relay
         // commitment for an enrolled browser recipient, never evidence that
@@ -1066,7 +1148,7 @@ impl Store {
                 "INSERT INTO outbox(kind, dedupe_key, subject, payload, created_at, expires_at)
                  VALUES ('delivery', ?1, ?2, ?3, unixepoch(), ?4)",
                 params![
-                    envelope.request_id,
+                    format!("auth:{}", envelope.request_id),
                     format!("oshioki.delivery.{}", envelope.request_id),
                     delivery,
                     envelope.expires_at
@@ -1328,27 +1410,27 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<PushClaimRow> = transaction
             .query_row(
-                "SELECT p.id, p.subscription_id, s.endpoint, s.p256dh, s.auth, p.payload,
+                &format!(
+                    "SELECT p.id, p.endpoint_id, s.endpoint, s.p256dh, s.auth, p.payload,
                             p.request_kind, p.request_id,
                             CASE p.request_kind WHEN 'request' THEN r.expires_at
                                  WHEN 'auth' THEN a.expires_at ELSE t.expires_at END,
                             p.attempts
                      FROM push_outbox p
-                     JOIN push_subscriptions s ON s.id=p.subscription_id
+                     JOIN push_endpoints s ON s.id=p.endpoint_id
                      LEFT JOIN requests r ON p.request_kind='request' AND r.id=p.request_id
                      LEFT JOIN auth_requests a ON p.request_kind='auth' AND a.id=p.request_id
                      LEFT JOIN tool_requests t ON p.request_kind='tool' AND t.id=p.request_id
-                     JOIN devices d ON d.fingerprint=s.device_fingerprint
                      WHERE p.sent_at IS NULL AND p.abandoned_at IS NULL
                        AND p.available_at<=?1
                        AND (p.claimed_until IS NULL OR p.claimed_until<=?1)
                        AND p.attempts < ?2
-                       AND d.active=1 AND s.disabled_at IS NULL
-                       AND (s.expiration_at IS NULL OR s.expiration_at>?1)
+                       AND {PUSH_ELIGIBLE}
                        AND ((p.request_kind='request' AND r.state='pending' AND r.expires_at>?1)
                             OR (p.request_kind='auth' AND a.state='pending' AND a.expires_at>?1)
                             OR (p.request_kind='tool' AND t.state='pending' AND t.expires_at>?1))
-                     ORDER BY p.id LIMIT 1",
+                     ORDER BY p.id LIMIT 1"
+                ),
                 params![now, PUSH_MAX_ATTEMPTS],
                 |row| {
                     Ok((
@@ -1368,7 +1450,7 @@ impl Store {
             .optional()?;
         let Some((
             id,
-            subscription_id,
+            endpoint_id,
             endpoint,
             p256dh,
             auth,
@@ -1397,7 +1479,7 @@ impl Store {
         transaction.commit()?;
         Ok(Some(PushItem {
             id,
-            subscription_id,
+            endpoint_id,
             endpoint,
             p256dh,
             auth,
@@ -1463,28 +1545,30 @@ impl Store {
     pub fn disable_push_for_claim(
         &self,
         id: i64,
-        subscription_id: &str,
+        endpoint_id: &str,
         claim_token: &str,
         now: i64,
         error: &str,
     ) -> Result<bool> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE push_outbox SET abandoned_at=?4, claim_token=NULL, claimed_until=NULL, last_error=?5
-             WHERE id=?1 AND subscription_id=?2 AND claim_token=?3
-               AND sent_at IS NULL AND abandoned_at IS NULL",
-            params![id, subscription_id, claim_token, now, error],
+        let owns: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM push_outbox WHERE id=?1 AND endpoint_id=?2 AND claim_token=?3
+             AND sent_at IS NULL AND abandoned_at IS NULL)", params![id, endpoint_id, claim_token], |row| row.get(0),
         )?;
-        if changed == 1 {
+        if owns {
             transaction.execute(
-                "UPDATE push_subscriptions SET disabled_at=?2, updated_at=?2, last_error=?3
-                 WHERE id=?1 AND disabled_at IS NULL",
-                params![subscription_id, now, error],
+                "UPDATE push_endpoints SET disabled_at=?2, updated_at=?2, last_error=?3 WHERE id=?1",
+                params![endpoint_id, now, error],
+            )?;
+            transaction.execute(
+                "UPDATE push_outbox SET abandoned_at=?2, claim_token=NULL, claimed_until=NULL, last_error=?3
+                 WHERE endpoint_id=?1 AND sent_at IS NULL AND abandoned_at IS NULL",
+                params![endpoint_id, now, error],
             )?;
         }
         transaction.commit()?;
-        Ok(changed == 1)
+        Ok(owns)
     }
 
     /// Verdicts, delivery receipts, and enrollment relays publish to NATS.
@@ -1598,7 +1682,8 @@ impl Store {
             [now - SERVER_REQUEST_RETENTION_SECS],
         )?;
         connection.execute(
-            "DELETE FROM push_subscriptions WHERE disabled_at IS NOT NULL AND disabled_at < ?1",
+            "DELETE FROM push_subscriptions WHERE disabled_at IS NOT NULL AND disabled_at < ?1
+             AND endpoint_id IN (SELECT id FROM push_endpoints WHERE installation_token_hash IS NULL)",
             [now - PUSH_DISABLED_RETENTION_SECS],
         )?;
         Ok(())
@@ -1886,6 +1971,84 @@ PRAGMA user_version = 4;
 COMMIT;
 ";
 
+/// Preserve the original v4 file in the verified restore snapshot. All v5
+/// table rebuilds and the version update commit together with FK protection on.
+fn migrate_v5(connection: &Connection) -> Result<()> {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATION_V5)?;
+    let violations: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 {
+        bail!("schema v5 foreign key integrity check failed");
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+const MIGRATION_V5: &str = r"
+CREATE TABLE push_endpoints (
+  id TEXT PRIMARY KEY,
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh BLOB NOT NULL,
+  auth BLOB NOT NULL,
+  expiration_at INTEGER,
+  installation_token_hash BLOB CHECK(installation_token_hash IS NULL OR length(installation_token_hash)=32),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  disabled_at INTEGER,
+  last_error TEXT
+);
+INSERT INTO push_endpoints
+  (id,endpoint,p256dh,auth,expiration_at,created_at,updated_at,disabled_at,last_error)
+SELECT 'pe_' || id, endpoint,p256dh,auth,expiration_at,created_at,updated_at,disabled_at,last_error
+FROM push_subscriptions;
+ALTER TABLE push_outbox RENAME TO push_outbox_v4;
+ALTER TABLE push_subscriptions RENAME TO push_subscriptions_v4;
+CREATE TABLE push_subscriptions (
+  id TEXT PRIMARY KEY,
+  endpoint_id TEXT NOT NULL REFERENCES push_endpoints(id),
+  device_fingerprint TEXT NOT NULL REFERENCES devices(fingerprint),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  disabled_at INTEGER,
+  UNIQUE(endpoint_id,device_fingerprint)
+);
+INSERT INTO push_subscriptions(id,endpoint_id,device_fingerprint,created_at,updated_at,disabled_at)
+SELECT id,'pe_' || id,device_fingerprint,created_at,updated_at,disabled_at FROM push_subscriptions_v4;
+CREATE TABLE push_outbox (
+  id INTEGER PRIMARY KEY,
+  request_kind TEXT NOT NULL CHECK(request_kind IN ('request','auth','tool')),
+  request_id TEXT NOT NULL,
+  endpoint_id TEXT NOT NULL REFERENCES push_endpoints(id) ON DELETE CASCADE,
+  payload BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  available_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  sent_at INTEGER,
+  abandoned_at INTEGER,
+  claim_token TEXT,
+  claimed_until INTEGER,
+  last_error TEXT,
+  UNIQUE(request_kind,request_id,endpoint_id)
+);
+INSERT INTO push_outbox(id,request_kind,request_id,endpoint_id,payload,created_at,available_at,
+                        attempts,sent_at,abandoned_at,claim_token,claimed_until,last_error)
+SELECT id,request_kind,request_id,'pe_' || subscription_id,payload,created_at,available_at,
+       attempts,sent_at,abandoned_at,claim_token,claimed_until,last_error FROM push_outbox_v4;
+DROP TABLE push_outbox_v4;
+DROP TABLE push_subscriptions_v4;
+CREATE INDEX push_subscriptions_device_idx ON push_subscriptions(device_fingerprint,disabled_at);
+CREATE INDEX push_outbox_pending_idx ON push_outbox(sent_at,abandoned_at,available_at,id);
+-- Request IDs exclude ':', so this namespace cannot overlap command receipt keys.
+-- Existing auth request rows remain the ingestion idempotency guard: changing the
+-- internal key never resets sent state or requeues a retained receipt.
+UPDATE outbox SET dedupe_key='auth:' || dedupe_key
+WHERE kind='delivery' AND EXISTS (SELECT 1 FROM auth_requests a WHERE a.id=outbox.dedupe_key);
+PRAGMA user_version=5;
+";
+
 const MIGRATION_V2: &str = r"
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS auth_requests (
@@ -1939,6 +2102,7 @@ COMMIT;
 
 #[cfg(test)]
 mod tests {
+    include!("db_push_tests.rs");
     use super::*;
     use oshioki_protocol::{
         DenyV1, DeviceKindV1, EnrollmentSubmissionV1, NativeEnrollmentSubmissionV1,
@@ -2267,6 +2431,18 @@ mod tests {
         assert_eq!(verdicts, 1);
     }
 
+    fn endpoint_for(store: &Store, membership: &str) -> String {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT endpoint_id FROM push_subscriptions WHERE id=?1",
+                [membership],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn push_material() -> (Vec<u8>, Vec<u8>) {
         let signing = SigningKey::from_bytes((&[8; 32]).into()).unwrap();
         let point = signing.verifying_key().to_encoded_point(false);
@@ -2320,7 +2496,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
         drop(store);
         let snapshot = restore_snapshot_path(&path, 1);
         assert!(snapshot.exists(), "{}", snapshot.display());
@@ -2370,7 +2546,7 @@ mod tests {
         store.ingest_request(&raw, &envelope, 20).unwrap();
         store.ingest_request(&raw, &envelope, 20).unwrap();
         let item = store.claim_push(20, PUSH_LEASE_SECS).unwrap().unwrap();
-        assert_eq!(item.subscription_id, id);
+        assert_eq!(item.endpoint_id, endpoint_for(&store, &id));
         let payload: serde_json::Value = serde_json::from_slice(&item.payload).unwrap();
         assert_eq!(
             payload,
@@ -2396,8 +2572,8 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO push_outbox(request_kind, request_id, subscription_id, payload, created_at, available_at)
-                 VALUES ('request', ?1, ?2, ?3, ?4, ?4)",
+                "INSERT INTO push_outbox(request_kind, request_id, endpoint_id, payload, created_at, available_at)
+                 VALUES ('request', ?1, (SELECT endpoint_id FROM push_subscriptions WHERE id=?2), ?3, ?4, ?4)",
                 params!["request-1", id2, serde_json::to_vec(&payload).unwrap(), 20],
             )
             .unwrap();
@@ -2479,12 +2655,10 @@ mod tests {
                 .is_err()
         );
         assert!(store.set_device_active(&first.fingerprint, false).unwrap());
-        assert_eq!(
-            store
-                .register_push_subscription(second_token, endpoint, &p256dh, &auth, None, 20)
-                .unwrap(),
-            id
-        );
+        let second_id = store
+            .register_push_subscription(second_token, endpoint, &p256dh, &auth, None, 20)
+            .unwrap();
+        assert_ne!(second_id, id);
         let envelope = envelope(&second.fingerprint);
         store
             .ingest_request(&serde_json::to_vec(&envelope).unwrap(), &envelope, 20)
@@ -2497,7 +2671,7 @@ mod tests {
             .unwrap()
             .query_row(
                 "SELECT disabled_at IS NOT NULL FROM push_subscriptions WHERE id=?1",
-                [id],
+                [second_id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -2753,7 +2927,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
 
         let browser = device(b"upgrade-token");
         store.put_device(&browser).unwrap();

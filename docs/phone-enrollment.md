@@ -72,6 +72,24 @@ be available to the Home Screen app; use a fresh URL in the app if necessary.
 A denied notification permission does not undo enrollment, but prevents push
 delivery.
 
+To approve requests from several hosts in one installed app, configure those
+hosts to use the **same HTTPS origin and Oshioki backend** with the shared NATS
+lanes. Repeat enrollment from each host and open each complete enrollment URL
+inside that same installed app. Every enrollment keeps its own bearer, passkey,
+and decryption key; notifications use one browser subscription for all saved
+enrollments. Adding an enrollment to an app with notifications enabled registers
+it automatically without another permission prompt. Enable notifications retries
+registration for all saved enrollments and reports any partial failures.
+
+Independent backends or HTTPS origins remain separate browser installations.
+This feature does not synchronize enrollment credentials or browser notification
+state between origins, browser profiles, or phones.
+
+Refresh or reopen the app to load the current browser code before using several
+enrollments. An older open app can still replace its subscription when switching
+enrollments. If the server does not advertise multi-enrollment support, update it
+first; the current app preserves existing notification settings until then.
+
 ## 3. Activate and verify
 
 On the host, confirm the device and send a test:
@@ -94,6 +112,27 @@ The phone must reach the same HTTPS origin when a notification is tapped.
 With Tailscale Serve, that means an active tailnet connection. Keep the hostname
 stable: passkeys are scoped to the RP ID. Do not substitute `localhost`;
 on the phone it refers to the phone itself.
+
+Revoking one enrollment on its host disables only that identity's notification
+membership and request access. Other saved enrollments keep the shared browser
+subscription and continue to receive and approve their own requests. A generic
+notification already in flight may still arrive after revocation; it does not
+grant access to the revoked identity's request.
+
+The current app automatically migrates an existing single-enrollment notification
+subscription using its recorded original enrollment, even when a different
+enrollment is displayed. It preserves the endpoint and the other saved keys.
+Notification setup requires browser Web Locks support to coordinate tabs; an
+unsupported browser preserves existing registrations and shows the prerequisite.
+
+The app stores a random notification capability in origin-local IndexedDB. It
+only proves control of the push endpoint and cannot fetch or approve requests.
+If that storage is lost, or the original enrollment can no longer claim an old
+subscription, the app preserves the existing endpoint and offers **Replace
+notification subscription**. That explicit action unsubscribes the inaccessible
+endpoint, creates a fresh one, and registers the enrollments still saved in the
+app. Re-enroll first if the enrollment credentials themselves were also lost.
+Clearing browser storage is not a way to transfer endpoint ownership.
 
 Managed state and logs live under `~/.local/share/oshioki/phone-server`.
 The default ports are NATS 14222, HTTP 18443, and Tailscale HTTPS 18444,
@@ -124,7 +163,10 @@ if approvals must work while a laptop sleeps.
 | URL expired | Run enrollment again; its lifetime cannot be extended. |
 | Host preflight fails | Restore server health, HTTPS trust, and matching origin/RP ID first. |
 | Host succeeds but phone cannot connect | Check the phone's network and tailnet access. |
-| Enrolled but no notifications | Check permission and push registration in the installed app; `/healthz` alone does not prove delivery. |
+| Enrolled but no notifications | Check permission and registration for all saved enrollments in the installed app; `/healthz` alone does not prove delivery. |
+| Some enrollments need attention | Retry Enable notifications; confirm each enrollment is still active. Successful registrations remain saved. |
+| Notification ownership unavailable | Use the app's explicit Replace notification subscription action after checking that the desired enrollments are saved. |
+| Server needs an update | Update the shared backend and refresh the app before enabling multi-enrollment notifications. |
 | Server confirmation timed out | The host may already have pinned the device. Inspect status and re-enroll once the server is healthy. |
 
 Local browser development can use `oshioki enroll --allow-localhost`; that

@@ -90,6 +90,26 @@ v0.1.14. Older binaries than that release cannot read a version-3 file;
 the snapshot is the rollback path. This binary still snapshots before
 applying V3 if it opens a version 0–2 file.
 
+Schema version 5 separates canonical Web Push endpoints from enrollment
+memberships and deduplicates delivery by endpoint and exact request lane/ID.
+This is class 2: the previous server cannot use the new SQL shape. Upgrading
+from version 4 first verifies `state.pre-v4.sqlite3`; that snapshot retains
+original devices, subscription IDs, keys, and queued/sent delivery state in
+the old schema. Restore it using the procedure above before running the
+previous binary. Versions 0–3 likewise snapshot their original version and
+advance through version 5. Protected endpoint capability hashes and stable
+membership IDs survive disabled-registration retention cleanup. V5 also
+namespaces retained authentication delivery receipt keys internally; payloads,
+NATS subjects, sent state, and request-ingestion idempotency remain unchanged.
+
+The push HTTP API stays version 1 and adds `multi_enrollment: true` to config.
+New browsers require this capability before sharing one browser subscription
+among enrollments. Old clients can safely refresh an existing enabled
+membership with identical transport material; they cannot add a protected
+endpoint membership or reset its capability without the installation token.
+Refresh/reopen an old browser bundle before using several enrollments: cached
+older JavaScript still implements single-owner subscription replacement.
+
 The server refuses `user_version` newer than it writes.
 
 ## Identity-file rule
