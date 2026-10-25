@@ -91,7 +91,8 @@ async fn revocation_stale_command_and_auth_cannot_restore_or_accept_positive_or_
                 revocation_success(&dir, &device.fingerprint).await;
             }
             let error = apply_decision(
-                revocation_command_decision(&key, &device, &command, &command_raw, counter), DecisionLane::Nats,
+                revocation_command_decision(&key, &device, &command, &command_raw, counter),
+                DecisionLane::Nats,
                 &command,
                 &command_raw,
                 &snapshot.registry.devices,
@@ -109,7 +110,8 @@ async fn revocation_stale_command_and_auth_cannot_restore_or_accept_positive_or_
                 &snapshot.registry.devices,
                 snapshot.revocation_epoch,
                 &dir,
-            ).await
+            )
+            .await
             .unwrap_err();
             assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
             let current = registry::snapshot(&dir).unwrap();
@@ -150,7 +152,8 @@ async fn revocation_stale_native_both_command_kinds_and_auth_fail_without_write(
             }
             assert!(
                 apply_decision(
-                    revocation_native_command(&key, &device, &command, &raw), DecisionLane::Nats,
+                    revocation_native_command(&key, &device, &command, &raw),
+                    DecisionLane::Nats,
                     &command,
                     &raw,
                     &snapshot.registry.devices,
@@ -169,7 +172,8 @@ async fn revocation_stale_native_both_command_kinds_and_auth_fail_without_write(
                     &snapshot.registry.devices,
                     snapshot.revocation_epoch,
                     &dir,
-                ).await
+                )
+                .await
                 .unwrap_err();
                 assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
             }
@@ -197,7 +201,8 @@ async fn revocation_epoch_blocks_identical_record_aba_and_fresh_requests_work() 
     let auth_raw = auth.raw_json().unwrap();
     // A passed gate before revoke is allowed ordering, not cancellable execution.
     apply_decision(
-        revocation_command_decision(&key, &device, &command, &raw, 0), DecisionLane::Nats,
+        revocation_command_decision(&key, &device, &command, &raw, 0),
+        DecisionLane::Nats,
         &command,
         &raw,
         &old.registry.devices,
@@ -212,7 +217,8 @@ async fn revocation_epoch_blocks_identical_record_aba_and_fresh_requests_work() 
     assert_eq!(registry::snapshot(&dir).unwrap().revocation_epoch, 1);
     assert!(
         apply_decision(
-            revocation_command_decision(&key, &device, &command, &raw, 17), DecisionLane::Nats,
+            revocation_command_decision(&key, &device, &command, &raw, 17),
+            DecisionLane::Nats,
             &command,
             &raw,
             &old.registry.devices,
@@ -230,14 +236,16 @@ async fn revocation_epoch_blocks_identical_record_aba_and_fresh_requests_work() 
             &old.registry.devices,
             old.revocation_epoch,
             &dir
-        ).await
+        )
+        .await
         .is_err()
     );
     let fresh = registry::snapshot(&dir).unwrap();
     let next = build_synthetic_request();
     let next_raw = next.raw_json().unwrap();
     apply_decision(
-        revocation_command_decision(&key, &device, &next, &next_raw, 18), DecisionLane::Nats,
+        revocation_command_decision(&key, &device, &next, &next_raw, 18),
+        DecisionLane::Nats,
         &next,
         &next_raw,
         &fresh.registry.devices,
@@ -255,7 +263,8 @@ async fn revocation_epoch_blocks_identical_record_aba_and_fresh_requests_work() 
         &fresh.registry.devices,
         fresh.revocation_epoch,
         &dir,
-    ).await
+    )
+    .await
     .unwrap();
     assert_eq!(
         registry::snapshot(&dir).unwrap().registry.devices[0].sign_count,
@@ -278,7 +287,8 @@ async fn revocation_counters_merge_current_rows_and_pin_enroll_preserve_high_wat
     let raw = command.raw_json().unwrap();
     for counter in [40, 9, 0] {
         apply_decision(
-            revocation_command_decision(&key, &device, &command, &raw, counter), DecisionLane::Nats,
+            revocation_command_decision(&key, &device, &command, &raw, counter),
+            DecisionLane::Nats,
             &command,
             &raw,
             &snapshot.registry.devices,
@@ -298,7 +308,8 @@ async fn revocation_counters_merge_current_rows_and_pin_enroll_preserve_high_wat
             &snapshot.registry.devices,
             snapshot.revocation_epoch,
             &dir,
-        ).await
+        )
+        .await
         .unwrap();
     }
     let mut refreshed = device.clone();
@@ -346,7 +357,8 @@ async fn revocation_counters_merge_current_rows_and_pin_enroll_preserve_high_wat
     let raw = command.raw_json().unwrap();
     assert!(
         apply_decision(
-            revocation_command_decision(&key, &device, &command, &raw, 70), DecisionLane::Nats,
+            revocation_command_decision(&key, &device, &command, &raw, 70),
+            DecisionLane::Nats,
             &command,
             &raw,
             &snapshot.registry.devices,
@@ -385,9 +397,9 @@ async fn revocation_exact_identity_gate_rejects_token_kind_and_key_changes_but_a
             _ => unreachable!(),
         }
         if field == "public" {
-            let other = SigningKey::from_bytes((&[88; 32]).into()).unwrap();
+            let other = SigningKey::from_slice(&[88; 32]).unwrap();
             changed.credential_public_key =
-                URL_SAFE_NO_PAD.encode(other.verifying_key().to_encoded_point(false).as_bytes());
+                URL_SAFE_NO_PAD.encode(other.verifying_key().to_sec1_point(false).as_bytes());
         }
         // Keep each replacement internally valid: key/credential/box changes
         // change fingerprint too; token/kind replacements retain fingerprint.
@@ -409,7 +421,8 @@ async fn revocation_exact_identity_gate_rejects_token_kind_and_key_changes_but_a
         changed.validate().unwrap();
         seed_registry(&dir, vec![changed]);
         let error = apply_decision(
-            revocation_native_command(&key, &device, &command, &raw), DecisionLane::Nats,
+            revocation_native_command(&key, &device, &command, &raw),
+            DecisionLane::Nats,
             &command,
             &raw,
             &snapshot.registry.devices,
@@ -426,7 +439,8 @@ async fn revocation_exact_identity_gate_rejects_token_kind_and_key_changes_but_a
             &snapshot.registry.devices,
             snapshot.revocation_epoch,
             &dir,
-        ).await
+        )
+        .await
         .unwrap_err();
         assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
     }
@@ -435,7 +449,8 @@ async fn revocation_exact_identity_gate_rejects_token_kind_and_key_changes_but_a
     metadata.sign_count = 0;
     seed_registry(&dir, vec![metadata]);
     apply_decision(
-        revocation_native_command(&key, &device, &command, &raw), DecisionLane::Nats,
+        revocation_native_command(&key, &device, &command, &raw),
+        DecisionLane::Nats,
         &command,
         &raw,
         &snapshot.registry.devices,
@@ -451,7 +466,8 @@ async fn revocation_exact_identity_gate_rejects_token_kind_and_key_changes_but_a
         &snapshot.registry.devices,
         0,
         &dir,
-    ).await
+    )
+    .await
     .unwrap();
 }
 
@@ -509,7 +525,8 @@ async fn revocation_final_expiry_host_fault_and_counter_write_policy() {
             std::slice::from_ref(&native),
             0,
             &dir,
-        ).await
+        )
+        .await
         .unwrap_err();
         assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
     }
@@ -525,7 +542,8 @@ async fn revocation_final_expiry_host_fault_and_counter_write_policy() {
             std::slice::from_ref(&native),
             0,
             &dir,
-        ).await
+        )
+        .await
         .unwrap_err();
         assert_eq!(check_error_exit_code(&error), CHECK_RC_UNAVAILABLE);
     }
@@ -537,7 +555,8 @@ async fn revocation_final_expiry_host_fault_and_counter_write_policy() {
         std::slice::from_ref(&native),
         0,
         &dir,
-    ).await
+    )
+    .await
     .unwrap_err();
     assert_eq!(check_error_exit_code(&error), CHECK_RC_DENIED);
 }
@@ -944,7 +963,8 @@ async fn revocation_cleanup_preserves_new_other_device_counter_during_remote_wor
                 &auth_recipients(&snapshot.registry),
                 snapshot.revocation_epoch,
                 &dir,
-            ).await?;
+            )
+            .await?;
             Ok(())
         },
         registry::persist,

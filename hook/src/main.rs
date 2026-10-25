@@ -4445,8 +4445,8 @@ mod tests {
         let request = build_synthetic_request();
         let raw = request.raw_json().unwrap();
         let credential = vec![1; 8];
-        let signing = SigningKey::from_bytes((&[2; 32]).into()).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = SigningKey::from_slice(&[2; 32]).unwrap();
+        let point = signing.verifying_key().to_sec1_point(false);
         let cose = ciborium::Value::Map(vec![
             (
                 ciborium::Value::Integer(1.into()),
@@ -4697,10 +4697,10 @@ mod tests {
 
     /// One pinned Secure Enclave device with a real key, for denial tests.
     pub(super) fn deny_test_device() -> (DevicePublicRecordV1, p256::ecdsa::SigningKey) {
-        let signing = p256::ecdsa::SigningKey::from_bytes((&[21; 32]).into()).unwrap();
+        let signing = p256::ecdsa::SigningKey::from_slice(&[21; 32]).unwrap();
         let public = signing
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let credential_id = oshioki_protocol::native_credential_id(&public);
@@ -4724,10 +4724,10 @@ mod tests {
     /// A device distinct from `deny_test_device`, for tests that need to
     /// seed the registry with an unrelated entry before pinning.
     fn other_test_device() -> DevicePublicRecordV1 {
-        let signing = p256::ecdsa::SigningKey::from_bytes((&[31; 32]).into()).unwrap();
+        let signing = p256::ecdsa::SigningKey::from_slice(&[31; 32]).unwrap();
         let public = signing
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let credential_id = oshioki_protocol::native_credential_id(&public);
@@ -4803,7 +4803,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("explicitly denied"), "{error:#}");
-        let other = p256::ecdsa::SigningKey::from_bytes((&[24; 32]).into()).unwrap();
+        let other = p256::ecdsa::SigningKey::from_slice(&[24; 32]).unwrap();
         let error = apply(
             DecisionV1::Deny(deny_for(&other, "req-1", &device)),
             &request,
@@ -5187,7 +5187,7 @@ mod tests {
         let box_secret = x25519_dalek::StaticSecret::from([0x22; 32]);
         let credential_public_key = signing
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let credential_id = oshioki_protocol::native_credential_id(&credential_public_key);
@@ -6369,10 +6369,10 @@ mod auth_tests {
     /// A pinned Secure Enclave device and its private key, so a test can
     /// produce the one signature `apply_auth_decision` will accept.
     fn auth_test_device() -> (DevicePublicRecordV1, SigningKey) {
-        let signing = SigningKey::from_bytes((&[41; 32]).into()).unwrap();
+        let signing = SigningKey::from_slice(&[41; 32]).unwrap();
         let public = signing
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let credential_id = oshioki_protocol::native_credential_id(&public);
@@ -6397,8 +6397,8 @@ mod auth_tests {
     /// `protocol/src/auth_v1.rs`'s own tests build one: a COSE P-256 public
     /// key as the credential key, so `cose_p256_verifying_key` accepts it.
     fn webauthn_test_device() -> (DevicePublicRecordV1, SigningKey) {
-        let signing = SigningKey::from_bytes((&[61; 32]).into()).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = SigningKey::from_slice(&[61; 32]).unwrap();
+        let point = signing.verifying_key().to_sec1_point(false);
         let cose = vec![
             (
                 ciborium::Value::Integer(1.into()),
@@ -6861,7 +6861,7 @@ mod auth_tests {
     #[tokio::test]
     async fn an_unpinned_device_fails() {
         let (device, _) = auth_test_device();
-        let impostor = SigningKey::from_bytes((&[51; 32]).into()).unwrap();
+        let impostor = SigningKey::from_slice(&[51; 32]).unwrap();
         let request = auth_request();
         let raw = request.raw_json().unwrap();
         let decision = native_decision(&impostor, &device, &request.request_id, &raw);
@@ -7178,7 +7178,7 @@ mod auth_tests {
     #[tokio::test]
     async fn after_expiry_a_forged_assertion_is_invalid_and_a_genuine_one_fails() {
         let (device, signing) = auth_test_device();
-        let impostor = SigningKey::from_bytes((&[81; 32]).into()).unwrap();
+        let impostor = SigningKey::from_slice(&[81; 32]).unwrap();
         let mut request = auth_request();
         request.issued_at = now() - 120;
         request.expires_at = request.issued_at
@@ -7848,7 +7848,7 @@ mod auth_tests {
     /// Every way to send a decision that does not verify for this request,
     /// as an unprivileged NATS publisher could.
     fn h2_forgeries(request: &RequestV1, device: &DevicePublicRecordV1) -> Vec<Vec<u8>> {
-        let impostor = SigningKey::from_bytes((&[77; 32]).into()).unwrap();
+        let impostor = SigningKey::from_slice(&[77; 32]).unwrap();
         let mut unpinned = super::tests::deny_for(&impostor, &request.request_id, device);
         unpinned.device_fingerprint = URL_SAFE_NO_PAD.encode([78; 16]);
         let mut wrong_request = h2_native_approval(&impostor, device, request);
@@ -8014,7 +8014,7 @@ mod auth_tests {
             return;
         };
         let (device, signing) = auth_test_device();
-        let impostor = SigningKey::from_bytes((&[79; 32]).into()).unwrap();
+        let impostor = SigningKey::from_slice(&[79; 32]).unwrap();
         for genuine in [true, false] {
             let directory = h2_dir(
                 "nats-auth",
@@ -8171,7 +8171,7 @@ mod auth_tests {
     #[tokio::test]
     async fn socket_forgeries_are_unavailable_and_a_verified_denial_denies() {
         let (device, signing) = super::tests::deny_test_device();
-        let impostor = SigningKey::from_bytes((&[80; 32]).into()).unwrap();
+        let impostor = SigningKey::from_slice(&[80; 32]).unwrap();
         for (name, key, approve) in [
             ("socket-forged-deny", &impostor, false),
             ("socket-forged-approve", &impostor, true),

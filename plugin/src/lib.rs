@@ -15,7 +15,10 @@
 #![deny(clippy::alloc_instead_of_core)]
 #![deny(clippy::std_instead_of_alloc)]
 
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+extern crate alloc;
+
+use alloc::ffi::CString;
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::io::Write as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::panic::catch_unwind;
@@ -822,34 +825,31 @@ Run `install-oshioki-hook --contextual-pam-status` and remove one of the two lan
         }
         drain_password_ready(password.as_mut());
         drain_hook_stderr(hook, password.as_mut());
-        if !hook_done {
-            if let Some(result) = reap_hook(hook, true) {
-                hook_done = true;
-                hook_result = Some(result);
-                drain_hook_stderr(hook, password.as_mut());
-                match result {
-                    HookResult::Approved => {
-                        cancel_password(password.take(), true);
-                        return 1;
-                    }
-                    HookResult::Denied | HookResult::Failed => {
-                        cancel_password(password.take(), true);
-                        return 0;
-                    }
-                    HookResult::Unavailable => {}
+        if !hook_done && let Some(result) = reap_hook(hook, true) {
+            hook_done = true;
+            hook_result = Some(result);
+            drain_hook_stderr(hook, password.as_mut());
+            match result {
+                HookResult::Approved => {
+                    cancel_password(password.take(), true);
+                    return 1;
                 }
+                HookResult::Denied | HookResult::Failed => {
+                    cancel_password(password.take(), true);
+                    return 0;
+                }
+                HookResult::Unavailable => {}
             }
         }
 
-        if !password_done {
-            if let Some(worker) = &mut password {
-                if let Some(result) = reap_password(worker) {
-                    password_done = true;
-                    password_result = Some(result);
-                    if matches!(result, PasswordResult::Rejected) {
-                        write_fd(libc::STDERR_FILENO, b"[sudo/oshioki] password rejected\n");
-                    }
-                }
+        if !password_done
+            && let Some(worker) = &mut password
+            && let Some(result) = reap_password(worker)
+        {
+            password_done = true;
+            password_result = Some(result);
+            if matches!(result, PasswordResult::Rejected) {
+                write_fd(libc::STDERR_FILENO, b"[sudo/oshioki] password rejected\n");
             }
         }
 
@@ -1223,11 +1223,9 @@ fn drain_hook_stderr(
         break;
     }
     #[cfg(target_os = "linux")]
-    if output_seen {
-        if let Some(worker) = password {
-            drain_password_ready(Some(&mut *worker));
-            redraw_password_prompt(worker);
-        }
+    if output_seen && let Some(worker) = password {
+        drain_password_ready(Some(&mut *worker));
+        redraw_password_prompt(worker);
     }
 }
 
@@ -1656,7 +1654,8 @@ fn authenticate_with_pam(username: &str, password: &[u8], tty: &CStr) -> Passwor
 #[cfg(target_os = "linux")]
 mod pam {
     use super::PasswordResult;
-    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use alloc::ffi::CString;
+    use std::ffi::{CStr, c_char, c_int, c_void};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr;
 

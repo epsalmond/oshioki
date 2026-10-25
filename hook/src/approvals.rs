@@ -803,10 +803,10 @@ fn read_profile_credentials(path: &Path) -> Result<HashMap<String, String>> {
     let text = String::from_utf8(read_bounded_file(path, MAX_PROFILE_CREDENTIAL_BYTES)?)?;
     let mut values = HashMap::new();
     for line in text.lines() {
-        if let Some((key, value)) = line.split_once('=') {
-            if values.insert(key.to_owned(), value.to_owned()).is_some() {
-                bail!("profile NATS config has duplicate keys");
-            }
+        if let Some((key, value)) = line.split_once('=')
+            && values.insert(key.to_owned(), value.to_owned()).is_some()
+        {
+            bail!("profile NATS config has duplicate keys");
         }
     }
     if values.len() != 3

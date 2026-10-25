@@ -207,7 +207,7 @@ mod tests {
     }
 
     fn submission(key: &SigningKey, label: &str) -> NativeEnrollmentSubmissionV1 {
-        let public = key.verifying_key().to_encoded_point(false);
+        let public = key.verifying_key().to_sec1_point(false);
         let box_public = [6; 32];
         let api_token_hash = [7; 32];
         let proof = native_enrollment_proof(
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn rejects_webauthn_record_in_native_approval() {
         let key = signing_key();
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let cose = webauthn_v1::tests::cose_key(point.x().unwrap(), point.y().unwrap());
         let credential_id = [1; 16];
         let box_public = [6; 32];
@@ -366,7 +366,7 @@ mod tests {
         let other = SigningKey::from_slice(&[0x22; 32]).unwrap();
         let mut swapped_key = submission(&key, "vector");
         swapped_key.credential_public_key =
-            encode_base64url(other.verifying_key().to_encoded_point(false).as_bytes());
+            encode_base64url(other.verifying_key().to_sec1_point(false).as_bytes());
         swapped_key.transcript_hmac =
             encode_base64url(&native_transcript_hmac(&SECRET, &swapped_key).unwrap());
         assert!(matches!(

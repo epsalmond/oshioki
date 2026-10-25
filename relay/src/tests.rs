@@ -73,8 +73,8 @@ impl Harness {
         })
         .await
         .unwrap();
-        let host_key = SigningKey::random(&mut rand::rngs::OsRng);
-        let mac_key = SigningKey::random(&mut rand::rngs::OsRng);
+        let host_key = SigningKey::generate();
+        let mac_key = SigningKey::generate();
         let subject = format!("oshioki.browser.v1.{}", uuid::Uuid::new_v4());
         let host = Peer {
             client: client.clone(),
@@ -170,18 +170,16 @@ async fn authenticated_nats_url_uses_url_credentials() {
     let directory = PathBuf::from(format!("/tmp/oshioki-relay-auth-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&directory).unwrap();
     let _cleanup = TempDir(directory.clone());
-    let key = SigningKey::random(&mut rand::rngs::OsRng);
+    let key = SigningKey::generate();
     let key_path = directory.join("key");
     fs::write(&key_path, encode_base64url(&key.to_bytes())).unwrap();
     fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
-    let peer_key = SigningKey::random(&mut rand::rngs::OsRng);
+    let peer_key = SigningKey::generate();
     let config = Config {
         nats_url,
         lane: uuid::Uuid::new_v4().to_string(),
         private_key: key_path,
-        peer_public_key: encode_base64url(
-            peer_key.verifying_key().to_encoded_point(false).as_bytes(),
-        ),
+        peer_public_key: encode_base64url(peer_key.verifying_key().to_sec1_point(false).as_bytes()),
         google_account: None,
         approval_public_key: None,
         approval_identity: None,
@@ -292,8 +290,8 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
     .await
     .expect("nats-server did not start");
 
-    let signing = SigningKey::random(&mut rand::rngs::OsRng);
-    let peer = SigningKey::random(&mut rand::rngs::OsRng);
+    let signing = SigningKey::generate();
+    let peer = SigningKey::generate();
     let lane = uuid::Uuid::new_v4().to_string();
     let key_path = directory.join("key");
     fs::write(&key_path, encode_base64url(&signing.to_bytes())).unwrap();
@@ -302,7 +300,7 @@ async fn startup_transport_fault_is_bounded(stage: StartupStage) {
         nats_url: format!("nats://127.0.0.1:{port}"),
         lane: lane.clone(),
         private_key: key_path,
-        peer_public_key: encode_base64url(peer.verifying_key().to_encoded_point(false).as_bytes()),
+        peer_public_key: encode_base64url(peer.verifying_key().to_sec1_point(false).as_bytes()),
         google_account: None,
         approval_public_key: None,
         approval_identity: None,

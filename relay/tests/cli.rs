@@ -12,6 +12,7 @@ use futures::StreamExt as _;
 use oshioki_browser_relay::{Action, Message, approval_challenge, sign, verify};
 use oshioki_protocol::encode_base64url;
 use p256::ecdsa::{SigningKey, signature::Signer as _};
+use p256::elliptic_curve::Generate as _;
 use tokio::{process::Command, time::timeout};
 
 struct Temp(PathBuf);
@@ -59,8 +60,8 @@ async fn wrapper_preserves_browser_flow_and_fails_on_google_denial_or_mac_failur
         })
         .await
         .unwrap();
-        let host = SigningKey::random(&mut rand::rngs::OsRng);
-        let mac = SigningKey::random(&mut rand::rngs::OsRng);
+        let host = SigningKey::generate();
+        let mac = SigningKey::generate();
         let lane = uuid::Uuid::new_v4().to_string();
         let key = dir.0.join("key");
         std::fs::write(&key, encode_base64url(&host.to_bytes())).unwrap();
@@ -68,7 +69,7 @@ async fn wrapper_preserves_browser_flow_and_fails_on_google_denial_or_mac_failur
         let config = dir.0.join("config.json");
         std::fs::write(&config, serde_json::to_vec(&serde_json::json!({
             "lane": lane, "nats_url": nats_url, "private_key": key,
-            "peer_public_key": encode_base64url(mac.verifying_key().to_encoded_point(false).as_bytes())
+            "peer_public_key": encode_base64url(mac.verifying_key().to_sec1_point(false).as_bytes())
         })).unwrap()).unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
         let gcloud = dir.0.join("gcloud");
@@ -205,9 +206,9 @@ async fn account_bound_flow_approves_headless_reuse_and_browser_fallback() {
         })
         .await
         .unwrap();
-        let host = SigningKey::random(&mut rand::rngs::OsRng);
-        let mac = SigningKey::random(&mut rand::rngs::OsRng);
-        let approval = SigningKey::random(&mut rand::rngs::OsRng);
+        let host = SigningKey::generate();
+        let mac = SigningKey::generate();
+        let approval = SigningKey::generate();
         let lane = uuid::Uuid::new_v4().to_string();
         let key = dir.0.join("key");
         std::fs::write(&key, encode_base64url(&host.to_bytes())).unwrap();
@@ -220,9 +221,9 @@ async fn account_bound_flow_approves_headless_reuse_and_browser_fallback() {
                 "lane": lane,
                 "nats_url": nats_url,
                 "private_key": key,
-                "peer_public_key": encode_base64url(mac.verifying_key().to_encoded_point(false).as_bytes()),
+                "peer_public_key": encode_base64url(mac.verifying_key().to_sec1_point(false).as_bytes()),
                 "google_account": "selected@example.com",
-                "approval_public_key": encode_base64url(approval.verifying_key().to_encoded_point(false).as_bytes())
+                "approval_public_key": encode_base64url(approval.verifying_key().to_sec1_point(false).as_bytes())
             }))
             .unwrap(),
         )

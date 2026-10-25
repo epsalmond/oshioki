@@ -623,17 +623,17 @@ mod tests {
     };
     use p256::{
         ecdsa::{SigningKey, signature::Signer as _},
-        elliptic_curve::rand_core::OsRng,
+        elliptic_curve::Generate as _,
     };
 
     const NOW: i64 = 10_000;
 
     fn signing_key() -> SigningKey {
-        SigningKey::random(&mut OsRng)
+        SigningKey::generate()
     }
 
     fn secure_enclave_device(key: &SigningKey, box_key: &[u8; 32]) -> DevicePublicRecordV1 {
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let sec1 = point.as_bytes();
         let credential_id = crate::native_v1::native_credential_id(sec1);
         DevicePublicRecordV1 {
@@ -651,7 +651,7 @@ mod tests {
     }
 
     fn webauthn_fixture(key: &SigningKey) -> (DevicePublicRecordV1, HookConfigV1) {
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let cose = vec![
             (
                 ciborium::Value::Integer(1.into()),

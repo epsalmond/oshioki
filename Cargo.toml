@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/web-push-native"]
 members = [
     "protocol",
     "transport",
@@ -19,7 +20,7 @@ members = [
 [workspace.package]
 version = "0.4.3"
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.88.0"
 repository = "https://github.com/epsalmond/oshioki"
 license = "MIT OR Apache-2.0"
 publish = false
@@ -67,7 +68,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 async-nats = { version = "0.50" }
 
 # Crypto / auth
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14.0", features = ["ecdsa", "getrandom"] }
 sha2 = { version = "0.10" }
 hmac = { version = "0.12" }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }

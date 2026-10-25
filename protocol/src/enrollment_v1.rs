@@ -259,7 +259,7 @@ mod tests {
     use crate::webauthn_v1::MAX_CBOR_DEPTH;
     use p256::{
         ecdsa::{Signature, SigningKey, signature::Signer as _},
-        elliptic_curve::rand_core::OsRng,
+        elliptic_curve::Generate as _,
     };
 
     fn fixture() -> (WebauthnEnrollmentSubmissionV1, [u8; 32], HookConfigV1) {
@@ -270,8 +270,8 @@ mod tests {
             rp_id: "sudo.example".into(),
             server_base_url: "https://sudo.example".into(),
         };
-        let signing = SigningKey::random(&mut OsRng);
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = SigningKey::generate();
+        let point = signing.verifying_key().to_sec1_point(false);
         let cose = Value::Map(vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
             (Value::Integer(3.into()), Value::Integer((-7).into())),
@@ -460,10 +460,10 @@ mod tests {
             unreachable!();
         };
         for (key, value) in &mut entries {
-            if *key == Value::Text("authData".into()) {
-                if let Value::Bytes(auth_data) = value {
-                    auth_data.push(0);
-                }
+            if *key == Value::Text("authData".into())
+                && let Value::Bytes(auth_data) = value
+            {
+                auth_data.push(0);
             }
         }
         assert!(parse_attestation(&encode_value(&Value::Map(entries)), &config.rp_id).is_err());

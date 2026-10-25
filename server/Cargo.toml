@@ -30,8 +30,8 @@ sha2 = { workspace = true }
 time = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 url = "2"
-web-push-native = { version = "0.5.0", default-features = false, features = ["serialization"] }
-jwt-compact = { version = "0.9.0-beta.1", default-features = false, features = ["std", "clock", "p256"] }
+web-push-native = { path = "../vendor/web-push-native", default-features = false, features = ["serialization"] }
+jwt-compact = { git = "https://github.com/slowli/jwt-compact", rev = "6b410eeff261738123d6993388183fde66df5e26", default-features = false, features = ["clock", "p256"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 p256 = { workspace = true }
 uuid = { workspace = true }

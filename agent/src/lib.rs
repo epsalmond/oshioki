@@ -21,6 +21,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail, ensure};
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
+use p256::elliptic_curve::Generate as _;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -66,7 +67,7 @@ impl Signer for SoftwareSigner {
     fn public_key_sec1(&self) -> Vec<u8> {
         self.0
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec()
     }
@@ -429,7 +430,7 @@ impl Identity {
         let mut rng = rand::thread_rng();
         let mut token = [0_u8; 32];
         rng.fill_bytes(&mut token);
-        let (signer, signing) = new_signer(kind, &mut rng)?;
+        let (signer, signing) = new_signer(kind)?;
         let identity = Self {
             signer,
             signing,
@@ -447,7 +448,7 @@ impl Identity {
         let mut rng = rand::thread_rng();
         let mut token = [0_u8; 32];
         rng.fill_bytes(&mut token);
-        let (signer, signing) = new_signer(kind, &mut rng)?;
+        let (signer, signing) = new_signer(kind)?;
         let identity = Self {
             signer,
             signing,
@@ -735,13 +736,10 @@ fn signer_from_file(signing: &SigningFileV1) -> Result<Box<dyn Signer + Send + S
 }
 
 /// Creates a signing key of the requested kind, and its persistable form.
-fn new_signer(
-    kind: SignerKind,
-    rng: &mut (impl rand::CryptoRng + rand::RngCore),
-) -> Result<(Box<dyn Signer + Send + Sync>, SigningFileV1)> {
+fn new_signer(kind: SignerKind) -> Result<(Box<dyn Signer + Send + Sync>, SigningFileV1)> {
     match kind {
         SignerKind::Software => {
-            let signing = SigningKey::random(rng);
+            let signing = SigningKey::generate();
             let file = SigningFileV1::Software {
                 key: encode_base64url(&signing.to_bytes()),
             };
