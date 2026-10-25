@@ -552,9 +552,13 @@ if (process.env.OSHIOKI_COMPAT_CONTINUITY === "1") {
         expect(approvals[0].bearer).toBe(`Bearer ${saved.apiToken}`);
         expect(approvals[0].body.device_fingerprint).toBe(saved.fingerprint);
         expect(approvals[0].body.credential_id).toBe(saved.credentialId);
-        const verdictResponse = await profile.context.request.get(`${origin}/api/v1/requests/${envelope.request_id}/verdict`);
-        expect(verdictResponse.status()).toBe(200);
-        expect(await verdictResponse.json()).toEqual({ action: "approve", ...approvals[0].body });
+        // Use Chromium's fixture DNS mapping for this same-origin server read.
+        const verdictResponse = await profile.page.evaluate(async requestId => {
+          const response = await fetch(`/api/v1/requests/${requestId}/verdict`);
+          return { status: response.status, body: await response.json() };
+        }, envelope.request_id);
+        expect(verdictResponse.status).toBe(200);
+        expect(verdictResponse.body).toEqual({ action: "approve", ...approvals[0].body });
         expect(await enrolledDevice(profile.page, saved.fingerprint)).toEqual(saved);
         expect(await profile.page.evaluate(() => allDevices())).toEqual([saved]);
         const { credentials: currentPasskeys } = await profile.cdp.send("WebAuthn.getCredentials", { authenticatorId: profile.authenticatorId });
