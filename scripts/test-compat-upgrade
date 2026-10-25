@@ -37,6 +37,9 @@ cleanup() {
   set +e
   [ -z "${AGENT_PID:-}" ] || kill "$AGENT_PID" >/dev/null 2>&1 || true
   [ -z "${AGENT_PID:-}" ] || wait "$AGENT_PID" >/dev/null 2>&1 || true
+  if [ -n "${AGENT_INPUT_FD:-}" ]; then
+    exec {AGENT_INPUT_FD}>&-
+  fi
   [ -z "${HOOK_PID:-}" ] || kill "$HOOK_PID" >/dev/null 2>&1 || true
   [ -z "${HOOK_PID:-}" ] || wait "$HOOK_PID" >/dev/null 2>&1 || true
   [ -z "${SERVER_PID:-}" ] || kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -115,10 +118,15 @@ wait_for_line() {
 }
 
 stop_agent() {
-  [ -n "${AGENT_PID:-}" ] || return 0
-  kill "$AGENT_PID" >/dev/null 2>&1 || true
-  wait "$AGENT_PID" >/dev/null 2>&1 || true
+  if [ -n "${AGENT_PID:-}" ]; then
+    kill "$AGENT_PID" >/dev/null 2>&1 || true
+    wait "$AGENT_PID" >/dev/null 2>&1 || true
+  fi
   AGENT_PID=""
+  if [ -n "${AGENT_INPUT_FD:-}" ]; then
+    exec {AGENT_INPUT_FD}>&-
+    unset AGENT_INPUT_FD
+  fi
 }
 
 # Socket-only: init a software identity, pin it, auto-approve a synthetic request.
@@ -274,13 +282,28 @@ start_server() {
 }
 
 start_nats_agent() {
-  local bin="$1" log="$2"
+  local bin="$1" log="$2" mode="${3:-auto}" input=/dev/null
+  local -a approval_args=(--auto approve)
+  if [ "$mode" = prompt ]; then
+    input="$log.stdin"
+    mkfifo "$input"
+    # Keep a writer open: EOF would stop the interactive agent before the
+    # server restart and approval. No answer is sent until the exact prompt.
+    exec {AGENT_INPUT_FD}<>"$input"
+    approval_args=()
+  fi
   : >"$log"
   NATS_URL="$NATS_URL" NATS_USER=oshioki NATS_PASS=test-only \
     OSHIOKI_ALLOW_PLAINTEXT_NATS=1 \
-    RUST_LOG=info "$bin" run --state "$AGENT_STATE" --auto approve >"$log" 2>&1 &
+    RUST_LOG=info NO_COLOR=1 "$bin" run --state "$AGENT_STATE" "${approval_args[@]}" \
+    <"$input" >"$log" 2>&1 &
   AGENT_PID=$!
   wait_for_line "$log" 'NATS connected; watching for requests'
+  if [ "$mode" = prompt ]; then
+    # The connected event can precede subscription setup. The pending test
+    # needs the live core NATS subscription before publishing its request.
+    wait_for_line "$log" 'NATS connection in progress; requests are answered once it is up'
+  fi
 }
 
 SERVER_TOKEN="compat-server-token-0123456789ab"
@@ -382,13 +405,13 @@ assert_server_enrollment() {
 wait_for_pending_request() {
   python3 - "$SERVER_DB" "$1" <<'PY'
 import sqlite3, sys, time
-path, cutoff = sys.argv[1], int(sys.argv[2])
+path, cursor = sys.argv[1], int(sys.argv[2])
 for _ in range(80):
     try:
         conn = sqlite3.connect(path)
         row = conn.execute(
-            "SELECT id FROM requests WHERE state='pending' AND created_at>=? LIMIT 1",
-            (cutoff,),
+            "SELECT id FROM requests WHERE state='pending' AND rowid>? ORDER BY rowid LIMIT 1",
+            (cursor,),
         ).fetchone()
         conn.close()
         if row:
@@ -468,13 +491,39 @@ fi
 echo "previous server stack approved with enrolled credential ($fingerprint)"
 
 echo "in-flight request across server upgrade"
-cutoff="$(date +%s)"
-OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 45 "$PREV_BIN/oshioki" test &
+# Core NATS does not replay the old request to an agent started later.
+# Subscribe the candidate first, using the previous release's same identity.
+start_nats_agent "$CUR_BIN/oshioki-agent" "$SERVER_DIR/agent-inflight.log" prompt
+# Native approvals leave pending rows behind. A row cursor avoids selecting
+# an earlier request inserted in the same second as this one.
+request_cursor="$(python3 - "$SERVER_DB" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as conn:
+    print(conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM requests").fetchone()[0])
+PY
+)"
+OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 45 "$PREV_BIN/oshioki" test \
+  >"$SERVER_DIR/hook-inflight.log" 2>&1 &
 HOOK_PID=$!
-inflight_id="$(wait_for_pending_request "$cutoff")"
-kill "$HOOK_PID" >/dev/null 2>&1 || true
-wait "$HOOK_PID" >/dev/null 2>&1 || true
-HOOK_PID=""
+inflight_id="$(wait_for_pending_request "$request_cursor")"
+wait_for_line "$SERVER_DIR/agent-inflight.log" "request ${inflight_id} needs an answer"
+wait_for_line "$SERVER_DIR/agent-inflight.log" 'Approve\? \[y/N\]'
+python3 - "$SERVER_DB" "$inflight_id" "$SERVER_DIR/inflight-before.json" <<'PY'
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as conn:
+    row = conn.execute(
+        """SELECT id, state, hex(envelope_hash), hex(envelope_json), issued_at, expires_at
+           FROM requests WHERE id=?""", (sys.argv[2],),
+    ).fetchone()
+    assert row is not None and row[1] == "pending", row
+    bodies = conn.execute(
+        """SELECT fingerprint, hex(body_json) FROM sealed_bodies
+           WHERE request_id=? ORDER BY fingerprint""", (sys.argv[2],),
+    ).fetchall()
+    assert bodies, "pending request has no sealed body"
+with open(sys.argv[3], "w", encoding="utf-8") as snapshot:
+    json.dump({"request": row, "sealed_bodies": bodies}, snapshot)
+PY
 stop_server
 previous_schema="$(python3 - "$SERVER_DB" <<'PY'
 import sqlite3, sys
@@ -484,18 +533,52 @@ with closing(sqlite3.connect(sys.argv[1])) as db:
 PY
 )"
 start_server "$CUR_BIN/oshioki-server" "$SERVER_DIR/current.log"
-python3 - "$SERVER_DB" "$inflight_id" <<'PY'
-import sqlite3, sys
-conn = sqlite3.connect(sys.argv[1])
-row = conn.execute(
-    "SELECT id, state FROM requests WHERE id=?",
-    (sys.argv[2],),
-).fetchone()
+python3 - "$SERVER_DB" "$inflight_id" "$SERVER_DIR/inflight-before.json" <<'PY'
+import json, sqlite3, sys, time
+with open(sys.argv[3], encoding="utf-8") as snapshot:
+    before = json.load(snapshot)
+with sqlite3.connect(sys.argv[1]) as conn:
+    row = conn.execute(
+        """SELECT id, state, hex(envelope_hash), hex(envelope_json), issued_at, expires_at
+           FROM requests WHERE id=?""", (sys.argv[2],),
+    ).fetchone()
+    bodies = conn.execute(
+        """SELECT fingerprint, hex(body_json) FROM sealed_bodies
+           WHERE request_id=? ORDER BY fingerprint""", (sys.argv[2],),
+    ).fetchall()
 assert row is not None and row[1] == "pending", row
-print(f"in-flight {row[0]} still pending after current server open")
+assert {"request": list(row), "sealed_bodies": [list(body) for body in bodies]} == before, \
+    "pending request or sealed envelope changed during upgrade"
+assert row[5] > time.time(), "original request expired during server restart"
+print(f"in-flight {row[0]} and its sealed envelope survived current server open")
 PY
+# Native approvals go directly to NATS; the server does not ingest them into
+# SQLite. Completion is the original hook's result and this exact signed ID;
+# the native path has no server row transition to approved/resolved.
+printf 'y\n' >&"$AGENT_INPUT_FD"
+approve_status=0
+wait "$HOOK_PID" || approve_status=$?
+HOOK_PID=""
+if [ "$approve_status" -ne 0 ]; then
+  echo "in-flight previous hook failed after upgrade (status $approve_status, request $inflight_id)" >&2
+  cat "$SERVER_DIR/hook-inflight.log" "$SERVER_DIR/agent-inflight.log" >&2 || true
+  exit "$approve_status"
+fi
+wait_for_line "$SERVER_DIR/agent-inflight.log" \
+  "decision published.*request_id=${inflight_id}([[:space:]]|$).*verb[^[:alnum:]]*approved"
+stop_agent
+echo "in-flight previous hook approved by current agent after server upgrade ($inflight_id)"
+
 assert_server_enrollment "compat-current-1" "current server"
 start_nats_agent "$CUR_BIN/oshioki-agent" "$SERVER_DIR/agent-current.log"
+approve_status=0
+OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 20 "$PREV_BIN/oshioki" test || approve_status=$?
+if [ "$approve_status" -ne 0 ]; then
+  echo "fresh previous hook failed with current server/agent (status $approve_status)" >&2
+  cat "$SERVER_DIR/current.log" "$SERVER_DIR/agent-current.log" >&2 || true
+  exit "$approve_status"
+fi
+echo "fresh previous hook approved with current server/agent and the same enrollment"
 approve_status=0
 OSHIOKI_CONFIG_DIR="$HOOK_DIR" run_with_timeout 20 "$CUR_BIN/oshioki" test || approve_status=$?
 stop_agent
@@ -530,6 +613,13 @@ if [ "$approve_status" -ne 0 ]; then
   exit "$approve_status"
 fi
 echo "previous server stack approved after rollback ($fingerprint)"
+
+echo "previous requester and saved browser enrollment with current app assets"
+OSHIOKI_COMPAT_PREV_HOOK="$PREV_BIN/oshioki" \
+  OSHIOKI_COMPAT_PREV_APP_JS="$PREV_SRC/server/web/app.js" \
+  OSHIOKI_COMPAT_PREV_TAG="$PREV_TAG" \
+  OSHIOKI_HOOK="$CUR_BIN/oshioki" OSHIOKI_SERVER="$CUR_BIN/oshioki-server" \
+  "$SCRIPT_DIR/test-browser-local" --compat-continuity
 
 TEST_OK=1
 echo "compat upgrade: ok (previous $PREV_TAG)"

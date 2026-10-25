@@ -64,7 +64,16 @@ jobs:
           # test-compat-upgrade builds the previous release in a temp worktree;
           # OSHIOKI_COMPAT_PREV_TARGET (set below) puts that build here.
           cache-directories: ${{ runner.temp }}/compat-prev-target
-      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev nats-server
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Browser compatibility prerequisites
+        run: |
+          go install github.com/nats-io/natscli/nats@v0.4.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          npm --prefix server/web ci
+          npm --prefix server/web exec playwright install --with-deps chromium
       - name: NATS lane repair
         run: scripts/test-nats-lane-upgrade
       - name: Mixed-version upgrade

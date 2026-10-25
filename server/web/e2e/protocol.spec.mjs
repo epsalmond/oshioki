@@ -52,8 +52,8 @@ test.afterEach(async () => {
   expect(failures).toEqual([]);
 });
 
-function hook(args) {
-  const child = spawn(hookBinary, args, {
+function hook(args, binary = hookBinary) {
+  const child = spawn(binary, args, {
     env: hookConfigDir
       ? { ...process.env, OSHIOKI_CONFIG_DIR: hookConfigDir }
       : process.env,
@@ -166,8 +166,8 @@ async function completeEnrollment(profile, processHandle, url) {
   return device;
 }
 
-async function enroll(profile) {
-  const processHandle = hook(["enroll"]);
+async function enroll(profile, binary = hookBinary) {
+  const processHandle = hook(["enroll"], binary);
   return completeEnrollment(profile, processHandle, await enrollmentUrl(processHandle));
 }
 
@@ -194,7 +194,7 @@ async function enrollAfterResume(profile) {
   return device;
 }
 
-async function pendingRequest() {
+async function pendingRequest(binary = hookBinary) {
   const connection = await connect(natsOptions);
   let resolveMessage;
   let rejectMessage;
@@ -210,7 +210,7 @@ async function pendingRequest() {
     },
   });
   await connection.flush();
-  const processHandle = hook(["test"]);
+  const processHandle = hook(["test"], binary);
   const timeout = new Promise((_, reject) => {
     setTimeout(() => reject(new Error("timed out waiting for sudo request")), 15_000);
   });
@@ -273,8 +273,8 @@ async function waitForRouted(page, requestId, token) {
   throw new Error(`request ${requestId} was not routed`);
 }
 
-async function requestWith(profile, device, action) {
-  const { envelope, processHandle } = await pendingRequest();
+async function requestWith(profile, device, action, { binary = hookBinary, beforeApprove = async () => {} } = {}) {
+  const { envelope, processHandle } = await pendingRequest(binary);
   await navigate(profile.page, `${origin}/healthz`);
   await waitForRouted(profile.page, envelope.request_id, device.apiToken);
   await navigate(profile.page, `${origin}/r/${envelope.request_id}`);
@@ -298,6 +298,7 @@ async function requestWith(profile, device, action) {
   const wrongTokenStatus = await requestStatus(envelope.request_id, "x".repeat(32));
   expect(wrongTokenStatus).toBe(401);
 
+  await beforeApprove(envelope);
   await profile.page.getByRole("button", { name: action === "approve" ? "Approve" : "Deny" }).click();
   await expect(profile.page.locator("#status")).toContainText(action === "approve" ? "Approval sent" : "Denied");
   const result = await processHandle.exited;
@@ -307,6 +308,7 @@ async function requestWith(profile, device, action) {
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain("request explicitly denied");
   }
+  return { envelope, result };
 }
 
 async function oneMessage(connection, subject) {
@@ -456,6 +458,139 @@ async function exerciseToolDecision(profile, device, action) {
   expect(request.native_event_json).toContain("agent_type");
   await connection.drain();
   activeConnections.delete(connection);
+}
+
+// The compatibility runner requires the prior release artifacts before selecting
+// this lane. Ordinary browser runs retain their current-version selection.
+if (process.env.OSHIOKI_COMPAT_CONTINUITY === "1") {
+  const previousHook = process.env.OSHIOKI_COMPAT_PREV_HOOK;
+  const previousApp = readFileSync(process.env.OSHIOKI_COMPAT_PREV_APP_JS, "utf8");
+  const previousTag = process.env.OSHIOKI_COMPAT_PREV_TAG;
+  if (!previousHook || !previousTag || !previousApp) throw new Error("missing required prior-release continuity artifacts");
+
+  for (const failure of ["legacy push config", "push config 503", "hanging push initialization"]) {
+    test(`sudo continuity: ${failure}`, async ({ browser }, testInfo) => {
+      testInfo.annotations.push({ type: "previous-release", description: previousTag });
+      const consoleErrors = [];
+      const profile = await virtualProfile(browser, consoleErrors, { consoleLocations: true });
+      try {
+        const submissions = [], approvals = [], approvalResponses = [];
+        let credentialCreations = 0, previousAssetLoads = 0, candidateAssetLoads = 0;
+        await profile.context.exposeBinding("recordCredentialCreation", () => { credentialCreations++; });
+        await profile.context.addInitScript(() => {
+          const create = navigator.credentials.create.bind(navigator.credentials);
+          navigator.credentials.create = async options => {
+            await window.recordCredentialCreation();
+            return create(options);
+          };
+        });
+        profile.page.on("request", request => {
+          if (request.method() === "POST" && /\/api\/v1\/enrollments\/[^/]+\/submission$/.test(request.url())) submissions.push(request.url());
+          if (request.method() === "POST" && /\/api\/v1\/requests\/[^/]+\/approve$/.test(request.url())) {
+            approvals.push({ url: request.url(), bearer: request.headers().authorization, body: request.postDataJSON() });
+          }
+        });
+        profile.page.on("response", response => {
+          if (response.url().endsWith("/approve")) approvalResponses.push(response.status());
+          if (response.url() === `${origin}/assets/app.js` && new URL(profile.page.url()).pathname.startsWith("/r/")) candidateAssetLoads++;
+        });
+        const servePreviousApp = route => {
+          previousAssetLoads++;
+          return route.fulfill({ status: 200, contentType: "application/javascript", body: previousApp });
+        };
+        await profile.context.route(`${origin}/assets/app.js`, servePreviousApp);
+        const saved = await enroll(profile, previousHook);
+        expect(previousAssetLoads).toBe(1);
+        expect(submissions).toHaveLength(1);
+        expect(credentialCreations).toBe(1);
+        expect(consoleErrors).toEqual([]);
+        const { credentials: savedPasskeys } = await profile.cdp.send("WebAuthn.getCredentials", { authenticatorId: profile.authenticatorId });
+        expect(savedPasskeys).toHaveLength(1);
+        await profile.context.unroute(`${origin}/assets/app.js`, servePreviousApp);
+
+        // Only platform push APIs and the push config endpoint are replaced.
+        // The old hook, request routing/decryption, ack and signature stay real.
+        await profile.context.addInitScript(({ hanging }) => {
+          window.__continuityPush = { started: 0, settled: 0, notificationPrompts: 0 };
+          Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: {
+            register: () => {
+              window.__continuityPush.started++;
+              if (hanging) return new Promise(() => {});
+              window.__continuityPush.settled++;
+              return Promise.resolve({ pushManager: { getSubscription: async () => null } });
+            },
+          } });
+          Object.defineProperty(window, "PushManager", { configurable: true, value: function PushManager() {} });
+          Object.defineProperty(window, "Notification", { configurable: true, value: {
+            permission: "granted",
+            requestPermission: async () => { window.__continuityPush.notificationPrompts++; throw new Error("unexpected notification prompt"); },
+          } });
+        }, { hanging: failure === "hanging push initialization" });
+        const injections = [];
+        await profile.context.route(`${origin}/api/v1/push/config`, route => {
+          injections.push(new URL(route.request().frame().url()).pathname);
+          if (failure === "push config 503") return route.fulfill({ status: 503, body: "push unavailable" });
+          // A valid old-server response omits multi_enrollment. The hanging
+          // case advertises capability so sync reaches the stalled worker.
+          const config = { version: 1, enabled: true,
+            vapid_public_key: "BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU" };
+          if (failure === "hanging push initialization") config.multi_enrollment = true;
+          return route.fulfill({ status: 200, json: config });
+        });
+        const { envelope } = await requestWith(profile, saved, "approve", {
+          binary: previousHook,
+          beforeApprove: async envelope => {
+            await expect.poll(() => injections).toEqual([`/r/${envelope.request_id}`]);
+            expect(await profile.page.evaluate(() => __continuityPush.started)).toBe(1);
+          },
+        });
+        expect(candidateAssetLoads).toBe(1);
+        expect(previousAssetLoads).toBe(1);
+        expect(approvals).toHaveLength(1);
+        expect(approvalResponses).toEqual([202]);
+        expect(approvals[0].url).toBe(`${origin}/api/v1/requests/${envelope.request_id}/approve`);
+        expect(approvals[0].bearer).toBe(`Bearer ${saved.apiToken}`);
+        expect(approvals[0].body.device_fingerprint).toBe(saved.fingerprint);
+        expect(approvals[0].body.credential_id).toBe(saved.credentialId);
+        // Use Chromium's fixture DNS mapping for this same-origin server read.
+        const verdictResponse = await profile.page.evaluate(async requestId => {
+          const response = await fetch(`/api/v1/requests/${requestId}/verdict`);
+          return { status: response.status, body: await response.json() };
+        }, envelope.request_id);
+        expect(verdictResponse.status).toBe(200);
+        expect(verdictResponse.body).toEqual({ action: "approve", ...approvals[0].body });
+        expect(await enrolledDevice(profile.page, saved.fingerprint)).toEqual(saved);
+        expect(await profile.page.evaluate(() => allDevices())).toEqual([saved]);
+        const { credentials: currentPasskeys } = await profile.cdp.send("WebAuthn.getCredentials", { authenticatorId: profile.authenticatorId });
+        // Assertion counters advance; the actual passkey and its private key
+        // must be the same one created by the prior app.
+        expect(currentPasskeys.map(({ signCount, ...credential }) => credential))
+          .toEqual(savedPasskeys.map(({ signCount, ...credential }) => credential));
+        expect(submissions).toHaveLength(1);
+        expect(credentialCreations).toBe(1);
+        expect(await profile.page.evaluate(() => __continuityPush.notificationPrompts)).toBe(0);
+        if (failure === "hanging push initialization") {
+          expect(await profile.page.evaluate(() => __continuityPush)).toEqual({ started: 1, settled: 0, notificationPrompts: 0 });
+          expect(consoleErrors).toEqual([]);
+        } else {
+          const expectedError = failure === "legacy push config"
+            ? "Error: The server needs an update for notifications across saved enrollments. Existing notification settings were preserved."
+            : "Error: push configuration failed 503";
+          await expect.poll(() => consoleErrors.some(error => typeof error === "object" && error.text.startsWith(expectedError))).toBe(true);
+          for (const error of consoleErrors) {
+            expect(typeof error).toBe("object"); // page exceptions are never expected
+            if (error.text.startsWith(expectedError)) continue;
+            expect(failure).toBe("push config 503");
+            expect(error.url).toBe(`${origin}/api/v1/push/config`);
+            expect(error.text).toMatch(/^Failed to load resource: the server responded with a status of 503(?: \(.*\))?$/);
+          }
+        }
+      } finally {
+        // Closing the context releases the deliberately unsettled promise.
+        await profile.context.close();
+      }
+    });
+  }
 }
 
 test("two browser profiles enroll independently and own their approvals", async ({ browser }) => {
