@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-25
+
+### Added
+
+- One installed phone web app can receive approval notifications for multiple
+  authenticated enrollments through a shared origin. Push delivery is deduplicated
+  for each endpoint and request, each enrollment can be revoked independently,
+  and cross-tab locking coordinates subscription updates.
+
+### Fixed
+
+- Preserve an existing browser push subscription when a new enrollment's
+  capability preflight fails, and isolate retained delivery receipts by request
+  lane.
+- Keep existing sudo enrollments and browser credentials, bearer tokens, and
+  encryption identities across upgrades. The same valid, unexpired request from
+  the previous release can still be approved after a server restart; explicit
+  browser approval remains available when push setup is unavailable or pending.
+
+### Security
+
+- Resolve eight dependency advisories and the dependency-audit warnings without
+  adding advisory ignores. Retain the existing Web Push encryption implementation
+  with a documented, narrow P-256 0.14 wrapper patch and pin the official
+  `jwt-compact` source. See [crypto dependency sources](docs/crypto-dependencies.md)
+  for source provenance and compatibility evidence.
+
+### Changed
+
+- The server automatically migrates SQLite schema 4 to schema 5 to separate Web
+  Push endpoints from enrollment memberships. Before migration it creates and
+  verifies `state.pre-v4.sqlite3` next to `state.sqlite3`, preserving the old
+  enrollments, subscriptions, keys, and delivery state. Rollback requires stopping
+  the new server and restoring that snapshot before starting the previous binary;
+  downgrading the binary alone is insufficient. See [update and restore](docs/update.md).
+- Refresh or reopen an older browser bundle before sharing its push subscription
+  across enrollments; cached older JavaScript uses single-owner replacement.
+- Declare Rust 1.88 as the minimum supported version. Release-candidate validation
+  used Rust 1.98; it does not establish a successful Rust 1.88 build.
+
+### Validation
+
+- Automated coverage verifies previous-release pending-request approval, browser
+  enrollment continuity under push failures, and schema migration and rollback.
+  Physical iPhone push delivery and Touch ID acceptance remain separate device
+  checks and were not performed for this release candidate.
+
 ## [0.4.3] - 2026-10-12
 
 ### Security
