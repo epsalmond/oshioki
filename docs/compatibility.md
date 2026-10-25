@@ -21,8 +21,25 @@ additive:
 - server + browser bundle + hook (NATS `DeliveryV1` / ack subjects)
 - server + SQLite file + NATS stream/consumer config
 
-Rolling inside a set is not required. Rolling across sets is allowed only
-where the matrix below says so.
+Private protocol changes can require coordinated updates within a set.
+The supported previous-release requester must still work with the candidate
+approver and server as specified below. Other rolling combinations are
+allowed only where the matrix says so.
+
+## Existing sudo enrollments
+
+Existing enrolled sudo requesters continue working with the updated approver
+and server, including valid, unexpired requests already pending during an
+upgrade. They retain their enrollment and do not need a requester upgrade,
+re-enrollment, or sudo-access recovery. The browser keeps its existing
+credential, bearer, and encryption identity.
+
+Push setup and delivery are independent of approval. Missing push capability,
+failed push initialization, or initialization that remains pending must not
+prevent an explicit approval with the existing enrollment. Ownership,
+signature, expiry, and revocation checks continue to apply. This contract
+does not promise availability while a phone or server is offline, extend a
+request's lifetime, or grant access to an invalid or revoked enrollment.
 
 ## Mixed-version matrix
 
@@ -40,6 +57,9 @@ Must keep working:
   continue.
 - New agent loading a previous-release identity file (embedded `box_secret`
   or `box_secret_ref`).
+- Previous-release enrolled hook with the candidate server and native or
+  browser approver, including completing the same request across a server
+  restart before its original expiry.
 
 Must fail closed with an actionable diagnostic (not hang, not silent allow,
 not silent drop of an authentication lane):
@@ -149,19 +169,40 @@ permanent outage. The required checks are:
 1. Previous-release goldens load on the candidate.
 2. Old-reader/new-writer and new-reader/old-writer pass wherever this
    matrix allows it.
-3. An upgrade with enrolled credentials and an in-flight request still
-   approves, with no re-enroll.
+3. An upgrade completes the same previous-release in-flight request with the
+   existing enrollment, and a fresh previous-release request still approves.
+   The updated browser also approves previous-release requests when push
+   capability is missing, push config returns 503, or push initialization
+   remains pending, without changing the saved enrollment.
 4. Rollback via the SQLite snapshot and `agent.json.prev` lets the previous
    release authenticate again.
 5. Stale NATS filters are repaired on start.
 6. Unsupported mixes fail closed with a diagnostic or unavailable-with-fallback;
    they do not hang or silently allow.
 
-The current integration test checks a narrower case: the current server
-preserves a pending row from the previous server's database, then approves a
-new request with the same enrolled credential. It does not complete that
-pre-upgrade request, so the in-flight completion requirement remains
-unverified.
+`scripts/test-compat-upgrade` keeps the previous-release hook waiting while
+the server restarts. The candidate native agent subscribes before that
+request is published, retains the previous identity, and receives an explicit
+answer only after the candidate server becomes healthy. The check requires
+the original hook to exit successfully and the agent to publish an approval
+for that exact request ID. It separately compares the pending SQLite row,
+encrypted envelope, and sealed bodies before and after the restart. Native
+verdicts go directly to NATS and do not resolve the server's database row;
+browser API decisions resolve it to `resolved`, with an approve verdict.
+Fresh requests from both hook versions and the previous stack after rollback
+remain required checks.
+
+Before its temporary previous-release artifacts are cleaned up, the upgrade
+runner requires `scripts/test-browser-local --compat-continuity`. It passes
+`OSHIOKI_COMPAT_PREV_HOOK`, `OSHIOKI_COMPAT_PREV_APP_JS`, and
+`OSHIOKI_COMPAT_PREV_TAG` from that same prior-release build. The browser lane
+must fail if required artifacts are missing. It enrolls using the old hook
+and app assets once, then retains the browser profile and virtual
+authenticator while navigating to candidate assets. Every push-failure case
+requires one real approval, an unchanged complete saved device record, no
+additional enrollment, and the old hook's successful exit. Chromium virtual
+WebAuthn verifies these fixtures; physical-phone and Home Screen push
+acceptance require separate device validation.
 
 The mixed hook/agent checks accept a successful result or any nonzero result
 and reject a timeout. They do not verify that a failed mix printed an

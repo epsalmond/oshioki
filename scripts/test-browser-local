@@ -3,6 +3,31 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+CONTINUITY=0
+PLAYWRIGHT_ARGS=()
+case "${1:-}" in
+  "") ;;
+  --compat-continuity)
+    CONTINUITY=1
+    PLAYWRIGHT_ARGS=(--grep 'sudo continuity:')
+    for artifact in OSHIOKI_COMPAT_PREV_HOOK OSHIOKI_COMPAT_PREV_APP_JS; do
+      path="${!artifact:-}"
+      if [[ "$path" != /* ]] || [ ! -f "$path" ] || [ ! -r "$path" ] || [ ! -s "$path" ]; then
+        echo "required continuity artifact must be an absolute readable nonempty file: $artifact" >&2
+        exit 2
+      fi
+    done
+    if [ ! -x "$OSHIOKI_COMPAT_PREV_HOOK" ] || [ -z "${OSHIOKI_COMPAT_PREV_TAG:-}" ]; then
+      echo "continuity requires executable OSHIOKI_COMPAT_PREV_HOOK and OSHIOKI_COMPAT_PREV_TAG" >&2
+      exit 2
+    fi
+    ;;
+  *) echo "usage: scripts/test-browser-local [--compat-continuity]" >&2; exit 2 ;;
+esac
+if [ "$#" -gt 1 ]; then
+  echo "usage: scripts/test-browser-local [--compat-continuity]" >&2
+  exit 2
+fi
 free_port() {
   node -e 'const net=require("node:net"); const server=net.createServer(); server.listen(0,"127.0.0.1",()=>{ console.log(server.address().port); server.close(); });'
 }
@@ -41,7 +66,19 @@ trap cleanup EXIT
 
 mkdir -p "$STATE_ROOT/nats" "$STATE_ROOT/server" "$STATE_ROOT/hook" "$STATE_ROOT/tls"
 chmod 0700 "$STATE_ROOT/hook"
-cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --locked
+# The upgrade harness already built the candidate. Honor its binaries rather
+# than rebuilding a second profile; ordinary local runs still build normally.
+if [ -z "${OSHIOKI_HOOK:-}" ] || [ -z "${OSHIOKI_SERVER:-}" ]; then
+  cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --workspace --locked
+fi
+HOOK_BINARY="${OSHIOKI_HOOK:-$REPO_ROOT/target/debug/oshioki}"
+SERVER_BINARY="${OSHIOKI_SERVER:-$REPO_ROOT/target/debug/oshioki-server}"
+for path in "$HOOK_BINARY" "$SERVER_BINARY"; do
+  if [[ "$path" != /* ]] || [ ! -f "$path" ] || [ ! -x "$path" ]; then
+    echo "browser fixture binary must be an absolute executable file: $path" >&2
+    exit 2
+  fi
+done
 npm --prefix "$REPO_ROOT/server/web" ci
 npm --prefix "$REPO_ROOT/server/web" exec playwright install chromium
 
@@ -75,7 +112,7 @@ OSHIOKI_STATE_PATH="$STATE_ROOT/server/state.sqlite3" \
 OSHIOKI_LISTEN="127.0.0.1:$SERVER_PORT" \
 OSHIOKI_ORIGIN="$origin" \
 OSHIOKI_RP_ID=sudo.test \
-  "$REPO_ROOT/target/debug/oshioki-server" >"$STATE_ROOT/server.log" 2>&1 &
+  "$SERVER_BINARY" >"$STATE_ROOT/server.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 100); do
   if curl --fail --silent "http://127.0.0.1:$SERVER_PORT/healthz" >/dev/null; then
@@ -101,7 +138,8 @@ printf 'resolve = "sudo.test:%s:127.0.0.1"\n' "$HTTPS_PORT" >"$STATE_ROOT/curl/.
 export CURL_HOME="$STATE_ROOT/curl"
 export CURL_CA_BUNDLE="$STATE_ROOT/tls/cert.pem"
 
-OSHIOKI_HOOK="$REPO_ROOT/target/debug/oshioki" \
+OSHIOKI_HOOK="$HOOK_BINARY" \
+OSHIOKI_COMPAT_CONTINUITY="$CONTINUITY" \
 OSHIOKI_TEST_CONFIG_DIR="$STATE_ROOT/hook" \
 OSHIOKI_ORIGIN="$origin" \
 OSHIOKI_SERVER_HTTP="http://127.0.0.1:$SERVER_PORT" \
@@ -111,7 +149,7 @@ OSHIOKI_HTTPS_PORT="$HTTPS_PORT" \
 NATS_URL="nats://127.0.0.1:$NATS_PORT" \
 NATS_USER=oshioki \
 NATS_PASS=test-only \
-  npm --prefix "$REPO_ROOT/server/web" run test:e2e
+  npm --prefix "$REPO_ROOT/server/web" run test:e2e -- "${PLAYWRIGHT_ARGS[@]}"
 
 TEST_OK=1
 echo "test-browser-local: PASS"
