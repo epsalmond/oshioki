@@ -751,8 +751,8 @@ mod tests {
     }
 
     fn webauthn_device() -> (DevicePublicRecordV1, SigningKey, StaticSecret) {
-        let signing = SigningKey::from_bytes((&[31; 32]).into()).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = SigningKey::from_slice(&[31; 32]).unwrap();
+        let point = signing.verifying_key().to_sec1_point(false);
         let cose = ciborium::Value::Map(vec![
             (
                 ciborium::Value::Integer(1.into()),

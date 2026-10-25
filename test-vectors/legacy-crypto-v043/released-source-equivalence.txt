@@ -1,0 +1,7 @@
+PASS released v0.4.3 == base b57f72b: server/src/main.rs::load_or_create_vapid_pem
+PASS released v0.4.3 == base b57f72b: server/src/main.rs::load_vapid_config
+PASS released v0.4.3 == base b57f72b: server/src/main.rs::build_push_request
+PASS released v0.4.3 == base b57f72b: server/src/main.rs::vapid_authorization
+PASS released v0.4.3 == base b57f72b: server/src/main.rs::endpoint_audience
+PASS released v0.4.3 == base b57f72b: protocol/src/webauthn_v1.rs::verify_approval_v1
+PASS released v0.4.3 == base b57f72b: protocol/src/webauthn_v1.rs::cose_p256_verifying_key

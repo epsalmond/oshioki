@@ -207,8 +207,9 @@ mod tests {
 
     #[test]
     fn signatures_bind_type_id_expiry_and_exact_body() {
-        let key = SigningKey::random(&mut rand::rngs::OsRng);
-        let other = SigningKey::random(&mut rand::rngs::OsRng);
+        use p256::elliptic_curve::Generate as _;
+        let key = SigningKey::generate();
+        let other = SigningKey::generate();
         let message = Message {
             version: 1,
             attempt: uuid::Uuid::new_v4().to_string(),

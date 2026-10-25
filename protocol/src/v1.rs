@@ -1127,7 +1127,7 @@ mod tests {
     fn pre_kind_device_record_loads_as_webauthn() {
         use p256::ecdsa::SigningKey;
         let signing = SigningKey::from_slice(&[0x33; 32]).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+        let point = signing.verifying_key().to_sec1_point(false);
         let cose = crate::webauthn_v1::tests::cose_key(point.x().unwrap(), point.y().unwrap());
         let credential_id = [7; 32];
         let box_key = [8; 32];
@@ -1297,8 +1297,8 @@ mod tests {
     /// denial round trips.
     fn deny_fixture(kind: DeviceKindV1) -> (DevicePublicRecordV1, p256::ecdsa::SigningKey) {
         use p256::ecdsa::SigningKey;
-        let signing = SigningKey::from_bytes((&[11; 32]).into()).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = SigningKey::from_slice(&[11; 32]).unwrap();
+        let point = signing.verifying_key().to_sec1_point(false);
         let public = point.as_bytes().to_vec();
         let (credential_id, credential_public_key) = match kind {
             DeviceKindV1::Software | DeviceKindV1::SecureEnclave => (
@@ -1376,7 +1376,7 @@ mod tests {
         use p256::ecdsa::signature::Signer as _;
         let (device, signing) = deny_fixture(DeviceKindV1::SecureEnclave);
         let denial = signed_denial(&signing, "req-1", &device);
-        let other_signing = p256::ecdsa::SigningKey::from_bytes((&[12; 32]).into()).unwrap();
+        let other_signing = p256::ecdsa::SigningKey::from_slice(&[12; 32]).unwrap();
         let other_signature: p256::ecdsa::Signature =
             other_signing.sign(&deny_challenge("req-1", &device.fingerprint));
         let mut forged = denial.clone();

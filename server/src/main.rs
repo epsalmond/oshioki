@@ -2,6 +2,9 @@
 
 mod db;
 
+#[cfg(test)]
+mod crypto_compat_tests;
+
 use anyhow::{Context as _, Result, bail};
 use axum::{
     Json, Router,
@@ -25,7 +28,10 @@ use oshioki_protocol::{
     verify_tool_decision_v1,
 };
 use oshioki_transport::{Ack, JetStreamMessage, NatsTransport, ServerTransport};
-use p256::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
+use p256::{
+    elliptic_curve::Generate as _,
+    pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -280,10 +286,7 @@ fn load_vapid_config(state_path: &FsPath, origin: &str) -> Result<VapidConfig> {
     let signing_key = p256::ecdsa::SigningKey::from_slice(key.to_bytes().as_ref())
         .context("load VAPID private key")?;
     let public_key = oshioki_protocol::encode_base64url(
-        signing_key
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes(),
+        signing_key.verifying_key().to_sec1_point(false).as_bytes(),
     );
     let subject = std::env::var("OSHIOKI_VAPID_SUBJECT").unwrap_or_else(|_| origin.to_owned());
     let parsed_subject = url::Url::parse(&subject).context("parse OSHIOKI_VAPID_SUBJECT")?;
@@ -306,7 +309,7 @@ fn load_or_create_vapid_pem(path: &FsPath) -> Result<Vec<u8>> {
         }
     }
 
-    let key = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+    let key = p256::SecretKey::generate();
     let pem = key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
         .context("encode VAPID private key")?;
@@ -955,10 +958,7 @@ fn vapid_authorization(vapid: &VapidConfig, endpoint: &str, ttl: u32) -> Result<
         .token(&JwtHeader::empty(), &claims, &signing_key)
         .context("sign VAPID JWT")?;
     let public_key = oshioki_protocol::encode_base64url(
-        signing_key
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes(),
+        signing_key.verifying_key().to_sec1_point(false).as_bytes(),
     );
     Ok(format!("vapid t={token}, k={public_key}"))
 }
@@ -1988,18 +1988,15 @@ mod tests {
         VapidConfig {
             private_key: Arc::new(key.to_bytes().to_vec()),
             public_key: oshioki_protocol::encode_base64url(
-                signing_key
-                    .verifying_key()
-                    .to_encoded_point(false)
-                    .as_bytes(),
+                signing_key.verifying_key().to_sec1_point(false).as_bytes(),
             ),
             subject: "https://sudo.test".into(),
         }
     }
 
-    fn test_push_item() -> db::PushItem {
-        let signing = p256::ecdsa::SigningKey::from_bytes((&[8; 32]).into()).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+    pub(super) fn test_push_item() -> db::PushItem {
+        let signing = p256::ecdsa::SigningKey::from_slice(&[8; 32]).unwrap();
+        let point = signing.verifying_key().to_sec1_point(false);
         let mut p256dh = vec![4];
         p256dh.extend_from_slice(point.x().unwrap());
         p256dh.extend_from_slice(point.y().unwrap());
@@ -3224,7 +3221,7 @@ mod tests {
         action: oshioki_protocol::ToolDecisionActionV1,
     ) -> ToolApprovalDecisionV1 {
         use p256::ecdsa::{SigningKey, signature::Signer as _};
-        let signing = SigningKey::from_bytes((&[2; 32]).into()).unwrap();
+        let signing = SigningKey::from_slice(&[2; 32]).unwrap();
         let challenge = oshioki_protocol::tool_approval_challenge(action, raw);
         let client_data = serde_json::to_vec(&json!({
             "type":"webauthn.get",
@@ -3926,8 +3923,8 @@ mod tests {
 
     fn test_device() -> oshioki_protocol::DevicePublicRecordV1 {
         let credential_id = vec![1; 16];
-        let signing = p256::ecdsa::SigningKey::from_bytes((&[2; 32]).into()).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = p256::ecdsa::SigningKey::from_slice(&[2; 32]).unwrap();
+        let point = signing.verifying_key().to_sec1_point(false);
         let cose = ciborium::Value::Map(vec![
             (
                 ciborium::Value::Integer(1.into()),

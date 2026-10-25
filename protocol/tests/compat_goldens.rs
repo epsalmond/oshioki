@@ -106,8 +106,8 @@ struct PreAuthEnvelope {
 }
 
 fn webauthn_device() -> DevicePublicRecordV1 {
-    let signing = SigningKey::from_bytes((&[2; 32]).into()).unwrap();
-    let point = signing.verifying_key().to_encoded_point(false);
+    let signing = SigningKey::from_slice(&[2; 32]).unwrap();
+    let point = signing.verifying_key().to_sec1_point(false);
     let cose = cose_key(point.x().unwrap(), point.y().unwrap());
     let credential_id = vec![1; 16];
     let box_public_key = vec![3; 32];
@@ -176,8 +176,8 @@ fn device_and_auth_goldens_round_trip() {
     let mut without_kind = serde_json::to_value(&device).unwrap();
     without_kind.as_object_mut().unwrap().remove("kind");
     let second = {
-        let signing = SigningKey::from_bytes((&[5; 32]).into()).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = SigningKey::from_slice(&[5; 32]).unwrap();
+        let point = signing.verifying_key().to_sec1_point(false);
         let cose = cose_key(point.x().unwrap(), point.y().unwrap());
         let credential_id = vec![6; 16];
         let box_public_key = vec![7; 32];

@@ -23,6 +23,7 @@ use oshioki_browser_relay::{
 };
 use oshioki_protocol::{decode_base64url, encode_base64url};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Verifier as _};
+use p256::elliptic_curve::Generate as _;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -293,10 +294,11 @@ impl Peer {
         attempt: &Message,
     ) -> Result<Message> {
         while let Some(frame) = sub.next().await {
-            if let Ok(message) = verify(&frame.payload, &self.verifying, now()) {
-                if message.attempt == attempt.attempt && message.expires == attempt.expires {
-                    return Ok(message);
-                }
+            if let Ok(message) = verify(&frame.payload, &self.verifying, now())
+                && message.attempt == attempt.attempt
+                && message.expires == attempt.expires
+            {
+                return Ok(message);
             }
         }
         bail!("relay subscription ended")
@@ -1256,7 +1258,7 @@ async fn main() {
 async fn run() -> Result<()> {
     match Cli::parse().command {
         Commands::Keygen { path } => {
-            let key = SigningKey::random(&mut rand::rngs::OsRng);
+            let key = SigningKey::generate();
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1266,7 +1268,7 @@ async fn run() -> Result<()> {
             file.sync_all()?;
             println!(
                 "{}",
-                encode_base64url(key.verifying_key().to_encoded_point(false).as_bytes())
+                encode_base64url(key.verifying_key().to_sec1_point(false).as_bytes())
             );
             Ok(())
         }

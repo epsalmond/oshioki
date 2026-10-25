@@ -1,0 +1,84 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -84,8 +84,8 @@
+ default-features = false
+ 
+ [dependencies.p256]
+-version = "0.13.2"
+-features = ["ecdh"]
++version = "0.14.0"
++features = ["ecdh", "getrandom"]
+ 
+ [dependencies.serde]
+ version = "1.0.229"
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -27,7 +27,7 @@
+ hkdf = "0.13.0"
+ http = "1.4.2"
+ jwt-simple = { version = "0.12.17", default-features = false, features = ["pure-rust"], optional = true }
+-p256 = { version = "0.13.2", features = ["ecdh"] }
++p256 = { version = "0.14.0", features = ["ecdh", "getrandom"] }
+ serde = { version = "1.0.229", features = ["derive"], optional = true }
+ sha2 = "0.11.0"
+ 
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -69,7 +69,7 @@
+ #[cfg(feature = "vapid")]
+ pub use jwt_simple;
+ pub use p256;
+-use p256::elliptic_curve::sec1::ToEncodedPoint;
++use p256::elliptic_curve::{sec1::ToSec1Point, Generate};
+ use sha2::Sha256;
+ 
+ /// Error type for HTTP push failure modes
+@@ -203,7 +203,7 @@
+ ) -> Result<Vec<u8>, Error> {
+     let mut salt = [0u8; 16];
+     OsRng.fill_bytes(&mut salt);
+-    let as_secret = p256::SecretKey::random(&mut OsRng);
++    let as_secret = p256::SecretKey::generate();
+     encrypt_predictably(salt, message, &as_secret, ua_public, ua_auth).map_err(Error::ECE)
+ }
+ 
+@@ -218,7 +218,7 @@
+     let shared = p256::ecdh::diffie_hellman(as_secret.to_nonzero_scalar(), ua_public.as_affine());
+ 
+     let ikm = compute_ikm(ua_auth, &shared, ua_public, &as_public);
+-    let keyid = as_public.as_affine().to_encoded_point(false);
++    let keyid = as_public.as_affine().to_sec1_point(false);
+     let encrypted_record_length = (message.len() + 17)
+         .try_into()
+         .map_err(|_| ece_native::Error::RecordLengthInvalid)?;
+@@ -258,8 +258,8 @@
+     let mut info = Vec::new();
+     info.extend_from_slice(&b"WebPush: info"[..]);
+     info.push(0u8);
+-    info.extend_from_slice(ua_public.as_affine().to_encoded_point(false).as_bytes());
+-    info.extend_from_slice(as_public.as_affine().to_encoded_point(false).as_bytes());
++    info.extend_from_slice(ua_public.as_affine().to_sec1_point(false).as_bytes());
++    info.extend_from_slice(as_public.as_affine().to_sec1_point(false).as_bytes());
+ 
+     let mut okm = [0u8; 32];
+     let hk = Hkdf::<Sha256>::new(Some(auth), shared.raw_secret_bytes().as_ref());
+--- a/src/serde_.rs
++++ b/src/serde_.rs
+@@ -2,7 +2,7 @@
+ 
+ use base64ct::{Base64UrlUnpadded, Encoding};
+ use http::Uri;
+-use p256::elliptic_curve::sec1::ToEncodedPoint;
++use p256::elliptic_curve::sec1::ToSec1Point;
+ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+ 
+ use super::{Auth, WebPushBuilder};
+@@ -46,7 +46,7 @@
+ 
+ fn p256_to_bytes<S: Serializer>(auth: &p256::PublicKey, s: S) -> Result<S::Ok, S::Error> {
+     s.serialize_str(&Base64UrlUnpadded::encode_string(
+-        auth.to_encoded_point(false).as_bytes(),
++        auth.to_sec1_point(false).as_bytes(),
+     ))
+ }
+ 

@@ -255,7 +255,7 @@ pub(crate) mod tests {
     use crate::v1::{device_fingerprint, encode_base64url};
     use p256::{
         ecdsa::{SigningKey, signature::Signer as _},
-        elliptic_curve::rand_core::OsRng,
+        elliptic_curve::Generate as _,
     };
 
     /// Encodes a P-256 point as a COSE ES256 key, for fixtures.
@@ -273,8 +273,8 @@ pub(crate) mod tests {
     }
 
     fn fixture() -> (SigningKey, DevicePublicRecordV1, HookConfigV1) {
-        let signing = SigningKey::random(&mut OsRng);
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = SigningKey::generate();
+        let point = signing.verifying_key().to_sec1_point(false);
         let cose = cose_key(point.x().unwrap(), point.y().unwrap());
         let credential_id = vec![7; 32];
         let box_key = vec![8; 32];

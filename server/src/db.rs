@@ -690,10 +690,10 @@ fn submission_binds_device(
                 )
             }
         };
-    if let Some(expected) = credential_public_key {
-        if device.credential_public_key != expected {
-            return Ok(false);
-        }
+    if let Some(expected) = credential_public_key
+        && device.credential_public_key != expected
+    {
+        return Ok(false);
     }
     Ok(device.credential_id == credential_id
         && device.box_public_key == box_public_key
@@ -2146,8 +2146,8 @@ mod tests {
 
     fn device(token: &[u8]) -> DevicePublicRecordV1 {
         let credential_id = vec![1; 16];
-        let signing = SigningKey::from_bytes((&[2; 32]).into()).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = SigningKey::from_slice(&[2; 32]).unwrap();
+        let point = signing.verifying_key().to_sec1_point(false);
         let cose = ciborium::Value::Map(vec![
             (
                 ciborium::Value::Integer(1.into()),
@@ -2444,8 +2444,8 @@ mod tests {
     }
 
     fn push_material() -> (Vec<u8>, Vec<u8>) {
-        let signing = SigningKey::from_bytes((&[8; 32]).into()).unwrap();
-        let point = signing.verifying_key().to_encoded_point(false);
+        let signing = SigningKey::from_slice(&[8; 32]).unwrap();
+        let point = signing.verifying_key().to_sec1_point(false);
         let mut p256dh = vec![4];
         p256dh.extend_from_slice(point.x().unwrap());
         p256dh.extend_from_slice(point.y().unwrap());
@@ -2621,18 +2621,34 @@ mod tests {
         let token = b"push-key-token";
         store.put_device(&device(token)).unwrap();
         let (p256dh, auth) = push_material();
-        assert!(
-            store
-                .register_push_subscription(
-                    token,
-                    "https://push.example.test/send",
-                    &p256dh[..64],
-                    &auth,
-                    None,
-                    20,
-                )
-                .is_err()
-        );
+        for malformed in [vec![], p256dh[..64].to_vec(), vec![4; PUSH_P256DH_BYTES]] {
+            assert!(
+                store
+                    .register_push_subscription(
+                        token,
+                        "https://push.example.test/send",
+                        &malformed,
+                        &auth,
+                        None,
+                        20,
+                    )
+                    .is_err()
+            );
+        }
+        for length in [0, PUSH_AUTH_BYTES - 1, PUSH_AUTH_BYTES + 1] {
+            assert!(
+                store
+                    .register_push_subscription(
+                        token,
+                        "https://push.example.test/send",
+                        &p256dh,
+                        &vec![9; length],
+                        None,
+                        20,
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -3409,10 +3425,10 @@ mod tests {
         token: &[u8],
         label: &str,
     ) -> (EnrollmentSubmissionV1, DevicePublicRecordV1) {
-        let signing = SigningKey::from_bytes((&[key_byte; 32]).into()).unwrap();
+        let signing = SigningKey::from_slice(&[key_byte; 32]).unwrap();
         let public = signing
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         assert_eq!(public.len(), 65);

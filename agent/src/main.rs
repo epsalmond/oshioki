@@ -516,16 +516,16 @@ fn load_or_create_with(
 
 fn reuse_or_complain(pairing: &Pairing, identity: Identity) -> Result<Identity> {
     let existing = identity.signer_kind();
-    if let Some(requested) = pairing.requested {
-        if requested != existing {
-            bail!(
-                "this device already has an identity with a {existing} signing key, and \
+    if let Some(requested) = pairing.requested
+        && requested != existing
+    {
+        bail!(
+            "this device already has an identity with a {existing} signing key, and \
                  --signer {requested} cannot change it; drop the flag to pair this host \
                  with the existing key, or pass --force to replace the identity, which \
                  gives the device a new fingerprint and needs the host's old record \
                  revoked"
-            );
-        }
+        );
     }
     info!(
         fingerprint = %identity.fingerprint(),
@@ -1849,10 +1849,10 @@ fn session_name_for(request: &oshioki_protocol::RequestV1) -> Option<String> {
     }) {
         return Some(escape_for_terminal(&format!("{comm}[{pid}]")));
     }
-    if let Some(tty) = &request.tty {
-        if let Some(basename) = tty.rsplit('/').next().filter(|value| !value.is_empty()) {
-            return Some(escape_for_terminal(basename));
-        }
+    if let Some(tty) = &request.tty
+        && let Some(basename) = tty.rsplit('/').next().filter(|value| !value.is_empty())
+    {
+        return Some(escape_for_terminal(basename));
     }
     None
 }
