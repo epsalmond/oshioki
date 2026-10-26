@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Print the highest published stable version tag strictly preceding HEAD."""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+
+def command(*args, check=True):
+    return subprocess.run(args, check=check, capture_output=True, text=True)
+
+
+def main():
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    if not repository:
+        raise ValueError("GITHUB_REPOSITORY must name the published-release repository")
+    head = command("git", "rev-parse", "HEAD").stdout.strip()
+    # Paginate rather than trusting GitHub's latest-release marker or a fixed
+    # release count: reruns can need a predecessor from an older API page.
+    pages = json.loads(command(
+        "gh", "api", "--paginate", "--slurp",
+        f"repos/{repository}/releases?per_page=100",
+    ).stdout)
+    published = {
+        release["tag_name"]
+        for page in pages for release in page
+        if release.get("draft") is False and release.get("prerelease") is False
+        and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", release.get("tag_name", ""))
+    }
+    # Use the same version ordering as the local upgrade runner. Publication
+    # time/order does not make a backfilled old release the newest version.
+    tags = command("git", "tag", "--sort=-v:refname").stdout.splitlines()
+    for tag in tags:
+        if tag not in published:
+            continue
+        commit = command("git", "rev-parse", "--verify", "--quiet",
+                         f"refs/tags/{tag}^{{commit}}", check=False)
+        if commit.returncode or commit.stdout.strip() == head:
+            continue
+        ancestor = command("git", "merge-base", "--is-ancestor",
+                           commit.stdout.strip(), head, check=False)
+        if ancestor.returncode == 0:
+            print(tag)
+            return
+        if ancestor.returncode != 1:
+            raise ValueError(f"could not check ancestry of {tag}: {ancestor.stderr.strip()}")
+    raise ValueError("no eligible published stable version tag (vMAJOR.MINOR.PATCH) "
+                     "is a strict ancestor of HEAD; fetch full history and tags")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+        sys.exit(f"select-compat-previous-release: {detail}")

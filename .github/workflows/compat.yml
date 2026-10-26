@@ -65,7 +65,7 @@ jobs:
           # OSHIOKI_COMPAT_PREV_TARGET (set below) puts that build here.
           cache-directories: ${{ runner.temp }}/compat-prev-target
       - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libpam0g-dev nats-server
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
       - name: Browser compatibility prerequisites
@@ -74,6 +74,13 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           npm --prefix server/web ci
           npm --prefix server/web exec playwright install --with-deps chromium
+      - name: Select previous published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/test-compat-release-selection
+          tag="$(scripts/select-compat-previous-release)"
+          echo "OSHIOKI_COMPAT_PREV_TAG=$tag" >> "$GITHUB_ENV"
       - name: NATS lane repair
         run: scripts/test-nats-lane-upgrade
       - name: Mixed-version upgrade

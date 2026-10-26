@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Offline predecessor-selection tests using disposable Git/release fixtures."""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+SELECTOR = Path(__file__).resolve().with_name("select-compat-previous-release")
+
+
+def release(tag, **flags):
+    return {"tag_name": tag, "draft": False, "prerelease": False, **flags}
+
+
+class SelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="oshioki-compat-selection-")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.repo = self.directory / "repo"
+        self.bin = self.directory / "bin"
+        self.bin.mkdir()
+        self.fixture = self.directory / "releases.json"
+        self.env = {
+            **os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_AUTHOR_DATE": "2026-10-25T00:00:00Z", "GIT_COMMITTER_DATE": "2026-10-25T00:00:00Z",
+            "GITHUB_REPOSITORY": "fixture/oshioki", "RELEASE_FIXTURE": str(self.fixture),
+            "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
+        }
+        # Assert production requests all pages; the fixture has gh --slurp's
+        # array-of-pages shape. No credentials or network access are needed.
+        gh = self.bin / "gh"
+        gh.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+assert sys.argv[1:] == ["api", "--paginate", "--slurp", "repos/fixture/oshioki/releases?per_page=100"]
+if os.environ.get("FAIL_GH"):
+    sys.exit("fixture release API unavailable")
+print(pathlib.Path(os.environ["RELEASE_FIXTURE"]).read_text())
+''')
+        gh.chmod(0o755)
+        # A regression that tries to compile is a test failure, even on a host
+        # with Cargo installed. Fixtures contain no Rust workspace.
+        cargo = self.bin / "cargo"
+        cargo.write_text("#!/bin/sh\necho unexpected-compilation >&2\nexit 99\n")
+        cargo.chmod(0o755)
+        self.git("init", "-q", "-b", "main", str(self.repo), cwd=self.directory)
+        self.git("config", "user.name", "Compatibility fixture")
+        self.git("config", "user.email", "fixture@example.invalid")
+        self.old = self.commit("v0.4.3")
+        self.commit("v0.5.0")  # Local failed release tag, never published.
+        self.candidate = self.commit("v0.5.1", annotated=True)
+        self.future = self.commit("v0.6.0")
+        self.git("checkout", "-q", "--detach", self.candidate)
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(["git", *args], cwd=cwd or self.repo, env=self.env,
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, tag=None, annotated=False):
+        self.git("commit", "--allow-empty", "--no-gpg-sign", "-qm", tag or "unreleased")
+        if tag:
+            args = ["tag", "--no-sign"]
+            if annotated:
+                args += ["-a", "-m", "fixture release"]
+            self.git(*args, tag)
+        return self.git("rev-parse", "HEAD")
+
+    def select(self, pages, expected=None, error=None, **env):
+        self.fixture.write_text(json.dumps(pages))
+        result = subprocess.run([str(SELECTOR)], cwd=self.repo, env={**self.env, **env},
+                                capture_output=True, text=True)
+        self.assertNotIn("unexpected-compilation", result.stderr)
+        if error:
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result.stdout, "")
+            self.assertIn(error, result.stderr)
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected + "\n")
+
+    def test_published_self_falls_back_to_older_release(self):
+        self.select([[release("v0.5.1"), release("v0.4.3")]], "v0.4.3")
+
+    def test_historical_rerun_excludes_future_and_self(self):
+        self.select([[release("v0.6.0"), release("v0.5.1"), release("v0.4.3")]], "v0.4.3")
+
+    def test_unreleased_descendant_selects_highest_version_not_api_order(self):
+        self.git("checkout", "-q", "--detach", self.future)
+        self.commit()
+        self.select([[release("v0.4.3"), release("v0.6.0"), release("v0.5.1")]], "v0.6.0")
+
+    def test_failed_unpublished_tag_is_ignored(self):
+        self.select([[release("v0.4.3")]], "v0.4.3")
+
+    def test_predecessor_on_later_release_page(self):
+        self.select([[release("v0.6.0"), release("v0.5.1")], [release("v0.4.3")]], "v0.4.3")
+
+    def test_divergent_release_is_not_a_predecessor(self):
+        self.git("checkout", "-q", "--detach", self.old)
+        self.commit("v0.7.0")
+        self.git("checkout", "-q", "--detach", self.candidate)
+        self.select([[release("v0.7.0"), release("v0.4.3")]], "v0.4.3")
+
+    def test_draft_prerelease_and_nonversion_tags_are_ignored(self):
+        self.git("tag", "--no-sign", "nightly", "v0.5.0")
+        self.git("tag", "--no-sign", "v0.8.0-rc.1", "v0.5.0")
+        for ignored in (release("v0.5.0", draft=True), release("v0.5.0", prerelease=True),
+                        release("nightly"), release("v0.8.0-rc.1")):
+            with self.subTest(ignored=ignored):
+                self.select([[ignored, release("v0.4.3")]], "v0.4.3")
+
+    def test_missing_local_tag_is_skipped(self):
+        self.select([[release("v0.9.0"), release("v0.4.3")]], "v0.4.3")
+
+    def test_no_eligible_release_is_actionable(self):
+        for pages in ([], [[release("v0.5.1"), release("v0.6.0")]], [[release("v0.9.0")]]):
+            with self.subTest(pages=pages):
+                self.select(pages, error="no eligible published stable version tag")
+
+    def test_invalid_tag_only_is_actionable(self):
+        self.git("tag", "--no-sign", "nightly", "v0.5.0")
+        self.select([[release("nightly")]], error="vMAJOR.MINOR.PATCH")
+
+    def test_api_failure_does_not_fall_back_to_unpublished_tags(self):
+        self.select([[release("v0.4.3")]], error="fixture release API unavailable", FAIL_GH="1")
+
+    def test_missing_repository_is_actionable(self):
+        self.select([], error="GITHUB_REPOSITORY must name", GITHUB_REPOSITORY="")
+
+
+if __name__ == "__main__":
+    unittest.main()

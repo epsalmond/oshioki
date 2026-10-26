@@ -180,6 +180,23 @@ permanent outage. The required checks are:
 6. Unsupported mixes fail closed with a diagnostic or unavailable-with-fallback;
    they do not hang or silently allow.
 
+Both CI upgrade jobs use `scripts/select-compat-previous-release` to set
+`OSHIOKI_COMPAT_PREV_TAG` to the highest version among published, non-draft,
+non-prerelease GitHub releases whose existing `vMAJOR.MINOR.PATCH` tag is a
+strict ancestor of the checked-out candidate. The selector reads every release
+page and requires full Git history and tags. It excludes the candidate itself,
+future or divergent commits, and unpublished tags (such as the failed `v0.5.0`
+release), so post-publication and historical reruns keep a valid predecessor.
+It fails with a diagnostic when none exists.
+
+For local runs, set `OSHIOKI_COMPAT_PREV_TAG` explicitly to select a baseline
+when unpublished tags exist. This operator override requires an existing
+version tag pointing to a different commit; it does not enforce GitHub
+publication or ancestry. Without an override, the upgrade script selects the
+newest local tag pointing to a different commit. To use CI's published-release
+policy locally, export `GITHUB_REPOSITORY=epsalmond/oshioki` and run
+`tag="$(scripts/select-compat-previous-release)" && OSHIOKI_COMPAT_PREV_TAG="$tag" scripts/test-compat-upgrade`.
+
 `scripts/test-compat-upgrade` keeps the previous-release hook waiting while
 the server restarts. The candidate native agent subscribes before that
 request is published, retains the previous identity, and receives an explicit

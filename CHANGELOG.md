@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-10-25
+## [0.5.1] - 2026-10-25
+
+This is the first published release of the feature and security changes below.
+The immutable `v0.5.0` tag was retained after its release workflow failed on
+missing browser-test prerequisites; no 0.5.0 release assets or APT package were
+published.
 
 ### Added
 
@@ -18,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Install the browser compatibility test prerequisites in the release workflow,
+  and test upgrades from the latest published release rather than an unpublished
+  tag.
 - Preserve an existing browser push subscription when a new enrollment's
   capability preflight fails, and isolate retained delivery receipts by request
   lane.
