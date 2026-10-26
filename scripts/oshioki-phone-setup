@@ -529,7 +529,7 @@ def _nats_probe(url: str, user: str, password: str, *, ensure_stream: bool = Fal
                     fail("authenticated NATS connection cannot inspect the OSHIOKI stream")
                 stream = json.dumps({
                     "name": "OSHIOKI",
-                    "subjects": ["oshioki.request.>"],
+                    "subjects": ["oshioki.request.>", "oshioki.auth.>"],
                     "storage": "file",
                     "retention": "limits",
                     "discard": "old",
@@ -974,7 +974,8 @@ def _nats_config(state: Path, credentials: dict[str, str], port: int) -> Path:
     _owned_directory(store, "NATS store", 0o700)
     # These lists must track every subject each role actually uses in
     # transport/src/nats.rs (hook/client side) and server/src (server side):
-    #   hook publishes:   oshioki.request.<host>, oshioki.enrollment.intent,
+    #   hook publishes:   oshioki.request.<host>, oshioki.auth.<host>,
+    #                      oshioki.enrollment.intent,
     #                      oshioki.enrollment.activation.<id>, oshioki.device.revoke.<fp>
     #   hook subscribes:  oshioki.verdict.<id>, oshioki.ack.<id>, oshioki.delivery.<id>
     #                      (DeliveryV1, added in #57), oshioki.enrollment.submission.<id>,
@@ -986,13 +987,14 @@ def _nats_config(state: Path, credentials: dict[str, str], port: int) -> Path:
     #                      server/src/main.rs's outbox worker publishes it back to the hook
     #                      that is waiting on that subject), $JS.API.> (JetStream
     #                      admin/consumer calls), $JS.ACK.> (consumer acks)
-    #   server subscribes: oshioki.request.> (JetStream consumer), oshioki.enrollment.intent,
+    #   server subscribes: oshioki.request.>, oshioki.auth.> (JetStream consumer),
+    #                      oshioki.enrollment.intent,
     #                      oshioki.enrollment.submission.>, oshioki.enrollment.activation.>,
     #                      oshioki.device.revoke.>, _INBOX.> (JetStream API + revoke replies)
-    hook_publish = ["oshioki.request.>", "oshioki.enrollment.intent", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>"]
+    hook_publish = ["oshioki.request.>", "oshioki.auth.>", "oshioki.enrollment.intent", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>"]
     hook_subscribe = ["oshioki.verdict.>", "oshioki.ack.>", "oshioki.delivery.>", "oshioki.enrollment.submission.>", "oshioki.device.revoked.>", "oshioki.request.>"]
     server_publish = ["oshioki.ack.>", "oshioki.verdict.>", "oshioki.delivery.>", "oshioki.enrollment.submission.>", "oshioki.device.revoked.>", "$JS.API.>", "$JS.ACK.>"]
-    server_subscribe = ["oshioki.request.>", "oshioki.enrollment.intent", "oshioki.enrollment.submission.>", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>", "_INBOX.>"]
+    server_subscribe = ["oshioki.request.>", "oshioki.auth.>", "oshioki.enrollment.intent", "oshioki.enrollment.submission.>", "oshioki.enrollment.activation.>", "oshioki.device.revoke.>", "_INBOX.>"]
 
     def items(values: list[str]) -> str:
         return "[" + ", ".join(_quote_nats(item) for item in values) + "]"
