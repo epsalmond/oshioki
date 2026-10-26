@@ -256,6 +256,30 @@ class PhoneSetupTests(unittest.TestCase):
         self.assertIn('"oshioki.request.>"', text)
         self.assertIn('"$JS.ACK.>"', text)
 
+    def test_local_nats_permissions_allow_contextual_authentication_only_for_correct_roles(self) -> None:
+        state = self.root / "state"
+        state.mkdir(mode=0o700)
+        credentials = {
+            "hook_user": "oshioki-hook",
+            "hook_pass": "hook-secret",
+            "server_user": "oshioki-server",
+            "server_pass": "server-secret",
+        }
+        config = phone._nats_config(state, credentials, 14222)
+        rendered = config.read_text(encoding="utf-8")
+        hook_block = self._user_block(rendered, "oshioki-hook")
+        server_block = self._user_block(rendered, "oshioki-server")
+        hook_publish = hook_block.split("publish:", 1)[1].split("subscribe:", 1)[0]
+        server_subscribe = server_block.split("subscribe:", 1)[1]
+        self.assertIn('"oshioki.auth.>"', hook_publish)
+        self.assertIn('"oshioki.auth.>"', server_subscribe)
+        self.assertNotIn('"oshioki.tool.request"', rendered)
+
+        # A packaged setup rerun must render the identical durable ACL.
+        before = config.read_bytes()
+        self.assertEqual(phone._nats_config(state, credentials, 14222), config)
+        self.assertEqual(config.read_bytes(), before)
+
     def _user_block(self, text: str, user: str) -> str:
         # Isolate one user's stanza so assertions below check the
         # subject is granted to the *correct* role, not merely present
